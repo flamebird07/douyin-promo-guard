@@ -1,0 +1,17 @@
+node_modules/
+logs/
+data/
+cookies/*.json
+config/config.json
+*.log
+evidence/
+
+.env
+.env.*
+!.env.example
+*.jsonl
+backups/
+*.bak
+*.pem
+*.key
+

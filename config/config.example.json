@@ -1,0 +1,63 @@
+{
+  "_说明": "首版配置（2026-09-13）。店铺与数据入口均为用户确认/页面实测值：费用=抖店首页顶部『巨量千川』→账户整体消耗(元)（统计周期=当天）；订单=首页『成交订单数』→电商罗盘经营概况（售卖类型=全店 且 日期=实时）。真实执行 realMode 默认关闭。",
+  "shops": [
+    {
+      "id": "瑾漂亮潮流服饰",
+      "id_说明": "罗盘/千川页面均未暴露店铺稳定ID；id 取店铺名，身份按页面店铺名精确映射核验（归因记录在读取结果的 shopIdAttribution）",
+      "name": "瑾漂亮潮流服饰",
+      "compassShopName": "瑾漂亮潮流服饰",
+      "cookieFile": "瑾漂亮潮流服饰",
+      "accountId": "1710242295996424",
+      "accountId_说明": "页面实测：千川头部 ID 元素（账户『伊人美』）；千川费用/清单源用它做账户映射核验",
+      "enabled": true
+    }
+  ],
+  "promoPage": {
+    "costEntry": "抖店首页顶部『巨量千川』→ 首页『账户整体消耗(元)』（统计周期=当天）",
+    "orderEntry": "抖店首页『成交订单数』文字 → 电商罗盘『经营概况』（售卖类型=全店 且 日期=实时）",
+    "accountType": "巨量千川"
+  },
+  "rules": [
+    {
+      "type": "wholeShopCostPerOrder",
+      "name": "当天每单成本超额关全店",
+      "metric": "cost_per_order",
+      "metric_说明": "当天累计推广费用 ÷ 当天累计全店订单数；整数分判定：费用分 > 订单数×阈值分，恰好相等不关闭",
+      "thresholdCents": 100,
+      "comparator": ">",
+      "period": "today",
+      "timezone": "Asia/Shanghai",
+      "enabled": true
+    }
+  ],
+  "schedule": { "dailyStartHour": 8, "intervalMinutes": 30, "timezone": "Asia/Shanghai" },
+  "execution": {
+    "dryRun": true,
+    "realMode": false,
+    "realMode_说明": "真实执行开关，默认关闭；开启前需人工确认且千川开关点击路径须先经真实验证",
+    "maxRetries": 2,
+    "retryBackoffMs": 3000,
+    "closeTimeoutMs": 20000,
+    "readbackTimeoutMs": 15000,
+    "readbackAttempts": 3,
+    "readbackIntervalMs": 2000,
+    "zeroOrderRecheck": 1,
+    "maxAdPages": 50
+  },
+  "monitor": {
+    "snapshotMaxAgeMinutes": 30,
+    "mockDataSource": false,
+    "orderDataSource": "compass",
+    "costDataSource": "qianchuan",
+    "adListDataSource": "qianchuan",
+    "qianchuan": {
+      "adTypes": ["uni_promotion", "standard", "brand"],
+      "adTypes_说明": "已接入只读读取的投放类型。brand 已实测为空清单（共0条，确认无对象）；乘方（overall）控制对象未定位——覆盖缺口，阻止全店结论，待平台侧确认乘方托管计划的管理位置"
+    }
+  },
+  "login": {
+    "cookieSourceDir": "C:/Users/Administrator/Documents/电商助手/bill-manager/cookies",
+    "edgePath": "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+    "douyinHomeUrl": "https://fxg.jinritemai.com/ffa/mshop/homepage/index"
+  }
+}

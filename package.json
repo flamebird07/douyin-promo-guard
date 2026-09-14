@@ -1,0 +1,19 @@
+{
+  "name": "douyin-promo-guard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "抖店推广超额自动关闭广告 —— 基础实现（默认演练模式，真实关闭默认关闭）",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js serve",
+    "check": "node src/index.js check",
+    "login": "node src/index.js login",
+    "test": "node --test test/money-time.test.js test/rules-guard.test.js test/close-flow.test.js test/coordinator.test.js test/monitor.test.js test/compass-order.test.js test/compass-dom.test.js test/qianchuan-reader.test.js test/qianchuan-dom.test.js test/chengfang-dom.test.js test/chengfang-executor.test.js test/monitor-chengfang.test.js"
+  },
+  "dependencies": {
+    "playwright": "^1.62.1"
+  }
+}

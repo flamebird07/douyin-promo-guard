@@ -1,0 +1,203 @@
+<div id="tab-watchdrill" class="tab-content">
+  <style>
+    #tab-watchdrill .wd-badge { display: inline-block; padding: 3px 12px; border-radius: 12px; font-size: 13px; font-weight: 600; }
+    #tab-watchdrill .wd-idle  { background: #f1f5f9; color: #64748b; }
+    #tab-watchdrill .wd-reading { background: #dbeafe; color: #1d4ed8; }
+    #tab-watchdrill .wd-waiting { background: #e0f2fe; color: #0e7490; }
+    #tab-watchdrill .wd-waiting08 { background: #ede9fe; color: #6d28d9; }
+    #tab-watchdrill .wd-failed { background: #fee2e2; color: #dc2626; }
+    #tab-watchdrill .wd-stopping { background: #ffedd5; color: #c2410c; }
+    #tab-watchdrill .wd-lock { font-size: 12px; color: #16a34a; background: #ecfdf5; border: 1px solid #bbf7d0; border-radius: 6px; padding: 4px 10px; display: inline-block; }
+    #tab-watchdrill .wd-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 16px; margin-top: 10px; }
+    #tab-watchdrill .wd-cell { font-size: 13px; }
+    #tab-watchdrill .wd-cell .k { color: #888; font-size: 12px; }
+    #tab-watchdrill .wd-cell .v { font-size: 15px; font-weight: 600; color: #222; margin-top: 2px; }
+    #tab-watchdrill .wd-concl-ok { color: #16a34a; }
+    #tab-watchdrill .wd-concl-over { color: #dc2626; }
+    #tab-watchdrill .wd-concl-unknown { color: #d97706; }
+    #tab-watchdrill .wd-logbox { height: 320px; overflow-y: auto; background: #111827; color: #d1d5db; border-radius: 8px; padding: 10px 12px; font-family: Consolas, Menlo, monospace; font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
+    #tab-watchdrill .wd-logbox .t { color: #6b7280; margin-right: 6px; }
+    #tab-watchdrill .wd-logbox .lvl-warn { color: #fbbf24; }
+    #tab-watchdrill .wd-logbox .lvl-error { color: #f87171; }
+    #tab-watchdrill .wd-logbox .lvl-info { color: #93c5fd; }
+  </style>
+  <div class="card">
+    <div class="card-title">推广值守演练
+      <span class="wd-lock" style="margin-left:10px;">只读演练 · 不操作广告</span>
+    </div>
+    <div class="form-row">
+      <span class="form-label">店铺</span>
+      <span id="wdShopName" style="font-weight:600;">—</span>
+      <span class="form-label" style="margin-left:18px;">当前状态</span>
+      <span id="wdStatusBadge" class="wd-badge wd-idle">未启动</span>
+      <button class="btn btn-primary" id="wdToggleBtn" onclick="wdToggle()">启动值守</button>
+      <button class="btn" style="background:#eee;color:#666;" onclick="wdRefreshAll()">🔄 刷新</button>
+    </div>
+    <div id="wdError" style="display:none;font-size:13px;color:#dc2626;margin:6px 0 0;padding:8px 12px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;"></div>
+    <div class="wd-grid">
+      <div class="wd-cell"><div class="k">最近检查时间</div><div class="v" id="wdLastCheck">—</div></div>
+      <div class="wd-cell"><div class="k">下次检查时间</div><div class="v" id="wdNextRun">—</div></div>
+      <div class="wd-cell"><div class="k">当天费用</div><div class="v" id="wdCost">—</div></div>
+      <div class="wd-cell"><div class="k">全店订单数</div><div class="v" id="wdOrders">—</div></div>
+      <div class="wd-cell"><div class="k">每单成本</div><div class="v" id="wdPerOrder">—</div></div>
+      <div class="wd-cell"><div class="k">判断结果</div><div class="v" id="wdConclusion">—</div></div>
+    </div>
+    <div id="wdReason" style="font-size:12.5px;color:#666;margin-top:8px;"></div>
+    <p style="font-size:12px;color:#999;margin:8px 0 0;">
+      规则：费用=千川「账户整体消耗」，订单=罗盘经营概况「全店+实时」成交订单数；
+      费用整数分 &gt; 订单数×100 分才超标（恰好 1 元/单不超标）。本页为强制演练：只评估数据，绝不暂停/开启/删除任何广告。
+    </p>
+  </div>
+  <div class="card">
+    <div class="card-title">值守日志</div>
+    <div class="wd-logbox" id="wdLog"><div style="color:#6b7280;">尚未有日志</div></div>
+  </div>
+  <script>
+    (function () {
+      var lastSeq = 0;
+      var pollTimer = null;
+      var POLL_MS = 5000;
+
+      function $(id) { return document.getElementById(id); }
+      function esc(s) { return s == null ? '' : String(s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+      function fmtTime(iso) {
+        if (!iso) return '—';
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) return '—';
+        return d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      }
+      function api(method, path, body) {
+        var o = { method: method, headers: { 'Content-Type': 'application/json' } };
+        if (body) o.body = JSON.stringify(body);
+        return fetch(path, o).then(function (r) { return r.json().catch(function () { throw new Error('HTTP ' + r.status); }); });
+      }
+      function setError(msg) {
+        var el = $('wdError');
+        if (msg) { el.textContent = msg; el.style.display = 'block'; }
+        else { el.textContent = ''; el.style.display = 'none'; }
+      }
+
+      function statusMeta(s) {
+        if (!s) return { text: '未知', cls: 'wd-idle' };
+        if (!s.running) {
+          if (s.status === 'reading') return { text: '停止中（本轮读取结束后停止）', cls: 'wd-stopping' };
+          return { text: '未启动', cls: 'wd-idle' };
+        }
+        switch (s.status) {
+          case 'reading': return { text: '读取中', cls: 'wd-reading' };
+          case 'waiting': return { text: '等待下一轮', cls: 'wd-waiting' };
+          case 'waiting08': return { text: '等待08:00', cls: 'wd-waiting08' };
+          case 'failed': return { text: '读取失败', cls: 'wd-failed' };
+          default: return { text: s.statusText || s.status, cls: 'wd-idle' };
+        }
+      }
+
+      function renderState(s) {
+        if (!s) return;
+        var st = statusMeta(s);
+        $('wdShopName').textContent = s.shopName || '—';
+        var badge = $('wdStatusBadge');
+        badge.textContent = st.text;
+        badge.className = 'wd-badge ' + st.cls;
+        var btn = $('wdToggleBtn');
+        if (s.running) {
+          btn.textContent = '停止值守';
+          btn.className = 'btn btn-danger';
+        } else {
+          btn.textContent = '启动值守';
+          btn.className = 'btn btn-primary';
+        }
+        $('wdLastCheck').textContent = fmtTime(s.lastCheckAt);
+        $('wdNextRun').textContent = fmtTime(s.nextRunAt);
+        var r = s.lastRound;
+        if (r) {
+          $('wdCost').textContent = (r.costCents == null) ? '—' : (r.costCents / 100).toFixed(2) + ' 元';
+          $('wdOrders').textContent = (r.orders == null) ? '—' : r.orders + ' 单';
+          $('wdPerOrder').textContent = (r.orders > 0 && r.costCents != null)
+            ? '约 ' + (r.costCents / r.orders / 100).toFixed(2) + ' 元/单（展示值，判定用整数分）'
+            : '—';
+          var concl = $('wdConclusion');
+          if (r.conclusion === 'over') { concl.textContent = '超标'; concl.className = 'v wd-concl-over'; }
+          else if (r.conclusion === 'under') { concl.textContent = '未超标'; concl.className = 'v wd-concl-ok'; }
+          else { concl.textContent = r.conclusionText || '本轮无法判断'; concl.className = 'v wd-concl-unknown'; }
+          $('wdReason').textContent = r.reason ? ('依据：' + r.reason) : '';
+        } else {
+          $('wdCost').textContent = '—'; $('wdOrders').textContent = '—';
+          $('wdPerOrder').textContent = '—';
+          var c2 = $('wdConclusion'); c2.textContent = '—'; c2.className = 'v';
+          $('wdReason').textContent = '';
+        }
+      }
+
+      function renderLogs(logs) {
+        if (!logs || !logs.length) return;
+        var box = $('wdLog');
+        var first = !box.querySelector('.t');
+        if (first) box.innerHTML = ''; // 移除“尚未有日志”占位
+        logs.forEach(function (e) {
+          var line = document.createElement('div');
+          var t = document.createElement('span');
+          t.className = 't';
+          t.textContent = fmtTime(e.t);
+          var m = document.createElement('span');
+          m.className = 'lvl-' + (e.level || 'info');
+          m.textContent = esc(e.msg);
+          line.appendChild(t); line.appendChild(m);
+          box.appendChild(line);
+        });
+        var children = box.children;
+        while (children.length > 400) box.removeChild(children[0]);
+        box.scrollTop = box.scrollHeight;
+      }
+
+      function loadStateAndLogs() {
+        return api('GET', '/api/watch-drill/state').then(function (d) {
+          if (d && d.ok) renderState(d.state);
+          return api('GET', '/api/watch-drill/logs?since=' + lastSeq).then(function (ld) {
+            if (ld && ld.ok) {
+              lastSeq = ld.seq || lastSeq;
+              renderLogs(ld.logs);
+            }
+          });
+        }).catch(function (e) {
+          setError('接口异常：' + String(e).slice(0, 120) + '（服务未就绪或未重启）');
+        });
+      }
+
+      function wdToggle() {
+        var btn = $('wdToggleBtn');
+        var starting = btn.textContent.indexOf('启动') === 0;
+        btn.disabled = true;
+        api('POST', starting ? '/api/watch-drill/start' : '/api/watch-drill/stop').then(function (d) {
+          if (d && d.ok) {
+            setError('');
+            if (starting) lastSeq = 0; // 重新拉全量日志
+            renderState(d.state);
+          } else {
+            setError('操作失败：' + (d && d.error ? d.error : '未知错误'));
+          }
+        }).catch(function (e) {
+          setError('操作失败：' + String(e).slice(0, 120));
+        }).finally(function () { btn.disabled = false; });
+      }
+
+      function wdRefreshAll() {
+        return loadStateAndLogs().then(function () { setError(''); });
+      }
+
+      function wdStartPolling() {
+        if (pollTimer) return;
+        pollTimer = setInterval(function () {
+          if (document.hidden) return; // 后台标签不轮询；回到页面后下一个周期自动补拉
+          loadStateAndLogs().catch(function () {});
+        }, POLL_MS);
+      }
+
+      // 页面加载：只恢复查看，绝不自动启动值守（后端默认未启动）。
+      wdRefreshAll().catch(function () {}).then(function () { wdStartPolling(); });
+      // 暴露给全局（switchTab 懒加载进入时补拉一次）
+      window.wdRefreshAll = wdRefreshAll;
+      window.wdToggle = wdToggle;
+    })();
+  </script>
+</div>

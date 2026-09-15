@@ -13,7 +13,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const { closeOneAd } = require('../src/engine/close-flow');
 const { CloseOutcomeUnknownError } = require('../src/lib/errors');
-const { makeStatefulController } = require('./helpers');
+const { makeStatefulController, waitFor } = require('./helpers');
 
 const SHOP = { id: 'shop-001', name: '测试店铺一', cookieFile: 'x', accountId: null };
 const IDENTITY = { id: 'shop-001', name: '测试店铺一' };
@@ -97,16 +97,46 @@ test('回归 #2：回读全部失败 → 结果未知', async () => {
   assert.match(r.error, /结果未知/);
 });
 
-test('回归 #7：超时后底层请求延迟完成 → 只发出一次关闭请求，不重叠重试', async () => {
+test('回归 #7：超时后底层请求延迟完成 → 只发出一次关闭请求，不重叠重试（可控时序）', async () => {
+  // 旧写法用 delayMsFor=260 与 closeTimeoutMs=200 的**真实计时差**区分分支：
+  // 负载下回读可能落在延迟完成之后，走另一条 confirmed 文案（/延迟完成/ 断言随机失败）。
+  // 现改为手工控制的延迟 Promise + 审计轨迹驱动解决时机，精确复现：
+  //   超时分支 → 回读仍未关闭 → 在途请求落定 → 延迟后回读确认；
+  // 各步以观察到的实际行为为界，不依赖任何狭窄计时差。
   const controller = makeStatefulController({
     identity: IDENTITY,
     ads: [{ adId: 'ad-1', name: 'A', status: '投放中' }],
-    delayMsFor: { 'ad-1': 260 }, // 请求 260ms 后才完成，超过 closeTimeoutMs=200
   });
-  const r = await closeOneAd({ controller, pageCtx: null, shopCfg: SHOP, hit: HIT('ad-1', 'A'), opts: OPTS });
+  let resolveClose;
+  const closePromise = new Promise((res) => { resolveClose = res; });
+  controller.closeAd = async (p) => {
+    // 与 stateful 控制器同形的记账；不调用原实现——原实现会同步翻转广告状态，
+    // 破坏「落定前回读必须仍在投放侧」的前提
+    controller.state.closeCalls.push({ adId: p.adId, at: new Date().toISOString() });
+    await closePromise;      // 请求挂起：任何时点都未落定（由测试显式放行）
+    controller._testSetStatus('ad-1', '已关闭', false); // 落定后广告才进入关闭侧
+  };
+  const records = [];
+  // 时序参数：closeTimeoutMs 只需>0（超时分支由审计确认，不靠等待时长）；
+  // 500ms join 窗口仅为容纳负载下的调度延迟，与被验证行为无关。
+  const TIMING = { ...OPTS, closeTimeoutMs: 500, readbackAttempts: 1, readbackIntervalMs: 1 };
+  const flow = closeOneAd({ controller, pageCtx: null, shopCfg: SHOP, hit: HIT('ad-1', 'A'), opts: TIMING, audit: (e) => records.push(e) });
+
+  // ① 恰好发出一次关闭请求，随后超时分支落地（请求仍未落定、已登记在途）
+  await waitFor(() => controller.state.closeCalls.length === 1, 2000, '关闭请求发出');
+  await waitFor(() => records.some((e) => e.step === 'close-request' && e.unknown === true), 5000, '关闭请求超时分支');
+  // ② 回读（延迟请求未完成）：广告仍在投放侧 → 此处不得确认关闭
+  await waitFor(() => records.some((e) => e.step === 'readback' && e.ok === false && /尚未进入关闭侧/.test(e.note || '')), 5000, '落定前回读未关闭');
+  assert.strictEqual(controller.state.closeCalls.length, 1, '回读期间绝不发出第二个关闭请求');
+  // ③ 此时（且仅此时）让在途请求落定 → 流程必须「先等落定，再延迟回读」后才确认
+  resolveClose();
+  const r = await flow;
   assert.strictEqual(controller.state.closeCalls.length, 1, '绝不在旧请求仍在执行时发出第二个请求');
   assert.strictEqual(r.outcome, 'confirmed_closed', '延迟完成后经再次回读确认');
+  assert.strictEqual(r.afterStatus, '已关闭', '确认依据是延迟落定后的回读状态');
   assert.match(r.note, /延迟完成/);
+  assert.ok(records.some((e) => e.step === 'readback' && e.delayed === true && e.ok === true),
+    '必须存在"延迟后回读"审计记录（确认发生在落定之后）');
 });
 
 test('在途请求登记：第二个调用加入既有请求，不重复发起', async () => {

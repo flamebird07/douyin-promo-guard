@@ -35,6 +35,7 @@
     </div>
     <div id="wdError" style="display:none;font-size:13px;color:#dc2626;margin:6px 0 0;padding:8px 12px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;"></div>
     <div id="wdGates" style="font-size:12.5px;color:#555;margin:6px 0 0;padding:8px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;"></div>
+    <div id="wdGap" style="display:none;font-size:12.5px;color:#b45309;margin-top:6px;"></div>
     <div class="wd-grid">
       <div class="wd-cell"><div class="k">最近检查时间</div><div class="v" id="wdLastCheck">—</div></div>
       <div class="wd-cell"><div class="k">下次检查时间</div><div class="v" id="wdNextRun">—</div></div>
@@ -79,6 +80,19 @@
         var el = $('wdError');
         if (msg) { el.textContent = msg; el.style.display = 'block'; }
         else { el.textContent = ''; el.style.display = 'none'; }
+      }
+      // 日志缺口提示（接口语义：gap=null 且 droppedCount=0 = 未发生裁剪 → 隐藏）。
+      // 整体覆写文本，重复拉取不重复追加。
+      function renderGap(gap) {
+        var el = $('wdGap');
+        if (gap && gap.droppedCount > 0) {
+          el.style.display = 'block';
+          el.textContent = '⚠ 日志缺口：自上次同步后事件缓存发生裁剪，共丢失 ' + gap.droppedCount
+            + ' 条事件（后续事件继续同步；完整历史请查阅审计文件）。';
+        } else {
+          el.style.display = 'none';
+          el.textContent = '';
+        }
       }
 
       function statusMeta(s) {
@@ -128,6 +142,10 @@
             ? '真实执行 · 会操作广告'
             : ('真实执行 · 暂不会操作 · 阻断：' + (blockers.join('；') || '执行许可未通过（详见门槛明细）'));
           mb.style.background = '#fee2e2'; mb.style.color = '#b91c1c'; mb.style.borderColor = '#fecaca';
+        } else if (s.realModeKnown === false || g.modeKnown === false || !s.gates) {
+          // 未知模式 / 门槛未取得：不得当作已确认演练（fail-closed 展示）
+          mb.textContent = s.modeText || '模式待核实（配置缺少 execution.realMode，不得据此认为安全）';
+          mb.style.background = '#fef3c7'; mb.style.color = '#b45309'; mb.style.borderColor = '#fde68a';
         } else {
           mb.textContent = '演练模式 · 不操作广告';
           mb.style.background = '#eef2ff'; mb.style.color = '#4338ca'; mb.style.borderColor = '#c7d2fe';
@@ -209,6 +227,8 @@
           if (d && d.ok) renderState(d.state);
           return api('GET', '/api/watch-drill/logs?since=' + lastSeq).then(function (ld) {
             if (ld && ld.ok) {
+              // 缺口优先报告（真实 droppedCount），即使本轮没有新增普通日志
+              renderGap(ld.gap || (ld.droppedCount ? { droppedCount: ld.droppedCount } : null));
               lastSeq = ld.seq || lastSeq;
               renderLogs(ld.logs);
             }

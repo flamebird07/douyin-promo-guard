@@ -1395,13 +1395,15 @@ function extractWatchScript(htmlSrc, name) {
   return hit[0];
 }
 
-/** 在 Node VM 里以桩 DOM/fetch 运行值守脚本，返回渲染后的徽标与门槛明细。 */
-async function renderWatchUi(htmlSrc, name, state) {
+/** 在 Node VM 里以桩 DOM/fetch 运行值守脚本，返回渲染结果与控制句柄。 */
+async function renderWatchUi(htmlSrc, name, state, opts = {}) {
   const elements = {};
   const mkEl = () => ({ textContent: '', className: '', innerHTML: '', style: {} });
-  for (const id of ['wdShopName', 'wdStatusBadge', 'wdToggleBtn', 'wdModeBadge', 'wdGates', 'wdLastCheck', 'wdNextRun', 'wdEnableToday', 'wdPhase', 'wdCost', 'wdOrders', 'wdPerOrder', 'wdConclusion', 'wdReason', 'wdError', 'wdLog']) {
+  for (const id of ['wdShopName', 'wdStatusBadge', 'wdToggleBtn', 'wdModeBadge', 'wdGates', 'wdGap', 'wdLastCheck', 'wdNextRun', 'wdEnableToday', 'wdPhase', 'wdCost', 'wdOrders', 'wdPerOrder', 'wdConclusion', 'wdReason', 'wdError', 'wdLog']) {
     elements[id] = mkEl();
   }
+  // /logs 响应盒：测试可在多次刷新之间改写，模拟接口语义变化（缺口出现/消失）
+  const logsResp = { current: opts.logsResponse || { ok: true, seq: 1, logs: [], gap: null, droppedCount: 0 } };
   const sandbox = {
     document: { getElementById: (id) => elements[id] || mkEl(), hidden: true, querySelector: () => null },
     setInterval: () => 0,
@@ -1410,7 +1412,7 @@ async function renderWatchUi(htmlSrc, name, state) {
       json: () => Promise.resolve(
         String(p).includes('/api/watch-drill/state')
           ? { ok: true, state }
-          : { ok: true, seq: 1, logs: [] },
+          : logsResp.current,
       ),
     }),
     console,
@@ -1418,9 +1420,18 @@ async function renderWatchUi(htmlSrc, name, state) {
   sandbox.window = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(extractWatchScript(htmlSrc, name), sandbox, { filename: `${name}#watch-script` });
-  await new Promise((r) => setImmediate(r)); // 让脚本启动时的 wdRefreshAll 异步链跑完
-  await new Promise((r) => setImmediate(r));
-  return { badgeText: elements.wdModeBadge.textContent, gatesHtml: elements.wdGates.innerHTML };
+  const settle = async () => {
+    for (let i = 0; i < 4; i += 1) await new Promise((r) => setImmediate(r));
+  };
+  await settle(); // 让脚本启动时的 wdRefreshAll 异步链（state→logs→renderGap/renderLogs）跑完
+  return {
+    badgeText: elements.wdModeBadge.textContent,
+    gatesHtml: elements.wdGates.innerHTML,
+    els: elements,
+    logsResp,
+    refreshAll: () => sandbox.window.wdRefreshAll(),
+    settle,
+  };
 }
 
 const GATES_ALL_ON_DRY = {
@@ -1492,4 +1503,84 @@ test('第三轮：徽标回归 —— 三开且无 dryRun → "会操作广告"�
     },
   });
   assert.ok(r3.badgeText.includes('演练模式'), `realMode=false 应显示演练模式，实际：${r3.badgeText}`);
+});
+
+// ══════════════════════════════════════════════════════════════
+// 15) 第四轮回归（Codex 复核）：未知模式展示 + 日志缺口提示
+//     以 Node VM 真实运行页面脚本（renderState/loadStateAndLogs 实际输出），
+//     覆盖运行页与公开片段；修复前的旧代码在本节用例上必须失败。
+// ══════════════════════════════════════════════════════════════
+
+/** 页面来源（运行页 + 公开片段）。公开仓库副本无运行页时自动跳过运行页。 */
+function pageSources() {
+  const sources = [['watch-drill-tab.html(公开片段)', fs.readFileSync(path.join(PROMO, 'integrations/bill-manager/watch-drill-tab.html'), 'utf-8')]];
+  const runtimeIndexPath = path.join(__dirname, '..', 'index.html');
+  if (fs.existsSync(runtimeIndexPath)) sources.unshift(['index.html(运行页)', fs.readFileSync(runtimeIndexPath, 'utf-8')]);
+  return sources;
+}
+
+const GATES_UNKNOWN_MODE = {
+  realMode: false, modeKnown: false, dryRun: true, pauseEnabled: false, enableEnabled: false,
+  pauseWillExecute: false, enableWillExecute: false,
+  pauseGateReason: 'execution.realMode 未开启（演练模式不执行真实暂停）',
+  enableGateReason: null, blockedBy: ['realMode 未开启', 'execution.dryRun=true（演练）'],
+  scope: ['全店托管', '商品自选'], deleteAdEnabled: false,
+};
+
+test('第四轮：未知模式徽标 —— realMode=false 但 modeKnown=false → 显示"待核实"，不得当作已确认演练', async () => {
+  for (const [name, src] of pageSources()) {
+    // Codex 复现形状：realMode=false + realModeKnown=false + gates.modeKnown=false + modeText=待核实
+    const r = await renderWatchUi(src, name, {
+      shopName: SHOP_ID, realMode: false, realModeKnown: false,
+      modeText: '待核实（配置缺少 execution.realMode，不得据此认为安全）',
+      running: false, status: 'idle', gates: GATES_UNKNOWN_MODE,
+    });
+    assert.ok(/待核实/.test(r.badgeText), `${name} 未知模式必须显示"待核实"，实际：${r.badgeText}`);
+    assert.ok(!r.badgeText.includes('演练模式'), `${name} 未知模式不得显示"演练模式"（不能把未知当作已确认演练），实际：${r.badgeText}`);
+  }
+});
+
+test('第四轮：未知模式徽标 —— 已确认演练仍显示"演练模式"；门槛未取得（gates 缺失）→ 待核实', async () => {
+  for (const [name, src] of pageSources()) {
+    // 已确认演练（modeKnown=true）→ 保留"演练模式 · 不操作广告"
+    const confirmed = await renderWatchUi(src, name, {
+      shopName: SHOP_ID, realMode: false, realModeKnown: true,
+      modeText: '演练模式（不操作广告）', running: false, status: 'idle',
+      gates: { ...GATES_UNKNOWN_MODE, realMode: false, modeKnown: true },
+    });
+    assert.ok(confirmed.badgeText.includes('演练模式'), `${name} 已确认演练必须显示演练模式，实际：${confirmed.badgeText}`);
+    assert.ok(!/待核实/.test(confirmed.badgeText), `${name} 已确认演练不得显示待核实，实际：${confirmed.badgeText}`);
+    // 门槛未取得（gates 缺失）→ 不得宣称演练安全
+    const noGates = await renderWatchUi(src, name, {
+      shopName: SHOP_ID, realMode: false, realModeKnown: false,
+      running: false, status: 'idle', gates: null,
+    });
+    assert.ok(/待核实/.test(noGates.badgeText), `${name} 门槛未取得必须显示待核实，实际：${noGates.badgeText}`);
+    assert.ok(!noGates.badgeText.includes('不操作广告'), `${name} 门槛未取得不得宣称不操作广告，实际：${noGates.badgeText}`);
+  }
+});
+
+test('第四轮：日志缺口 —— /logs 无新日志但 gap.droppedCount=700 → 必须展示缺口；重复拉取不重复追加；缺口消失即隐藏', async () => {
+  for (const [name, src] of pageSources()) {
+    const r = await renderWatchUi(src, name, {
+      shopName: SHOP_ID, realMode: false, realModeKnown: true, running: false, status: 'idle',
+      gates: { ...GATES_UNKNOWN_MODE, modeKnown: true },
+    }, {
+      logsResponse: { ok: true, seq: 5, logs: [], gap: { droppedCount: 700, trimmedTotal: 700, source: 'eventStream' }, droppedCount: 700 },
+    });
+    // 无新增普通日志（logs=[]）也必须展示接口提供的缺口
+    assert.strictEqual(r.els.wdGap.style.display, 'block', `${name} 缺口提示必须可见，实际：${JSON.stringify(r.els.wdGap)}`);
+    assert.ok(r.els.wdGap.textContent.includes('共丢失 700 条'), `${name} 缺口提示必须含真实条数，实际：${r.els.wdGap.textContent}`);
+    // 重复拉取（相同缺口）：textContent 整体覆写，不得重复追加
+    await r.refreshAll();
+    await r.settle();
+    const hits = (r.els.wdGap.textContent.match(/共丢失 700 条/g) || []).length;
+    assert.strictEqual(hits, 1, `${name} 重复拉取不得重复追加缺口提示，实际 ${hits} 处：${r.els.wdGap.textContent}`);
+    // 缺口消失（接口语义：gap=null 且 droppedCount=0 = 未发生裁剪）→ 明确隐藏
+    r.logsResp.current = { ok: true, seq: 6, logs: [], gap: null, droppedCount: 0 };
+    await r.refreshAll();
+    await r.settle();
+    assert.strictEqual(r.els.wdGap.style.display, 'none', `${name} 缺口消失后必须隐藏提示，实际：${JSON.stringify(r.els.wdGap)}`);
+    assert.strictEqual(r.els.wdGap.textContent, '', `${name} 缺口消失后必须清空提示文本`);
+  }
 });

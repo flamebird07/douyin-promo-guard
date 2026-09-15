@@ -1,3 +1,16 @@
+# HANDOFF — 页面同步回退修复 + 测试确定性 · 第十四轮（2026-09-15 第四轮定点收尾）
+
+> 交付日期：2026-09-15。**realMode=false、dryRun=true、pauseEnabled=false、enableEnabled=false 全程未变；未重启 3443（PID 18920）、未启动值守、未操作真实广告；删除零点击；测试仅用隔离数据。**
+> 本轮起点基线 `95d7f446501a513e460c9f43b103b54ad86c6703`（= origin/main）。Codex 复核确认第十三轮 describeTrigger 动作映射与 dryRun 阻断文案有效；本轮只处理其发现的三项：
+
+1. **恢复未知模式展示**（`bill-manager/index.html` renderState + 同步公开片段）：上轮同步把徽标简化为仅按 `s.realMode` 二分，`realMode=false` 且 `realModeKnown=false / gates.modeKnown=false`（或 gates 未取得）时误显示"演练模式 · 不操作广告"。已恢复显式未知分支：显示 `modeText`（"待核实（配置缺少 execution.realMode，不得据此认为安全）"），琥珀色警示，不把未知当作已确认演练；已确认演练（modeKnown=true）仍显示"演练模式"。上轮的 dryRun 具体阻断原因、今日开启、调度展示全部保留。
+2. **恢复日志缺口提示**（同上两份文件）：对比 2280cbc 确认上轮同步删除了 `wdGap` 元素、`renderGap()`、`loadStateAndLogs` 对 `/logs` 的 `gap/droppedCount` 消费。已按旧实现恢复（文案与接口语义一致：`gap=null 且 droppedCount=0`=未发生裁剪 → 隐藏；textContent 整体覆写 → 重复拉取不重复追加；`logs=[]` 也展示缺口）。后台事件计数零改动。
+3. **修复 close-flow 回归 #7 测试抖动**（`test/close-flow.test.js`）：旧写法依赖 `delayMsFor=260` 与 `closeTimeoutMs=200` 的**真实计时差**决定 confirmed 文案分支，负载下回读可能落在延迟完成之后而走另一条文案（Codex 实跑 271/272 即此因）。改为**手工 deferred + 审计轨迹驱动**：closeAd 返回测试显式放行的挂起 Promise，按审计记录依次确认「请求发出一次 → 超时分支（unknown=true）→ 落定前回读仍在投放侧 → 放行落定 → 延迟后回读（delayed=true）确认关闭」；断言 closeCalls===1、confirmed_closed、afterStatus=已关闭、note /延迟完成/。生产 close-flow 零改动。验证：close-flow 17/17，串行 5 连跑 + 并行 6 连跑全部退出码 0。
+
+**回归测试（真实页面脚本渲染，非源文件文字检查）**：bill-manager `tests/watch-drill.test.js` 新增 3 用例（51→54，Node VM 实际运行 renderState/loadStateAndLogs，覆盖运行页与公开片段；修复前旧代码 3/3 失败，修复后全绿）；主项目 `test/watch-drill-tab.test.js` 同步镜像（6→9 用例）。验证：bill-manager 54/54（含集成副本清空 `PROMO_GUARD_DIR` 自举实跑 54/54）；主项目 `npm test`、`npm run check`、`node evidence/codex-workbuddy-r3-verify.cjs`（结果见本轮交付报告）。
+
+**加载状态**：3443 页面（index.html 静态读取）本轮修复已即时生效（已核实线上 HTML 含 wdGap/renderGap/待核实分支）；后端 watch-drill.js 本轮零改动，无需重启。
+
 # HANDOFF — 推广值守展示层修复 · 第十三轮（2026-09-15 第三轮定点修复）
 
 > 交付日期：2026-09-15。**realMode=false、dryRun=true、pauseEnabled=false、enableEnabled=false 全程未变；本轮未启动值守/未启动监控、未点击任何真实开关/暂停/开启/删除、未重启 3443（PID 18920 保持运行）；删除路径零触碰。**

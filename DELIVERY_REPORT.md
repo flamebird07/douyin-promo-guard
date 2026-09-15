@@ -529,6 +529,9 @@ status           : 检查中（演练模式（只记录不关闭））
 
 ### 6.0 第三轮定点修复（本次，R3）
 
+**推送记录**：`a64675d..f46ff2e`（2026-09-15 19:11 CST，PUSH_EXIT=0，1m33s 完成）。
+提交仅含上述 7 个安全文件；远端 HEAD 已确认为 `f46ff2e1db524697746a55eca467f7de61e51dc4`。
+
 **推广控制项目**
 ```
  M src/engine/monitor.js                (_audit 双写 processEvents + evtType 打标 25 处 +

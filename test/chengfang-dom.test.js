@@ -111,14 +111,16 @@ test('删除确认弹窗：检测为 delete_confirm（绝不确认）', async ()
   assert.strictEqual(d[0].kind, 'delete_confirm');
 });
 
-test('非预期确认弹窗（无"删除"字样）：检测为 unexpected_confirm', async () => {
+test('非预期确认弹窗（无"删除"字样）：检测为 unknown_confirm（一律阻断，不盲点确定）', async () => {
   await load({
     plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': [] },
     dialog: '<div role="dialog" style="position:fixed;top:0;left:0;width:400px;height:200px"><span>确认执行操作？</span><button>确定</button></div>',
   });
   const d = await page.evaluate(detectChengfangDangerDialogInPage);
   assert.strictEqual(d.length, 1);
-  assert.strictEqual(d[0].kind, 'unexpected_confirm');
+  // 交接第 2 项契约：未识别的确认弹窗必须归为 unknown_confirm 并阻断（绝不按其文案盲点"确定"）
+  assert.strictEqual(d[0].kind, 'unknown_confirm');
+  assert.ok(typeof d[0].text === 'string' && d[0].text.length > 0, `应保留弹窗原文供排查，实际：${d[0].text}`);
 });
 
 // ── 行收集 ──────────────────────────────────────────────────────────

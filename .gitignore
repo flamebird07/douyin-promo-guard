@@ -15,3 +15,9 @@ backups/
 *.pem
 *.key
 
+
+# 本地临时探针脚本（非交付物，含本地页面结构假设）
+test/probe-*.js
+
+# 工作区本地记忆/缓存（不入公开仓库）
+.workbuddy-ai/

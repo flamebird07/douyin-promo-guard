@@ -72,15 +72,96 @@ class Monitor {
     this.startedAt = null;
     this.lastCycleAt = null;
     this.schedule = { phase: 'idle', lastRunAt: null, nextRunAt: null, waitingFor08: false, lastWindowBlockReason: null };
-    this._lastEnableDate = null; // 每日自动开启相位已执行的上海日历日（跨日重置，当天只一次）
+
+    // 每日自动开启相位的持久化状态（2026-09-15 修复，交接第 3 项）：
+    // 结构 { [shopId]: { [date]: { status:'in_progress'|'success'|'failed'|'unknown', at, phase, reason, detail } } }
+    // 原因：原先仅内存 _lastEnableDate 且在执行前赋值 → 新进程会重复开启、失败/演练也占用日期。
+    this.enablePhase = {};   // shopId -> date -> record
 
     this.triggers = [];          // 命中记录（演练=将关闭；真实=已触发执行）
     this.actions = [];           // 真实执行批次结果
     this.recentErrors = [];
 
+    // 事件序号（2026-09-15 修复第 1 项）：单调递增、永不回退，供外部增量消费。
+    // 消费方以 evtSeq 为游标，不再依赖有界数组长度；裁剪区段记录在 _evtDropped。
+    this._evtSeq = 0;
+    this._evtDropped = [];
+
+    // 巡查周期序号（2026-09-15 修复第 3 项）：每个完整周期 +1，用于"每周期必记一条判断"。
+    this.cycleNo = 0;
+    this.lastJudgementCycleNo = 0;
+    // 每周期判断记录（2026-09-15 修复第 3 项）：**每个完整周期一条**，
+    // 不以"数据是否变化"为记录条件（旧实现靠 changed 判定 → 连续相同数据会漏判断日志）。
+    this.judgements = [];
+
     const loaded = this._loadState();
     this.batches = loaded.batches || {}; // shopId -> date -> { runs:[], totals:{} }
+    this.enablePhase = loaded.enablePhase || {};
+    // 重启回读：上次进程遗留的 in_progress 视为 unknown（进程已中断，结果未确认），
+    // 交由 _runEnablePhase 先回读实际状态再决定，绝不盲目重发。
+    this._reconcileEnablePhaseOnBoot();
     this._saveState();
+  }
+
+  /**
+   * 启动时回读处理开启相位持久化状态：
+   * - in_progress → unknown（程序崩溃/重启，原请求结果未知，需先回读）
+   * - unknown 保持 unknown（等待下次开启窗口内回读判定）
+   * 返回受影响条目（供日志/审计说明），不在此处发起任何业务请求。
+   */
+  _reconcileEnablePhaseOnBoot() {
+    const recovered = [];
+    for (const shopId of Object.keys(this.enablePhase || {})) {
+      const byDate = this.enablePhase[shopId] || {};
+      for (const date of Object.keys(byDate)) {
+        const rec = byDate[date];
+        if (rec && rec.status === 'in_progress') {
+          rec.status = 'unknown';
+          rec.reason = `进程中断（原状态 in_progress 于 ${rec.at}），结果未知，重启后先回读再决定`;
+          rec.reconciledAt = new Date(this.nowFn()).toISOString();
+          recovered.push({ shopId, date, phase: rec.phase || null });
+        }
+      }
+    }
+    if (recovered.length > 0) {
+      this._memPush(this.recentErrors, { scope: 'enable-phase', error: `重启回读：${recovered.length} 条开启相位记录由 in_progress 转为 unknown（先回读，不盲重发）`, recovered });
+      try { log.warn(`重启回读开启相位：${recovered.length} 条 in_progress → unknown`); } catch (_) {}
+    }
+    return recovered;
+  }
+
+  /** 读取某店铺某上海日期的开启相位状态记录（无则 null）。 */
+  getEnablePhaseRecord(shopId, date) {
+    const byDate = (this.enablePhase || {})[shopId];
+    if (!byDate) return null;
+    return byDate[date] || null;
+  }
+
+  /** 写入开启相位状态（in_progress/success/failed/unknown）+ 原子落盘。 */
+  _setEnablePhase(shopId, date, status, extra = {}) {
+    if (!this.enablePhase[shopId]) this.enablePhase[shopId] = {};
+    const prev = this.enablePhase[shopId][date] || {};
+    this.enablePhase[shopId][date] = {
+      ...prev,
+      status,
+      at: new Date(this.nowFn()).toISOString(),
+      ...extra,
+    };
+    // 保留 30 天，避免无限增长
+    const dates = Object.keys(this.enablePhase[shopId]).sort();
+    while (dates.length > 30) delete this.enablePhase[shopId][dates.shift()];
+    this._saveState();
+    return this.enablePhase[shopId][date];
+  }
+
+  /**
+   * 今日是否仍需执行开启相位。
+   * 仅当状态为 success 时视为"今日已完成"（失败/unknown 允许在窗口内按规则再处理，
+   * 但 unknown 必须先回读确认，见 _runEnablePhase）。
+   */
+  _enablePhaseDone(shopId, date) {
+    const rec = this.getEnablePhaseRecord(shopId, date);
+    return !!(rec && rec.status === 'success');
   }
 
   // ── 持久化（原子写 + 损坏隔离）────────────────────────────────────
@@ -99,7 +180,7 @@ class Monitor {
           this._memPush(this.recentErrors, { scope: 'state', error: `状态文件损坏已隔离重建: ${e.message}` });
         } catch (_) { /* 隔离失败则忽略，按空状态继续 */ }
       }
-      return { version: STATE_VERSION, batches: {} };
+      return { version: STATE_VERSION, batches: {}, enablePhase: {} };
     }
   }
 
@@ -107,7 +188,12 @@ class Monitor {
     try {
       this._ensureDataDir();
       const tmp = `${this.stateFile}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify({ version: STATE_VERSION, batches: this.batches, savedAt: new Date(this.nowFn()).toISOString() }, null, 2));
+      fs.writeFileSync(tmp, JSON.stringify({
+        version: STATE_VERSION,
+        batches: this.batches,
+        enablePhase: this.enablePhase || {},
+        savedAt: new Date(this.nowFn()).toISOString(),
+      }, null, 2));
       fs.renameSync(tmp, this.stateFile);
     } catch (e) {
       log.warn('状态持久化失败:', e.message);
@@ -136,9 +222,63 @@ class Monitor {
     } catch (_) { /* 审计落盘失败不阻塞 */ }
   }
 
-  _memPush(arr, entry) {
-    arr.push({ ts: new Date(this.nowFn()).toISOString(), ...log.sanitize(entry) });
-    if (arr.length > 300) arr.splice(0, arr.length - 300);
+  /**
+   * 有界数组写入 + **单调递增稳定序号**（2026-09-15 修复第 1 项）。
+   *
+   * 旧行为：消费方以 `arr.length` 作为增量游标。数组上限 300，一旦写满就会
+   * 从头部裁剪，长度停止增长 → 消费方永远看不到新事件（永久漏日志）；
+   * 或者裁剪后长度回退 → 重复消费。
+   *
+   * 修复：每条事件附加单调递增的 `evtSeq`（进程内全局唯一、永不回退），
+   * 并在裁剪时把被丢弃的区段记入 `this._evtDropped`（供消费方报告日志缺口）。
+   * 消费方以 `evtSeq > lastSeq` 判定增量，与数组长度无关。
+   *
+   * @param {Array} arr   有界数组（triggers/actions/recentErrors）
+   * @param {object} entry 事件体
+   * @param {number} [limit] 数组上限
+   */
+  _memPush(arr, entry, limit) {
+    const cap = limit || 300;
+    this._evtSeq = (this._evtSeq || 0) + 1;
+    const ts = new Date(this.nowFn()).toISOString();
+    arr.push({ evtSeq: this._evtSeq, ts, ...log.sanitize(entry) });
+    if (arr.length > cap) {
+      const removed = arr.splice(0, arr.length - cap);
+      // 记录被裁剪的序号区段，供消费方在游标落后时报告明确缺口（而非静默漏日志）
+      const firstSeq = removed[0] && removed[0].evtSeq;
+      const lastSeq = removed[removed.length - 1] && removed[removed.length - 1].evtSeq;
+      if (typeof firstSeq === 'number' && typeof lastSeq === 'number') {
+        this._evtDropped.push({ firstSeq, lastSeq, count: removed.length, at: ts });
+        if (this._evtDropped.length > 50) this._evtDropped.splice(0, this._evtDropped.length - 50);
+      }
+    }
+    return this._evtSeq;
+  }
+
+  /**
+   * 事件流快照（供外部增量消费）。
+   *
+   * - `events`：当前仍保留在内存中的事件（按 evtSeq 升序，跨 triggers/actions/recentErrors 合并）
+   * - `seq`：当前最大 evtSeq（进程内单调，永不回退）
+   * - `dropped`：因有界裁剪而丢失的序号区段（消费方可据此报告"日志缺口 N 条"）
+   *
+   * 消费方应保存上次的 `seq`，下次以 `since=seq` 拉取；即使期间发生裁剪，
+   * 也能通过 `dropped` 如实告知缺口，而不是永久漏日志或静默错位。
+   */
+  getEventStream(since = 0) {
+    const all = [];
+    for (const arr of [this.triggers, this.actions, this.recentErrors, this.judgements]) {
+      for (const e of arr) if (e && typeof e.evtSeq === 'number') all.push(e);
+    }
+    all.sort((a, b) => a.evtSeq - b.evtSeq);
+    const dropped = (this._evtDropped || []).filter((d) => d.lastSeq > since && d.firstSeq > since);
+    return {
+      seq: this._evtSeq || 0,
+      cycleNo: this.cycleNo || 0,
+      events: all.filter((e) => e.evtSeq > since),
+      dropped,
+      droppedCount: dropped.reduce((n, d) => n + d.count, 0),
+    };
   }
 
   // ── 模式 ─────────────────────────────────────────────────────────
@@ -188,12 +328,18 @@ class Monitor {
 
   /**
    * 每日相位调度：
-   * - 开启窗口 [enableHour, dailyStartHour)：每天一次自动开启（跨日重置，见 _lastEnableDate）；
+   * - 开启窗口 [enableHour, dailyStartHour)：每天一次自动开启（跨日重置，持久化见 this.enablePhase）；
    *   执行后等待到 dailyStartHour 进入暂停巡查。
    * - 00:00–enableHour：等待开启窗口起点（未配置开启窗口则等待 dailyStartHour）。
    * - dailyStartHour 后：暂停巡查（原有逻辑），跨日等待目标改为 enableHour（若配置了开启窗口），
    *   使次日 07:00 的自动开启相位能被唤醒，而不是直接跳到 08:00。
    * 停止/重启通过代数防止多循环；所有等待用 delayFn（可注入时钟门）。
+   *
+   * 2026-09-15 修复：
+   *  - 第 3 项：每日"是否已开启"改为按 店铺+上海日期 持久化（this.enablePhase），
+   *    成功才计入当日完成；失败/unknown 可在窗口内按规则重处理，重启不重复开启。
+   *  - 第 4 项：相位执行后用**执行后当前时间**重算到 dailyStartHour 的等待
+   *    （原先用相位前 now，慢执行/跨 08:00 会导致首轮暂停巡查延后）。
    */
   async _intervalLoop(gen) {
     const sch = this.config.schedule;
@@ -203,27 +349,46 @@ class Monitor {
       const now = this.nowFn();
       const w = shanghaiWall(now);
 
-      // ── 开启窗口：[enableHour, dailyStartHour)，每天一次（跨日重置）──
+      // ── 开启窗口：[enableHour, dailyStartHour)，每天一次（按店铺+日期持久化）──
       if (enableWindow && w.hour >= enableHour && w.hour < sch.dailyStartHour) {
         const today = w.date;
-        if (this._lastEnableDate !== today) {
-          this._lastEnableDate = today;
+        // 仅当所有启用店铺当日均为 success 时才算"已完成"
+        const shopsToRun = (this.config.shops || []).filter(
+          (s) => s.enabled !== false && !this._enablePhaseDone(s.id, today)
+        );
+        if (shopsToRun.length > 0) {
           this.schedule.phase = 'enable_window';
           this.schedule.waitingFor08 = false;
           try {
-            await this._runEnablePhase(gen);
+            await this._runEnablePhase(gen, today);
           } catch (e) {
             this._memPush(this.recentErrors, { scope: 'cycle', error: `乘方自动开启相位失败：${e.message}` });
           }
         }
-        // 窗口内剩余时间：等到 dailyStartHour 进入暂停巡查
-        const waitMs = msUntilDailyStart(now, sch.dailyStartHour);
-        const target = now + waitMs;
-        this.schedule.nextRunAt = new Date(target).toISOString();
-        this.schedule.phase = 'waiting_window';
-        this.schedule.waitingFor08 = true;
-        this.schedule.lastWindowBlockReason = `等待每日 ${sch.dailyStartHour}:00（Asia/Shanghai）进入暂停巡查`;
-        await this.delayFn(waitMs, gen);
+        // 第 4 项：相位执行完毕，用**执行后的当前时间**重算，而不是相位前的 now。
+        // 依据执行后的绝对时间决定：
+        //   - 仍在同一上海日且未到 dailyStartHour 且 waitMs>0 → 等到 dailyStartHour 再进入暂停巡查
+        //   - 已跨过 dailyStartHour（慢执行）→ 不等待，直接进入暂停巡查（避免首轮巡查延后）
+        //   - 执行期间跨到次日（罕见，慢执行跨零/虚拟时钟快进）→ 回环重算，由下一轮窗口判定
+        const afterMs = this.nowFn();
+        const afterWall = shanghaiWall(afterMs);
+        const waitMs = msUntilDailyStart(afterMs, sch.dailyStartHour);
+        if (afterWall.date !== w.date) {
+          // 跨日（含虚拟时钟快进）：不做固定等待，回环让下一轮按次日相位重新判定
+          this.schedule.lastWindowBlockReason = `开启相位执行至 ${shanghaiClockText(afterMs)}，已跨日，重新判定下次相位`;
+          continue;
+        }
+        if (afterWall.hour < sch.dailyStartHour && waitMs > 0) {
+          const target = afterMs + waitMs;
+          this.schedule.nextRunAt = new Date(target).toISOString();
+          this.schedule.phase = 'waiting_window';
+          this.schedule.waitingFor08 = true;
+          this.schedule.lastWindowBlockReason = `等待每日 ${sch.dailyStartHour}:00（Asia/Shanghai）进入暂停巡查（相位执行至 ${shanghaiClockText(afterMs)}）`;
+          await this.delayFn(waitMs, gen);
+          continue;
+        }
+        // 已到/已过 dailyStartHour → 不等待，直接进入暂停巡查
+        this.schedule.lastWindowBlockReason = `开启相位执行至 ${shanghaiClockText(afterMs)}，已到 ${sch.dailyStartHour}:00，直接进入暂停巡查`;
         continue;
       }
 
@@ -268,6 +433,10 @@ class Monitor {
     const token = { aborted: false };
     this._activeTokens.add(token);
     this._cycleRunning = true;
+    // 巡查周期序号（2026-09-15 修复第 3 项）：一次 pollOnce = 一个完整周期，序号明确递增。
+    this.cycleNo += 1;
+    const cycleNo = this.cycleNo;
+    this._currentCycle = { cycleNo, trigger, startedAt: this.nowFn() };
     try {
       const results = [];
       for (const shopCfg of this.config.shops) {
@@ -276,10 +445,11 @@ class Monitor {
         results.push({ shopId: shopCfg.id, ...(await this._pollShop(shopCfg, token, trigger)) });
       }
       this.lastCycleAt = new Date(this.nowFn()).toISOString();
-      return { ok: true, trigger, results };
+      return { ok: true, trigger, cycleNo, results };
     } finally {
       this._activeTokens.delete(token);
       this._cycleRunning = false;
+      this._currentCycle = null;
     }
   }
 
@@ -392,6 +562,46 @@ class Monitor {
     return !!(this.config.monitor && this.config.monitor.legacyWholeShopCloseEnabled === true);
   }
 
+  /**
+   * 记录一条"每周期判断"（2026-09-15 修复第 3 项）。
+   *
+   * 旧行为：控制台/日志只在 `data.costCents`/`orders` **发生变化**时才输出判断文案，
+   * 导致连续两轮（或多轮）数据相同时**没有判断记录**，无法证明"每 30 分钟确实巡查了"。
+   *
+   * 修复：每个完整周期都产生一条 judgement（带 cycleNo、业务日期、费用/订单/每单、
+   * 整数分判定过程、结论），进入事件流供 3443 增量消费。**与数据是否变化无关。**
+   */
+  _emitJudgement(shopCfg, { data, over, status, reason }) {
+    const cycleNo = (this._currentCycle && this._currentCycle.cycleNo) || this.cycleNo;
+    const costCents = data && data.cost ? data.cost.valueCents : null;
+    const orders = data && data.orders ? data.orders.valueCount : null;
+    const rule = (this.config.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
+    const thresholdCents = rule ? rule.thresholdCents : null;
+    const rec = {
+      cycleNo,
+      trigger: this._currentCycle ? this._currentCycle.trigger : null,
+      shopId: shopCfg.id,
+      businessDate: data && data.cost ? data.cost.businessDate : null,
+      costCents,
+      orders,
+      thresholdCents,
+      expectedCents: (typeof orders === 'number' && typeof thresholdCents === 'number') ? orders * thresholdCents : null,
+      over: over === true,
+      overKnown: over !== null && over !== undefined,
+      status,
+      reason: reason || null,
+      perOrderText: (data && data.cost && data.orders && typeof costCents === 'number' && orders > 0)
+        ? perOrderDisplayText(costCents, orders) : null,
+      at: new Date(this.nowFn()).toISOString(),
+    };
+    // 每个周期一条（同一个 cycleNo 只记一次，防止重入重复）
+    if (this.lastJudgementCycleNo !== cycleNo) {
+      this._memPush(this.judgements, { kind: 'judgement', ...rec });
+      this.lastJudgementCycleNo = cycleNo;
+    }
+    return rec;
+  }
+
   // ── 单店铺轮询 ───────────────────────────────────────────────────
   async _pollShop(shopCfg, cycleToken, trigger) {
     const rt = this._runtime(shopCfg.id);
@@ -422,9 +632,12 @@ class Monitor {
       if (data.ok === false) {
         // 零订单/无效订单已重读核实仍异常 → 阻止本轮关闭
         rt.lastData.blockedReason = data.reason;
+        this._emitJudgement(shopCfg, { data, over: null, status: 'blocked', reason: data.reason });
         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: data.reason, blocked: data.blocked });
         return { status: 'blocked', reason: data.reason, blocked: data.blocked };
       }
+      // 2026-09-15 修复第 3 项：**每个完整周期记录一条判断**，不以"数据是否变化"为条件。
+      this._emitJudgement(shopCfg, { data, over: data.evaluation.over === true, status: 'ok', reason: data.evaluation.reason });
       if (!data.evaluation.over) {
         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'ok', over: false, reason: data.evaluation.reason });
         return { status: 'ok', over: false, reason: data.evaluation.reason };
@@ -481,7 +694,7 @@ class Monitor {
         rt.lastError = reason;
         this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: `乘方演练失败：${reason}` });
         this._memPush(this.triggers, {
-          shopId: shopCfg.id, mode: 'dry', failed: true, reason,
+          shopId: shopCfg.id, mode: 'dry', actionType: 'pause', action: 'pause', failed: true, reason,
           businessDate: data.cost.businessDate,
           costText: `${centsToYuan(data.cost.valueCents)} 元`,
           orders: data.orders.valueCount,
@@ -493,7 +706,8 @@ class Monitor {
         return { status: 'ok', over: true, dryRun: true, targetCount: 0, chengfang: { outcome: 'dry_failed', error: reason } };
       }
       const triggerRec = {
-        shopId: shopCfg.id, mode: 'dry', scope: '乘方(全店托管+商品自选)',
+        shopId: shopCfg.id, mode: 'dry', actionType: 'pause', action: 'pause',
+        scope: '乘方(全店托管+商品自选)',
         reason: data.evaluation.reason,
         businessDate: data.cost.businessDate,
         costText: `${centsToYuan(data.cost.valueCents)} 元`,
@@ -538,6 +752,8 @@ class Monitor {
       return { status: 'blocked', reason, batch: this._summarizeBatch(batch) };
     }
     // cancelled / nothing_to_pause / all_paused_confirmed / partial → 记录批次
+    // 第 4 项：显式声明动作类型，下游禁止从 outcome 推断
+    batch.actionType = batch.actionType || 'pause';
     this._recordBatch(shopCfg.id, batch);
     this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) });
     this._audit({ kind: 'action', shopId: shopCfg.id, ...this._summarizeBatch(batch) });
@@ -547,16 +763,18 @@ class Monitor {
   // ── 每日自动开启相位（07:00 窗口，每天一次；独立于费用/订单阈值）────
 
   /** 每日开启相位：遍历启用的店铺执行开启（真实=executeChengfangEnableBatch；演练=runDryEnableCycle）。 */
-  async _runEnablePhase(gen) {
+  async _runEnablePhase(gen, businessDate = null) {
     const token = { aborted: false };
     this._activeTokens.add(token);
     this._cycleRunning = true;
+    const today = businessDate || shanghaiDate(this.nowFn());
     try {
       for (const shopCfg of this.config.shops) {
         if (gen !== this._gen || !this.running) break;
         if (token.aborted) break;
         if (shopCfg.enabled === false) continue;
-        await this._runShopEnablePhase(shopCfg, token);
+        if (this._enablePhaseDone(shopCfg.id, today)) continue;
+        await this._runShopEnablePhase(shopCfg, token, today);
       }
     } finally {
       this._activeTokens.delete(token);
@@ -571,12 +789,27 @@ class Monitor {
    *   → 乘方全店托管+商品自选 → 全量回读；逐请求检查停止/时段/跨日。
    * 窗口未开放/门槛不通过 → 零请求，且不打开乘方页面。
    */
-  async _runShopEnablePhase(shopCfg, cycleToken) {
+  async _runShopEnablePhase(shopCfg, cycleToken, businessDate = null) {
     const rt = this._runtime(shopCfg.id);
     const runner = this._getChengfangRunner(shopCfg);
     const opener = this._chengfangOpener || defaultChengfangOpener;
     const loginCfg = this.config.login;
     const enableHour = this._enableHour();
+    const today = businessDate || shanghaiDate(this.nowFn());
+
+    // 第 3 项：执行前记录 in_progress（区分"执行中"），成功/失败/未知分别落状态。
+    // 重启时 in_progress → unknown（见 _reconcileEnablePhaseOnBoot），不会重复开启。
+    const prevRec = this.getEnablePhaseRecord(shopCfg.id, today);
+    const prevNote = (prevRec && prevRec.status === 'unknown')
+      ? `上次为 unknown（${prevRec.reason || '结果未确认'}），本轮先按真实状态回读处理，不盲重发` : null;
+    this._setEnablePhase(shopCfg.id, today, 'in_progress', {
+      phase: this.realMode ? 'execute' : 'dry',
+      enableHour,
+      prevNote,
+    });
+    if (prevNote) {
+      this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'reconcile', note: prevNote });
+    }
 
     if (!this.realMode) {
       let res;
@@ -585,6 +818,7 @@ class Monitor {
       } catch (e) {
         const reason = `乘方开启演练周期失败：${e.reason || e.message}`;
         rt.lastError = reason;
+        this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'dry', reason });
         this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason });
         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'stopped', reason });
         return { status: 'stopped', reason };
@@ -592,10 +826,12 @@ class Monitor {
       if (res.outcome === 'dry_failed') {
         const reason = res.error || res.reason || '乘方开启演练未完成（身份/读取/分页/选择范围失败）';
         rt.lastError = reason;
+        this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'dry', reason });
         this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: `乘方开启演练失败：${reason}` });
         this._memPush(this.triggers, {
-          shopId: shopCfg.id, mode: 'dry', scope: '乘方(全店托管+商品自选)', failed: true, reason,
-          businessDate: shanghaiDate(this.nowFn()), targetCount: 0, targets: [],
+          shopId: shopCfg.id, mode: 'dry', actionType: 'enable', action: 'enable',
+          scope: '乘方(全店托管+商品自选)', failed: true, reason,
+          businessDate: today, targetCount: 0, targets: [],
           dryOutcome: 'dry_failed',
           note: `每日开启相位演练未完成（失败），不计为"正常枚举"：${reason}`,
         });
@@ -603,9 +839,10 @@ class Monitor {
         return { status: 'ok', dryRun: true, targetCount: 0, enable: { outcome: 'dry_failed', error: reason } };
       }
       const triggerRec = {
-        shopId: shopCfg.id, mode: 'dry', scope: '乘方(全店托管+商品自选)',
+        shopId: shopCfg.id, mode: 'dry', actionType: 'enable', action: 'enable',
+        scope: '乘方(全店托管+商品自选)',
         reason: `每日 ${enableHour}:00 自动开启相位`,
-        businessDate: shanghaiDate(this.nowFn()),
+        businessDate: today,
         targetCount: (res.targets || []).length,
         targets: res.targets,
         dryOutcome: res.outcome,
@@ -615,25 +852,42 @@ class Monitor {
       };
       this._memPush(this.triggers, triggerRec);
       this._audit({ kind: 'trigger', ...triggerRec, targets: (res.targets || []).map((t) => t.planId || t.adId) });
+      // 演练不计入"已开启成功"——保留为 dry_done（不阻塞当日真实窗口，但也不谎报成功）
+      this._setEnablePhase(shopCfg.id, today, res.error ? 'unknown' : 'dry_done', {
+        phase: 'dry', reason: res.error || null, targetCount: (res.targets || []).length,
+      });
       return { status: 'ok', dryRun: true, targetCount: (res.targets || []).length, enable: { outcome: res.outcome, error: res.error } };
     }
 
     this.schedule.lastWindowBlockReason = null;
-    const batch = await runner.executeChengfangEnableBatch({
-      shopCfg,
-      cycleToken,
-      trigger: { reason: `每日 ${enableHour}:00 自动开启` },
-      pageOpener: opener,
-      loginCfg,
-    });
+    let batch;
+    try {
+      batch = await runner.executeChengfangEnableBatch({
+        shopCfg,
+        cycleToken,
+        trigger: { reason: `每日 ${enableHour}:00 自动开启` },
+        pageOpener: opener,
+        loginCfg,
+      });
+    } catch (e) {
+      const reason = `乘方开启批次异常：${e.reason || e.message}`;
+      // 异常可能已发出部分请求 → unknown（不盲重发，等待回读）
+      this._setEnablePhase(shopCfg.id, today, 'unknown', { phase: 'execute', reason });
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason });
+      this._audit({ kind: 'action', shopId: shopCfg.id, status: 'unknown', reason });
+      return { status: 'unknown', reason };
+    }
     if (batch.outcome === 'blocked_window') {
       this.schedule.lastWindowBlockReason = batch.reason;
+      this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'execute', reason: batch.reason, blocked: 'window' });
       this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason, targetCount: 0 });
       this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason });
       return { status: 'window_blocked', reason: batch.reason };
     }
     if (batch.outcome === 'blocked_stopped') {
       const reason = batch.reason || '监控已停止，未发出乘方开启请求';
+      // 未发出任何请求 → 不占用当日（标记为 failed，允许窗口内重试）
+      this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'execute', reason, stopped: true });
       this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'stopped', reason });
       return { status: 'stopped', reason };
     }
@@ -641,14 +895,25 @@ class Monitor {
       const reason = batch.reason || '乘方开启被门槛阻止，未发出任何请求';
       rt.lastData = rt.lastData || {};
       rt.lastData.blockedReason = reason;
+      this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'execute', reason });
       this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason });
       this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason });
       return { status: 'blocked', reason, batch: this._summarizeBatch(batch) };
     }
     // nothing_to_enable / all_enabled_confirmed / partial → 记录批次
+    // 第 4 项：显式声明动作类型，下游禁止从 outcome 推断
+    batch.actionType = batch.actionType || 'enable';
     this._recordBatch(shopCfg.id, batch);
     this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) });
     this._audit({ kind: 'action', shopId: shopCfg.id, ...this._summarizeBatch(batch) });
+    // 全部确认开启 → success；部分确认 → unknown（不谎报成功，不阻塞已确认部分）
+    const okStatus = batch.allEnabledConfirmed === true ? 'success' : 'unknown';
+    this._setEnablePhase(shopCfg.id, today, okStatus, {
+      phase: 'execute',
+      outcome: batch.outcome,
+      allEnabledConfirmed: batch.allEnabledConfirmed === true,
+      reason: batch.reason || null,
+    });
     return { status: 'ok', enable: { outcome: batch.outcome }, batch: this._summarizeBatch(batch) };
   }
 
@@ -717,6 +982,7 @@ class Monitor {
 
     const todayStatus = new Map(); // 批次内结果累积（跨批次状态以最新清单读取为准）
     const batch = await coord.executeWholeShopCloseBatch({ shopCfg, cycleToken, todayStatus, trigger: { reason: data.evaluation.reason } });
+    batch.actionType = batch.actionType || 'pause';
     this._recordBatch(shopCfg.id, batch);
     this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) });
     this._audit({ kind: 'action', shopId: shopCfg.id, ...this._summarizeBatch(batch) });
@@ -752,9 +1018,31 @@ class Monitor {
     };
   }
 
+  /**
+   * 批次结果归一化（供 actions 事件流使用）。
+   *
+   * 2026-09-15 修复第 4 项：显式携带 `actionType`（'pause' | 'enable'），
+   * **禁止下游用 `outcome` 字符串推断动作**（旧实现用 `/enable/i.test(outcome)`
+   * 判断，导致 `nothing_to_enable`/`blocked_window`（开启窗口未到）等被误判为暂停）。
+   *
+   * 判定顺序（fail-closed，宁可标 unknown 也不猜）：
+   *   1) 批次自带 `actionType`（runner 显式声明，最可信）；
+   *   2) 否则用"专属字段"反推：allEnabledConfirmed/allPausedConfirmed 存在时成立；
+   *   3) 否则查 `_actionTypes` 登记表（runDryCycle/runDryEnableCycle 的调用方登记）；
+   *   4) 都拿不到 → `actionType: 'unknown'`（下游按"未识别"保守处理）。
+   */
   _summarizeBatch(batch) {
     const allConfirmed = batch.allClosedConfirmed === true || batch.allPausedConfirmed === true;
+    let actionType = batch.actionType || batch.action || null;
+    if (!actionType) {
+      if (batch.allEnabledConfirmed !== undefined || batch.dryEnableRun === true) actionType = 'enable';
+      else if (batch.allPausedConfirmed !== undefined || batch.dryRun === true) actionType = 'pause';
+      else if (batch.actionTypeHint) actionType = batch.actionTypeHint;
+      else actionType = 'unknown';
+    }
     return {
+      actionType,
+      action: actionType,
       outcome: batch.outcome,
       reason: batch.reason || null,
       counts: batch.counts,
@@ -834,6 +1122,7 @@ class Monitor {
         cookieInfo = { found: false, error: e.reason || e.message };
       }
       const dateRec = (this.batches[s.id] && this.batches[s.id][today]) || null;
+      const enableRec = this.getEnablePhaseRecord(s.id, today);
       return {
         id: s.id,
         name: s.name || null,
@@ -842,6 +1131,7 @@ class Monitor {
         cookieInfo,
         lastError: rt.lastError || null,
         today: rt.lastData || null,
+        enablePhase: enableRec || null,
         batchToday: dateRec ? { runs: dateRec.runs.length, totals: { confirmed: dateRec.totals.confirmed.length, failed: dateRec.totals.failed.length, unknown: dateRec.totals.unknown.length, skipped: dateRec.totals.skipped.length }, allClosedConfirmed: dateRec.allClosedConfirmed, allPausedConfirmed: dateRec.allPausedConfirmed === true, allEnabledConfirmed: dateRec.allEnabledConfirmed === true, lastBatchAt: dateRec.lastBatchAt, lastRuns: dateRec.runs.slice(-3) } : null,
       };
     });
@@ -856,6 +1146,7 @@ class Monitor {
       monitor: {
         running: this.running,
         phase: this.schedule.phase,
+        cycleNo: this.cycleNo || 0,
         startedAt: this.startedAt,
         lastCycleAt: this.lastCycleAt,
         nextRunAt: this.schedule.nextRunAt,
@@ -864,7 +1155,10 @@ class Monitor {
         dailyStartHour: this.config.schedule.dailyStartHour,
         intervalMinutes: this.config.schedule.intervalMinutes,
         enableHour: this._enableHour(),
-        lastEnableDate: this._lastEnableDate,
+        // 第 3 项：按店铺+上海日期的持久化开启相位状态（界面展示"今日是否已开启"及失败/未知原因）
+        enablePhaseToday: shops.map((s) => ({ shopId: s.id, record: s.enablePhase })).filter((x) => x.record),
+        // 兼容字段：任一启用店铺今日 success 即视为该日期已完成（不再是纯内存值）
+        lastEnableDate: shops.some((s) => s.enablePhase && s.enablePhase.status === 'success') ? today : null,
         snapshotMaxAgeMinutes: this.config.monitor.snapshotMaxAgeMinutes,
         mockDataSource: this.config.monitor.mockDataSource === true,
         chengfang: (this.config.monitor && this.config.monitor.chengfang) || null,
@@ -872,8 +1166,12 @@ class Monitor {
       },
       shops,
       rules: this.config.rules || [],
+      // 事件流（2026-09-15 修复第 1 项）：附带单调序号，供消费方可靠增量。
+      evtSeq: this._evtSeq || 0,
+      cycleNo: this.cycleNo || 0,
       triggers: this.triggers.slice(-100).reverse(),
       actions: this.actions.slice(-100).reverse(),
+      judgements: this.judgements.slice(-100).reverse(),
       recentErrors: this.recentErrors.slice(-50).reverse(),
       promoReaderConnected: this._injectedReader ? this._injectedReader.connected : false,
     };

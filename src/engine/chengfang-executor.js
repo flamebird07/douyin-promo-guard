@@ -221,7 +221,7 @@ async function pauseTuoguan({ controller, page, result, dryRun, requestGate, fai
     // 弹窗检测失败 → 停止（绝不当作无弹窗）
     let danger;
     try {
-      danger = await controller.detectDanger({ page });
+      danger = await controller.detectDanger({ page, expectedAction: 'shop_disable' });
     } catch (e) {
       fail('tuoguan', V_PARTIAL_FAILED, `弹窗检测失败，停止点击行内开关：${e.reason || e.message}`);
       return false;
@@ -232,7 +232,8 @@ async function pauseTuoguan({ controller, page, result, dryRun, requestGate, fai
     }
     let clickError = null;
     try {
-      await controller.clickRowSwitch({ page, planId: r.id });
+      // 托管关闭实测有确认弹窗「确定关闭乘方投放吗？」，走精确提交闭环
+      await controller.clickRowSwitch({ page, planId: r.id, expectAction: 'shop_disable' });
     } catch (e) {
       clickError = e;
     }
@@ -495,13 +496,14 @@ async function pausePageTargets({ controller, page, shopCfg, targets, rows, resu
   }
 
   let clickError = null;
+  let clickResult = null;
   try {
-    await controller.clickBatchPause({ page });
+    clickResult = await controller.clickBatchPause({ page, expectedCount: targetIds.length });
   } catch (e) {
     clickError = e;
   }
   if (clickError instanceof DataGuardError) {
-    // 定位/标记/检测类失败 → 点击尚未发出（零点击停止）
+    // 定位/标记/检测/弹窗类失败 → 点击或确认未发出（零点击/零确认停止）
     fail('zixuan', V_PARTIAL_FAILED, `批量暂停未发出（零点击）：${clickError.reason || clickError.message}`);
     return false;
   }
@@ -536,12 +538,29 @@ async function pausePageTargets({ controller, page, shopCfg, targets, rows, resu
   }
   if (failed.length > 0) {
     // 千川实机限制：首次提交有时确认成功却未落地。保持同一页面/同一浏览器会话，
-    // 按当前页重新选择并仅重试一次；不关闭浏览器、不重新读取 Cookie。二次仍失败才停止。
-    if (retryAttempt === 0 && failed.length === targetIds.length) {
-      audit({ kind: 'chengfang', event: 'retry', view: '商品自选', attempt: 2, targets: targetIds, note: '首次暂停回读仍全部开启，同会话重试一次' });
-      return pausePageTargets({ controller, page, shopCfg, targets, rows: postRows, result, dryRun, processed, drySeen, requestGate, fail, audit, retryAttempt: 1 });
+    // 按**实际仍未落地**的目标（含部分成功场景）重新选择并仅重试一次；
+    // 不关闭浏览器、不重新读取 Cookie、不反向切换、不扩范围。
+    // 2026-09-15 修复（交接第 6 项）：原实现仅在"全部失败"时重试，部分成功/未知状态一律直接失败；
+    // 现改为：仍有失败目标且本次未重试过 → 以回读为准只对失败目标重试一次。
+    if (retryAttempt === 0 && failed.length > 0 && failed.length <= targetIds.length) {
+      // 未知状态（notFound/开关状态未知）不参与重试：无法确认目标当前实际状态，避免盲重发。
+      if (notFound.length > 0) {
+        fail('zixuan', V_PARTIAL_FAILED,
+          `暂停回读存在 ${notFound.length} 个目标行消失（状态未知），不盲目重发；失败目标 ${failed.length} 个：${failed.slice(0, 5).join(',')}`);
+        return false;
+      }
+      const retryTargets = targets.filter((t) => failed.includes(t.id));
+      audit({
+        kind: 'chengfang', event: 'retry', view: '商品自选', attempt: 2,
+        targets: retryTargets.map((t) => t.id),
+        note: `首次暂停回读仍有 ${failed.length}/${targetIds.length} 个未落地，仅对未落地目标同会话重试一次（不反向切换、不扩范围）`,
+      });
+      return pausePageTargets({
+        controller, page, shopCfg, targets: retryTargets, rows: postRows, result, dryRun,
+        processed, drySeen, requestGate, fail, audit, retryAttempt: 1,
+      });
     }
-    fail('zixuan', V_PARTIAL_FAILED, `暂停未生效（开关仍开启）：${failed.slice(0, 5).join(',')}...${clickError ? `（点击结果曾未知，以回读为准：${clickError.reason || clickError.message}）` : ''}`);
+    fail('zixuan', V_PARTIAL_FAILED, `暂停未生效（开关仍开启）：${failed.slice(0, 5).join(',')}...${failed.length > 5 ? `（共 ${failed.length} 个）` : ''}${clickError ? `（点击结果曾未知，以回读为准：${clickError.reason || clickError.message}）` : ''}`);
     return false;
   }
   if (notFound.length > 0) {
@@ -552,18 +571,79 @@ async function pausePageTargets({ controller, page, shopCfg, targets, rows, resu
   return true;
 }
 
-/** 同一会话回读前保证仍在乘方管理页；页面跳转时才用原 URL 恢复。 */
-async function restoreManagementPageForReadback({ controller, page, shopCfg, managementUrl }) {
+/**
+ * 同一会话回读前保证仍在乘方管理页；页面跳转时才用原 URL 恢复。
+ *
+ * 2026-09-15 修复（交接第 5 项）：原实现只 goto + 固定等 8 秒 + 切"商品自选"标签，
+ * 真实页面 goto 后先呈现营销目标标签（"直播/商品"），必须先点"商品"才会出现
+ * "商品自选/全店托管"子标签；且恢复后还需 100条/页 与分页位置/完整性核验。
+ * 身份不匹配必须阻断——不得仅导航恢复掩盖账户变更。
+ *
+ * @param {object} o { controller, page, shopCfg, managementUrl, wantTab }
+ * @returns {{ok:boolean, restored?:boolean, reason?:string, pageSize?:string, pageNo?:number|null, total?:number|null}}
+ */
+async function restoreManagementPageForReadback({ controller, page, shopCfg, managementUrl, wantTab = '商品自选' }) {
   const identity = await controller.verifyIdentity({ page, shopCfg }).catch(() => null);
   if (identity && identity.ok === true) return { ok: true, restored: false };
   if (!managementUrl || typeof page.goto !== 'function') return { ok: false, reason: '当前页面非乘方管理页，且没有可用的同会话管理页 URL' };
   try {
     await page.goto(managementUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(8000);
-    await controller.switchView({ page, tab: '商品自选' });
+    if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(3000);
+
+    // 1) goto 后需先点"商品"营销目标标签，才会出现"商品自选/全店托管"子标签（实测）
+    const deadlineTab = Date.now() + 25000;
+    let identityOk = false;
+    while (Date.now() < deadlineTab) {
+      const cur = await controller.verifyIdentity({ page, shopCfg }).catch(() => null);
+      if (cur && cur.ok === true) { identityOk = true; break; }
+      // 尝试点击"商品"标签（自包含点击；找不到则等待）
+      await page.evaluate(() => {
+        const els = [...document.querySelectorAll('body *')].filter((el) => {
+          const own = Array.from(el.childNodes).filter((n) => n.nodeType === Node.TEXT_NODE).map((n) => n.textContent.trim()).join('');
+          return own === '商品' && el.querySelectorAll('*').length <= 4;
+        });
+        const el = els.find((e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+        if (el) el.click();
+      }).catch(() => {});
+      if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(2000);
+    }
+    if (!identityOk) {
+      const last = await controller.verifyIdentity({ page, shopCfg }).catch(() => null);
+      return { ok: false, reason: `恢复后身份/页面核验失败：${(last && last.reason) || '未到达乘方管理页（含"商品"标签点击后）'}` };
+    }
+
+    // 2) 切到目标子标签（商品自选）
+    await controller.switchView({ page, tab: wantTab });
+
+    // 3) 商品自选需确保 100条/页，并核验分页位置与完整性
+    let pageSize = null;
+    let pageNo = null;
+    let total = null;
+    if (wantTab === '商品自选') {
+      let v = await readViewFor(controller, page, wantTab);
+      if (!v) return { ok: false, reason: '恢复后商品自选视图读取失败' };
+      const ps = v.pagination && v.pagination.pageSize;
+      if (!ps || !String(ps).includes('100')) {
+        await controller.switchPageSize({ page, size: '100条/页' });
+        v = await readViewFor(controller, page, wantTab);
+        if (!v) return { ok: false, reason: '恢复后切换100条/页失败，视图读取失败' };
+      }
+      pageSize = (v.pagination && v.pagination.pageSize) || null;
+      pageNo = (v.pagination && v.pagination.activePage != null) ? Number(v.pagination.activePage) : null;
+      total = (v.pagination && v.pagination.total != null) ? v.pagination.total : null;
+      if (!pageSize || !String(pageSize).includes('100')) {
+        return { ok: false, reason: `恢复后每页条数核验失败（当前 ${pageSize || '缺失'}），回读范围不可确认` };
+      }
+      // 分页位置核验：无法确定当前页码 → 回读起点不可信
+      if (total != null && total > 100 && pageNo == null) {
+        return { ok: false, reason: `恢复后无法确认分页位置（total=${total} 但 activePage 缺失），回读完整性不可确认` };
+      }
+    }
+
+    // 4) 再次身份核验（慢加载后账户可能变化；身份不匹配阻断）
     const again = await controller.verifyIdentity({ page, shopCfg }).catch(() => null);
     if (!again || again.ok !== true) return { ok: false, reason: (again && again.reason) || '恢复后身份/页面核验失败' };
-    return { ok: true, restored: true };
+    return { ok: true, restored: true, pageSize, pageNo, total };
   } catch (e) {
     return { ok: false, reason: e.reason || e.message };
   }
@@ -864,7 +944,7 @@ async function enableTuoguan({ controller, page, result, dryRun, requestGate, fa
     if (!g.ok) { fail('tuoguan', V_PARTIAL_FAILED, `停止发出托管开启请求：${g.reason}`); return false; }
     let danger;
     try {
-      danger = await controller.detectDanger({ page });
+      danger = await controller.detectDanger({ page, expectedAction: 'shop_enable' });
     } catch (e) {
       fail('tuoguan', V_PARTIAL_FAILED, `弹窗检测失败，停止点击行内开关：${e.reason || e.message}`);
       return false;
@@ -875,7 +955,8 @@ async function enableTuoguan({ controller, page, result, dryRun, requestGate, fa
     }
     let clickError = null;
     try {
-      await controller.clickRowSwitch({ page, planId: r.id });
+      // 托管开启弹窗结构未实测：若出现确认弹窗且无法精确匹配，控制器内部阻断（不盲点确定）
+      await controller.clickRowSwitch({ page, planId: r.id, expectAction: 'shop_enable' });
     } catch (e) {
       clickError = e;
     }
@@ -1114,7 +1195,7 @@ async function enablePageTargets({ controller, page, shopCfg, targets, rows, res
 
   let clickError = null;
   try {
-    await controller.clickBatchEnable({ page });
+    await controller.clickBatchEnable({ page, expectedCount: targetIds.length });
   } catch (e) {
     clickError = e;
   }
@@ -1153,12 +1234,27 @@ async function enablePageTargets({ controller, page, shopCfg, targets, rows, res
   }
   if (failed.length > 0) {
     // 千川实机限制：首次提交有时确认成功却未落地。保持同一页面/同一浏览器会话，
-    // 按当前页重新选择并仅重试一次；不关闭浏览器、不重新读取 Cookie。二次仍失败才停止。
-    if (retryAttempt === 0 && failed.length === targetIds.length) {
-      audit({ kind: 'chengfang-enable', event: 'retry', view: '商品自选', attempt: 2, targets: targetIds, note: '首次开启回读仍全部关闭，同会话重试一次' });
-      return enablePageTargets({ controller, page, shopCfg, targets, rows: postRows, result, dryRun, processed, drySeen, requestGate, fail, audit, retryAttempt: 1 });
+    // 按**实际仍未落地**的目标（含部分成功场景）重新选择并仅重试一次；
+    // 不关闭浏览器、不重新读取 Cookie、不反向切换、不扩范围。
+    // 2026-09-15 修复（交接第 6 项）：原实现仅在"全部失败"时重试，部分成功/未知状态一律直接失败。
+    if (retryAttempt === 0 && failed.length > 0 && failed.length <= targetIds.length) {
+      if (notFound.length > 0) {
+        fail('zixuan', V_PARTIAL_FAILED,
+          `开启回读存在 ${notFound.length} 个目标行消失（状态未知），不盲目重发；失败目标 ${failed.length} 个：${failed.slice(0, 5).join(',')}`);
+        return false;
+      }
+      const retryTargets = targets.filter((t) => failed.includes(t.id));
+      audit({
+        kind: 'chengfang-enable', event: 'retry', view: '商品自选', attempt: 2,
+        targets: retryTargets.map((t) => t.id),
+        note: `首次开启回读仍有 ${failed.length}/${targetIds.length} 个未落地，仅对未落地目标同会话重试一次（不反向切换、不扩范围）`,
+      });
+      return enablePageTargets({
+        controller, page, shopCfg, targets: retryTargets, rows: postRows, result, dryRun,
+        processed, drySeen, requestGate, fail, audit, retryAttempt: 1,
+      });
     }
-    fail('zixuan', V_PARTIAL_FAILED, `开启未生效（开关仍关闭）：${failed.slice(0, 5).join(',')}...${clickError ? `（点击结果曾未知，以回读为准：${clickError.reason || clickError.message}）` : ''}`);
+    fail('zixuan', V_PARTIAL_FAILED, `开启未生效（开关仍关闭）：${failed.slice(0, 5).join(',')}...${failed.length > 5 ? `（共 ${failed.length} 个）` : ''}${clickError ? `（点击结果曾未知，以回读为准：${clickError.reason || clickError.message}）` : ''}`);
     return false;
   }
   if (notFound.length > 0) {

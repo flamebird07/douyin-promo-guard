@@ -110,6 +110,7 @@ class ChengfangRunner {
         this.audit({ kind: 'chengfang-dry', shopId: shopCfg.id, outcome: 'dry_failed', reason });
         return {
           outcome: 'dry_failed',
+          actionType: 'pause',
           dryRun: true,
           executor: result,
           targets: [],
@@ -121,6 +122,7 @@ class ChengfangRunner {
       }
       return {
         outcome: 'dry',
+        actionType: 'pause',
         dryRun: true,
         executor: result,
         targets: (result.dryRunTargets || []).map((t) => ({ view: t.view, planId: t.planId })),
@@ -133,6 +135,7 @@ class ChengfangRunner {
       this.audit({ kind: 'chengfang-dry', shopId: shopCfg.id, outcome: 'dry_failed', reason });
       return {
         outcome: 'dry_failed',
+        actionType: 'pause',
         dryRun: true,
         executor: null,
         targets: [],
@@ -169,6 +172,7 @@ class ChengfangRunner {
         this.audit({ kind: 'chengfang-enable-dry', shopId: shopCfg.id, outcome: 'dry_failed', reason });
         return {
           outcome: 'dry_failed',
+          actionType: 'enable',
           dryRun: true,
           executor: result,
           targets: [],
@@ -180,6 +184,7 @@ class ChengfangRunner {
       }
       return {
         outcome: 'dry',
+        actionType: 'enable',
         dryRun: true,
         executor: result,
         targets: (result.dryRunTargets || []).map((t) => ({ view: t.view, planId: t.planId })),
@@ -192,6 +197,7 @@ class ChengfangRunner {
       this.audit({ kind: 'chengfang-enable-dry', shopId: shopCfg.id, outcome: 'dry_failed', reason });
       return {
         outcome: 'dry_failed',
+        actionType: 'enable',
         dryRun: true,
         executor: null,
         targets: [],

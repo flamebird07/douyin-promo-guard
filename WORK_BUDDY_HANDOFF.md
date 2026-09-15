@@ -38,3 +38,39 @@
 先修真实闭环和调度，再接3443，同一后端状态源驱动启动/停止/日志；不要只改标签。不破坏电商助手其他业务。使用现有单活跃读取防重叠逻辑，开启与暂停互斥。
 覆盖内层开关、真实确认弹窗结构、数量不符/删除零点击、最终身份核验期间停止/跨日/许可关闭、首次未落地同会话重试、回到首页恢复、分页不完整、部分成功、未知不重发、持久化恢复、防重复07:00开启和08:00准时巡查。
 完成 npm test、npm run check 和3443接口/UI隔离验证，给出修改文件、实际测试总数、已验证/未验证、配置与服务加载状态。不要启动值守、不要擅自真实开启计划，不要上传秘密；将受控可视实机验证步骤留给用户明确发起。需要重启共享3443时先检查业务状态并报告影响。不得通过批量结束node/Edge清理。
+
+
+---
+
+## 第二轮修复交接（2026-09-15，提交 1996e15 / 6ac1d77）
+
+上一轮 6 项交接修复已落地并复测。本轮针对「日志与展示可信度」追加 7 项修复，
+全部带回归测试；详见 DELIVERY_REPORT.md 第 0 节（旧行为 / 修复位置 / 回归测试名）。
+
+1. **日志增量游标**：删除 `_lastActionsSeen = list.length` 等**基于有界数组长度**的游标；
+   Monitor `_memPush` 为每条事件附加单调 `evtSeq`，新增 `_evtDropped`（裁剪区段）与
+   `getEventStream(since)`；watch-drill 按 `evtSeq > lastSeq` 增量消费，与数组长度解耦。
+   超缓存时记录明确「日志缺口 N 条」并继续同步。
+2. **六类日志**（每日开启 / 每轮判断 / 暂停 / 重试 / 回读 / 失败原因）全部真实进入
+   `/api/watch-drill/logs`；重试与回读不再只写审计文件。
+3. **每周期一条判断**：Monitor `cycleNo` + `_emitJudgement` **无条件**记录（连续两轮相同数据
+   也有两条）；watch-drill `roundNo` 跟随 `Monitor.cycleNo`。
+4. **actionType 显式字段**：runner dry 路径 + Monitor `_summarizeBatch` 显式输出
+   `actionType`/`action`；watch-drill 移除 `/enable/i.test(outcome)` 文本推断。
+   部分开启 / 开启失败 / 每日开启演练一律标「开启」；缺失字段如实报「未知动作」。
+5. **危险弹窗 fail-closed**：`submitConfirmIfPresent` 删除弹窗检测异常不再 catch 成
+   `{found:false}`；`clickRowSwitch` 两处检测异常在**业务点击派发前**抛 `DataGuardError`（零点击）。
+6. **门槛实时一致**：watch-drill 每轮重读 Monitor 配置（含实时 `realMode`），运行中改
+   `realMode`/`pauseEnabled`/`enableEnabled` 后 state 与 logs 立即反映。
+7. **未实测开启弹窗保守阻断**：`confirmDialogs` 中 `batch_enable`/`shop_enable` 保持 `false`（阻断），
+   未因测试放宽为盲点「确定」。
+
+### 本轮测试总数
+- 推广控制 `npm test`：**265/265**（乘方四套 124 + 其余 141）。
+- `npm run check`：通过（配置齐全，演练模式，阈值 100 分/单，1 家店铺）。
+- bill-manager `tests/watch-drill.test.js`：**38/38**。
+- `test/chengfang-confirm-switch.test.js`：21 → **28**（新增 fail-closed 7 例）。
+
+### 仍未做（按要求）
+未重启 3443（仍 PID 18916 旧只读版，实测仍返回 `forcedDrill:true` 且无 `gates`）；
+未启动值守；未修改生产三开关；未点击真实广告或删除。

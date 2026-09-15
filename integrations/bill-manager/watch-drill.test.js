@@ -1,20 +1,26 @@
 'use strict';
 
 /**
- * 推广值守演练（watch-drill）隔离测试 —— 不触碰生产页面。
+ * 推广值守（watch-drill，2026-09-15 接入真实操作模式）隔离测试 —— 不触碰生产页面、不操作真实广告。
  *
- * 覆盖用户规则：
- * - 幂等启动/停止、停止后不再安排下一轮、正在读取按明确状态结束；
- * - 上海 08:00 后立即读取一次、每 30 分钟巡查、08:00 前等待、跨日等到次日 08:00；
- * - 判定：费用整数分 > 订单数×100 才超标（恰好相等不超标）；零订单/读取失败显示「本轮无法判断」；
- * - 强制只读：即使配置 realMode=true、pauseEnabled=true，演练入口仍零广告操作；
- * - 单轮读取超时不卡死调度；重启后默认未启动、日志可恢复；日志 scrub 敏感信息。
+ * 本文件替换原先的「强制只读演练」测试。契约变化（用户 2026-09-15 明确要求）：
+ *   1) 每天 07:00 开启全部乘方计划；
+ *   2) 08:00 后每 30 分钟检查，当天费用÷当天全店订单 **严格超过** 1 元/单即暂停乘方；
+ *   3) 绝不删除广告；
+ *   4) 日志必须包含：开启、判断数据、暂停、重试、回读、失败原因。
+ *
+ * 实现方式变化：watch-drill 不再自己实现一套只读调度，而是**进程内装配推广控制项目的
+ * Monitor**（同一份经过测试的调度与乘方链路），本模块只做「日志转译 + HTTP 暴露」。
+ * 因此这里断言的是：
+ *   - 装配正确（Monitor 被创建、门槛快照如实透出、fail-closed 不被绕过）；
+ *   - 启停幂等、重启默认未启动；
+ *   - 日志转译包含用户点名的六类信息；
+ *   - 敏感信息 scrub；无删除广告路径。
  */
 
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 
 const { createWatchDrill, scrub } = require('../watch-drill');
@@ -26,39 +32,42 @@ const { shanghaiDate, shanghaiMs } = timeLib;
 const SHOP_ID = '瑾漂亮潮流服饰';
 const ACC = 'acc-1';
 
-// 上海 2026-09-14 09:00:00（UTC 01:00:00）
+// 上海 2026-09-14 09:00:00
 const BASE_SH = shanghaiMs('2026-09-14', '09:00');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ── 可控时钟 ──────────────────────────────────────────────────
 function makeClock(startMs) {
   let ms = startMs;
-  return {
-    now: () => ms,
-    set: (v) => { ms = v; },
-    advance: (v) => { ms += v; },
-  };
+  return { now: () => ms, set: (v) => { ms = v; }, advance: (v) => { ms += v; } };
 }
 
-// ── 可控定时器（捕获 setTimeout 回调，测试手动触发）────────────
+// ── 可控定时器 ────────────────────────────────────────────────
+// Monitor 的调度循环会 `await delayFn(ms)`；若 delayFn 立刻 resolve，循环会**空转**。
+// 因此这里返回一个**保持 pending 的 Promise**，只在测试显式 fireAll()/advance() 时 resolve。
 function makeTimers() {
   const active = new Set();
   let seq = 0;
   return {
-    delayFn: (ms, cb) => { const h = { id: ++seq, ms, cb, fired: false }; active.add(h); return h; },
+    delayFn: (ms) => new Promise((resolve) => {
+      const h = { id: ++seq, ms, resolve, done: false };
+      active.add(h);
+    }),
     cancelTimer: (h) => { if (h) active.delete(h); },
     activeCount: () => active.size,
     pendingMs: () => [...active].map((h) => h.ms),
+    /** 触发所有挂起的延时（模拟时间推进）。 */
     fireAll: async () => {
       const list = [...active];
       active.clear();
-      for (const h of list) { h.fired = true; await h.cb(); }
+      for (const h of list) { h.done = true; h.resolve(); }
+      await sleep(0);
     },
+    clear: () => { active.clear(); },
   };
 }
 
-async function until(fn, timeout = 3000) {
+async function until(fn, timeout = 5000) {
   const t0 = Date.now();
   while (!fn()) {
     if (Date.now() - t0 > timeout) throw new Error('until() 超时，状态未按预期变化');
@@ -66,14 +75,31 @@ async function until(fn, timeout = 3000) {
   }
 }
 
+// ── 配置（对齐生产 config.json 的关键字段）──────────────────────
+// Cookie：Monitor 每轮会先做登录态静态核验，因此测试用一个临时目录放一份
+// **占位** cookie 文件（非真实凭据，仅含 platform 会话结构），避免触网且不读生产 cookie。
+const COOKIE_DIR = fs.mkdtempSync(path.join(require('os').tmpdir(), 'wd-cookies-'));
+const COOKIE_FILE = 'test-shop';
+fs.writeFileSync(
+  path.join(COOKIE_DIR, `${COOKIE_FILE}.json`),
+  JSON.stringify([
+    { name: 'sessionid', value: 'dummy-not-a-real-credential', domain: '.jinritemai.com', path: '/', expires: Math.floor(Date.now() / 1000) + 86400 },
+  ])
+);
+process.on('exit', () => { try { fs.rmSync(COOKIE_DIR, { recursive: true, force: true }); } catch (_) {} });
+
 function makeCfg(overrides = {}) {
   return {
-    shops: [{ id: SHOP_ID, name: SHOP_ID, cookieFile: 'cf', accountId: ACC, enabled: true }],
+    shops: [{ id: SHOP_ID, name: SHOP_ID, cookieFile: COOKIE_FILE, accountId: ACC, enabled: true }],
     rules: [{ type: 'wholeShopCostPerOrder', thresholdCents: 100, enabled: true }],
     schedule: { dailyStartHour: 8, intervalMinutes: 30 },
-    monitor: { snapshotMaxAgeMinutes: 30, chengfang: { pauseEnabled: true } },
-    login: {},
-    execution: { realMode: true },
+    monitor: {
+      snapshotMaxAgeMinutes: 30,
+      mockDataSource: false,
+      chengfang: { scope: ['全店托管', '商品自选'], pauseEnabled: false, enableEnabled: false, enableHour: 7 },
+    },
+    login: { cookieSourceDir: COOKIE_DIR },
+    execution: { realMode: false, maxAdPages: 50, readbackTimeoutMs: 1000, readbackAttempts: 1, readbackIntervalMs: 10 },
     ...overrides,
   };
 }
@@ -88,521 +114,853 @@ function mkSummary(kind, v, clock) {
 }
 
 function makeReaders(clock, opts = {}) {
-  // calls.costPeak/orderPeak：并发读取峰值，用于断言任一时刻最多一个活跃读取任务
-  const calls = { cost: 0, order: 0, costActive: 0, orderActive: 0, costPeak: 0, orderPeak: 0 };
-  const adOps = [];
-  const begin = (k) => { calls[k]++; calls[k + 'Active']++; calls[k + 'Peak'] = Math.max(calls[k + 'Peak'], calls[k + 'Active']); };
-  const finish = (k) => { calls[k + 'Active']--; };
-  return {
-    costReader: {
-      kind: 'cost',
-      async readCostSummary() {
-        begin('cost');
-        try {
-          if (opts.costError) throw opts.costError;
-          if (opts.costHang) return await new Promise(() => {});
-          // costDelay 仅作用于首次调用（构造「首轮超时、随后延迟结束」的回归场景）
-          if (opts.costDelay) { const d = opts.costDelay; opts.costDelay = 0; await sleep(d); }
-          return mkSummary('cost', opts.costCents, clock);
-        } finally { finish('cost'); }
-      },
-    },
-    orderReader: {
-      kind: 'orders',
-      async readOrderSummary() {
-        begin('order');
-        try {
-          if (opts.orderError) throw opts.orderError;
-          if (opts.orderHang) return await new Promise(() => {});
-          if (opts.orderDelay) await sleep(opts.orderDelay);
-          return mkSummary('orders', opts.orderCount, clock);
-        } finally { finish('order'); }
-      },
-    },
-    calls,
-    adOps,
+  const calls = { cost: 0, order: 0 };
+  const costReader = {
+    connected: true,
+    kind: 'cost',
+    async readCostSummary() { calls.cost++; return mkSummary('cost', opts.costCents, clock); },
   };
+  const orderReader = {
+    connected: true,
+    kind: 'orders',
+    async readOrderSummary() { calls.order++; return mkSummary('orders', opts.orderCount, clock); },
+  };
+  return { costReader, orderReader, calls };
 }
+
+// ── 装配 watch-drill（内部会 new Monitor；这里注入 config + 只读适配器）────
+// `adapters.reader` 会被 Monitor 直接用作注入读取器（见 monitor.js _getCoordinator），
+// 因此测试通过 createCompositeReader 包一层，避免触网。
+// 记录本进程创建的所有实例：测试结束后统一 stop + 清空挂起延时，
+// 否则 Monitor 的调度循环（pending Promise）会阻止进程退出。
+const CREATED = [];
 
 function makeDrill(clock, timers, opts = {}) {
   const readers = opts.readers || makeReaders(clock, opts);
+  const cfg = makeCfg(opts.cfg);
+  const { createCompositeReader } = require(path.join(PROMO, 'src/adapters/promo-reader.js'));
+  const reader = opts.injectedReader || createCompositeReader({
+    costReader: readers.costReader,
+    orderReader: readers.orderReader,
+    adReader: opts.adReader || null,
+  });
   const drill = createWatchDrill({
     shopName: SHOP_ID,
     persistFile: opts.persistFile || null,
     nowFn: clock.now,
     delayFn: timers.delayFn,
-    cancelTimer: timers.cancelTimer,
-    readTimeoutMs: opts.readTimeoutMs || 60000,
-    prevGraceMs: opts.prevGraceMs || 20,
-    config: makeCfg(opts.cfg),
-    readers: { costReader: readers.costReader, orderReader: readers.orderReader },
-    cookieMetaCheck: opts.cookieMetaCheck || (() => {}),
+    dataDir: opts.dataDir || path.join(require('os').tmpdir(), `wd-state-${process.pid}-${Date.now()}`),
+    config: cfg,
+    configSourcePath: 'test',
+    adapters: {
+      reader,
+      controller: opts.controller || null,
+    },
+    chengfangOpener: opts.chengfangOpener || null,
   });
+  CREATED.push({ drill, timers });
   return { drill, readers };
 }
 
 const allLogs = (drill) => drill.logs.map((l) => l.msg).join('\n');
 
+// 每个用例结束后统一停止调度并清空挂起延时，保证进程能正常退出。
+test.after(() => {
+  for (const { drill, timers } of CREATED) {
+    try { drill.stop(); } catch (_) {}
+    try { timers.clear(); } catch (_) {}
+  }
+});
+
 // ══════════════════════════════════════════════════════════════
-// 1) 默认状态与强制只读标识
+// 1) 默认状态
 // ══════════════════════════════════════════════════════════════
-test('创建后默认未启动，且为强制只读演练', () => {
+test('创建后默认未启动、无日志、不安排任何定时器（不自动启动值守）', () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
   const { drill } = makeDrill(clock, timers);
   const s = drill.snapshot();
   assert.strictEqual(s.running, false);
   assert.strictEqual(s.status, 'idle');
-  assert.strictEqual(s.forcedDrill, true);
   assert.strictEqual(s.statusText, '未启动');
   assert.strictEqual(timers.activeCount(), 0);
   assert.strictEqual(drill.logs.length, 0);
 });
 
-test('watch-drill 模块不含任何广告操作代码路径', () => {
+test('watch-drill 模块自身不含删除广告的操作代码路径', () => {
   const src = fs.readFileSync(require.resolve('../watch-drill'), 'utf-8');
-  const reqs = [...src.matchAll(/require\(['"]([^'"]+)['"]\)/g)].map((m) => m[1]);
-  for (const r of reqs) {
-    assert.ok(!/ad-controller|chengfang|executor|close-flow|pause|enable|delete/i.test(r), `禁止引用广告操作模块: ${r}`);
+  // 去掉注释后再检查，避免把"本模块不含删除路径"这类说明文字误判为违规
+  const code = src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+  // 检查"操作"型标识（函数调用/方法名），而非开关字段名
+  for (const bad of ['closeAd', 'deleteAdPlan', 'removeAd', 'batchDelete', 'deleteBatch', 'btn-delete', 'group-item-btn-delete']) {
+    assert.ok(!code.includes(bad), `模块代码不应包含删除操作路径: ${bad}`);
   }
-  for (const bad of ['closeAd', 'pauseAd', 'batchPause', 'ad-controller']) {
-    assert.ok(!src.includes(bad), `模块不应包含: ${bad}`);
-  }
+  // 显式声明删除广告永久关闭（这是允许且必须存在的常量）
+  assert.ok(/deleteAdEnabled:\s*false/.test(src), '应显式声明 deleteAdEnabled=false');
+});
+
+test('watch-drill 委托推广控制 Monitor（不重复实现调度/乘方链路）', () => {
+  const src = fs.readFileSync(require.resolve('../watch-drill'), 'utf-8');
+  assert.ok(/src\/engine\/monitor\.js/.test(src), '应装配推广控制 Monitor');
+  assert.ok(!/setTimeout\(.*fireRound/s.test(src), '不应保留自研轮次调度');
 });
 
 // ══════════════════════════════════════════════════════════════
-// 2) 启动/停止/幂等
+// 2) 门槛快照（fail-closed，绝不绕过）
 // ══════════════════════════════════════════════════════════════
-test('08:00 后启动立即读取一轮，随后等待下一轮（30 分钟）', async () => {
+test('门槛快照如实透出：realMode/pauseEnabled/enableEnabled 全关时，真实暂停与开启都不会执行', () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
-  const { drill, readers } = makeDrill(clock, timers, { costCents: 7937, orderCount: 89 });
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
   drill.start();
-  assert.strictEqual(drill.snapshot().status, 'reading');
-  await until(() => drill.snapshot().status === 'waiting');
-  assert.strictEqual(readers.calls.cost, 1);
-  assert.strictEqual(readers.calls.order, 1);
-  const s = drill.snapshot();
-  assert.strictEqual(s.running, true);
-  assert.ok(s.lastCheckAt);
-  assert.ok(s.nextRunAt);
-  assert.strictEqual(s.lastRound.conclusion, 'under');
-  assert.strictEqual(new Date(s.nextRunAt).getTime(), BASE_SH + 30 * 60 * 1000);
-  assert.strictEqual(timers.activeCount(), 1);
-  const log = allLogs(drill);
-  assert.ok(log.includes('开始读取'));
-  assert.ok(log.includes('业务日期 2026-09-14'));
-  assert.ok(log.includes('费用=千川账户整体消耗：79.37 元'));
-  assert.ok(log.includes('订单=罗盘经营概况（全店+实时）：89 单'));
-  assert.ok(log.includes('每单约0.89元'));
-  assert.ok(log.includes('7937分 ≤ 89×100分=8900分，未超标。本轮仅演练，不暂停广告。'));
-  assert.ok(log.includes('本轮耗时'));
-  assert.ok(log.includes('下次检查时间'));
+  const g = drill.snapshot().gates;
+  assert.ok(g, '必须暴露门槛快照供界面展示');
+  assert.strictEqual(g.realMode, false);
+  assert.strictEqual(g.pauseEnabled, false);
+  assert.strictEqual(g.enableEnabled, false);
+  assert.strictEqual(g.pauseWillExecute, false, '两个开关未同开 → 不执行真实暂停');
+  assert.strictEqual(g.enableWillExecute, false, '两个开关未同开 → 不执行真实开启');
+  assert.strictEqual(g.deleteAdEnabled, false, '删除广告永久关闭');
+  assert.deepStrictEqual(g.scope, ['全店托管', '商品自选']);
+  assert.strictEqual(g.enableHour, 7);
+  assert.strictEqual(g.dailyStartHour, 8);
+  assert.strictEqual(g.intervalMinutes, 30);
 });
 
-test('重复点击启动幂等：不产生多个循环', async () => {
+test('门槛快照：realMode + pauseEnabled 同开 → 真实暂停会执行；enableEnabled 未开 → 开启仍不执行', () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
-  const { drill, readers } = makeDrill(clock, timers, { costCents: 5000, orderCount: 100 });
+  const { drill } = makeDrill(clock, timers, {
+    costCents: 100, orderCount: 100,
+    cfg: { execution: { realMode: true }, monitor: { snapshotMaxAgeMinutes: 30, chengfang: { scope: ['全店托管', '商品自选'], pauseEnabled: true, enableEnabled: false, enableHour: 7 } } },
+  });
   drill.start();
-  drill.start();
-  drill.start();
-  await until(() => drill.snapshot().status === 'waiting');
-  assert.strictEqual(readers.calls.cost, 1, '只应执行一轮');
-  assert.strictEqual(readers.calls.order, 1);
-  assert.strictEqual(timers.activeCount(), 1, '只应有一个下一轮定时器');
+  const g = drill.snapshot().gates;
+  assert.strictEqual(g.pauseWillExecute, true);
+  assert.strictEqual(g.enableWillExecute, false);
 });
 
-test('停止在读取中：按明确状态结束，不误报立即停止，且不再安排下一轮', async () => {
+// ══════════════════════════════════════════════════════════════
+// 3) 启停幂等与重启语义
+// ══════════════════════════════════════════════════════════════
+test('启动后 running=true 且记录已装配；重复启动不叠加循环', () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
-  const { drill, readers } = makeDrill(clock, timers, { costCents: 5000, orderCount: 100, costDelay: 120 });
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
   drill.start();
-  await until(() => readers.calls.cost === 1); // 读取已开始
-  drill.stop();
-  let s = drill.snapshot();
-  assert.strictEqual(s.running, false);
-  assert.strictEqual(s.status, 'reading', '读取中停止：状态保持读取中，等待本轮明确结束');
-  await until(() => drill.snapshot().status === 'idle');
-  s = drill.snapshot();
-  assert.strictEqual(s.running, false);
-  assert.strictEqual(s.status, 'idle');
-  assert.strictEqual(s.nextRunAt, null);
-  assert.strictEqual(timers.activeCount(), 0, '停止后不得再安排下一轮');
-  const log = allLogs(drill);
-  assert.ok(log.includes('值守停止：不再开始新一轮'));
-  assert.ok(log.includes('值守已停止，不再安排下一轮'));
+  assert.strictEqual(drill.snapshot().running, true);
+  const logs1 = drill.logs.length;
+  drill.start();
+  assert.strictEqual(drill.snapshot().running, true);
+  assert.ok(allLogs(drill).includes('已在运行'), '重复启动应明确记录为忽略');
+  assert.ok(drill.logs.length >= logs1);
 });
 
-test('停止在等待中：立即空闲，定时器取消', async () => {
+test('停止后 running=false、状态回到未启动；重复停止幂等', () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
-  const { drill } = makeDrill(clock, timers, { costCents: 5000, orderCount: 100 });
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
   drill.start();
-  await until(() => drill.snapshot().status === 'waiting');
   drill.stop();
   const s = drill.snapshot();
   assert.strictEqual(s.running, false);
   assert.strictEqual(s.status, 'idle');
-  assert.strictEqual(s.nextRunAt, null);
-  assert.strictEqual(timers.activeCount(), 0);
+  assert.ok(s.stoppedAt);
+  drill.stop(); // 幂等
+  assert.strictEqual(drill.snapshot().running, false);
 });
 
-test('停止后再次启动可重新开始值守', async () => {
+test('服务重启语义：新建实例默认未启动，但历史日志可从 JSONL 恢复查看', () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
-  const { drill, readers } = makeDrill(clock, timers, { costCents: 5000, orderCount: 100 });
-  drill.start();
-  await until(() => drill.snapshot().status === 'waiting');
-  drill.stop();
-  await until(() => drill.snapshot().status === 'idle');
-  drill.start();
-  await until(() => drill.snapshot().status === 'waiting');
-  assert.strictEqual(readers.calls.cost, 2, '重新启动应执行新一轮');
+  const tmp = path.join(require('os').tmpdir(), `wd-restore-${Date.now()}.jsonl`);
+  try {
+    const first = makeDrill(clock, makeTimers(), { costCents: 100, orderCount: 100, persistFile: tmp }).drill;
+    first.start();
+    const ranLogs = first.logs.length;
+    assert.ok(ranLogs > 0);
+    // 模拟进程重启：新实例复用同一日志文件
+    const second = makeDrill(clock, makeTimers(), { persistFile: tmp }).drill;
+    assert.strictEqual(second.snapshot().running, false, '重启后默认未启动');
+    assert.ok(second.logs.length > 0, '历史日志应可恢复查看');
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (_) {}
+  }
 });
 
 // ══════════════════════════════════════════════════════════════
-// 3) 判定与日志
+// 4) 用户点名要求的日志内容：开启 / 判断数据 / 暂停 / 重试 / 回读 / 失败原因
 // ══════════════════════════════════════════════════════════════
-test('超标：费用整数分 > 订单数×100', async () => {
+test('启动日志说明规则：07:00 开启、08:00 后每 30 分钟、严格超过 1 元/单、绝不删除广告', () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('07:00'), `应说明 07:00 开启，实际日志：\n${logs}`);
+  assert.ok(logs.includes('08:00 后每 30 分钟检查'), '应说明 08:00 后每 30 分钟检查');
+  assert.ok(logs.includes('严格超过 1 元/单'), '应说明判定阈值');
+  assert.ok(logs.includes('绝不删除广告'), '应说明不删除广告');
+});
+
+test('装配日志透出模式与门槛明细（含"删除广告=永不执行"）', () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('值守装配完成'), '应有装配日志');
+  assert.ok(logs.includes('门槛：'), '应有门槛明细');
+  assert.ok(logs.includes('删除广告=永不执行'));
+  assert.ok(logs.includes('控制范围=全店托管+商品自选'));
+});
+
+test('判断数据日志：恰好等于 1 元/单（不超标）时给出费用/订单/每单与整数分判定过程', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  // 判定式：费用分 > 订单数 × 阈值分(100) 才超标。
+  // 费用 10000 分、订单 100 单 → 10000 ≤ 100×100 = 10000，恰好相等不超标。
+  const { drill } = makeDrill(clock, timers, { costCents: 10000, orderCount: 100 });
+  drill.start();
+  // 等首轮轮询完成（Monitor 置 lastCycleAt），再经 /state 同步出日志
+  await until(() => drill._internal._monitor.lastCycleAt, 8000);
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  const logs = allLogs(drill);
+  assert.ok(/第 \d+ 轮判断数据（周期 \d+/.test(logs), `应含周期号与判断标题，实际：\n${logs}`);
+  assert.ok(/费用 .* 元（\d+ 分），订单 \d+ 单，每单/.test(logs), `应含费用/订单/每单，实际：\n${logs}`);
+  assert.ok(logs.includes('10000 分 ≤ 100×100 分') || logs.includes('10000 分 ≤ 100×100'), '应含整数分判定过程');
+  assert.ok(logs.includes('未超标，不暂停乘方'));
+});
+
+test('判断数据日志：严格超过 1 元/单时判为超标并说明应暂停乘方', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  // 费用 10001 分、订单 100 单 → 10001 > 100×100 = 10000，超标（严格大于）
+  const { drill } = makeDrill(clock, timers, { costCents: 10001, orderCount: 100 });
+  drill.start();
+  await until(() => drill._internal._monitor.lastCycleAt, 8000);
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('10001 分 > 100×100 分'), `应含严格大于的整数分判定，实际：\n${logs}`);
+  assert.ok(logs.includes('超标'), '应判为超标');
+  assert.ok(logs.includes('应暂停乘方'), '应说明应暂停乘方');
+});
+
+test('判断数据日志：连续两轮数据完全相同 → 仍然各有两条判断日志（不以"数据变化"为条件）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  // 费用与订单在两轮之间保持不变
+  const { drill } = makeDrill(clock, timers, { costCents: 10000, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  await until(() => m.lastCycleAt, 8000);
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  const cycle1 = m.cycleNo;
+  // 让 Monitor 完成第二个完整周期（数据完全相同）
+  await timers.fireAll();
+  await until(() => m.cycleNo > cycle1, 8000);
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  const logs = allLogs(drill);
+  const hits = logs.match(/第 \d+ 轮判断数据（周期 \d+/g) || [];
+  assert.ok(hits.length >= 2, `连续两轮相同数据也必须有两条判断日志，实际命中 ${hits.length} 条：\n${logs}`);
+  // 每一轮的 cycleNo 必须递增且不同
+  const cycles = hits.map((h) => Number(/周期 (\d+)/.exec(h)[1]));
+  assert.strictEqual(new Set(cycles).size, cycles.length, '周期号必须严格递增、互不重复');
+});
+
+test('周期号正确递增：roundNo 跟随 Monitor.cycleNo（每个完整巡查周期 +1）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  await until(() => m.lastCycleAt, 8000);
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  const r1 = drill.snapshot().roundNo;
+  assert.strictEqual(r1, m.cycleNo, 'roundNo 必须等于 Monitor 的 cycleNo');
+  await timers.fireAll();
+  await until(() => m.cycleNo > r1, 8000);
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  const r2 = drill.snapshot().roundNo;
+  assert.ok(r2 > r1, `第二轮 roundNo 必须递增：${r1} → ${r2}`);
+});
+
+test('失败原因进入日志：读取异常时记录失败原因（不是静默忽略）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const readers = {
+    costReader: { connected: true, kind: 'cost', async readCostSummary() { throw new Error('页面未到达千川首页'); } },
+    orderReader: { connected: true, kind: 'orders', async readOrderSummary() { return mkSummary('orders', 10, clock); } },
+    calls: { cost: 0, order: 0 },
+  };
+  const { drill } = makeDrill(clock, timers, { readers });
+  drill.start();
+  await until(() => drill._internal._monitor.lastCycleAt, 8000);
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('失败'), '必须有失败记录');
+  assert.ok(/页面未到达千川首页/.test(logs), `失败原因不得被吞掉，实际：\n${logs}`);
+});
+
+// ══════════════════════════════════════════════════════════════
+// 5) 动作转译（暂停 / 开启 / 重试 / 回读）
+// ══════════════════════════════════════════════════════════════
+test('日志转译：暂停批次结果含目标数/计数/回读/失败原因（经 /state 接口触发）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.actions = [];
+  m._memPush(m.actions, {
+    shopId: SHOP_ID,
+    actionType: 'pause',
+    outcome: 'partial',
+    counts: { confirmed: 98, failed: 2, unknown: 0, skipped: 0 },
+    targets: ['123456', '234567', '345678'],
+    allPausedConfirmed: false,
+    confirmReason: '回读仍有 2 条处于投放中，状态与请求不一致',
+    remaining: { total: 2, ids: ['234567', '345678'] },
+    error: '计划 234567 行内层开关点击后未生效',
+    batchDate: shanghaiDate(clock.now()),
+  });
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('暂停批次结果'), '应转译暂停批次');
+  assert.ok(logs.includes('本次动作=暂停'), '显式 actionType=pause → 必须标为暂停');
+  assert.ok(logs.includes('已确认 98'), '应含已确认计数');
+  assert.ok(logs.includes('失败 2'), '应含失败计数');
+  assert.ok(logs.includes('目标 3 条'), '应含目标条数');
+  assert.ok(logs.includes('回读核验'), '应含回读核验');
+  assert.ok(logs.includes('行内层开关点击后未生效'), '应含失败原因');
+});
+
+test('日志转译：开启批次结果与每日开启相位状态（in_progress/success/failed/unknown）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.actions = [];
+  m._memPush(m.actions, {
+    shopId: SHOP_ID,
+    actionType: 'enable',
+    outcome: 'ok',
+    counts: { confirmed: 120, failed: 0, unknown: 0, skipped: 0 },
+    targets: ['111111', '222222'],
+    allEnabledConfirmed: true,
+    confirmReason: '回读全部处于投放中',
+    batchDate: shanghaiDate(clock.now()),
+  });
+  // 写入一条开启相位记录
+  m._setEnablePhase(SHOP_ID, shanghaiDate(clock.now()), 'success', { date: shanghaiDate(clock.now()), phase: 'enable_window' });
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('开启批次结果'), '应转译开启批次');
+  assert.ok(logs.includes('本次动作=开启'), '显式 actionType=enable → 必须标为开启');
+  assert.ok(logs.includes('每日开启相位：开启成功'), '应记录开启相位成功');
+});
+
+// ══════════════════════════════════════════════════════════════
+// 5b) 第 4 项回归：actionType 必须显式传递，禁止用 outcome 文本推断动作类型
+// ══════════════════════════════════════════════════════════════
+test('actionType 显式传递：outcome 含 "enable" 字样但 actionType=pause → 仍标为暂停（不按文本猜测）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.actions = [];
+  // outcome 里带 "enable" 字样（旧实现会据此误判为"开启"）
+  m._memPush(m.actions, {
+    shopId: SHOP_ID,
+    actionType: 'pause',
+    outcome: 'enable_retry_failed',
+    counts: { confirmed: 0, failed: 3 },
+    targets: ['111111'],
+    allPausedConfirmed: false,
+    batchDate: shanghaiDate(clock.now()),
+  });
+  drill.sync();
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('暂停批次结果'), `显式 actionType 必须优先于 outcome 文本，实际：\n${logs}`);
+  assert.ok(!/开启批次结果/.test(logs), '不得按 outcome 文本误判为开启');
+});
+
+test('actionType 显式传递：部分开启（partial）必须标为"开启"，绝不误写为"暂停"', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.actions = [];
+  m._memPush(m.actions, {
+    shopId: SHOP_ID,
+    actionType: 'enable',
+    outcome: 'partial',
+    counts: { confirmed: 60, failed: 2, unknown: 1 },
+    targets: ['111111', '222222'],
+    allEnabledConfirmed: false,
+    remaining: { total: 3 },
+    confirmReason: '回读仍有 3 条未处于投放中',
+    batchDate: shanghaiDate(clock.now()),
+  });
+  drill.sync();
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('开启批次结果'), `部分开启必须标为开启，实际：\n${logs}`);
+  assert.ok(logs.includes('本次动作=开启'), '必须显式标注本次动作为开启');
+  assert.ok(!/暂停批次结果/.test(logs), '部分开启绝不误写为暂停');
+  assert.ok(logs.includes('仍未开启 3'), '回读未开启条数必须说明');
+});
+
+test('actionType 显式传递：开启失败（failed）必须标为"开启"并记录失败原因', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.actions = [];
+  m._memPush(m.actions, {
+    shopId: SHOP_ID,
+    actionType: 'enable',
+    outcome: 'failed',
+    counts: { confirmed: 0, failed: 5 },
+    targets: ['111111', '222222', '333333', '444444', '555555'],
+    allEnabledConfirmed: false,
+    error: '批量开启按钮二次定位不一致，零点击',
+    batchDate: shanghaiDate(clock.now()),
+  });
+  drill.sync();
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('开启批次结果'), `开启失败必须标为开启，实际：\n${logs}`);
+  assert.ok(logs.includes('批量开启按钮二次定位不一致'), '失败原因必须可见');
+  assert.ok(!/暂停批次结果/.test(logs), '开启失败绝不误写为暂停');
+});
+
+test('actionType 缺失（unknown）→ 如实报"未知动作"，绝不按结果文本猜测为暂停/开启', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.actions = [];
+  m._memPush(m.actions, {
+    shopId: SHOP_ID,
+    outcome: 'ok',
+    counts: { confirmed: 10, failed: 0 },
+    targets: ['111111'],
+    batchDate: shanghaiDate(clock.now()),
+  });
+  drill.sync();
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('未知动作批次结果'), `缺 actionType 必须如实报未知，实际：\n${logs}`);
+  assert.ok(logs.includes('actionType 未提供，未按结果文本猜测'), '必须显式说明未做文本推断');
+});
+
+test('演练开启（dry enable）必须写"将开启"，绝不误写为"暂停"', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.actions = [];
+  m._memPush(m.actions, {
+    shopId: SHOP_ID,
+    actionType: 'enable',
+    dryEnableRun: true,
+    outcome: 'dry_enable',
+    counts: { confirmed: 0, failed: 0, skipped: 12 },
+    targets: ['111111', '222222'],
+    batchDate: shanghaiDate(clock.now()),
+  });
+  drill.sync();
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('开启批次结果'), `演练开启必须标为开启，实际：\n${logs}`);
+  assert.ok(logs.includes('本次动作=开启'), '演练开启的目标动作是"开启"');
+  assert.ok(!/暂停批次结果/.test(logs), '演练开启绝不误写为暂停');
+});
+
+// ══════════════════════════════════════════════════════════════
+// 6) HTTP 接口契约（保持与 index.html 兼容）
+// ══════════════════════════════════════════════════════════════
+function callHttp(drill, method, url) {
+  return new Promise((resolve) => {
+    const req = { url, method };
+    const chunks = [];
+    const res = {
+      writeHead(code, headers) { this._code = code; this._headers = headers; },
+      end(body) { resolve({ code: this._code, headers: this._headers, body: JSON.parse(body) }); },
+    };
+    Promise.resolve(drill.serveHttp(req, res)).then(() => {
+      if (res._code === undefined) resolve({ code: 0, body: null });
+    });
+    return chunks;
+  });
+}
+
+test('HTTP: /state 返回 ok 与门槛快照；/logs 支持 since 增量', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const st = await callHttp(drill, 'GET', '/api/watch-drill/state');
+  assert.strictEqual(st.code, 200);
+  assert.strictEqual(st.body.ok, true);
+  assert.ok(st.body.state.gates, 'state 必须含 gates');
+  assert.strictEqual(typeof st.body.state.realMode, 'boolean');
+
+  const lg = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+  assert.strictEqual(lg.body.ok, true);
+  assert.ok(lg.body.seq > 0);
+  assert.ok(Array.isArray(lg.body.logs));
+  const since = lg.body.seq;
+  const lg2 = await callHttp(drill, 'GET', `/api/watch-drill/logs?since=${since}`);
+  assert.strictEqual(lg2.body.logs.length, 0, '增量拉取无新日志时应为空');
+});
+
+test('HTTP: start/stop 幂等且返回最新 state', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  const a = await callHttp(drill, 'POST', '/api/watch-drill/start');
+  assert.strictEqual(a.body.ok, true);
+  assert.strictEqual(a.body.state.running, true);
+  const b = await callHttp(drill, 'POST', '/api/watch-drill/start');
+  assert.strictEqual(b.body.state.running, true);
+  const c = await callHttp(drill, 'POST', '/api/watch-drill/stop');
+  assert.strictEqual(c.body.state.running, false);
+});
+
+test('HTTP: 未知路径 404、非预期方法不误触发', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, {});
+  const r = await callHttp(drill, 'GET', '/api/watch-drill/nope');
+  assert.strictEqual(r.code, 404);
+  const r2 = await callHttp(drill, 'GET', '/api/watch-drill/start');
+  assert.strictEqual(r2.code, 404, 'start 仅接受 POST');
+});
+
+// ══════════════════════════════════════════════════════════════
+// 7) 日志安全
+// ══════════════════════════════════════════════════════════════
+test('scrub 遮蔽 Cookie/令牌，但保留正常中文说明文本', () => {
+  assert.ok(!scrub('cookie=abcdef123456789').includes('abcdef123456789'));
+  assert.ok(!scrub('Cookie: abcdef123456789').includes('abcdef123456789'));
+  assert.ok(!scrub('Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345').includes('abcdefghijklmnopqrstuvwxyz012345'));
+  // 中文说明不应被吞
+  assert.ok(scrub('Cookie 过期，请重新登录').includes('Cookie 过期，请重新登录'));
+  // 单行长度上限
+  assert.strictEqual(scrub('x'.repeat(5000)).length, 2000);
+  // 控制字符剔除
+  assert.ok(!scrub('a\u0000b').includes('\u0000'));
+});
+
+test('日志落盘为 JSONL，可被再次读取恢复', () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const tmp = path.join(require('os').tmpdir(), `wd-jsonl-${Date.now()}.jsonl`);
+  try {
+    const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100, persistFile: tmp });
+    drill.start();
+    assert.ok(drill.logs.length > 0);
+    const raw = fs.readFileSync(tmp, 'utf-8').trim().split('\n');
+    assert.ok(raw.length > 0);
+    for (const line of raw) {
+      const e = JSON.parse(line);
+      assert.ok(typeof e.seq === 'number' && typeof e.msg === 'string' && typeof e.t === 'string');
+    }
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (_) {}
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// 8) 第 1 项回归：增量游标必须基于单调 evtSeq（不受有界数组裁剪影响）
+// ══════════════════════════════════════════════════════════════
+test('增量游标：超过 100 条动作后仍能持续接收最新事件（不因数组封顶而永久漏日志）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.actions = [];
+  m._lastActionsSeen = undefined; // 确保不依赖旧游标
+  // 连续写入 130 条动作（远超 actions 默认上限 300 不会裁剪，因此这里同时验证序号连续性）
+  for (let i = 0; i < 130; i += 1) {
+    m._memPush(m.actions, {
+      shopId: SHOP_ID,
+      actionType: i % 3 === 0 ? 'enable' : 'pause',
+      outcome: 'ok',
+      counts: { confirmed: 1, failed: 0 },
+      targets: [String(100000 + i)],
+      batchDate: shanghaiDate(clock.now()),
+    });
+  }
+  drill.sync();
+  const logs = allLogs(drill);
+  const hits = logs.match(/批次结果：ok/g) || [];
+  assert.strictEqual(hits.length, 130, `130 条动作必须全部转译，实际 ${hits.length} 条`);
+  const cursor = drill.cursor.evtSeq;
+  assert.strictEqual(cursor, m._evtSeq, '游标必须推进到最新 evtSeq');
+  // 再来一条：必须仍能被接收
+  m._memPush(m.actions, {
+    shopId: SHOP_ID, actionType: 'pause', outcome: 'ok', counts: { confirmed: 1, failed: 0 },
+    targets: ['999999'], batchDate: shanghaiDate(clock.now()),
+  });
+  drill.sync();
+  assert.ok(allLogs(drill).includes('999999'), '新事件必须仍能被接收（不因数组长度封顶而漏）');
+});
+
+test('增量游标：>50 条错误与 >50 条触发后，最新事件仍可到达日志', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.recentErrors = [];
+  m.triggers = [];
+  for (let i = 0; i < 60; i += 1) {
+    m._memPush(m.recentErrors, { scope: `shop:${SHOP_ID}`, error: `错误编号-${i}` });
+    m._memPush(m.triggers, {
+      shopId: SHOP_ID, mode: 'dry', costText: `${i}.00`, orders: i + 1, targetCount: 1,
+      note: `触发编号-${i}`,
+    });
+  }
+  drill.sync();
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('错误编号-59'), '最新的错误必须进入日志');
+  assert.ok(logs.includes('触发编号-59'), '最新的触发必须进入日志');
+  assert.ok(logs.includes('错误编号-0'), '最早的错误在未被裁剪时也应进入日志');
+  // 幂等：再次同步不得重复
+  const before = drill.logs.length;
+  drill.sync();
+  assert.strictEqual(drill.logs.length, before, '重复同步不得重复记录（幂等）');
+});
+
+test('增量游标：事件被裁剪（超缓存）时记录明确日志缺口，并继续同步后续事件', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.actions = [];
+  m._evtDropped = [];
+  // 手工把 actions 上限压到很小，制造裁剪
+  m._memPush(m.actions, { shopId: SHOP_ID, actionType: 'pause', outcome: 'ok', counts: { confirmed: 1 }, targets: ['1'] });
+  drill.sync(); // 消费第 1 条
+  const consumed = drill.cursor.evtSeq;
+  // 现在推入大量事件并强制裁剪（模拟 UI 轮询期间超出缓存）
+  for (let i = 0; i < 20; i += 1) {
+    m._memPush(m.actions, { shopId: SHOP_ID, actionType: 'pause', outcome: 'ok', counts: { confirmed: 1 }, targets: [String(200000 + i)] });
+    if (m.actions.length > 5) {
+      const removed = m.actions.splice(0, m.actions.length - 5);
+      m._evtDropped.push({
+        firstSeq: removed[0].evtSeq, lastSeq: removed[removed.length - 1].evtSeq,
+        count: removed.length, at: new Date(clock.now()).toISOString(),
+      });
+    }
+  }
+  drill.sync();
+  const logs = allLogs(drill);
+  assert.ok(/日志缺口：.*共丢失 \d+ 条事件/.test(logs), `必须明确记录日志缺口，实际：\n${logs}`);
+  assert.ok(logs.includes('200019'), '缺口之后的最新事件必须仍然同步成功');
+  assert.ok(drill.cursor.evtSeq > consumed, '游标必须继续推进');
+});
+
+// ══════════════════════════════════════════════════════════════
+// 9) 第 2 项回归：六类日志必须真实出现在 /api/watch-drill/logs
+// ══════════════════════════════════════════════════════════════
+test('六类日志齐备：每日开启、每轮判断、暂停、重试、回读、失败原因都能经 /api/watch-drill/logs 取到', async () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
   const { drill } = makeDrill(clock, timers, { costCents: 10001, orderCount: 100 });
   drill.start();
-  await until(() => drill.snapshot().status === 'waiting');
-  const s = drill.snapshot();
-  assert.strictEqual(s.lastRound.conclusion, 'over');
-  assert.strictEqual(s.lastRound.conclusionText, '超标');
-  const log = allLogs(drill);
-  assert.ok(log.includes('费用100.01元，订单100单，每单约1.00元'));
-  assert.ok(log.includes('10001分 > 100×100分=10000分，超标'));
-  assert.ok(log.includes('应暂停乘方全店托管和商品自选，本轮未执行（仅演练，不操作广告）。'));
-});
+  const m = drill._internal._monitor;
+  await until(() => m.lastCycleAt, 8000);
 
-test('恰好等于阈值（1 元/单）不超标', async () => {
-  const clock = makeClock(BASE_SH);
-  const timers = makeTimers();
-  const { drill } = makeDrill(clock, timers, { costCents: 10000, orderCount: 100 });
-  drill.start();
-  await until(() => drill.snapshot().status === 'waiting');
-  const s = drill.snapshot();
-  assert.strictEqual(s.lastRound.conclusion, 'under');
-  assert.strictEqual(s.lastRound.conclusionText, '未超标');
-  const log = allLogs(drill);
-  assert.ok(log.includes('10000分 ≤ 100×100分=10000分，未超标。本轮仅演练，不暂停广告。'));
-});
-
-test('零订单显示「本轮无法判断」且记录原因', async () => {
-  const clock = makeClock(BASE_SH);
-  const timers = makeTimers();
-  const { drill } = makeDrill(clock, timers, { costCents: 500, orderCount: 0 });
-  drill.start();
-  await until(() => drill.snapshot().status === 'waiting');
-  const s = drill.snapshot();
-  assert.strictEqual(s.lastRound.conclusion, 'unknown');
-  assert.strictEqual(s.lastRound.conclusionText, '本轮无法判断');
-  const log = allLogs(drill);
-  assert.ok(log.includes('全店订单为 0 但推广费用大于 0：数据异常'));
-});
-
-test('读取失败显示「本轮无法判断」，且仍安排下一轮（避免静默停机）', async () => {
-  const clock = makeClock(BASE_SH);
-  const timers = makeTimers();
-  const { drill } = makeDrill(clock, timers, { orderError: new Error('登录失效：Cookie 过期') });
-  drill.start();
-  await until(() => drill.snapshot().status === 'failed');
-  const s = drill.snapshot();
-  assert.strictEqual(s.running, true);
-  assert.strictEqual(s.status, 'failed');
-  assert.strictEqual(s.statusText, '读取失败');
-  assert.ok(s.nextRunAt, '失败也必须记录下一轮安排');
-  assert.strictEqual(timers.activeCount(), 1);
-  const log = allLogs(drill);
-  assert.ok(log.includes('本轮无法判断：登录失效：Cookie 过期'), '说明性中文文本不被遮蔽');
-  assert.ok(log.includes('失败也记录下一轮安排，避免静默停机'));
-});
-
-test('登录 Cookie 静态核验失败：本轮无法判断，不读取数据', async () => {
-  const clock = makeClock(BASE_SH);
-  const timers = makeTimers();
-  const { drill, readers } = makeDrill(clock, timers, {
-    costCents: 5000, orderCount: 100,
-    cookieMetaCheck: () => { throw new Error('店铺「瑾漂亮潮流服饰」的抖站 Cookie 已过有效期'); },
+  // 暂停批次（含回读、重试、失败原因）
+  m._memPush(m.actions, {
+    shopId: SHOP_ID, actionType: 'pause', outcome: 'partial',
+    counts: { confirmed: 98, failed: 1, unknown: 1, skipped: 0 },
+    targets: ['111111', '222222'],
+    allPausedConfirmed: false,
+    confirmReason: '回读仍有 2 条处于投放中',
+    remaining: { total: 2 },
+    error: '计划 222222 行内层开关点击后未生效；已在同会话内重试 1 次仍失败',
+    batchDate: shanghaiDate(clock.now()),
   });
-  drill.start();
-  await until(() => drill.snapshot().status === 'failed');
-  assert.strictEqual(readers.calls.cost, 0, 'Cookie 失效不得启动浏览器读取');
-  assert.strictEqual(readers.calls.order, 0);
-  assert.ok(allLogs(drill).includes('本轮无法判断'));
+  // 每日开启相位
+  m._setEnablePhase(SHOP_ID, shanghaiDate(clock.now()), 'success', { date: shanghaiDate(clock.now()), phase: 'enable_window' });
+  // 失败原因
+  m._memPush(m.recentErrors, { scope: `shop:${SHOP_ID}`, error: '罗盘页面读取超时', code: 'READ_TIMEOUT' });
+
+  const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+  const logs = resp.body.logs.map((l) => l.msg).join('\n');
+  assert.ok(/第 \d+ 轮判断数据（周期 \d+/.test(logs), `①每轮判断必须在 /logs 中：\n${logs}`);
+  assert.ok(logs.includes('每日开启相位：开启成功'), `②每日开启必须在 /logs 中：\n${logs}`);
+  assert.ok(logs.includes('暂停批次结果'), `③暂停必须在 /logs 中：\n${logs}`);
+  assert.ok(logs.includes('重试 1 次仍失败'), `④重试必须在 /logs 中（不能只写审计文件）：\n${logs}`);
+  assert.ok(logs.includes('回读核验'), `⑤回读必须在 /logs 中（不能只写审计文件）：\n${logs}`);
+  assert.ok(logs.includes('罗盘页面读取超时'), `⑥失败原因必须在 /logs 中：\n${logs}`);
 });
 
-// ══════════════════════════════════════════════════════════════
-// 4) 调度：08:00 前等待 / 跨日
-// ══════════════════════════════════════════════════════════════
-test('08:00 前启动：等待到当日 08:00，不立即读取', async () => {
-  const clock = makeClock(shanghaiMs('2026-09-14', '07:30'));
-  const timers = makeTimers();
-  const { drill, readers } = makeDrill(clock, timers, { costCents: 5000, orderCount: 100 });
-  drill.start();
-  const s = drill.snapshot();
-  assert.strictEqual(s.status, 'waiting08');
-  assert.strictEqual(s.statusText, '等待08:00');
-  assert.strictEqual(readers.calls.cost, 0);
-  assert.strictEqual(timers.activeCount(), 1);
-  assert.strictEqual(new Date(s.nextRunAt).getTime(), shanghaiMs('2026-09-14', '08:00'));
-  // 时钟走到 08:00 后触发定时器 → 立即读取
-  clock.set(shanghaiMs('2026-09-14', '08:00'));
-  await timers.fireAll();
-  await until(() => drill.snapshot().status === 'waiting');
-  assert.strictEqual(readers.calls.cost, 1, '到 08:00 后应执行第一轮读取');
-});
-
-test('跨日：23:30 轮次后等待到次日 08:00', async () => {
-  const clock = makeClock(shanghaiMs('2026-09-14', '23:30'));
-  const timers = makeTimers();
-  const { drill } = makeDrill(clock, timers, { costCents: 5000, orderCount: 100 });
-  drill.start();
-  await until(() => drill.snapshot().status === 'waiting08');
-  const s = drill.snapshot();
-  assert.strictEqual(s.status, 'waiting08');
-  assert.strictEqual(new Date(s.nextRunAt).getTime(), shanghaiMs('2026-09-15', '08:00'));
-  const log = allLogs(drill);
-  assert.ok(log.includes('业务日期 2026-09-14'));
-});
-
-test('读取失败跨日：状态显示读取失败且仍等待次日 08:00', async () => {
-  const clock = makeClock(shanghaiMs('2026-09-14', '23:30'));
-  const timers = makeTimers();
-  const { drill } = makeDrill(clock, timers, { orderError: new Error('读取失败') });
-  drill.start();
-  await until(() => drill.snapshot().status === 'failed');
-  const s = drill.snapshot();
-  assert.strictEqual(s.status, 'failed');
-  assert.strictEqual(new Date(s.nextRunAt).getTime(), shanghaiMs('2026-09-15', '08:00'));
-});
-
-// ══════════════════════════════════════════════════════════════
-// 5) 强制只读边界：双真实开关全开仍零广告操作
-// ══════════════════════════════════════════════════════════════
-test('即使 realMode=true 且 pauseEnabled=true，演练仍只读取数据，零广告操作', async () => {
+test('/logs 增量契约：since 游标单调，重复拉取不重复；缺口字段可查询', async () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
-  const { drill, readers } = makeDrill(clock, timers, {
-    costCents: 10001, orderCount: 100, // 超标情形：若演练误操作会去暂停
-    cfg: {
-      shops: [{ id: SHOP_ID, name: SHOP_ID, cookieFile: 'cf', accountId: ACC, enabled: true }],
-      rules: [{ type: 'wholeShopCostPerOrder', thresholdCents: 100, enabled: true }],
-      schedule: { dailyStartHour: 8, intervalMinutes: 30 },
-      monitor: { snapshotMaxAgeMinutes: 30, chengfang: { pauseEnabled: true } },
-      login: {},
-      execution: { realMode: true },
-    },
-  });
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
   drill.start();
-  await until(() => drill.snapshot().status === 'waiting');
-  assert.strictEqual(readers.calls.cost, 1);
-  assert.strictEqual(readers.calls.order, 1);
-  assert.deepStrictEqual(readers.adOps, [], '不得有任何广告操作');
-  // 状态机全程只有读取（cost/order）两个调用源
-  const s = drill.snapshot();
-  assert.strictEqual(s.lastRound.conclusion, 'over');
-  assert.strictEqual(s.lastRound.conclusionText, '超标');
-  assert.ok(s.lastRound.reason.includes('全店触发'));
+  const a = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+  assert.strictEqual(a.body.ok, true);
+  assert.strictEqual(typeof a.body.seq, 'number');
+  assert.strictEqual(a.body.gap, null, '未发生裁剪时不应报告缺口');
+  assert.strictEqual(a.body.confirmDialogs.shop_enable, false, '开启弹窗未实测 → 必须为 false（保守阻断）');
+  assert.strictEqual(a.body.confirmDialogs.batch_enable, false, '批量开启弹窗未实测 → 必须为 false（保守阻断）');
+  assert.strictEqual(a.body.confirmDialogs.batch_pause, true, '暂停弹窗已实测');
+  const b = await callHttp(drill, 'GET', `/api/watch-drill/logs?since=${a.body.seq}`);
+  assert.strictEqual(b.body.logs.length, 0, '无新日志时增量为空');
 });
 
 // ══════════════════════════════════════════════════════════════
-// 6) 单轮超时 / 日志安全 / 重启语义 / HTTP 接口
+// 10) 第 6 项回归：门槛展示与实际执行条件一致（运行中改配置立即反映）
 // ══════════════════════════════════════════════════════════════
-test('读取超时不卡死调度：本轮无法判断，下一轮仍安排', async () => {
+test('门槛实时性：运行中修改 realMode/pauseEnabled/enableEnabled 后，state 与 logs 立即反映且与实际 gate 一致', async () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
-  const { drill, readers } = makeDrill(clock, timers, { costHang: true, readTimeoutMs: 60 });
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
   drill.start();
-  await until(() => drill.snapshot().status === 'failed', 3000);
-  assert.strictEqual(readers.calls.cost, 1);
-  const s = drill.snapshot();
-  assert.ok(s.nextRunAt, '超时后仍要安排下一轮');
-  assert.strictEqual(timers.activeCount(), 1);
-  const log = allLogs(drill);
-  assert.ok(log.includes('费用读取超时（0 秒），本轮无法判断'));
+  const m = drill._internal._monitor;
+  const g0 = (await callHttp(drill, 'GET', '/api/watch-drill/state')).body.state.gates;
+  assert.strictEqual(g0.realMode, false);
+  assert.strictEqual(g0.pauseWillExecute, false);
+
+  // 运行中把三个开关打开（直接改 Monitor 持有的配置对象 —— 等价于磁盘配置被改后重载）
+  m.config.execution.realMode = true;
+  m.config.monitor.chengfang.pauseEnabled = true;
+  m.config.monitor.chengfang.enableEnabled = true;
+
+  const st = (await callHttp(drill, 'GET', '/api/watch-drill/state')).body.state;
+  assert.strictEqual(st.gates.realMode, true, 'state 必须立即反映 realMode=true');
+  assert.strictEqual(st.gates.pauseEnabled, true);
+  assert.strictEqual(st.gates.enableEnabled, true);
+  assert.strictEqual(st.gates.pauseWillExecute, true, '真实暂停此时会执行 → 展示必须为会执行');
+  assert.strictEqual(st.gates.enableWillExecute, true, '真实开启此时会执行 → 展示必须为会执行');
+  assert.strictEqual(st.realMode, true, '顶层 realMode 必须与门槛一致');
+  assert.ok(/门槛已变化（运行中配置变更）/.test(allLogs(drill)), '门槛变化必须记录日志');
+
+  // 再关回去 → 立即回落到"不会执行"
+  m.config.execution.realMode = false;
+  const st2 = (await callHttp(drill, 'GET', '/api/watch-drill/state')).body.state;
+  assert.strictEqual(st2.gates.pauseWillExecute, false, 'realMode 关闭后必须立即显示不会执行');
+  assert.strictEqual(st2.gates.enableWillExecute, false);
 });
 
-test('日志 scrub：Cookie/令牌绝不写入日志', async () => {
+test('门槛与 dryRun 一致：dryRun 开启时页面不得显示"会执行"真实操作', async () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
-  const { drill } = makeDrill(clock, timers, {
-    costError: new Error('读取失败 cookie=SUPER_SECRET_ABC123 token=TOKEN_XYZ_987654321'),
-  });
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
   drill.start();
-  await until(() => drill.snapshot().status === 'failed');
-  const log = allLogs(drill);
-  assert.ok(!log.includes('SUPER_SECRET_ABC123'), '不得出现原始 Cookie 值');
-  assert.ok(!log.includes('TOKEN_XYZ_987654321'), '不得出现原始令牌值');
-  assert.ok(log.includes('cookie=***'));
-  assert.ok(log.includes('token=***'));
-  assert.strictEqual(scrub('Bearer abcdefghijklmnopqrstuvwxyz0123456789'), 'Bearer ***');
+  const m = drill._internal._monitor;
+  // realMode=true + 两个开关都开，但 Monitor 处于 dryRun（演练）→ Monitor.realMode 必须为 false
+  m.config.execution.realMode = true;
+  m.config.monitor.chengfang.pauseEnabled = true;
+  m.config.monitor.chengfang.enableEnabled = true;
+  m.config.execution.dryRun = true;
+  // Monitor.realMode 的语义由 Monitor 决定；此处断言 watch-drill 与 Monitor 保持一致
+  const st = (await callHttp(drill, 'GET', '/api/watch-drill/state')).body.state;
+  assert.strictEqual(st.gates.realMode, m.realMode === true,
+    'gates.realMode 必须等于 Monitor 的实时 realMode（不能是装配时的旧快照）');
+  assert.strictEqual(st.gates.pauseWillExecute, (m.realMode === true) && st.gates.pauseEnabled,
+    'pauseWillExecute 必须由实时 realMode 与暂停开关共同决定');
+  assert.strictEqual(st.gates.enableWillExecute, (m.realMode === true) && st.gates.enableEnabled,
+    'enableWillExecute 必须由实时 realMode 与开启开关共同决定');
 });
 
-test('重启语义：新实例默认未启动，日志从 JSONL 恢复', async () => {
-  const tmp = path.join(os.tmpdir(), `wd-restart-${Date.now()}.jsonl`);
+// ══════════════════════════════════════════════════════════════
+// 11) 第 7 项回归：开启确认弹窗未实测 → 保守阻断，不因测试放宽
+// ══════════════════════════════════════════════════════════════
+test('第 7 项：开启类确认弹窗仍未实测 → 界面契约明确标注为阻断（false），且不得盲点确定', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+  const cd = resp.body.confirmDialogs;
+  assert.strictEqual(cd.shop_enable, false, '全店托管"开启"确认弹窗未实测 → 明确为 false');
+  assert.strictEqual(cd.batch_enable, false, '批量"开启"确认弹窗未实测 → 明确为 false');
+  // 模块对外同样暴露该保守标记
+  assert.strictEqual(drill.confirmDialogs.shop_enable, false);
+  assert.strictEqual(drill.confirmDialogs.batch_enable, false);
+});
+
+test('第 7 项：生产控制器对"开启"未知确认弹窗必须阻断（复核，不经测试放宽）', async () => {
+  const { createChengfangController } = require(path.join(PROMO, 'src/adapters/chengfang-reader.js'));
+  const { chromium } = require(path.join(PROMO, 'node_modules/playwright'));
+  const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+  const browser = await chromium.launch({ headless: true, executablePath: EDGE });
   try {
-    const clock1 = makeClock(BASE_SH);
-    const timers1 = makeTimers();
-    const { drill: d1 } = makeDrill(clock1, timers1, { persistFile: tmp, costCents: 5000, orderCount: 100 });
-    d1.start();
-    await until(() => d1.snapshot().status === 'waiting');
-    assert.ok(d1.logs.length > 0);
-
-    const clock2 = makeClock(BASE_SH + 5 * 60 * 1000);
-    const timers2 = makeTimers();
-    const { drill: d2 } = makeDrill(clock2, timers2, { persistFile: tmp, costCents: 5000, orderCount: 100 });
-    const s = d2.snapshot();
-    assert.strictEqual(s.running, false, '服务重启默认不自动恢复值守');
-    assert.strictEqual(s.status, 'idle');
-    assert.ok(d2.logs.length > 0, '日志应从 JSONL 恢复');
-    assert.strictEqual(timers2.activeCount(), 0);
+    const page = await browser.newPage();
+    let okClicked = false;
+    await page.setContent(`<!doctype html><html><body>
+      <div class="qc-page-navigator-container">伊人美 ID：1710242295996424 乘方</div>
+      <div>商品自选 全店托管</div>
+      <table><tr class="ovui-tr" data-plan="777"><td>
+        <div class="oc-switch"><div class="ovui-switch"></div></div>
+      </td><td>托管 ID：777</td></tr></table>
+      <div role="dialog" style="position:fixed;top:100px;left:0;width:400px;height:200px">
+        确定要开始投放吗？<button id="ok">确定</button></div>
+      <script>document.getElementById('ok').onclick = () => { window.__ok = true; };</script>
+      </body></html>`);
+    const ctrl = createChengfangController({ loadWaitMs: 20, tabWaitMs: 10 });
+    await assert.rejects(
+      () => ctrl.clickRowSwitch({ page, planId: '777', expectAction: 'shop_enable' }),
+      (e) => /未实测|阻断|不符|结构/.test(e.message || e.reason || ''),
+    );
+    okClicked = await page.evaluate(() => window.__ok === true);
+    assert.strictEqual(okClicked, false, '未实测的开启确认弹窗必须零确认点击');
   } finally {
-    fs.rmSync(tmp, { force: true });
+    await browser.close();
   }
 });
 
-test('HTTP 接口：state/start/stop/logs(since 增量)', async () => {
-  const clock = makeClock(BASE_SH);
-  const timers = makeTimers();
-  const { drill } = makeDrill(clock, timers, { costCents: 5000, orderCount: 100 });
-
-  function fakeRes() {
-    const chunks = [];
-    return {
-      chunks,
-      writeHead(code, h) { this.code = code; this.headers = h; },
-      end(s) { chunks.push(s); },
-      json() { return JSON.parse(chunks.join('')); },
-    };
-  }
-  const req = (url, method) => ({ url, method });
-
-  let res = fakeRes();
-  await drill.serveHttp(req('/api/watch-drill/state', 'GET'), res);
-  let d = res.json();
-  assert.strictEqual(d.ok, true);
-  assert.strictEqual(d.state.running, false);
-  assert.strictEqual(d.state.statusText, '未启动');
-
-  res = fakeRes();
-  await drill.serveHttp(req('/api/watch-drill/start', 'POST'), res);
-  d = res.json();
-  assert.strictEqual(d.ok, true);
-  assert.strictEqual(d.state.running, true);
-  await until(() => drill.snapshot().status === 'waiting');
-
-  // 增量日志
-  res = fakeRes();
-  await drill.serveHttp(req('/api/watch-drill/logs?since=0', 'GET'), res);
-  d = res.json();
-  assert.ok(d.logs.length > 0);
-  assert.strictEqual(d.seq, drill.logs[drill.logs.length - 1].seq);
-  const since = d.seq;
-  res = fakeRes();
-  await drill.serveHttp(req(`/api/watch-drill/logs?since=${since}`, 'GET'), res);
-  d = res.json();
-  assert.strictEqual(d.logs.length, 0, 'since 之后无新日志');
-
-  res = fakeRes();
-  await drill.serveHttp(req('/api/watch-drill/stop', 'POST'), res);
-  d = res.json();
-  assert.strictEqual(d.ok, true);
-  assert.strictEqual(d.state.running, false);
-
-  res = fakeRes();
-  await drill.serveHttp(req('/api/watch-drill/nope', 'GET'), res);
-  assert.strictEqual(res.json().error, 'Not Found');
-});
-
-test('页面加载绝不自动启动（serveHttp 只读接口无副作用）', async () => {
-  const clock = makeClock(BASE_SH);
-  const timers = makeTimers();
-  const { drill, readers } = makeDrill(clock, timers, { costCents: 5000, orderCount: 100 });
-  const res = { writeHead() {}, end() {} };
-  await drill.serveHttp({ url: '/api/watch-drill/state', method: 'GET' }, res);
-  await drill.serveHttp({ url: '/api/watch-drill/logs?since=0', method: 'GET' }, res);
-  assert.strictEqual(readers.calls.cost, 0, '只读接口不得触发读取');
-  assert.strictEqual(drill.snapshot().running, false);
-  assert.strictEqual(timers.activeCount(), 0);
-});
-
 // ══════════════════════════════════════════════════════════════
-// 7) 超时重叠修复回归：单一活跃读取守护
+// 12) 日志安全：不得出现 Cookie/token/敏感请求参数
 // ══════════════════════════════════════════════════════════════
-const unsettledReads = (drill) => drill._internal._activeReads.filter((e) => !e.settled).length;
-
-test('回归：旧读取永久未结束 → 后续轮次跳过读取并显示「等待旧读取结束」，不堆积、不静默卡住', async () => {
+test('日志安全：/logs 输出不得含 Cookie/token/敏感参数（含被 Monitor 事件透传的情况）', async () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
-  const { drill, readers } = makeDrill(clock, timers, { costHang: true, readTimeoutMs: 60, prevGraceMs: 10 });
+  const { drill } = makeDrill(clock, timers, { costCents: 10001, orderCount: 100 });
   drill.start();
-  await until(() => drill.snapshot().status === 'failed'); // 首轮 60ms 超时，读取永久未结束
-  assert.strictEqual(readers.calls.cost, 1);
-  assert.strictEqual(unsettledReads(drill), 1, '超时读取仍在运行（未结束）');
-
-  for (let i = 0; i < 3; i++) {
-    clock.advance(30 * 60 * 1000);
-    await timers.fireAll();
-    await until(() => drill.snapshot().status === 'failed');
-    assert.strictEqual(readers.calls.cost, 1, '旧读取未结束时不得启动新读取');
-    assert.strictEqual(readers.calls.order, 0, '订单读取不得越过未结束的旧费用读取');
-    assert.strictEqual(unsettledReads(drill), 1, '同一值守实例最多一个活跃读取任务');
-    assert.strictEqual(timers.activeCount(), 1, '仍只安排下一轮，不堆积定时器');
-    assert.ok(drill.snapshot().nextRunAt, '跳过轮次仍记录下一轮安排（避免静默停机）');
-  }
-  const log = allLogs(drill);
-  assert.ok(log.includes('等待旧读取结束'), '应显示「等待旧读取结束」');
-  assert.ok(!log.includes('本轮继续'), '不得出现旧的「超时读取仍在运行……本轮继续」放行行为');
-  assert.strictEqual(readers.calls.costPeak, 1, '费用读取并发峰值不得超过 1');
-  assert.strictEqual(readers.calls.orderPeak, 0);
-});
-
-test('回归：旧读取延迟结束后恢复读取（下一轮正常判定，不误跳轮次）', async () => {
-  const clock = makeClock(BASE_SH);
-  const timers = makeTimers();
-  const { drill, readers } = makeDrill(clock, timers, {
-    costCents: 7937, orderCount: 89, costDelay: 80, readTimeoutMs: 30, prevGraceMs: 10,
+  const m = drill._internal._monitor;
+  // 恶意/意外地让敏感串出现在事件字段里（模拟上游把请求参数带进来）
+  m._memPush(m.recentErrors, {
+    scope: `shop:${SHOP_ID}`,
+    error: '请求失败 cookie=abcdef1234567890 token=zzzzzzzzzzzzzzzzzzzz',
   });
-  drill.start();
-  await until(() => drill.snapshot().status === 'failed'); // 首轮 30ms 超时（读取 80ms 后才结束）
-  assert.strictEqual(readers.calls.cost, 1);
-  await sleep(120); // 等旧读取真实结束并确认释放
-  assert.strictEqual(unsettledReads(drill), 0, '旧读取延迟结束后已确认释放');
-
-  clock.advance(30 * 60 * 1000);
-  await timers.fireAll();
-  await until(() => drill.snapshot().status === 'waiting');
-  assert.strictEqual(readers.calls.cost, 2, '旧读取结束后下一轮恢复正常读取');
-  assert.strictEqual(readers.calls.order, 1);
-  const s = drill.snapshot();
-  assert.strictEqual(s.lastRound.conclusion, 'under');
-  assert.strictEqual(s.lastRound.roundNo, 2);
-  assert.ok(!allLogs(drill).includes('等待旧读取结束'), '本轮无需等待，直接读取');
-  assert.strictEqual(readers.calls.costPeak, 1, '恢复后仍无并发读取');
+  m._memPush(m.actions, {
+    shopId: SHOP_ID, actionType: 'pause', outcome: 'failed',
+    counts: { confirmed: 0, failed: 1 }, targets: ['111111'],
+    error: '带凭据的失败：Cookie: abcdef1234567890; Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345',
+    batchDate: shanghaiDate(clock.now()),
+  });
+  const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+  const raw = JSON.stringify(resp.body);
+  const logs = resp.body.logs.map((l) => l.msg).join('\n');
+  assert.ok(!logs.includes('abcdef1234567890'), `日志不得含 cookie 值：\n${logs}`);
+  assert.ok(!logs.includes('zzzzzzzzzzzzzzzzzzzz'), '日志不得含 token 值');
+  assert.ok(!raw.includes('abcdefghijklmnopqrstuvwxyz012345'), '日志不得含 Bearer 值');
+  assert.ok(/失败原因/.test(logs), '失败原因本体应保留（只是凭据被遮蔽）');
 });
 
-test('回归：读取中停止后立即重启，旧读取未结束前不得启动新读取', async () => {
+test('日志安全：state 与 logs 响应均不含 cookie 文件路径以外的凭据内容', async () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
-  const { drill, readers } = makeDrill(clock, timers, { costHang: true, readTimeoutMs: 60, prevGraceMs: 10 });
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
   drill.start();
-  await until(() => readers.calls.cost === 1); // 首轮读取中
-  drill.stop();
-  assert.strictEqual(drill.snapshot().status, 'reading', '读取中停止：状态保持读取中，等待本轮明确结束');
-  drill.start(); // 立即重启
-  await until(() => drill.snapshot().status === 'failed'); // 首轮超时结束 + 重启轮被读取门禁拦截
-  assert.strictEqual(readers.calls.cost, 1, '旧读取未结束时，重启后的轮次不得启动新读取');
-  assert.strictEqual(unsettledReads(drill), 1, '同一值守实例最多一个活跃读取任务');
-  const s = drill.snapshot();
-  assert.strictEqual(s.running, true, '重启后值守保持运行');
-  assert.ok(s.nextRunAt, '被拦截的轮次仍安排下一轮，不静默停机');
-  assert.strictEqual(timers.activeCount(), 1);
-  assert.ok(allLogs(drill).includes('等待旧读取结束'), '重启轮应显示「等待旧读取结束」');
-  assert.strictEqual(readers.calls.costPeak, 1);
-  assert.strictEqual(readers.calls.orderPeak, 0);
+  const st = await callHttp(drill, 'GET', '/api/watch-drill/state');
+  const raw = JSON.stringify(st.body);
+  assert.ok(!/sessionid"\s*:\s*"/.test(raw), 'state 不得含会话凭据字段值');
+  assert.ok(!raw.includes('dummy-not-a-real-credential'), 'state 不得含 cookie 值（即使测试用占位值也不应透出）');
 });

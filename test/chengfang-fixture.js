@@ -14,7 +14,10 @@
  * 页面内状态机模拟平台行为（全部为本地 fixture，点击只影响 fixture 数据）：
  * - checkbox 勾选/取消 → 批量栏显示与"已选N个"更新
  * - 表头全选框 → 按 scope 勾选当前页或跨全部页
- * - 批量暂停 → pauseEffect='ok' 时选中行 checked=false（shrink=true 时行从列表移除）
+ * - 批量暂停 → pauseEffect='ok' 时选中行 checked=false（shrink=true 时行从列表移除）；
+ *   pauseEffect='first-noop' 模拟千川首次确认未落地、同会话第二次成功
+ * - 批量开启 → enableEffect='ok' 时选中行 checked=true（shrink=true 时行从列表移除）；
+ *   enableEffect='first-noop' 模拟首次确认未落地、同会话第二次成功；'noop' 恒不生效
  * - 行内开关点击 → 翻转 checked
  * - 每页条数切换（10/20/50/100）→ 重渲染
  * - 翻页（prev/next）→ 重渲染
@@ -46,7 +49,7 @@ function planRowHtml({ id, name, checked, status, selected }) {
  */
 function buildChengfangFixtureHtml(opts = {}) {
   const plans = opts.plans || { '全店托管': [], '商品自选': [] };
-  const init = Object.assign({ view: '全店托管', pageSize: 10, shrink: false, pauseEffect: 'ok', selectAllScope: 'page', crossPageClearable: false }, opts.state || {});
+  const init = Object.assign({ view: '全店托管', pageSize: 10, shrink: false, pauseEffect: 'ok', enableEffect: 'ok', selectAllScope: 'page', crossPageClearable: false }, opts.state || {});
   const navText = opts.navText !== undefined ? opts.navText : '首页 乘方 全域投放 品牌投放 数据 工具 财务 营销学堂 成长伙伴 99+ 伊人美 ID：1710242295996424';
   const batchOpen = (opts.batchButtons && opts.batchButtons.open !== undefined) ? opts.batchButtons.open : `<button data-auto-id="bar-groups-group-item-btn-open">开启</button>`;
   const batchPause = (opts.batchButtons && opts.batchButtons.pause !== undefined) ? opts.batchButtons.pause : `<button data-auto-id="bar-groups-group-item-btn-pause">暂停</button>`;
@@ -74,12 +77,19 @@ function buildChengfangFixtureHtml(opts = {}) {
 </div>
 ${extraDialog}
 <script>
+// 尝试计数持久化到 sessionStorage：模拟平台侧"首次未落地"状态不因页面跳转（page.goto
+// 恢复乘方管理页）而重置；每次测试新建 page（新 context）天然隔离。
+var __cfAttempts = null;
+try { __cfAttempts = JSON.parse(sessionStorage.getItem('__cfAttempts') || 'null'); } catch (e) {}
 window.__CF = {
   view: '${init.view}',
   page: 1,
   pageSize: ${init.pageSize},
   shrink: ${init.shrink},
   pauseEffect: '${init.pauseEffect}',
+  pauseAttempts: (__cfAttempts && __cfAttempts.pause) || 0,
+  enableEffect: '${init.enableEffect}',
+  enableAttempts: (__cfAttempts && __cfAttempts.enable) || 0,
   selectAllScope: '${init.selectAllScope}',
   crossPageClearable: ${init.crossPageClearable},
   paginationMissing: ${!!opts.paginationMissing},
@@ -88,6 +98,11 @@ window.__CF = {
   plans: ${JSON.stringify(plans)},
   readCalls: 0
 };
+function __cfSaveAttempts() {
+  try {
+    sessionStorage.setItem('__cfAttempts', JSON.stringify({ pause: window.__CF.pauseAttempts, enable: window.__CF.enableAttempts }));
+  } catch (e) {}
+}
 // 测试钩子：向指定视图新增计划（模拟页面上新增/被恢复投放的对象）
 window.__CF.addPlan = function (view, plan) {
   if (!window.__CF.plans[view]) window.__CF.plans[view] = [];
@@ -207,13 +222,22 @@ function bind() {
       const autoId = b.getAttribute('data-auto-id') || '';
       const text = (b.textContent || '').trim();
       window.__CF.clickLog.push({ type: /btn-pause$/.test(autoId) ? 'pause' : (/btn-delete$/.test(autoId) ? 'delete' : (/btn-open$/.test(autoId) ? 'enable' : text)), ids: window.__CF.selected.slice() });
-      if (/btn-pause$/.test(autoId) && window.__CF.pauseEffect === 'ok') {
-        const selSet = new Set(window.__CF.selected);
-        const view = window.__CF.view;
+      if (/btn-pause$/.test(autoId)) { window.__CF.pauseAttempts += 1; __cfSaveAttempts(); }
+      if (/btn-open$/.test(autoId)) { window.__CF.enableAttempts += 1; __cfSaveAttempts(); }
+      const selSet = new Set(window.__CF.selected);
+      const view = window.__CF.view;
+      if (/btn-pause$/.test(autoId) && (window.__CF.pauseEffect === 'ok' || (window.__CF.pauseEffect === 'first-noop' && window.__CF.pauseAttempts >= 2))) {
         if (window.__CF.shrink) {
           window.__CF.plans[view] = curPlans().filter((p) => !selSet.has(String(p.id)));
         } else {
           for (const p of curPlans()) if (selSet.has(String(p.id))) p.checked = false;
+        }
+      }
+      if (/btn-open$/.test(autoId) && (window.__CF.enableEffect === 'ok' || (window.__CF.enableEffect === 'first-noop' && window.__CF.enableAttempts >= 2))) {
+        if (window.__CF.shrink) {
+          window.__CF.plans[view] = curPlans().filter((p) => !selSet.has(String(p.id)));
+        } else {
+          for (const p of curPlans()) if (selSet.has(String(p.id))) p.checked = true;
         }
       }
       window.__CF.selected = [];

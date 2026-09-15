@@ -33,7 +33,7 @@ const { ChengfangRunner, defaultChengfangOpener } = require('./chengfang-runner'
 const { perOrderDisplayText } = require('./rules');
 const guard = require('./guard');
 const { NotConnectedError } = require('../lib/errors');
-const { shanghaiDate, shanghaiClockText, isAfterDailyStart, msUntilDailyStart, nextIntervalDelayMs } = require('../lib/time');
+const { shanghaiDate, shanghaiClockText, shanghaiWall, isAfterDailyStart, msUntilDailyStart, msUntilHour, nextIntervalDelayMs } = require('../lib/time');
 const { centsToYuan } = require('../lib/money');
 const log = require('../lib/log');
 
@@ -72,6 +72,7 @@ class Monitor {
     this.startedAt = null;
     this.lastCycleAt = null;
     this.schedule = { phase: 'idle', lastRunAt: null, nextRunAt: null, waitingFor08: false, lastWindowBlockReason: null };
+    this._lastEnableDate = null; // 每日自动开启相位已执行的上海日历日（跨日重置，当天只一次）
 
     this.triggers = [];          // 命中记录（演练=将关闭；真实=已触发执行）
     this.actions = [];           // 真实执行批次结果
@@ -185,17 +186,56 @@ class Monitor {
     }
   }
 
+  /**
+   * 每日相位调度：
+   * - 开启窗口 [enableHour, dailyStartHour)：每天一次自动开启（跨日重置，见 _lastEnableDate）；
+   *   执行后等待到 dailyStartHour 进入暂停巡查。
+   * - 00:00–enableHour：等待开启窗口起点（未配置开启窗口则等待 dailyStartHour）。
+   * - dailyStartHour 后：暂停巡查（原有逻辑），跨日等待目标改为 enableHour（若配置了开启窗口），
+   *   使次日 07:00 的自动开启相位能被唤醒，而不是直接跳到 08:00。
+   * 停止/重启通过代数防止多循环；所有等待用 delayFn（可注入时钟门）。
+   */
   async _intervalLoop(gen) {
     const sch = this.config.schedule;
+    const enableHour = this._enableHour();
+    const enableWindow = this._enableWindowConfigured();
     while (gen === this._gen && this.running) {
       const now = this.nowFn();
-      if (!isAfterDailyStart(now, sch.dailyStartHour)) {
+      const w = shanghaiWall(now);
+
+      // ── 开启窗口：[enableHour, dailyStartHour)，每天一次（跨日重置）──
+      if (enableWindow && w.hour >= enableHour && w.hour < sch.dailyStartHour) {
+        const today = w.date;
+        if (this._lastEnableDate !== today) {
+          this._lastEnableDate = today;
+          this.schedule.phase = 'enable_window';
+          this.schedule.waitingFor08 = false;
+          try {
+            await this._runEnablePhase(gen);
+          } catch (e) {
+            this._memPush(this.recentErrors, { scope: 'cycle', error: `乘方自动开启相位失败：${e.message}` });
+          }
+        }
+        // 窗口内剩余时间：等到 dailyStartHour 进入暂停巡查
         const waitMs = msUntilDailyStart(now, sch.dailyStartHour);
+        const target = now + waitMs;
+        this.schedule.nextRunAt = new Date(target).toISOString();
+        this.schedule.phase = 'waiting_window';
+        this.schedule.waitingFor08 = true;
+        this.schedule.lastWindowBlockReason = `等待每日 ${sch.dailyStartHour}:00（Asia/Shanghai）进入暂停巡查`;
+        await this.delayFn(waitMs, gen);
+        continue;
+      }
+
+      if (!isAfterDailyStart(now, sch.dailyStartHour)) {
+        // 每日 00:00–enableHour：等待开启窗口起点（或 dailyStartHour，若未配置开启窗口）
+        const targetHour = enableWindow ? enableHour : sch.dailyStartHour;
+        const waitMs = msUntilHour(now, targetHour);
         const target = now + waitMs;
         this.schedule.phase = 'waiting_window';
         this.schedule.waitingFor08 = true;
         this.schedule.nextRunAt = new Date(target).toISOString();
-        this.schedule.lastWindowBlockReason = `等待每日 ${sch.dailyStartHour}:00（Asia/Shanghai）后执行`;
+        this.schedule.lastWindowBlockReason = `等待每日 ${targetHour}:00（Asia/Shanghai）${enableWindow ? '进入自动开启窗口' : '后执行'}`;
         await this.delayFn(waitMs, gen);
         continue;
       }
@@ -209,9 +249,9 @@ class Monitor {
       if (gen !== this._gen || !this.running) return;
       const lastRun = this.nowFn();
       this.schedule.lastRunAt = new Date(lastRun).toISOString();
-      const nd = nextIntervalDelayMs(this.nowFn(), lastRun, sch.intervalMinutes, sch.dailyStartHour);
+      const nd = nextIntervalDelayMs(this.nowFn(), lastRun, sch.intervalMinutes, sch.dailyStartHour, enableWindow ? enableHour : undefined);
       this.schedule.nextRunAt = new Date(nd.nextRunAt).toISOString();
-      this.schedule.waitingFor08 = nd.crossDay; // 跨日 → 等待次日 08:00
+      this.schedule.waitingFor08 = nd.crossDay; // 跨日 → 等待次日 enableHour（或 startHour）
       if (nd.crossDay) this.schedule.phase = 'waiting_window';
       await this.delayFn(nd.delayMs, gen);
     }
@@ -333,6 +373,18 @@ class Monitor {
   _chengfangScopeConfigured() {
     const cf = this.config.monitor && this.config.monitor.chengfang;
     return !!(cf && Array.isArray(cf.scope) && cf.scope.length > 0);
+  }
+
+  /** 每日自动开启时段起点（Asia/Shanghai 整点；配置缺省 7）。 */
+  _enableHour() {
+    const cf = this.config.monitor && this.config.monitor.chengfang;
+    const v = cf && cf.enableHour;
+    return (v !== undefined && v !== null && Number.isInteger(v) && v >= 0 && v <= 23) ? v : 7;
+  }
+
+  /** 是否启用每日自动开启相位（与暂停共用乘方范围配置；开启窗口 [enableHour, dailyStartHour)）。 */
+  _enableWindowConfigured() {
+    return this._chengfangScopeConfigured();
   }
 
   /** 历史全店关闭路径仅在测试显式开启（生产配置不设置，杜绝误入其他产品覆盖流程）。 */
@@ -492,6 +544,114 @@ class Monitor {
     return { status: 'ok', over: true, batch: this._summarizeBatch(batch) };
   }
 
+  // ── 每日自动开启相位（07:00 窗口，每天一次；独立于费用/订单阈值）────
+
+  /** 每日开启相位：遍历启用的店铺执行开启（真实=executeChengfangEnableBatch；演练=runDryEnableCycle）。 */
+  async _runEnablePhase(gen) {
+    const token = { aborted: false };
+    this._activeTokens.add(token);
+    this._cycleRunning = true;
+    try {
+      for (const shopCfg of this.config.shops) {
+        if (gen !== this._gen || !this.running) break;
+        if (token.aborted) break;
+        if (shopCfg.enabled === false) continue;
+        await this._runShopEnablePhase(shopCfg, token);
+      }
+    } finally {
+      this._activeTokens.delete(token);
+      this._cycleRunning = false;
+    }
+  }
+
+  /**
+   * 单店铺开启相位：
+   * - 演练（realMode=false）：只枚举将开启目标，零业务点击（executor 由配置门槛自动转演练）。
+   * - 真实（realMode=true）：runner 内部做集中门槛（realMode+enableEnabled）→ 开启窗口 → 停止
+   *   → 乘方全店托管+商品自选 → 全量回读；逐请求检查停止/时段/跨日。
+   * 窗口未开放/门槛不通过 → 零请求，且不打开乘方页面。
+   */
+  async _runShopEnablePhase(shopCfg, cycleToken) {
+    const rt = this._runtime(shopCfg.id);
+    const runner = this._getChengfangRunner(shopCfg);
+    const opener = this._chengfangOpener || defaultChengfangOpener;
+    const loginCfg = this.config.login;
+    const enableHour = this._enableHour();
+
+    if (!this.realMode) {
+      let res;
+      try {
+        res = await runner.runDryEnableCycle({ shopCfg, pageOpener: opener, loginCfg });
+      } catch (e) {
+        const reason = `乘方开启演练周期失败：${e.reason || e.message}`;
+        rt.lastError = reason;
+        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason });
+        this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'stopped', reason });
+        return { status: 'stopped', reason };
+      }
+      if (res.outcome === 'dry_failed') {
+        const reason = res.error || res.reason || '乘方开启演练未完成（身份/读取/分页/选择范围失败）';
+        rt.lastError = reason;
+        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: `乘方开启演练失败：${reason}` });
+        this._memPush(this.triggers, {
+          shopId: shopCfg.id, mode: 'dry', scope: '乘方(全店托管+商品自选)', failed: true, reason,
+          businessDate: shanghaiDate(this.nowFn()), targetCount: 0, targets: [],
+          dryOutcome: 'dry_failed',
+          note: `每日开启相位演练未完成（失败），不计为"正常枚举"：${reason}`,
+        });
+        this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'dry', failed: true, reason });
+        return { status: 'ok', dryRun: true, targetCount: 0, enable: { outcome: 'dry_failed', error: reason } };
+      }
+      const triggerRec = {
+        shopId: shopCfg.id, mode: 'dry', scope: '乘方(全店托管+商品自选)',
+        reason: `每日 ${enableHour}:00 自动开启相位`,
+        businessDate: shanghaiDate(this.nowFn()),
+        targetCount: (res.targets || []).length,
+        targets: res.targets,
+        dryOutcome: res.outcome,
+        note: res.error
+          ? `演练模式：每日开启相位演练未完成（${res.error}）`
+          : `演练模式：每日开启相位将开启以下乘方目标（未点击任何开关/开启/删除）`,
+      };
+      this._memPush(this.triggers, triggerRec);
+      this._audit({ kind: 'trigger', ...triggerRec, targets: (res.targets || []).map((t) => t.planId || t.adId) });
+      return { status: 'ok', dryRun: true, targetCount: (res.targets || []).length, enable: { outcome: res.outcome, error: res.error } };
+    }
+
+    this.schedule.lastWindowBlockReason = null;
+    const batch = await runner.executeChengfangEnableBatch({
+      shopCfg,
+      cycleToken,
+      trigger: { reason: `每日 ${enableHour}:00 自动开启` },
+      pageOpener: opener,
+      loginCfg,
+    });
+    if (batch.outcome === 'blocked_window') {
+      this.schedule.lastWindowBlockReason = batch.reason;
+      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason, targetCount: 0 });
+      this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason });
+      return { status: 'window_blocked', reason: batch.reason };
+    }
+    if (batch.outcome === 'blocked_stopped') {
+      const reason = batch.reason || '监控已停止，未发出乘方开启请求';
+      this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'stopped', reason });
+      return { status: 'stopped', reason };
+    }
+    if (batch.outcome === 'blocked') {
+      const reason = batch.reason || '乘方开启被门槛阻止，未发出任何请求';
+      rt.lastData = rt.lastData || {};
+      rt.lastData.blockedReason = reason;
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason });
+      this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason });
+      return { status: 'blocked', reason, batch: this._summarizeBatch(batch) };
+    }
+    // nothing_to_enable / all_enabled_confirmed / partial → 记录批次
+    this._recordBatch(shopCfg.id, batch);
+    this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) });
+    this._audit({ kind: 'action', shopId: shopCfg.id, ...this._summarizeBatch(batch) });
+    return { status: 'ok', enable: { outcome: batch.outcome }, batch: this._summarizeBatch(batch) };
+  }
+
   /**
    * 历史全店关闭路径（旧覆盖表/协调器流程）。仅在测试显式开启
    * monitor.legacyWholeShopCloseEnabled=true 时可达；生产配置不设置该开关，
@@ -602,6 +762,7 @@ class Monitor {
       inventoryPages: batch.inventoryPages,
       allClosedConfirmed: allConfirmed,
       allPausedConfirmed: batch.allPausedConfirmed === true,
+      allEnabledConfirmed: batch.allEnabledConfirmed === true,
       confirmReason: batch.confirmReason || null,
       finalInventoryPages: batch.finalInventoryPages !== undefined ? batch.finalInventoryPages : null,
       remaining: batch.remaining || null,
@@ -620,18 +781,29 @@ class Monitor {
       totals: { confirmed: [], failed: [], unknown: [], skipped: [] },
       allClosedConfirmed: false,
     };
-    rec.runs.push({ at: new Date(this.nowFn()).toISOString(), outcome: batch.outcome, counts: batch.counts, allClosedConfirmed: batch.allClosedConfirmed === true || batch.allPausedConfirmed === true, allPausedConfirmed: batch.allPausedConfirmed === true, reason: batch.reason || null });
+    const isEnable = batch.allEnabledConfirmed !== undefined; // 开启批次（映射 confirmed_open → confirmed）
+    rec.runs.push({
+      at: new Date(this.nowFn()).toISOString(),
+      outcome: batch.outcome,
+      counts: batch.counts,
+      allClosedConfirmed: batch.allClosedConfirmed === true || batch.allPausedConfirmed === true,
+      allPausedConfirmed: batch.allPausedConfirmed === true,
+      allEnabledConfirmed: isEnable ? batch.allEnabledConfirmed === true : undefined,
+      reason: batch.reason || null,
+    });
     const addAll = (key, list) => {
       for (const id of list || []) if (!rec.totals[key].includes(id)) rec.totals[key].push(id);
     };
     for (const d of batch.details || []) {
-      if (d.outcome === 'confirmed_closed') addAll('confirmed', [d.adId]);
+      const confirmedOutcome = isEnable ? 'confirmed_open' : 'confirmed_closed';
+      if (d.outcome === confirmedOutcome) addAll('confirmed', [d.adId]);
       else if (d.outcome === 'unknown') addAll('unknown', [d.adId]);
       else if (d.outcome === 'skipped') addAll('skipped', [d.adId]);
       else addAll('failed', [d.adId]);
     }
     rec.allClosedConfirmed = batch.allClosedConfirmed === true || batch.allPausedConfirmed === true;
     rec.allPausedConfirmed = batch.allPausedConfirmed === true;
+    if (isEnable) rec.allEnabledConfirmed = batch.allEnabledConfirmed === true;
     rec.lastBatchAt = new Date(this.nowFn()).toISOString();
     this.batches[shopId][date] = rec;
     this._pruneBatches();
@@ -670,7 +842,7 @@ class Monitor {
         cookieInfo,
         lastError: rt.lastError || null,
         today: rt.lastData || null,
-        batchToday: dateRec ? { runs: dateRec.runs.length, totals: { confirmed: dateRec.totals.confirmed.length, failed: dateRec.totals.failed.length, unknown: dateRec.totals.unknown.length, skipped: dateRec.totals.skipped.length }, allClosedConfirmed: dateRec.allClosedConfirmed, lastBatchAt: dateRec.lastBatchAt, lastRuns: dateRec.runs.slice(-3) } : null,
+        batchToday: dateRec ? { runs: dateRec.runs.length, totals: { confirmed: dateRec.totals.confirmed.length, failed: dateRec.totals.failed.length, unknown: dateRec.totals.unknown.length, skipped: dateRec.totals.skipped.length }, allClosedConfirmed: dateRec.allClosedConfirmed, allPausedConfirmed: dateRec.allPausedConfirmed === true, allEnabledConfirmed: dateRec.allEnabledConfirmed === true, lastBatchAt: dateRec.lastBatchAt, lastRuns: dateRec.runs.slice(-3) } : null,
       };
     });
     return {
@@ -691,6 +863,8 @@ class Monitor {
         windowBlockReason: this.schedule.lastWindowBlockReason,
         dailyStartHour: this.config.schedule.dailyStartHour,
         intervalMinutes: this.config.schedule.intervalMinutes,
+        enableHour: this._enableHour(),
+        lastEnableDate: this._lastEnableDate,
         snapshotMaxAgeMinutes: this.config.monitor.snapshotMaxAgeMinutes,
         mockDataSource: this.config.monitor.mockDataSource === true,
         chengfang: (this.config.monitor && this.config.monitor.chengfang) || null,

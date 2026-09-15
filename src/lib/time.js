@@ -52,19 +52,29 @@ function msUntilDailyStart(ms, startHour) {
   return shanghaiMs(w.date, `${String(startHour).padStart(2, '0')}:00`) - ms;
 }
 
+/** 距离当日 hour 点（整点）的毫秒数；已过该点返回 0。 */
+function msUntilHour(ms, hour) {
+  const w = shanghaiWall(ms);
+  if (w.hour >= hour) return 0;
+  return shanghaiMs(w.date, `${String(hour).padStart(2, '0')}:00`) - ms;
+}
+
 /**
  * 给定上次巡查时刻与间隔，计算下一次巡查应等待的毫秒数及目标说明。
  * - next = lastRun + intervalMinutes；
- * - next 与 now 不在同一天（跨日/跨午夜）→ 等到 next 所在日的 startHour；
+ * - next 与 now 不在同一天（跨日/跨午夜）→ 等到 next 所在日的 crossDayHour
+ *   （开启窗口配置时传 enableHour，使次日 07:00 的自动开启相位能被唤醒；
+ *   缺省用 startHour，保持原有"次日 08:00 后巡查"语义）；
  * - next 在今天且尚未到 → 等 next - now；
  * - next 已过（理论少见）→ 立即执行。
  */
-function nextIntervalDelayMs(nowMs, lastRunMs, intervalMinutes, startHour) {
+function nextIntervalDelayMs(nowMs, lastRunMs, intervalMinutes, startHour, crossDayHour) {
   const nextMs = lastRunMs + intervalMinutes * 60 * 1000;
   const nextWall = shanghaiWall(nextMs);
   const nowWall = shanghaiWall(nowMs);
   if (nextWall.date !== nowWall.date) {
-    const target = shanghaiMs(nextWall.date, `${String(startHour).padStart(2, '0')}:00`);
+    const targetHour = crossDayHour !== undefined && crossDayHour !== null ? crossDayHour : startHour;
+    const target = shanghaiMs(nextWall.date, `${String(targetHour).padStart(2, '0')}:00`);
     return { delayMs: Math.max(0, target - nowMs), nextRunAt: target, crossDay: true };
   }
   return { delayMs: Math.max(0, nextMs - nowMs), nextRunAt: nextMs, crossDay: false };
@@ -83,6 +93,7 @@ module.exports = {
   shanghaiMs,
   isAfterDailyStart,
   msUntilDailyStart,
+  msUntilHour,
   nextIntervalDelayMs,
   shanghaiClockText,
 };

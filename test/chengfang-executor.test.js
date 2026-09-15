@@ -13,6 +13,10 @@
  * - 暂停未生效（noop）→ 操作后强制新扫描发现仍开启 → 不报告全部暂停
  * - 两部分一项失败 → 不报告全部暂停
  * - dryRun：只枚举目标，零点击
+ * - 自动开启（executeChengfangEnable，07:00 窗口）：realMode+enableEnabled 门禁、
+ *   开启/暂停/删除并存只点开启、100条/页跨页/同名不同ID、开启后列表变化、
+ *   千川首次未落地同会话单次重试、跳回首页同会话恢复乘方URL、开启前/最终
+ *   身份复核期间停止/跨日/账户变化/关闭 enableEnabled 均零点击
  * 运行：npm test
  */
 
@@ -21,7 +25,7 @@ const assert = require('node:assert');
 const { chromium } = require('playwright');
 const { buildChengfangFixtureHtml } = require('./chengfang-fixture');
 const { createChengfangController } = require('../src/adapters/chengfang-reader');
-const { executeChengfangPause } = require('../src/engine/chengfang-executor');
+const { executeChengfangPause, executeChengfangEnable } = require('../src/engine/chengfang-executor');
 const { buildChengfangRequestGate } = require('../src/engine/chengfang-gate');
 const { makeClock } = require('./helpers');
 const { shanghaiMs } = require('../src/lib/time');
@@ -57,6 +61,12 @@ function makeController() {
   return createChengfangController({ loadWaitMs: 40, tabWaitMs: 10 });
 }
 
+// 暂停路径固定基准时钟：不依赖真实墙钟时间。真实时钟在上海 08:00 前运行时，
+// "每日 08:00 后"请求门禁会拦截所有真实点击，导致用例随运行时刻漂移（夜间必挂）。
+// 开启路径（runEnable）已有等价固定基准（ENABLE_NOW/ENABLE_DATE）。
+const PAUSE_NOW = shanghaiMs('2026-09-12', '08:00');
+const PAUSE_DATE = '2026-09-12';
+
 async function run(opts = {}) {
   const pageRef = await loadPage(opts.fixture || {});
   let controller = opts.controller || makeController();
@@ -73,8 +83,8 @@ async function run(opts = {}) {
     // 显式 dryRun:true 仍强制演练（零点击）。
     config,
     dryRun: opts.dryRun,
-    now: opts.now || Date.now,
-    businessDate: opts.businessDate,
+    now: opts.now || (() => PAUSE_NOW),
+    businessDate: opts.businessDate !== undefined ? opts.businessDate : PAUSE_DATE,
     audit: () => {},
     stopRequested: opts.stopRequested || (() => false),
   });
@@ -294,7 +304,7 @@ test('表头全选框为跨页全选但平台残留不可见选择（无法确�
 
 // ── 强制新扫描 / 失败传播 ───────────────────────────────────────────
 
-test('暂停未生效（noop）：操作后强制新扫描发现仍开启 → 不报告全部暂停', async () => {
+test('暂停两次均未生效（noop）：同会话仅重试一次后仍不报告全部暂停', async () => {
   const { result, state } = await run({
     fixture: {
       plans: { '全店托管': [], '商品自选': ZIXUAN_PLANS(3) },
@@ -305,8 +315,22 @@ test('暂停未生效（noop）：操作后强制新扫描发现仍开启 → �
   assert.strictEqual(result.allPausedConfirmed, false);
   assert.match(result.views.zixuan.reason, /开关仍开启/);
   // 点击已发生（pause 动作发出），但结果以强制新扫描回读为准
-  assert.strictEqual(pauseClicks(state).length, 1);
+  assert.strictEqual(pauseClicks(state).length, 2, '首次未落地时仅同会话重试一次');
   assert.ok(state.plansZixuan.some((p) => p.checked === true), '平台未生效，行仍开启');
+});
+
+test('千川首次暂停未落地：保持同一会话重试一次，第二次回读确认关闭', async () => {
+  const { result, state } = await run({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_PLANS(3) },
+      state: { pauseEffect: 'first-noop' },
+    },
+    dryRun: false,
+  });
+  assert.strictEqual(result.allPausedConfirmed, true, result.confirmReason);
+  assert.strictEqual(pauseClicks(state).length, 2, '首次未落地后仅同会话重试一次');
+  assert.strictEqual(deleteClicks(state).length, 0, '删除始终零点击');
+  assert.ok(state.plansZixuan.every((p) => p.checked === false), '第二次后全部关闭');
 });
 
 test('商品自选一项失败（读取失败）：不报告全部暂停（区分读取失败与已确认无计划）', async () => {
@@ -325,7 +349,8 @@ test('商品自选一项失败（读取失败）：不报告全部暂停（区�
     shopCfg: SHOP_CFG,
     config: { execution: { realMode: true, dryRun: false }, monitor: { chengfang: { pauseEnabled: true } } },
     dryRun: false,
-    now: Date.now,
+    now: () => PAUSE_NOW,
+    businessDate: PAUSE_DATE,
     audit: () => {},
   });
   await pageRef.close().catch(() => {});
@@ -588,4 +613,465 @@ test('最终身份核验期间关闭 pauseEnabled：复核返回后 requestGate 
   assert.strictEqual(state.clickLog.length, 0, '零业务点击');
   assert.strictEqual(switchClicks(state).length, 0, '托管开关零点击');
   assert.strictEqual(pauseClicks(state).length, 0);
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 乘方自动开启（每日 07:00 窗口）：executeChengfangEnable
+// 门禁 = realMode + enableEnabled + 上海 [enableHour, dailyStartHour) 窗口
+// + 未停止 + 业务日期一致；开启不读费用/订单阈值。
+// ═══════════════════════════════════════════════════════════════════
+
+const enableClicks = (state) => state.clickLog.filter((c) => c.type === 'enable');
+const TUOGUAN_CLOSED = { ...TUOGUAN_PLAN, checked: false };
+const ZIXUAN_CLOSED = (n) => ZIXUAN_PLANS(n).map((p) => ({ ...p, checked: false }));
+const ENABLE_NOW = () => shanghaiMs('2026-09-12', '07:30'); // 默认注入：开启窗口内
+const ENABLE_DATE = '2026-09-12';
+
+async function runEnable(opts = {}) {
+  const pageRef = await loadPage(opts.fixture || {});
+  let controller = opts.controller || makeController();
+  if (opts.controllerOverride) controller = await opts.controllerOverride(controller, pageRef);
+  const config = opts.config || {
+    execution: { realMode: true, dryRun: false },
+    monitor: { chengfang: { scope: ['全店托管', '商品自选'], enableEnabled: true } },
+  };
+  const result = await executeChengfangEnable({
+    controller,
+    page: pageRef,
+    shopCfg: SHOP_CFG,
+    config,
+    dryRun: opts.dryRun,
+    now: opts.now || ENABLE_NOW,
+    businessDate: opts.businessDate || ENABLE_DATE,
+    audit: () => {},
+    stopRequested: opts.stopRequested || (() => false),
+  });
+  const state = await pageRef.evaluate(() => ({
+    clickLog: window.__CF.clickLog,
+    pageSize: window.__CF.pageSize,
+    plansTuoguan: (window.__CF.plans['全店托管'] || []).map((p) => ({ id: p.id, checked: p.checked })),
+    plansZixuan: (window.__CF.plans['商品自选'] || []).map((p) => ({ id: p.id, checked: p.checked })),
+  }));
+  await pageRef.close().catch(() => {});
+  return { result, state };
+}
+
+// ── 开启正常路径 / 幂等 ─────────────────────────────────────────────
+
+test('开启正常：全店托管1条关闭 + 商品自选23条关闭 → 全部开启，allEnabledConfirmed=true', async () => {
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(23) } },
+  });
+  assert.strictEqual(result.allEnabledConfirmed, true, result.confirmReason);
+  assert.strictEqual(result.views.tuoguan.confirmedCount, 1);
+  assert.strictEqual(result.views.zixuan.confirmedCount, 23);
+  assert.strictEqual(switchClicks(state).length, 1, '全店托管行开关点击一次');
+  assert.strictEqual(enableClicks(state).length, 1, '商品自选批量开启一次');
+  assert.strictEqual(deleteClicks(state).length, 0, '删除零点击');
+  assert.strictEqual(state.pageSize, 100, '已切换 100条/页');
+  assert.ok(state.plansTuoguan.every((p) => p.checked === true), '全店托管已开启');
+  assert.ok(state.plansZixuan.every((p) => p.checked === true), '商品自选全部开启');
+  assert.strictEqual(enableClicks(state)[0].ids.length, 23, '点击开启时选中 23 条');
+});
+
+test('开启幂等：已全部开启 → 托管 already_enabled 跳过，零点击', async () => {
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(5) } },
+  });
+  assert.strictEqual(result.views.tuoguan.status, 'already_enabled');
+  assert.strictEqual(switchClicks(state).length, 0, '已开启托管不再点击');
+  assert.strictEqual(enableClicks(state).length, 0);
+  assert.strictEqual(result.allEnabledConfirmed, true, result.confirmReason);
+});
+
+test('开启：两视图均空（已确认无计划）→ confirmed_empty，allEnabledConfirmed=true（无目标）', async () => {
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [], '商品自选': [] } },
+  });
+  assert.strictEqual(result.views.tuoguan.status, 'confirmed_empty');
+  assert.strictEqual(result.views.zixuan.status, 'confirmed_empty');
+  assert.strictEqual(result.allEnabledConfirmed, true, '无目标时视为已满足（无关闭对象）');
+  assert.strictEqual(enableClicks(state).length, 0);
+  assert.strictEqual(switchClicks(state).length, 0);
+});
+
+// ── 范围与按钮定位（开启只点开启）──────────────────────────────────
+
+test('开启/暂停/删除并存：开启只点开启，暂停与删除均零点击', async () => {
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(5) } },
+  });
+  assert.strictEqual(result.allEnabledConfirmed, true, result.confirmReason);
+  assert.strictEqual(enableClicks(state).length, 1, '只点开启');
+  assert.strictEqual(pauseClicks(state).length, 0, '不点暂停');
+  assert.strictEqual(deleteClicks(state).length, 0, '删除始终零点击');
+});
+
+test('开启按钮缺失：零点击停止，不报告全部开启', async () => {
+  const { result, state } = await runEnable({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(3) },
+      batchButtons: { open: '' },
+    },
+  });
+  assert.strictEqual(enableClicks(state).length, 0);
+  assert.strictEqual(deleteClicks(state).length, 0);
+  assert.strictEqual(result.allEnabledConfirmed, false);
+  assert.match(result.confirmReason, /开启/);
+});
+
+test('开启按钮多候选：零点击停止', async () => {
+  const { result, state } = await runEnable({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(3) },
+      batchButtons: {
+        open: '<button data-auto-id="bar-groups-group-item-btn-open">开启</button><button data-auto-id="bar-groups-group-item-btn-open-x">开启</button>',
+      },
+    },
+  });
+  assert.strictEqual(enableClicks(state).length, 0);
+  assert.strictEqual(result.allEnabledConfirmed, false);
+  assert.match(result.confirmReason, /候选/);
+});
+
+test('开启按钮唯一但缺少稳定标识：拒绝模糊文本兜底，零点击', async () => {
+  const { result, state } = await runEnable({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(3) },
+      batchButtons: { open: '<button>开启</button>' },
+    },
+  });
+  assert.strictEqual(enableClicks(state).length, 0);
+  assert.strictEqual(result.allEnabledConfirmed, false);
+  assert.match(result.confirmReason, /可识别标记/);
+});
+
+// ── 开启门禁（realMode / enableEnabled）────────────────────────────
+
+test('开启：realMode=false → 自动转演练（只枚举目标），零点击，不报告已开启', async () => {
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(5) } },
+    config: {
+      execution: { realMode: false, dryRun: false },
+      monitor: { chengfang: { scope: ['全店托管', '商品自选'], enableEnabled: true } },
+    },
+    dryRun: false,
+  });
+  assert.strictEqual(result.mode, 'dry-run');
+  assert.strictEqual(result.dryRunTargets.length, 6, '枚举 1 托管 + 5 商品自选');
+  assert.strictEqual(switchClicks(state).length, 0);
+  assert.strictEqual(enableClicks(state).length, 0);
+  assert.strictEqual(deleteClicks(state).length, 0);
+  assert.strictEqual(result.allEnabledConfirmed, false, '演练不得宣称已开启');
+  assert.match(result.confirmReason, /演练/);
+});
+
+test('开启：enableEnabled=false → 自动转演练，零点击', async () => {
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(3) } },
+    config: {
+      execution: { realMode: true, dryRun: false },
+      monitor: { chengfang: { scope: ['全店托管', '商品自选'], enableEnabled: false } },
+    },
+    dryRun: false,
+  });
+  assert.strictEqual(result.mode, 'dry-run');
+  assert.strictEqual(enableClicks(state).length, 0);
+  assert.strictEqual(result.allEnabledConfirmed, false);
+});
+
+// ── 商品自选 100条/页 / 跨页 / 同名不同ID / 列表变化 ────────────────
+
+test('开启：商品自选 120条/2页（100条每页）跨页全部开启，同名不同ID精确去重', async () => {
+  const plans = ZIXUAN_CLOSED(120).map((p, i) => (
+    i < 3 ? { ...p, name: '同名计划A' } : (i < 5 ? { ...p, name: '同名计划B' } : p)
+  ));
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [], '商品自选': plans } },
+  });
+  assert.strictEqual(state.pageSize, 100);
+  assert.strictEqual(result.allEnabledConfirmed, true, result.confirmReason);
+  // 批量操作后平台回到第一页（fixture 重置 page=1）：第二页目标在逐页处理阶段以
+  // notFound 记录，最终以全量回读（verifyAllEnabled）确认全部 120 条开启。
+  assert.strictEqual(result.views.zixuan.confirmedCount, 120, '全量回读确认 120 条全部开启');
+  assert.strictEqual(enableClicks(state).length, 2, '两页各一次批量开启');
+  const ids = state.plansZixuan.map((p) => p.id);
+  assert.strictEqual(new Set(ids).size, 120, '稳定ID无重复（同名不合并）');
+  assert.ok(state.plansZixuan.every((p) => p.checked === true), '全部开启');
+  assert.strictEqual(deleteClicks(state).length, 0);
+});
+
+test('开启：开启后列表收缩（行消失）→ missing 不谎报全部开启', async () => {
+  const { result, state } = await runEnable({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(23) },
+      state: { shrink: true },
+    },
+  });
+  assert.strictEqual(enableClicks(state).length, 1, '批量开启发出一次');
+  assert.strictEqual(result.allEnabledConfirmed, false, '行消失无法确认开启，不报告全部开启');
+  assert.ok((result.finalVerify && result.finalVerify.missing.length) >= 23, '全量回读如实报告缺失');
+  assert.match(result.confirmReason, /找不到/);
+});
+
+test('开启：空清单缺分页总数证据 → read_failed，不当作无计划（零点击）', async () => {
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [], '商品自选': [] }, paginationMissing: true },
+  });
+  assert.strictEqual(result.views.tuoguan.status, 'read_failed');
+  assert.strictEqual(result.allEnabledConfirmed, false);
+  assert.strictEqual(enableClicks(state).length, 0);
+  assert.strictEqual(deleteClicks(state).length, 0);
+});
+
+test('开启：翻页失败（hasNext=true 但 next 无效）→ 停止，不谎报全部开启', async () => {
+  const { result } = await runEnable({
+    fixture: { plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(120) } },
+    controllerOverride: async (controller) => {
+      const orig = controller.clickNextPage.bind(controller);
+      controller.clickNextPage = async (p) => {
+        await orig(p);
+        return { clicked: false, reason: '翻页失效（测试注入）' };
+      };
+      return controller;
+    },
+  });
+  assert.strictEqual(result.allEnabledConfirmed, false);
+  assert.match(result.confirmReason, /翻页失败|停止/);
+});
+
+// ── 千川首次未落地 / 同会话恢复乘方 URL ────────────────────────────
+
+test('千川首次开启未落地（first-noop）：同会话仅重试一次，第二次回读确认开启', async () => {
+  const { result, state } = await runEnable({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(5) },
+      state: { enableEffect: 'first-noop' },
+    },
+  });
+  assert.strictEqual(enableClicks(state).length, 2, '首次未落地 + 同会话重试一次');
+  assert.strictEqual(result.allEnabledConfirmed, true, result.confirmReason);
+  assert.strictEqual(result.views.zixuan.processedCount, 5);
+  assert.strictEqual(deleteClicks(state).length, 0, '删除始终零点击');
+  assert.ok(state.plansZixuan.every((p) => p.checked === true), '第二次后全部开启');
+});
+
+test('开启连续两次未生效（noop）：同会话仅重试一次后停止，不报告全部开启且不再点击', async () => {
+  const { result, state } = await runEnable({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(5) },
+      state: { enableEffect: 'noop' },
+    },
+  });
+  assert.strictEqual(enableClicks(state).length, 2, '首次 + 唯一一次同会话重试，绝无第三次');
+  assert.strictEqual(result.allEnabledConfirmed, false);
+  assert.match(result.confirmReason, /未生效/);
+  assert.ok(state.plansZixuan.some((p) => p.checked === false), '平台未生效，行仍关闭');
+  assert.strictEqual(deleteClicks(state).length, 0);
+});
+
+test('千川提交后跳回首页：同会话恢复到记录的乘方 URL 回读并重试，最终确认开启', async () => {
+  const enableClickCount = [];
+  const { result, state } = await runEnable({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(3) },
+      state: { enableEffect: 'first-noop' }, // 首次点击确认但未落地 → 恢复后同会话重试一次
+    },
+    controllerOverride: async (controller) => {
+      const orig = controller.verifyIdentity.bind(controller);
+      let calls = 0;
+      controller.verifyIdentity = async (p) => {
+        calls += 1;
+        if (calls === 3) return { ok: false, reason: '模拟提交后跳回首页（身份消失）' };
+        return orig(p);
+      };
+      // page.goto 恢复会重建 fixture 的 __CF.clickLog → 用控制器包装计数"真正发出的开启点击"
+      const origClick = controller.clickBatchEnable.bind(controller);
+      controller.clickBatchEnable = async (p) => {
+        enableClickCount.push(1);
+        return origClick(p);
+      };
+      return controller;
+    },
+  });
+  assert.strictEqual(result.allEnabledConfirmed, true, result.confirmReason);
+  assert.strictEqual(enableClickCount.length, 2, '首次未落地 + 恢复到乘方URL后同会话重试一次成功（不重开浏览器）');
+  assert.strictEqual(deleteClicks(state).length, 0);
+});
+
+test('恢复乘方管理页失败（持续非管理页）→ 结果未知，不报告全部开启，不再重试', async () => {
+  const enableClickCount = [];
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(3) } },
+    controllerOverride: async (controller) => {
+      const orig = controller.verifyIdentity.bind(controller);
+      let calls = 0;
+      controller.verifyIdentity = async (p) => {
+        calls += 1;
+        if (calls >= 3) return { ok: false, reason: '持续不在乘方管理页（模拟恢复失败）' };
+        return orig(p);
+      };
+      // page.goto 恢复会重建 fixture 的 __CF.clickLog → 用控制器包装计数已发出的开启点击
+      const origClick = controller.clickBatchEnable.bind(controller);
+      controller.clickBatchEnable = async (p) => {
+        enableClickCount.push(1);
+        return origClick(p);
+      };
+      return controller;
+    },
+  });
+  assert.strictEqual(enableClickCount.length, 1, '首次开启已发出，恢复失败即停止，不再重试');
+  assert.strictEqual(result.allEnabledConfirmed, false);
+  assert.match(result.confirmReason, /无法恢复|回读/);
+  assert.strictEqual(deleteClicks(state).length, 0);
+});
+
+test('开启：批量开启后强制新扫描回读失败 → 结果未知，不报告全部开启', async () => {
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(3) } },
+    controllerOverride: async (controller) => {
+      const orig = controller.readView.bind(controller);
+      let zixuanReads = 0;
+      controller.readView = async (p) => {
+        const v = await orig(p);
+        if (p.tab === '商品自选') {
+          zixuanReads += 1;
+          // 第 4 次商品自选读取 = 批量开启后的强制新扫描回读 → 注入失败
+          if (zixuanReads === 4) return { tab: '商品自选', rows: { error: 'fixture 注入回读失败' }, pagination: null };
+        }
+        return v;
+      };
+      return controller;
+    },
+  });
+  assert.strictEqual(enableClicks(state).length, 1, '开启点击已发出（结果以回读为准）');
+  assert.strictEqual(result.allEnabledConfirmed, false, '回读失败不得判定全部开启');
+  assert.match(result.confirmReason, /回读失败|结果未知/);
+  assert.strictEqual(deleteClicks(state).length, 0);
+});
+
+// ── 开启前 / 最终身份复核期间中断 → 零点击 ─────────────────────────
+
+test('开启：选择完成后收到停止 → 不发批量开启请求', async () => {
+  let stopped = false;
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(5) } },
+    controllerOverride: async (controller) => {
+      const orig = controller.readBatchBar.bind(controller);
+      controller.readBatchBar = async (p) => {
+        const r = await orig(p);
+        stopped = true; // 选择完成后停止 → 点击前门槛拦截
+        return r;
+      };
+      return controller;
+    },
+    stopRequested: () => stopped,
+  });
+  assert.strictEqual(enableClicks(state).length, 0);
+  assert.strictEqual(result.allEnabledConfirmed, false);
+  assert.match(result.confirmReason, /停止发出批量开启请求|停止/);
+  assert.strictEqual(deleteClicks(state).length, 0);
+});
+
+test('开启：最终身份复核期间收到停止 → 复核返回后 requestGate 拦截，零业务点击', async () => {
+  let stopped = false;
+  let identityCalls = 0;
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': [] } },
+    stopRequested: () => stopped,
+    controllerOverride: async (controller) => {
+      const orig = controller.verifyIdentity.bind(controller);
+      controller.verifyIdentity = async (p) => {
+        identityCalls += 1;
+        const r = await orig(p);
+        if (identityCalls === 2) stopped = true; // 复核期间收到停止
+        return r;
+      };
+      return controller;
+    },
+  });
+  assert.ok(identityCalls >= 2, '身份复核确实发生（第二次调用）');
+  assert.strictEqual(result.allEnabledConfirmed, false);
+  assert.match(result.confirmReason, /停止/);
+  assert.strictEqual(state.clickLog.length, 0, '零业务点击');
+  assert.strictEqual(switchClicks(state).length, 0);
+  assert.strictEqual(enableClicks(state).length, 0);
+  assert.strictEqual(deleteClicks(state).length, 0);
+});
+
+test('开启：最终身份复核期间跨日（跨出开启窗口）→ 复核返回后 requestGate 拦截，零业务点击', async () => {
+  let identityCalls = 0;
+  let nowMs = shanghaiMs('2026-09-12', '07:30');
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': [] } },
+    businessDate: '2026-09-12',
+    now: () => nowMs,
+    controllerOverride: async (controller) => {
+      const orig = controller.verifyIdentity.bind(controller);
+      controller.verifyIdentity = async (p) => {
+        identityCalls += 1;
+        const r = await orig(p);
+        if (identityCalls === 2) nowMs = shanghaiMs('2026-09-13', '08:00'); // 复核期间跨日且跨出窗口
+        return r;
+      };
+      return controller;
+    },
+  });
+  assert.ok(identityCalls >= 2, '身份复核确实发生（第二次调用）');
+  assert.strictEqual(result.allEnabledConfirmed, false);
+  assert.match(result.confirmReason, /跨日|开启时段/);
+  assert.strictEqual(state.clickLog.length, 0, '零业务点击');
+  assert.strictEqual(switchClicks(state).length, 0);
+  assert.strictEqual(enableClicks(state).length, 0);
+});
+
+test('开启：最终身份复核期间页面账户变化 → 身份复检拦截，零业务点击', async () => {
+  let identityCalls = 0;
+  const { result, state } = await runEnable({
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': [] } },
+    controllerOverride: async (controller) => {
+      const orig = controller.verifyIdentity.bind(controller);
+      controller.verifyIdentity = async (p) => {
+        identityCalls += 1;
+        if (identityCalls === 2) return { ok: false, reason: '页面账户与配置不一致（模拟切换账户）' };
+        return orig(p);
+      };
+      return controller;
+    },
+  });
+  assert.ok(identityCalls >= 2, '身份复核确实发生（第二次调用）');
+  assert.strictEqual(result.allEnabledConfirmed, false);
+  assert.match(result.confirmReason, /账户|身份/);
+  assert.strictEqual(state.clickLog.length, 0, '零业务点击');
+  assert.strictEqual(switchClicks(state).length, 0);
+  assert.strictEqual(enableClicks(state).length, 0);
+});
+
+test('开启：最终身份复核期间关闭 enableEnabled → 复核返回后 requestGate 实时拦截，零业务点击', async () => {
+  let identityCalls = 0;
+  const config = {
+    execution: { realMode: true, dryRun: false },
+    monitor: { chengfang: { scope: ['全店托管', '商品自选'], enableEnabled: true } },
+    schedule: { dailyStartHour: 8 },
+  };
+  const { result, state } = await runEnable({
+    config,
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': [] } },
+    controllerOverride: async (controller) => {
+      const orig = controller.verifyIdentity.bind(controller);
+      controller.verifyIdentity = async (p) => {
+        identityCalls += 1;
+        const r = await orig(p);
+        if (identityCalls === 2) config.monitor.chengfang.enableEnabled = false; // 复核期间关闭许可
+        return r;
+      };
+      return controller;
+    },
+  });
+  assert.ok(identityCalls >= 2, '身份复核确实发生（第二次调用）');
+  assert.strictEqual(result.allEnabledConfirmed, false);
+  assert.match(result.confirmReason, /enableEnabled/);
+  assert.strictEqual(state.clickLog.length, 0, '零业务点击');
+  assert.strictEqual(switchClicks(state).length, 0);
+  assert.strictEqual(enableClicks(state).length, 0);
 });

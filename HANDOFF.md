@@ -1,3 +1,102 @@
+# HANDOFF — 乘方自动暂停 + 每日 07:00 自动开启 · 第十二轮
+
+> 交付日期：2026-09-14（第十二轮：乘方自动暂停之上新增"每日 07:00 自动开启"）。**realMode=false、pauseEnabled=false、enableEnabled=false 全程未变；本轮未启动值守/监控服务；未点击任何真实开关/暂停/删除；未提交 Git。**
+> 本轮：自动开启独立门禁 `monitor.chengfang.enableEnabled`（默认 false）+ `enableHour=7`（Asia/Shanghai），每天 07:00 开启**当前全部**乘方计划（全店托管+商品自选，含昨日被暂停的全部计划，而非仅系统暂停记录）；开启不依赖费用/订单阈值。隔离测试 **237/237 通过**（12 个测试文件 + 2 个辅助 fixture/helpers）。
+
+## 1. 每日 07:00 自动开启（r12）
+
+### 1.1 业务规则与独立门禁
+
+- 调度：每天上海时间 07:00（`monitor.chengfang.enableHour=7`）执行一次，开启**当前全部**乘方计划——全店托管（行内开关，已开启幂等跳过）+ 商品自选（100条/页 → 全选 → 批量"开启"）。不是只恢复系统前一天暂停的计划：回读以完整当前清单为准，全部开启侧才报告"乘方全部已开启"。
+- 独立门禁（与暂停完全分离）：真实开启必须同时满足 `execution.realMode=true` + `monitor.chengfang.enableEnabled=true` + 上海时间在 `[enableHour, dailyStartHour)` 窗口内 + 未停止 + 触发业务日期一致。**开启不读取费用与订单、不依赖任何阈值**。
+- 默认关闭：`enableEnabled=false`（config.json 默认）；`realMode=false` 或 `enableEnabled=false` → 开启相位自动转演练（只枚举将开启目标，零点击）。无 CLI 真实开启入口。
+- 监控未启动（`monitor.running=false`）→ 不自行执行任何开启或暂停；手动 `pollOnce` 在开启窗口内仅返回 `window_blocked`，不触发开启动作。
+
+### 1.2 调度实现（`src/engine/monitor.js`）
+
+`_intervalLoop` 重构为双相位：
+
+- 开启窗口 `[enableHour, dailyStartHour)`：`_lastEnableDate` 记录已执行日期（当天只一次，跨日重置）。到窗口且当日未执行 → `_runEnablePhase`（遍历启用店铺：演练=runDryEnableCycle / 真实=executeChengfangEnableBatch）→ 执行后等待到 `dailyStartHour` 进入暂停巡查。
+- 00:00–enableHour：等待开启窗口起点（未配置开启窗口则等待 dailyStartHour）。
+- 08:00 后暂停巡查不变；**跨日等待目标改为 enableHour**（配置了开启窗口时），保证次日 07:00 开启相位被唤醒（`nextIntervalDelayMs` 新增 `crossDayHour` 参数）。
+- 真实开启批次（`executeChengfangEnableBatch`）与暂停批次对称：前置门槛（enable 门禁 → 开启时段 → 停止）→ 打开乘方页 → `executeChengfangEnable` → 关闭会话 → 批次按 店铺+业务日期 持久化（`_recordBatch` 支持 `allEnabledConfirmed`）。
+
+### 1.3 门禁实现（`src/engine/chengfang-gate.js`）
+
+- 新增 `resolveChengfangEnableAllowed(config)`：`realMode=true` + `enableEnabled=true` + 非 `dryRun`。
+- `buildChengfangRequestGate` 支持 `action: 'enable'`：时段检查改用开启窗口 `[enableHour, dailyStartHour)`，配置许可实时重算 `resolveChengfangEnableAllowed(config)`（每次 `check()` 重算，无静态缓存，与暂停一致）。
+
+### 1.4 执行器实现（`src/engine/chengfang-executor.js` `executeChengfangEnable`）
+
+与 `executeChengfangPause` 完全对称的 fail-closed 流程：
+
+1. 身份核验（URL/子标签/账户 ID 精确比对）→ 记录本次会话内乘方管理页 URL（`result.managementUrl`，仅会话内使用，不写审计日志）。
+2. 全店托管：读取开关状态；已开启 → `already_enabled` 幂等跳过；关闭 → 严格单候选点击行内开关 → 强制新扫描回读。
+3. 商品自选：确保 100条/页 → 稳定 ID 逐页处理 → 表头全选后实测选择范围（跨页优先清除重选）→ 危险弹窗检测 → 精确定位唯一"开启"按钮（带稳定标识；缺失/多候选/无标记 → 零点击；删除/暂停绝不点击）→ 点击批量"开启" → 强制新扫描回读。
+4. 全量回读：两区域完整当前清单（第一页起逐页、核验分页总数与页码、对象键=`区域:稳定ID`）确认全部开启侧才报告"乘方全部已开启"；空页/跳回首页/分页不完整/回读失败 → 结果未知不报成功。
+5. `beforeDispatch` 双重门禁（与暂停共用）：每次真实点击派发前 requestGate → 异步身份复核 → 复核返回后**再同步检查一次** requestGate（停止/跨日/账户变化/关闭 enableEnabled 在复核期间到达均拦截，零点击）。
+
+### 1.5 千川首次未落地：同会话单次重试
+
+千川已知问题：首次批量操作有时确认成功却未落地。开启路径与暂停一致：
+
+- 本次浏览器会话内记录乘方管理页 URL；操作后回读仍关闭 → **同一 page/browser/context 内恢复该 URL 重试一次**（`restoreManagementPageForReadback`：先验证当前页身份 → 非管理页且有记录 URL 时 `page.goto` 恢复 → 恢复后再验身份；不重开浏览器、不重建上下文、不重读 Cookie）。
+- 提交后跳回首页同样回到记录的乘方 URL 回读；恢复失败 → 结果未知，不报成功、不再点击。
+- 第二次仍未确认 → 停止并标记结果未知（`partial_failed`），不报"全部开启"。
+
+### 1.6 修改文件（r12）
+
+```
+src/engine/monitor.js              修改：_intervalLoop 双相位调度（开启窗口/跨日唤醒）；_runEnablePhase/_runShopEnablePhase（演练/真实分流）；_recordBatch/_summarizeBatch 支持 allEnabledConfirmed；getStatus 增加 enableHour/lastEnableDate
+src/engine/chengfang-runner.js     修改：新增 runDryEnableCycle（无条件强制 dryRun:true，dry_failed 透出）与 executeChengfangEnableBatch（enable 门禁+开启窗口+停止；不读费用/订单）
+src/engine/chengfang-executor.js   修改：新增 executeChengfangEnable（托管/商品自选开启、同会话单次重试、全量回读 allEnabledConfirmed、beforeDispatch 双重门禁）；复用 restoreManagementPageForReadback
+src/engine/chengfang-gate.js       修改：新增 resolveChengfangEnableAllowed；buildChengfangRequestGate 支持 action='enable'（开启窗口+enableEnabled 实时重算）
+src/adapters/chengfang-reader.js   修改：新增"开启"按钮精确定位与 clickBatchEnable（定位→fireBeforeDispatch→点击三段式）
+src/lib/time.js                    修改：新增 msUntilHour；nextIntervalDelayMs 支持 crossDayHour（跨日等待次日 enableHour）
+src/config.js                      修改：chengfang 配置增加 enableEnabled/enableHour 默认值（false/7）
+config/config.json                 修改：monitor.chengfang 增加 enableEnabled=false、enableHour=7 及说明（默认关闭，须 realMode+enableEnabled 同时为真）
+test/chengfang-fixture.js          修改：开启状态机（enableEffect/批量开启/100条/页/尝试计数 sessionStorage 持久化——页面跳转不重置首次未落地状态）
+test/chengfang-executor.test.js    修改：新增 23 项开启用例（共 51 项）
+test/monitor-chengfang.test.js     修改：新增 8 项开启调度用例（共 30 项）
+test/probe-enable.js / test/probe-restore.js  新建（仅诊断用临时脚本，不纳入 npm test）
+README.md / HANDOFF.md             本轮更新（237/237、自动开启流程/门禁/重试、未验证边界）
+```
+
+### 1.7 测试（r12）
+
+`npm test` → **237/237 通过**（12 个测试文件 + 2 个辅助，隔离浏览器；本地 DOM fixture，模拟浏览器隔离，测试不访问生产页面）。
+
+- `test/chengfang-executor.test.js`（51 项，含 23 项开启用例）：
+  - 开启正常/幂等/两视图空（confirmed_empty）；realMode=false 或 enableEnabled=false → 自动转演练零点击
+  - 开启/暂停/删除并存 → 开启只点开启、暂停只点暂停、删除始终零点击；开启按钮缺失/多候选/无标记 → 零点击
+  - 120条/2页跨页开启、同名不同 ID 精确去重、开启后列表收缩不谎报；空清单缺分页字段 → read_failed
+  - 千川首次未落地（first-noop）→ 同会话仅重试一次、第二次回读确认开启；连续两次未生效 → 停止且不再点击
+  - 千川提交后跳回首页 → 同会话恢复记录的管理页 URL 回读并重试（不重开浏览器）；恢复失败 → 结果未知
+  - 开启前/最终身份复核期间收到停止、跨日（跨出开启窗口）、页面账户变化、关闭 enableEnabled → 零业务点击（beforeDispatch 双重门禁）
+- `test/monitor-chengfang.test.js`（30 项，含 8 项开启调度用例）：
+  - 07:00 前（06:00）启动 → 等待开启窗口，零开启动作、零页面会话；07:00 整 → 执行每日开启（真实 all_enabled_confirmed，只走全店托管+商品自选，删除零点击）
+  - 当天只执行一次（同一天重启监控不重复开启）；跨日重置 → 次日 07:00 允许再次执行
+  - 监控未启动 → 手动 pollOnce（07:00）也不触发开启（window_blocked，零会话）；enableEnabled=false → 07:00 相位 blocked 零会话零动作；realMode=false → 开启相位演练枚举零点击
+  - 演练入口强制只读：realMode+pauseEnabled+enableEnabled 全开也走 dryRun（托管/暂停/开启/删除均零点击）——3443「推广值守演练」只读边界不回退
+
+### 1.8 默认配置状态（r12 交付时）
+
+- `config/config.json`：`execution.realMode=false`、`monitor.chengfang.pauseEnabled=false`、`monitor.chengfang.enableEnabled=false`、`monitor.chengfang.enableHour=7`——**全部保持默认关闭**。
+- 本轮**未启动**任何值守/监控服务（未运行 `npm start`、未启动 3443 值守、未调用 pollOnce 真实链路）；3443「推广值守演练」由用户自行决定是否重启加载 r11.1 补丁（见 r11 §3.1，运行中进程仍为修复前逻辑）。
+- **未执行任何真实广告动作**：全部测试在本地 DOM fixture + 模拟浏览器隔离环境运行，零真实点击。
+- Cookie/浏览器会话不跨重试重建：千川重试只在同一 page/browser/context 内恢复记录的乘方管理页 URL，不重开浏览器、不重建上下文、不重读 Cookie（已测试断言）。
+
+### 1.9 未验证边界（r12，如实保留）
+
+1. **真实页面开启/暂停的确认弹窗结构**仍未人工确认（fixture 按无弹窗/有弹窗两态覆盖）——启用 pauseEnabled/enableEnabled 前必须人工确认。
+2. 千川"首次批量操作确认但不落地""提交后跳回首页"为已知问题描述，fixture 模拟两态；**真实页面行为未实测**。
+3. 批量开启后列表真实行为（收缩/前移/顺序变化）未实测；实现两态均安全（稳定 ID 去重 + 全量回读）。
+4. 千川页面类名（hash 后缀）长期稳定性未验证。
+5. **真实主链路未在真实页面跑通**（开启与暂停均如此）：Monitor→Runner→执行器仅在本地 fixture 下验证；当前真实页面 24 个对象全部关闭侧，真实暂停会幂等跳过、真实开启会批量开启——均需用户人工盯守验证（见 r10 §8 的下一步验证流程，开启路径同前置条件）。
+6. 真实 07:00 调度跨日行为（当天一次、次日重置）由模拟时钟验证；真实 24 小时观察待用户启动监控后确认。
+
+---
+
 # HANDOFF — 乘方自动暂停（全店托管 + 商品自选）· 第十一轮
 
 > 交付日期：2026-09-14（第十一轮：推广值守演练页面接入 3443）。**realMode=false、pauseEnabled=false 全程未变；未点击任何真实开关/暂停/删除；未开启长期监控；未提交 Git。**

@@ -8,8 +8,8 @@
  * - 当天累计推广费用 ÷ 当天累计全店订单数 > 1 元/单（=100 分/单，恰好相等不关），
  *   判定式：费用整数分 > 订单数 × 100，不得先四舍五入每单成本；
  * - 统计日期按 Asia/Shanghai，当天从 00:00 累计；
- * - 每天只在 08:00 后执行真实操作，每 30 分钟巡查一次；
- * - 只开启监控，不自动开启或恢复广告。
+ * - 每天只在 08:00 后执行真实暂停操作，每 30 分钟巡查一次；
+ * - 每天 07:00（enableHour）自动开启一次乘方（默认关闭，须 realMode+enableEnabled 同时开启）。
  *
  * 仍待用户提供（保持 TODO 占位，缺任一项监控不可启动）：
  * - 推广页面网址、目标店铺（店铺唯一标识 + Cookie 文件名）、可选广告账户 ID。
@@ -51,7 +51,8 @@ const DEFAULTS = {
     chengfang: {
       scope: ['全店托管', '商品自选'], // 本轮控制范围：乘方两视图
       pauseEnabled: false,            // 乘方暂停动作真实执行开关（默认关闭；realMode 为总闸）
-      enableEnabled: false,           // 自动开启仅预留位：本轮禁止启用，也不设开启条件
+      enableEnabled: false,           // 乘方开启动作真实执行开关（默认关闭；realMode 为总闸）
+      enableHour: 7,                  // 每日自动开启时段起点（Asia/Shanghai；当天一次，跨日重置）
     },
     qianchuan: {
       adTypes: ['uni_promotion', 'standard'], // 仅只读清单透明性；本轮动作范围 = chengfang.scope
@@ -178,10 +179,12 @@ function collectPending(cfg) {
   if (cf.pauseEnabled !== undefined && typeof cf.pauseEnabled !== 'boolean') {
     push('monitor.chengfang.pauseEnabled: 必须是布尔值（乘方暂停动作真实执行开关，默认 false）');
   }
-  if (cf.enableEnabled === true) {
-    push('monitor.chengfang.enableEnabled: 自动开启仅预留接口，本轮禁止启用（也不设置自动开启条件）');
-  } else if (cf.enableEnabled !== undefined && typeof cf.enableEnabled !== 'boolean') {
-    push('monitor.chengfang.enableEnabled: 必须是布尔值（当前仅允许 false）');
+  if (cf.enableEnabled !== undefined && typeof cf.enableEnabled !== 'boolean') {
+    push('monitor.chengfang.enableEnabled: 必须是布尔值（乘方开启动作真实执行开关，默认 false）');
+  }
+  if (cf.enableHour !== undefined) {
+    const enableHourErr = intInRange(cf.enableHour, 0, 23, 'monitor.chengfang.enableHour');
+    if (enableHourErr) push(enableHourErr);
   }
   if (!Array.isArray(cf.scope) || cf.scope.length === 0) {
     push('monitor.chengfang.scope: 必须声明本轮控制视图（默认 ["全店托管","商品自选"]）');

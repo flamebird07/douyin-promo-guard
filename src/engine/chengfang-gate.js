@@ -12,10 +12,18 @@
  * - 未收到停止信号
  * - 触发业务日期与当前上海日历日一致（未跨日）
  *
+ * 真实开启（每日 07:00 自动开启相位）独立于暂停门槛，必须同时满足：
+ * - execution.realMode === true
+ * - monitor.chengfang.enableEnabled === true
+ * - execution.dryRun !== true（非演练）
+ * - 上海时间 enableHour 起、dailyStartHour 前（每日一次，由监控相位调度）
+ * - 未收到停止信号；触发业务日期与当前上海日历日一致（未跨日）
+ * - 开启不依赖费用/订单阈值（不读费用与订单）
+ *
  * 显式传入 dryRun:false 不能越过上述配置门槛（执行器据此决定是否演练）。
  */
 
-const { shanghaiDate, isAfterDailyStart } = require('../lib/time');
+const { shanghaiDate, shanghaiWall, isAfterDailyStart } = require('../lib/time');
 
 /** 配置门槛：真实暂停是否被允许（不涉及时段/停止/日期，那些在请求级 gate 里）。 */
 function resolveChengfangRealAllowed(config) {
@@ -29,6 +37,22 @@ function resolveChengfangRealAllowed(config) {
   }
   if (exec.dryRun === true) {
     return { ok: false, reason: 'execution.dryRun=true（演练模式，禁止真实暂停）' };
+  }
+  return { ok: true };
+}
+
+/** 配置门槛：真实开启是否被允许（不涉及时段/停止/日期，那些在请求级 gate 里）。 */
+function resolveChengfangEnableAllowed(config) {
+  const exec = (config && config.execution) || {};
+  const cf = (config && config.monitor && config.monitor.chengfang) || {};
+  if (exec.realMode !== true) {
+    return { ok: false, reason: 'execution.realMode 未开启（演练模式不执行真实开启）' };
+  }
+  if (cf.enableEnabled !== true) {
+    return { ok: false, reason: 'monitor.chengfang.enableEnabled 未开启（乘方开启动作处于关闭门禁）' };
+  }
+  if (exec.dryRun === true) {
+    return { ok: false, reason: 'execution.dryRun=true（演练模式，禁止真实开启）' };
   }
   return { ok: true };
 }
@@ -51,23 +75,35 @@ function resolveChengfangRealAllowed(config) {
  * @param {()=>number} p.nowFn
  * @param {()=>boolean} [p.stopRequested]
  * @param {string} [p.businessDate] 触发批次业务日期（上海日历日），用于跨日检查
+ * @param {'pause'|'enable'} [p.action] 动作类型：pause 走 08:00 后暂停窗口与 pauseEnabled；
+ *                                      enable 走 enableHour 起窗口与 enableEnabled（默认 'pause'）
  * @returns {()=>{ok:boolean,reason?:string}}
  */
-function buildChengfangRequestGate({ config, nowFn, stopRequested, businessDate }) {
+function buildChengfangRequestGate({ config, nowFn, stopRequested, businessDate, action = 'pause' }) {
   const sch = (config && config.schedule) || { dailyStartHour: 8 };
+  const cf = (config && config.monitor && config.monitor.chengfang) || {};
+  const enableHour = cf.enableHour !== undefined && cf.enableHour !== null ? cf.enableHour : 7;
+  const label = action === 'enable' ? '开启' : '暂停';
   return function check() {
     if (stopRequested && stopRequested()) {
-      return { ok: false, reason: '停止信号：不再发出新的暂停请求' };
+      return { ok: false, reason: `停止信号：不再发出新的${label}请求` };
     }
-    if (!isAfterDailyStart(nowFn(), sch.dailyStartHour)) {
+    if (action === 'enable') {
+      const w = shanghaiWall(nowFn());
+      if (w.hour < enableHour || w.hour >= sch.dailyStartHour) {
+        const hh = String(enableHour).padStart(2, '0');
+        const dh = String(sch.dailyStartHour).padStart(2, '0');
+        return { ok: false, reason: `未到允许开启时段（每日 ${hh}:00–${dh}:00，Asia/Shanghai）：不再发出新的开启请求` };
+      }
+    } else if (!isAfterDailyStart(nowFn(), sch.dailyStartHour)) {
       const hh = String(sch.dailyStartHour).padStart(2, '0');
       return { ok: false, reason: `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：不再发出新的暂停请求` };
     }
     if (businessDate !== undefined && businessDate !== null && shanghaiDate(nowFn()) !== businessDate) {
-      return { ok: false, reason: `跨日（触发业务日期 ${businessDate} → 当前 ${shanghaiDate(nowFn())}）：不再发出新的暂停请求` };
+      return { ok: false, reason: `跨日（触发业务日期 ${businessDate} → 当前 ${shanghaiDate(nowFn())}）：不再发出新的${label}请求` };
     }
     // 实时重算当前配置许可：不依赖批次最初计算的静态 realAllowed
-    const realAllowed = resolveChengfangRealAllowed(config);
+    const realAllowed = action === 'enable' ? resolveChengfangEnableAllowed(config) : resolveChengfangRealAllowed(config);
     if (!realAllowed.ok) {
       return { ok: false, reason: realAllowed.reason };
     }
@@ -75,4 +111,4 @@ function buildChengfangRequestGate({ config, nowFn, stopRequested, businessDate 
   };
 }
 
-module.exports = { resolveChengfangRealAllowed, buildChengfangRequestGate };
+module.exports = { resolveChengfangRealAllowed, resolveChengfangEnableAllowed, buildChengfangRequestGate };

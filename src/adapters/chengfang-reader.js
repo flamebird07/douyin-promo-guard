@@ -231,6 +231,32 @@ function findChengfangBatchPauseButtonInPage() {
 }
 
 /**
+ * 批量操作栏"开启"按钮精确定位（防误删/防误暂停）：
+ * 限定在批量操作栏容器内，文本必须为"开启"；全部候选数 0 或 >1 → 拒绝（零点击）；
+ * 唯一候选必须带可识别标记（data-auto-id 含 btn-open 或 data-e2e 以 _open 结尾），
+ * 无标记的纯文本"开启"不可信（禁止模糊文本兜底）。绝不返回"删除"/"暂停"。
+ */
+function findChengfangBatchEnableButtonInPage() {
+  const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar');
+  let bar = null;
+  for (const b of bars) {
+    const r = b.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) { bar = b; break; }
+  }
+  if (!bar) return { ok: false, reason: '未找到可见批量操作栏' };
+  const btns = [...bar.querySelectorAll('button')].filter((b) => (b.textContent || '').trim() === '开启');
+  if (btns.length === 0) return { ok: false, reason: '批量操作栏内未找到"开启"按钮（删除/暂停不得被选中）' };
+  if (btns.length > 1) return { ok: false, reason: `批量操作栏内出现 ${btns.length} 个"开启"候选，拒绝点击` };
+  const b = btns[0];
+  const autoId = b.getAttribute('data-auto-id') || '';
+  const e2e = b.getAttribute('data-e2e') || '';
+  if (!/btn-open$/.test(autoId) && !/_open$/.test(e2e)) {
+    return { ok: false, reason: `唯一"开启"候选缺少可识别标记（autoId=${autoId || '-'} e2e=${e2e || '-'}），禁止模糊文本兜底` };
+  }
+  return { ok: true, e2e, autoId, tag: b.tagName };
+}
+
+/**
  * 读取批量操作栏当前状态（自包含）：
  * 返回 { visible, selectedText, selectedCount, buttons }；"已选N个" 用于
  * 点击前核验所选范围（与 readSelectedChengfangRowIdsInPage 交叉核对）。
@@ -607,6 +633,53 @@ function createChengfangController(p) {
       await sleep(1500);
     },
 
+    /**
+     * 点击批量"开启"（防误删：只接受精确定位且带标记的唯一"开启"按钮；删除/暂停绝不点击）。
+     * 点击前先检测非预期弹窗；定位失败/候选非唯一 → 抛 DataGuardError（零点击）。
+     * 返回 {clicked:true} 或抛 DataGuardError。
+     */
+    async clickBatchEnable({ page }) {
+      // 检测失败必须阻断点击（抛 DataGuardError，绝不 catch 成"无弹窗"）
+      let danger;
+      try {
+        danger = await page.evaluate(detectChengfangDangerDialogInPage);
+      } catch (e) {
+        throw new DataGuardError(`弹窗检测失败，停止点击批量"开启"（检测异常）：${e.reason || e.message}`);
+      }
+      if (danger.length > 0) {
+        throw new DataGuardError(`检测到非预期弹窗，停止点击：${danger.map((d) => `${d.kind}:${d.text}`).join('；')}`);
+      }
+      const found = await page.evaluate(findChengfangBatchEnableButtonInPage).catch((e) => ({ error: String(e) }));
+      if (!found || found.ok !== true) {
+        throw new DataGuardError(`批量"开启"按钮无法唯一定位，零点击：${(found && found.reason) || '定位失败'}`);
+      }
+      // 最终检查（贴近点击）：最后一次页面检查（定位/弹窗检测）完成后、DOM 点击派发前。
+      // 停止/时段/跨日/当前许可或账户身份变化 → 抛 DataGuardError，不派发点击。
+      await fireBeforeDispatch({ page });
+      // 二次定位并点击（与 findChengfangBatchEnableButtonInPage 同一严格条件），结果回传核验
+      const clicked = await page.evaluate(() => {
+        const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar');
+        let bar = null;
+        for (const b of bars) {
+          const r = b.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) { bar = b; break; }
+        }
+        if (!bar) return false;
+        const btns = [...bar.querySelectorAll('button')].filter((b) => (b.textContent || '').trim() === '开启');
+        if (btns.length !== 1) return false;
+        const b = btns[0];
+        const autoId = b.getAttribute('data-auto-id') || '';
+        const e2e = b.getAttribute('data-e2e') || '';
+        if (!/btn-open$/.test(autoId) && !/_open$/.test(e2e)) return false;
+        b.click();
+        return true;
+      }).catch((e) => ({ error: String(e) }));
+      if (clicked !== true) {
+        throw new DataGuardError('批量"开启"按钮二次定位不一致，零点击');
+      }
+      await sleep(1500);
+    },
+
     /** 点击指定计划行内投放开关（全店托管总开关用；严格单候选定位）。 */
     async clickRowSwitch({ page, planId }) {
       const loc = await page.evaluate(locateChengfangRowSwitchInPage, planId).catch((e) => ({ ok: false, reason: String(e) }));
@@ -662,6 +735,7 @@ module.exports = {
   clickChengfangHeaderSelectAllInPage,
   readSelectedChengfangRowIdsInPage,
   findChengfangBatchPauseButtonInPage,
+  findChengfangBatchEnableButtonInPage,
   findChengfangBatchDeleteButtonInPage,
   readChengfangBatchBarInPage,
   clickChengfangRowSwitchByPlanId,

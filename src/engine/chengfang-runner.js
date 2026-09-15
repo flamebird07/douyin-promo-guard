@@ -22,9 +22,9 @@
  * 否则关闭 browser。
  */
 
-const { resolveChengfangRealAllowed } = require('./chengfang-gate');
-const { executeChengfangPause, V_READ_FAILED, V_PARTIAL_FAILED } = require('./chengfang-executor');
-const { isAfterDailyStart, shanghaiDate } = require('../lib/time');
+const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed } = require('./chengfang-gate');
+const { executeChengfangPause, executeChengfangEnable, V_READ_FAILED, V_PARTIAL_FAILED } = require('./chengfang-executor');
+const { isAfterDailyStart, shanghaiDate, shanghaiWall } = require('../lib/time');
 const { perOrderDisplayText } = require('./rules');
 
 /** 生产默认会话开启器：真实乘方管理页（openChengfangShop + 真实控制器）。 */
@@ -47,6 +47,11 @@ function dryCycleSucceeded(result) {
     if (s && FAIL.has(s)) return false;
   }
   return true;
+}
+
+/** 开启演练是否"正常完成"：与 dryCycleSucceeded 同语义（身份 + 两区域无失败视图）。 */
+function dryEnableCycleSucceeded(result) {
+  return dryCycleSucceeded(result);
 }
 
 class ChengfangRunner {
@@ -142,6 +147,65 @@ class ChengfangRunner {
   }
 
   /**
+   * 开启演练周期：与 runDryCycle 同语义（无条件强制 dryRun=true，零业务点击），
+   * 用于每日开启相位在 realMode=false 或 enableEnabled=false 时枚举"将开启"目标。
+   */
+  async runDryEnableCycle({ shopCfg, pageOpener, loginCfg }) {
+    let session = null;
+    try {
+      session = await this._openSession(pageOpener, shopCfg, loginCfg);
+      const result = await executeChengfangEnable({
+        controller: session.controller,
+        page: session.page,
+        shopCfg,
+        config: this.config,
+        dryRun: true, // 演练入口无条件强制演练，无视 enableEnabled/realMode 是否已开启
+        now: this.now,
+        audit: this.audit,
+        stopRequested: () => false,
+      });
+      if (!dryEnableCycleSucceeded(result)) {
+        const reason = result.confirmReason || '乘方开启演练未完成（身份/读取/分页/选择范围失败）';
+        this.audit({ kind: 'chengfang-enable-dry', shopId: shopCfg.id, outcome: 'dry_failed', reason });
+        return {
+          outcome: 'dry_failed',
+          dryRun: true,
+          executor: result,
+          targets: [],
+          views: result.views,
+          mode: result.mode || 'dry-run',
+          error: reason,
+          reason,
+        };
+      }
+      return {
+        outcome: 'dry',
+        dryRun: true,
+        executor: result,
+        targets: (result.dryRunTargets || []).map((t) => ({ view: t.view, planId: t.planId })),
+        views: result.views,
+        mode: result.mode,
+        error: null,
+      };
+    } catch (e) {
+      const reason = e.reason || e.message;
+      this.audit({ kind: 'chengfang-enable-dry', shopId: shopCfg.id, outcome: 'dry_failed', reason });
+      return {
+        outcome: 'dry_failed',
+        dryRun: true,
+        executor: null,
+        targets: [],
+        views: null,
+        mode: 'dry-run',
+        error: reason,
+        reason,
+      };
+    } finally {
+      await this._closeSession(session);
+    }
+  }
+
+  /**
    * 真实批次（接入 monitor 主链路）。返回与 Monitor._recordBatch/_summarizeBatch 兼容的批次结果。
    */
   async executeChengfangBatch({ shopCfg, cycleToken, trigger, pageOpener, loginCfg }) {
@@ -218,6 +282,64 @@ class ChengfangRunner {
     }
   }
 
+  /**
+   * 真实开启批次（每日 07:00 相位接入 monitor 主链路）。
+   * 与暂停批次的关键差异：开启不依赖费用/订单阈值（不读费用与订单），
+   * 门槛 = realMode + enableEnabled + 上海 enableHour 起窗口 + 未停止 + 未跨日。
+   * 返回与 Monitor._recordBatch/_summarizeBatch 兼容的批次结果。
+   */
+  async executeChengfangEnableBatch({ shopCfg, cycleToken, trigger, pageOpener, loginCfg }) {
+    const batchDate = shanghaiDate(this.now());
+    const counts = { confirmed: 0, failed: 0, unknown: 0, skipped: 0, cancelled: 0 };
+    const base = { kind: 'chengfang-enable-batch', shopId: shopCfg.id, batchDate };
+    const cf = (this.config.monitor && this.config.monitor.chengfang) || {};
+    const enableHour = cf.enableHour !== undefined && cf.enableHour !== null ? cf.enableHour : 7;
+    const dailyStartHour = this.config.schedule.dailyStartHour;
+
+    // ── 0) 前置门槛（fail-closed）：集中配置门槛 → 开启时段 → 停止 ─────
+    const realAllowed = resolveChengfangEnableAllowed(this.config);
+    if (!realAllowed.ok) {
+      return { outcome: 'blocked', reason: realAllowed.reason, counts, batchDate, error: null };
+    }
+    const w = shanghaiWall(this.now());
+    if (!(w.hour >= enableHour && w.hour < dailyStartHour)) {
+      const hh = String(enableHour).padStart(2, '0');
+      const dh = String(dailyStartHour).padStart(2, '0');
+      return {
+        outcome: 'blocked_window',
+        reason: `未到允许开启时段（每日 ${hh}:00–${dh}:00，Asia/Shanghai），本轮不执行真实开启`,
+        counts, batchDate,
+      };
+    }
+    if (cycleToken && cycleToken.aborted) {
+      return { outcome: 'blocked_stopped', reason: '监控已停止，本轮不执行真实开启', counts, batchDate };
+    }
+    this.audit({ ...base, step: 'batch-start', trigger: trigger && trigger.reason });
+
+    // ── 1) 打开乘方页并执行（executor 内部再做身份核验/每请求门槛/全量回读）──
+    let session = null;
+    try {
+      session = await this._openSession(pageOpener, shopCfg, loginCfg);
+      const result = await executeChengfangEnable({
+        controller: session.controller,
+        page: session.page,
+        shopCfg,
+        config: this.config,
+        businessDate: batchDate,
+        now: this.now,
+        audit: this.audit,
+        stopRequested: () => !!(cycleToken && cycleToken.aborted),
+      });
+      return this._summarizeEnableResult({ result, counts, batchDate, base });
+    } catch (e) {
+      const reason = `乘方开启流程异常停止：${e.reason || e.message}。零新增请求`;
+      this.audit({ ...base, step: 'executor', ok: false, error: reason });
+      return { outcome: 'partial', reason, counts, batchDate, error: e };
+    } finally {
+      await this._closeSession(session);
+    }
+  }
+
   /** 把 executor 结果映射为批次结果：details 按「区域:稳定ID」键归类 confirmed/failed/unknown。 */
   _summarizeExecutorResult({ result, counts, pre, batchDate, base }) {
     // 身份核验失败/页面结构不可识别 → 未发出任何请求，按 blocked 处理（不进 actions）
@@ -269,6 +391,58 @@ class ChengfangRunner {
       confirmReason: reason, batchDate, details, executor: result,
     };
   }
+
+  /** 把开启 executor 结果映射为批次结果（details 按「区域:稳定ID」键；开启不读费用/订单，无 pre）。 */
+  _summarizeEnableResult({ result, counts, batchDate, base }) {
+    // 身份核验失败/页面结构不可识别 → 未发出任何请求，按 blocked 处理（不进 actions）
+    if (result.views && result.views.identity && result.views.identity.status === 'read_failed') {
+      const reason = result.confirmReason || '乘方开启身份核验失败（未发出任何请求）';
+      this.audit({ ...base, step: 'batch-end', outcome: 'blocked', reason });
+      return {
+        outcome: 'blocked', reason, counts, targets: [], details: [],
+        allEnabledConfirmed: false, confirmReason: reason, batchDate, executor: result,
+      };
+    }
+    const confirmedKeys = new Set((result.finalVerify && result.finalVerify.confirmed) || []);
+    const stillClosedKeys = new Set((result.finalVerify && result.finalVerify.stillClosed) || []);
+    const details = [];
+    for (const t of result.targets || []) {
+      const key = `${t.view}:${t.planId}`;
+      let outcome;
+      if (confirmedKeys.has(key)) outcome = 'confirmed_open';
+      else if (stillClosedKeys.has(key)) outcome = 'failed';
+      else outcome = 'unknown'; // 缺失/未扫描/流程中止 → 结果未知，绝不当作成功
+      details.push({
+        adId: key, view: t.view, planId: t.planId, outcome,
+        reason: outcome === 'confirmed_open' ? null : (result.confirmReason || null),
+      });
+      if (outcome === 'confirmed_open') counts.confirmed += 1;
+      else if (outcome === 'failed') counts.failed += 1;
+      else counts.unknown += 1;
+    }
+    const targets = (result.targets || []).map((t) => ({ view: t.view, planId: t.planId }));
+    const allEnabledConfirmed = result.allEnabledConfirmed === true;
+
+    if (targets.length === 0 && allEnabledConfirmed) {
+      const reason = '乘方清单内无关闭对象（已全部开启或已确认无计划），无需操作';
+      this.audit({ ...base, step: 'batch-end', outcome: 'nothing_to_enable', reason });
+      return {
+        outcome: 'nothing_to_enable', reason, counts, targets,
+        allEnabledConfirmed: true, confirmReason: result.confirmReason || null,
+        batchDate, details, executor: result,
+      };
+    }
+    const outcome = allEnabledConfirmed ? 'all_enabled_confirmed' : 'partial';
+    const reason = result.confirmReason || (allEnabledConfirmed ? '乘方全部已开启' : '乘方开启未全部确认');
+    this.audit({
+      ...base, step: 'batch-end', outcome, counts, targets: targets.length,
+      allEnabledConfirmed, confirmReason: reason,
+    });
+    return {
+      outcome, reason, counts, targets, allEnabledConfirmed,
+      confirmReason: reason, batchDate, details, executor: result,
+    };
+  }
 }
 
-module.exports = { ChengfangRunner, defaultChengfangOpener, dryCycleSucceeded };
+module.exports = { ChengfangRunner, defaultChengfangOpener, dryCycleSucceeded, dryEnableCycleSucceeded };

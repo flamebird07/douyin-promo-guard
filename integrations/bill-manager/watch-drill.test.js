@@ -25,7 +25,14 @@ const path = require('path');
 
 const { createWatchDrill, scrub } = require('../watch-drill');
 
-const PROMO = 'C:/Users/Administrator/Documents/ChatGPT/推广广告控制';
+// 推广控制主项目根目录：优先环境变量，其次本机生产路径，最后公开仓库内相对位置
+// （integrations/bill-manager 向上三级 = 仓库根），保证公开仓库中的副本可自举运行。
+const PROMO = [
+  process.env.PROMO_GUARD_DIR,
+  'C:/Users/Administrator/Documents/ChatGPT/推广广告控制',
+  path.join(__dirname, '..', '..', '..'),
+].filter(Boolean).find((p) => fs.existsSync(path.join(p, 'src/engine/monitor.js')));
+if (!PROMO) throw new Error('未找到推广控制主项目（src/engine/monitor.js）');
 const timeLib = require(path.join(PROMO, 'src/lib/time.js'));
 const { shanghaiDate, shanghaiMs } = timeLib;
 
@@ -1200,4 +1207,282 @@ test('日志安全：state 与 logs 响应均不含 cookie 文件路径以外的
   const raw = JSON.stringify(st.body);
   assert.ok(!/sessionid"\s*:\s*"/.test(raw), 'state 不得含会话凭据字段值');
   assert.ok(!raw.includes('dummy-not-a-real-credential'), 'state 不得含 cookie 值（即使测试用占位值也不应透出）');
+});
+
+// ══════════════════════════════════════════════════════════════
+// 13) 第三轮回归：describeTrigger 动作标签只认显式 targetAction
+//     （旧 bug：dry 分支硬编码"将暂停 N 条乘方计划"，不读 targetAction，
+//       每日开启演练被误展示为"将暂停"）
+// ══════════════════════════════════════════════════════════════
+
+/** 构造本地 fixture 会话开启器（生产 controller + 隔离 fixture 页，绝不触真实站点）。 */
+function makeFixtureOpener(browser, plans, clickLogRef) {
+  const { buildChengfangFixtureHtml } = require(path.join(PROMO, 'test/chengfang-fixture.js'));
+  const { createChengfangController } = require(path.join(PROMO, 'src/adapters/chengfang-reader.js'));
+  return async () => {
+    const page = await browser.newPage();
+    const html = buildChengfangFixtureHtml({ plans });
+    await page.route('**/uni-prom/overall**', (route) => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html }));
+    await page.goto('https://qianchuan.jinritemai.com/uni-prom/overall?aavid=1710242295996424', { waitUntil: 'load' });
+    return {
+      page,
+      controller: createChengfangController({ loadWaitMs: 40, tabWaitMs: 10 }),
+      close: async () => {
+        clickLogRef.v = await page.evaluate(() => window.__CF.clickLog).catch(() => null);
+        await page.close().catch(() => {});
+      },
+    };
+  };
+}
+
+test('第三轮：真实 Monitor 每日开启相位（dry）→ /logs 显示"将开启 N 条"，不显示"将暂停 N 条"，无 unknown 批次', async () => {
+  const clock = makeClock(shanghaiMs('2026-09-14', '07:00'));
+  const timers = makeTimers();
+  const { chromium } = require(path.join(PROMO, 'node_modules/playwright'));
+  const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+  const clickLogRef = { v: null };
+  const browser = await chromium.launch({ headless: true, executablePath: EDGE });
+  try {
+    const { drill } = makeDrill(clock, timers, {
+      costCents: 100, orderCount: 100,
+      cfg: { shops: [{ id: SHOP_ID, name: SHOP_ID, cookieFile: COOKIE_FILE, accountId: '1710242295996424', enabled: true }] },
+      chengfangOpener: makeFixtureOpener(browser, {
+        全店托管: [{ id: '184388555253250562', name: '全店托管_每日开启', checked: false }],
+        商品自选: [
+          { id: '1875859981405339001', name: '千川乘方_计划A', checked: false },
+          { id: '1875859981405339002', name: '千川乘方_计划B', checked: false },
+        ],
+      }, clickLogRef),
+    });
+    drill.start();
+    const m = drill._internal._monitor;
+    await until(() => m.triggers.some((t) => t.evtType === 'trigger' && t.mode === 'dry'), 15000);
+    const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+    const logs = resp.body.logs.map((l) => l.msg).join('\n');
+    // 动作短语断言（不依赖 note 文本——note 里本来就有"将开启"字样）
+    assert.ok(/将开启 \d+ 条乘方计划/.test(logs), `开启演练必须显示"将开启 N 条乘方计划"，实际：\n${logs}`);
+    assert.ok(!/将暂停 \d+ 条乘方计划/.test(logs), `开启演练不得显示"将暂停 N 条乘方计划"（旧 bug），实际：\n${logs}`);
+    assert.ok(!/批次结果：unknown/.test(logs), `trigger 不得被误判为 unknown 批次，实际：\n${logs}`);
+    // 真实事件流：trigger 必须由 Monitor 代码路径产出且带显式 targetAction=enable
+    const trig = m.getEventStream(0).events.filter((e) => e.evtType === 'trigger' && e.mode === 'dry' && !e.failed);
+    assert.ok(trig.length >= 1, `事件流必须含开启演练 trigger，实际：${JSON.stringify(m.getEventStream(0).events.map((e) => e.evtType))}`);
+    assert.strictEqual(trig[trig.length - 1].targetAction, 'enable', 'Monitor 真实路径产出的开启 trigger 必须带 targetAction=enable');
+    // 演练零业务点击（开关/开启/删除一律不点）
+    assert.strictEqual((clickLogRef.v || []).length, 0, `演练必须零业务点击，实际：${JSON.stringify(clickLogRef.v)}`);
+    drill.stop();
+  } finally {
+    await browser.close().catch(() => {});
+  }
+});
+
+test('第三轮：真实 Monitor 超标 dry 暂停周期 → /logs 显示"将暂停 N 条"，不显示"将开启 N 条"', async () => {
+  const clock = makeClock(BASE_SH); // 09:00（08:00 后进入暂停巡查）
+  const timers = makeTimers();
+  const { chromium } = require(path.join(PROMO, 'node_modules/playwright'));
+  const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+  const clickLogRef = { v: null };
+  const browser = await chromium.launch({ headless: true, executablePath: EDGE });
+  try {
+    // cost 摘要的账户必须与店铺 accountId（fixture 身份）一致，否则身份核验会正确拦截
+    const readers = {
+      costReader: {
+        connected: true, kind: 'cost',
+        async readCostSummary() { return { ...mkSummary('cost', 10001, clock), accountId: '1710242295996424' }; },
+      },
+      orderReader: {
+        connected: true, kind: 'orders',
+        async readOrderSummary() { return mkSummary('orders', 100, clock); },
+      },
+      calls: { cost: 0, order: 0 },
+    };
+    const { drill } = makeDrill(clock, timers, {
+      readers,
+      cfg: { shops: [{ id: SHOP_ID, name: SHOP_ID, cookieFile: COOKIE_FILE, accountId: '1710242295996424', enabled: true }] },
+      chengfangOpener: makeFixtureOpener(browser, {
+        全店托管: [{ id: '184388555253250562', name: '全店托管_超标暂停', checked: true }],
+        商品自选: [
+          { id: '1875859981405339001', name: '千川乘方_计划A', checked: true },
+          { id: '1875859981405339002', name: '千川乘方_计划B', checked: true },
+        ],
+      }, clickLogRef),
+    });
+    drill.start();
+    const m = drill._internal._monitor;
+    await until(() => m.triggers.some((t) => t.evtType === 'trigger' && t.mode === 'dry' && t.targetAction === 'pause'), 15000);
+    const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+    const logs = resp.body.logs.map((l) => l.msg).join('\n');
+    assert.ok(/将暂停 \d+ 条乘方计划/.test(logs), `超标 dry 周期必须显示"将暂停 N 条乘方计划"，实际：\n${logs}`);
+    assert.ok(!/将开启 \d+ 条乘方计划/.test(logs), `超标 dry 周期不得显示"将开启 N 条乘方计划"，实际：\n${logs}`);
+    assert.ok(!/批次结果：unknown/.test(logs), `trigger 不得被误判为 unknown 批次，实际：\n${logs}`);
+    assert.strictEqual((clickLogRef.v || []).length, 0, '演练必须零业务点击');
+    drill.stop();
+  } finally {
+    await browser.close().catch(() => {});
+  }
+});
+
+test('第三轮：targetAction 缺失/未识别 → 显示"未知动作/待核实"，不被 outcome/note 文本误导', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.triggers = [];
+  // 历史形状/异常事件：无 targetAction，但 outcome/note 文本带"开启/enabled"字样（旧实现会据此误猜）
+  m._memPush(m.triggers, {
+    shopId: SHOP_ID, mode: 'dry',
+    costText: '9.99 元', orders: 9, targetCount: 4,
+    dryOutcome: 'all_enabled_confirmed',
+    note: '开启演练（历史事件形状：targetAction 缺失）',
+  }, 300, 'trigger');
+  const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+  const logs = resp.body.logs.map((l) => l.msg).join('\n');
+  assert.ok(logs.includes('未知动作/待核实'), `缺失 targetAction 必须如实显示"未知动作/待核实"，实际：\n${logs}`);
+  assert.ok(logs.includes('未按结果文本猜测'), '必须显式声明未做文本推断');
+  assert.ok(!/将开启 \d+ 条乘方计划/.test(logs), `不得被 outcome 文本误导为"将开启"，实际：\n${logs}`);
+  assert.ok(!/将暂停 \d+ 条乘方计划/.test(logs), `不得默认回落为"将暂停"，实际：\n${logs}`);
+  // 未识别的非法值同样不得猜测
+  m._memPush(m.triggers, {
+    shopId: SHOP_ID, mode: 'dry', targetAction: 'close',
+    costText: '1.00 元', orders: 1, targetCount: 2,
+  }, 300, 'trigger');
+  const resp2 = await callHttp(drill, 'GET', `/api/watch-drill/logs?since=${resp.body.seq}`);
+  const logs2 = resp2.body.logs.map((l) => l.msg).join('\n');
+  assert.ok(logs2.includes('未知动作/待核实'), `非法 targetAction 值必须显示"未知动作/待核实"，实际：\n${logs2}`);
+  assert.ok(!/将暂停 \d+ 条乘方计划/.test(logs2) && !/将开启 \d+ 条乘方计划/.test(logs2), `非法值不得映射为暂停/开启，实际：\n${logs2}`);
+});
+
+test('第三轮：真实 blocked-window trigger 带 targetAction → 显示动作标签与"未执行"原因', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.triggers = [];
+  // Monitor 真实路径的 blocked_window trigger 形状（已带 targetAction）
+  m._memPush(m.triggers, {
+    shopId: SHOP_ID, mode: 'real', targetAction: 'enable', blocked: 'window',
+    reason: '未到允许开启时段（每日 07:00–08:00，Asia/Shanghai）：不再发出新的开启请求', targetCount: 0,
+  }, 300, 'trigger');
+  const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+  const logs = resp.body.logs.map((l) => l.msg).join('\n');
+  const line = (resp.body.logs.find((l) => l.msg.includes('命中（真实）')) || {}).msg || '';
+  assert.ok(line, `必须转译真实命中事件，实际：\n${logs}`);
+  assert.ok(/将开启 0 条乘方计划/.test(line), `真实开启 trigger 必须带"将开启"动作标签，实际：\n${line}`);
+  assert.ok(!/将暂停/.test(line), `真实开启 trigger 不得显示"将暂停"，实际：\n${line}`);
+  assert.ok(line.includes('未执行：'), '被窗口拦下的真实 trigger 必须显示"未执行"与原因');
+  assert.ok(line.includes('未到允许开启时段'), '窗口原因必须可见');
+});
+
+// ══════════════════════════════════════════════════════════════
+// 14) 第三轮回归：index.html 徽标/门槛明细必须显示真实阻断原因（如 dryRun）
+//     （旧展示：三开+dryRun 时误显示"但开关未全开，暂不会操作"）
+//     同时校验公开仓库值守页面片段（watch-drill-tab.html）与运行页保持一致。
+// ══════════════════════════════════════════════════════════════
+const vm = require('vm');
+
+function extractWatchScript(htmlSrc, name) {
+  const blocks = [...htmlSrc.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((mm) => mm[1]);
+  const hit = blocks.filter((b) => b.includes('wdModeBadge') && b.includes('renderState'));
+  assert.strictEqual(hit.length, 1, `${name} 应恰好包含一个值守渲染脚本块，实际 ${hit.length} 个`);
+  return hit[0];
+}
+
+/** 在 Node VM 里以桩 DOM/fetch 运行值守脚本，返回渲染后的徽标与门槛明细。 */
+async function renderWatchUi(htmlSrc, name, state) {
+  const elements = {};
+  const mkEl = () => ({ textContent: '', className: '', innerHTML: '', style: {} });
+  for (const id of ['wdShopName', 'wdStatusBadge', 'wdToggleBtn', 'wdModeBadge', 'wdGates', 'wdLastCheck', 'wdNextRun', 'wdEnableToday', 'wdPhase', 'wdCost', 'wdOrders', 'wdPerOrder', 'wdConclusion', 'wdReason', 'wdError', 'wdLog']) {
+    elements[id] = mkEl();
+  }
+  const sandbox = {
+    document: { getElementById: (id) => elements[id] || mkEl(), hidden: true, querySelector: () => null },
+    setInterval: () => 0,
+    clearInterval: () => {},
+    fetch: (p) => Promise.resolve({
+      json: () => Promise.resolve(
+        String(p).includes('/api/watch-drill/state')
+          ? { ok: true, state }
+          : { ok: true, seq: 1, logs: [] },
+      ),
+    }),
+    console,
+  };
+  sandbox.window = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(extractWatchScript(htmlSrc, name), sandbox, { filename: `${name}#watch-script` });
+  await new Promise((r) => setImmediate(r)); // 让脚本启动时的 wdRefreshAll 异步链跑完
+  await new Promise((r) => setImmediate(r));
+  return { badgeText: elements.wdModeBadge.textContent, gatesHtml: elements.wdGates.innerHTML };
+}
+
+const GATES_ALL_ON_DRY = {
+  realMode: true, pauseEnabled: true, enableEnabled: true, dryRun: true,
+  pauseWillExecute: false, enableWillExecute: false,
+  pauseGateReason: 'execution.dryRun=true（演练模式，禁止真实暂停）',
+  enableGateReason: 'execution.dryRun=true（演练模式，禁止真实开启）',
+  blockedBy: ['execution.dryRun=true（演练）'],
+  scope: ['全店托管', '商品自选'], deleteAdEnabled: false,
+};
+
+test('第三轮：徽标回归 —— 三开 + dryRun=true → 点名 dryRun 阻断，不再误报"开关未全开"（运行页 + 公开片段一致）', async () => {
+  // 公开仓库副本中不存在 3443 运行页（index.html）时，只校验公开片段
+  const runtimeIndexPath = path.join(__dirname, '..', 'index.html');
+  const sources = [['watch-drill-tab.html(公开片段)', fs.readFileSync(path.join(PROMO, 'integrations/bill-manager/watch-drill-tab.html'), 'utf-8')]];
+  if (fs.existsSync(runtimeIndexPath)) sources.unshift(['index.html(运行页)', fs.readFileSync(runtimeIndexPath, 'utf-8')]);
+  for (const [name, src] of sources) {
+    const state = {
+      shopName: SHOP_ID, realMode: true, running: false, status: 'idle', statusText: '未启动',
+      gates: GATES_ALL_ON_DRY,
+    };
+    const { badgeText, gatesHtml } = await renderWatchUi(src, name, state);
+    assert.ok(/dryRun/.test(badgeText), `${name} 徽标必须点名 dryRun 阻断，实际：${badgeText}`);
+    assert.ok(!badgeText.includes('开关未全开'), `${name} 三开关全开时不得误报"开关未全开"，实际：${badgeText}`);
+    assert.ok(badgeText.includes('真实执行'), `${name} 徽标必须保留"真实执行"模式标识，实际：${badgeText}`);
+    assert.ok(gatesHtml.includes('dryRun=<b>true</b>'), `${name} 门槛明细必须展示 dryRun=true，实际：${gatesHtml}`);
+    assert.ok(/execution\.dryRun=true/.test(gatesHtml), `${name} 门槛明细必须展示被 dryRun 拦截的原因，实际：${gatesHtml}`);
+    assert.ok(gatesHtml.includes('不会执行'), `${name} dryRun 下必须显示不会执行，实际：${gatesHtml}`);
+  }
+});
+
+test('第三轮：徽标回归 —— 三开且无 dryRun → "会操作广告"；开关未开 → 如实点名开关（不误报 dryRun）', async () => {
+  const fragHtml = fs.readFileSync(path.join(PROMO, 'integrations/bill-manager/watch-drill-tab.html'), 'utf-8');
+  // 会执行
+  const r1 = await renderWatchUi(fragHtml, 'frag', {
+    shopName: SHOP_ID, realMode: true, running: true, status: 'waiting',
+    gates: {
+      realMode: true, pauseEnabled: true, enableEnabled: true, dryRun: false,
+      pauseWillExecute: true, enableWillExecute: true,
+      pauseGateReason: null, enableGateReason: null, blockedBy: [],
+      scope: ['全店托管', '商品自选'], deleteAdEnabled: false,
+    },
+  });
+  assert.ok(r1.badgeText.includes('会操作广告'), `三开且无 dryRun 应显示会操作广告，实际：${r1.badgeText}`);
+  assert.ok(!/阻断/.test(r1.badgeText), `无阻断时不得显示阻断字样，实际：${r1.badgeText}`);
+  // 开关未开（无 dryRun）
+  const r2 = await renderWatchUi(fragHtml, 'frag', {
+    shopName: SHOP_ID, realMode: true, running: false, status: 'idle',
+    gates: {
+      realMode: true, pauseEnabled: false, enableEnabled: false, dryRun: false,
+      pauseWillExecute: false, enableWillExecute: false,
+      pauseGateReason: 'monitor.chengfang.pauseEnabled 未开启（乘方暂停动作处于演练门禁）',
+      enableGateReason: 'monitor.chengfang.enableEnabled 未开启（乘方开启动作处于关闭门禁）',
+      blockedBy: ['暂停开关未开启', '开启开关未开启'],
+      scope: ['全店托管', '商品自选'], deleteAdEnabled: false,
+    },
+  });
+  assert.ok(/开关/.test(r2.badgeText), `开关未开时徽标应点名开关阻断，实际：${r2.badgeText}`);
+  assert.ok(!/dryRun/.test(r2.badgeText), `无 dryRun 时不得误报 dryRun 阻断，实际：${r2.badgeText}`);
+  // 演练模式（realMode=false）
+  const r3 = await renderWatchUi(fragHtml, 'frag', {
+    shopName: SHOP_ID, realMode: false, running: false, status: 'idle',
+    gates: {
+      realMode: false, pauseEnabled: true, enableEnabled: true, dryRun: true,
+      pauseWillExecute: false, enableWillExecute: false,
+      pauseGateReason: 'execution.realMode 未开启（演练模式不执行真实暂停）',
+      enableGateReason: null, blockedBy: ['realMode 未开启', 'execution.dryRun=true（演练）'],
+      scope: ['全店托管', '商品自选'], deleteAdEnabled: false,
+    },
+  });
+  assert.ok(r3.badgeText.includes('演练模式'), `realMode=false 应显示演练模式，实际：${r3.badgeText}`);
 });

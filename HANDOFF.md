@@ -1,3 +1,19 @@
+# HANDOFF — 推广值守展示层修复 · 第十三轮（2026-09-15 第三轮定点修复）
+
+> 交付日期：2026-09-15。**realMode=false、dryRun=true、pauseEnabled=false、enableEnabled=false 全程未变；本轮未启动值守/未启动监控、未点击任何真实开关/暂停/开启/删除、未重启 3443（PID 18920 保持运行）；删除路径零触碰。**
+> **历史标注（重要）**：本文件下方 r10–r12 段落中的「强制只读 / 只读演练」为**历史轮次语义**（当时 watch-drill 确为强制只读入口）。2026-09-15 起 3443「推广值守」已接入真实操作模式：是否真实操作广告由 `config.json` 的 fail-closed 门槛（`execution.realMode` + `execution.dryRun` + `monitor.chengfang.pauseEnabled/enableEnabled` + 上海时段）决定，`/api/watch-drill/state` 的 `gates.blockedBy` 如实展示阻断原因。阅读历史段落时按历史记录理解，不得以其覆盖当前 3443 真实门槛语义。
+> 基准：`DELIVERY_REPORT.md` 中部分提交编号为旧交接编号；实际以 Git HEAD 与 origin/main 为准（本轮起点 `2280cbc100b3a142780166a92299a88aba4a36f7`，本地与远端已核对一致）。
+
+## 0. 第十三轮修改明细（全部含回归测试）
+
+1. **watch-drill `describeTrigger` 动作映射**（电商助手 `bill-manager/watch-drill.js`，同步 `integrations/bill-manager/watch-drill.js`）：dry 分支曾硬编码「将暂停 N 条乘方计划」不读 `targetAction`，每日开启演练被误展示为「将暂停」。修复为显式映射：`targetAction==='pause'`→「将暂停」、`==='enable'`→「将开启」、缺失/未识别→「未知动作/待核实（未按结果文本猜测）」；真实 blocked trigger 追加「未执行：原因」。保持 `evtType` 显式事件分派不变。
+2. **Monitor 真实 trigger 补显式动作标签**（`src/engine/monitor.js`）：乘方暂停 `blocked_window`、乘方开启 `blocked_window`、历史全店路径（仅测试可达）三处 trigger 记录与对应审计补 `targetAction`，使值守侧无需猜测。
+3. **3443 徽标/门槛明细真实阻断原因**（`bill-manager/index.html`，同步重生成 `integrations/bill-manager/watch-drill-tab.html`）：三开关全开 + dryRun=true 时原误显示「但开关未全开，暂不会操作」；现徽标显示「真实执行 · 暂不会操作 · 阻断：<blockedBy 明细>」，门槛明细新增 `dryRun` 字段与 per-action 拦截原因（`pauseGateReason/enableGateReason`）。fail-closed 执行逻辑零改动。
+4. **可移植性**：`watch-drill.js` 与集成测试副本的主项目根目录改为候选探测（env `PROMO_GUARD_DIR` → 本机生产路径 → 公开仓库内相对位置），公开仓库副本可自举。
+5. **测试**：bill-manager `tests/watch-drill.test.js` 新增 6 用例（45→51，含两个真实 Monitor→事件流→`/api/watch-drill/logs` E2E：开启相位显示「将开启 N 条」且不显示「将暂停 N 条」/无「批次结果：unknown」；超标 dry 周期显示「将暂停 N 条」；targetAction 缺失不被 outcome 文本误导；real blocked trigger 带动作标签；徽标 VM 回归 ×2）。主项目新增 `test/watch-drill-tab.test.js`（6 用例，VM 真实运行片段 renderState）并在 `test/monitor-chengfang.test.js` 补 real trigger `targetAction` 断言 + 新增开启 blocked_window 用例；`package.json` 注册新测试文件。
+6. **验证**：推广控制 `npm test` **272/272**、`npm run check` 通过、`node evidence/codex-workbuddy-r3-verify.cjs` `allOk=true`；值守测试 **51/51**。
+7. **3443 加载状态**：`index.html` 按请求静态读取 → 徽标修复已在 3443 生效（已核实线上页面含新文案）；`watch-drill.js` 为进程启动时 require → `describeTrigger` 修复需重启 3443 才生效。当前 `running=false/idle`，重启实际影响面小，但按约定本轮不擅自重启（重启会中断：该进程内的值守调度与 `/api/watch-drill/*` 日志内存态）。
+
 # HANDOFF — 乘方自动暂停 + 每日 07:00 自动开启 · 第十二轮
 
 > 交付日期：2026-09-14（第十二轮：乘方自动暂停之上新增"每日 07:00 自动开启"）。**realMode=false、pauseEnabled=false、enableEnabled=false 全程未变；本轮未启动值守/监控服务；未点击任何真实开关/暂停/删除；未提交 Git。**

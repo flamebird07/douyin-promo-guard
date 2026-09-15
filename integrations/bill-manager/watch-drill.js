@@ -29,7 +29,21 @@
 const fs = require('fs');
 const path = require('path');
 
-const PROMO_GUARD_DIR = process.env.PROMO_GUARD_DIR || 'C:/Users/Administrator/Documents/ChatGPT/推广广告控制';
+// 推广控制主项目根目录解析：优先环境变量；其次本机生产路径；最后按公开仓库内
+// 相对位置（integrations/bill-manager 向上两级 = 仓库根）探测，使公开仓库中的
+// 副本在无生产路径的机器上也能装配同一份生产模块。
+function resolvePromoGuardDir() {
+  const candidates = [
+    process.env.PROMO_GUARD_DIR,
+    'C:/Users/Administrator/Documents/ChatGPT/推广广告控制',
+    path.join(__dirname, '..', '..'),
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try { if (fs.existsSync(path.join(c, 'src/engine/monitor.js'))) return c; } catch (_) { /* 探测失败换下一个 */ }
+  }
+  return candidates[0];
+}
+const PROMO_GUARD_DIR = resolvePromoGuardDir();
 const promo = (rel) => require(path.join(PROMO_GUARD_DIR, rel));
 
 const { shanghaiDate, shanghaiClockText } = promo('src/lib/time.js');
@@ -364,17 +378,36 @@ function createWatchDrill(opts = {}) {
     return head + `${body}；整数分判定 ${cost} 分 ≤ ${orders}×${thr} 分（阈值 ${centsToYuan(j.expectedCents)} 元）→ 未超标，不暂停乘方。`;
   }
 
-  /** 命中事件（演练枚举 / 真实触发）。 */
+  /**
+   * 命中事件（演练枚举 / 真实触发）。
+   *
+   * 2026-09-15 修复（第三轮）：dry 分支曾硬编码"将暂停 N 条乘方计划"，
+   * 不读 `targetAction`，于是每日开启演练（targetAction='enable'）被误展示为
+   * "将暂停"。现在动作标签只认**显式 targetAction 字段**：
+   *   - 'pause' → 将暂停；'enable' → 将开启；
+   *   - 缺失/未知 → 如实标注"未知动作/待核实"，绝不从 outcome/note 文本猜测。
+   * 真实 trigger（如被时间窗口拦下）同样带 targetAction（Monitor 侧已补字段）。
+   */
   function describeTrigger(t) {
     if (t.failed) {
       return `命中处理失败：${t.reason || '未知原因'}${t.dryOutcome ? `（${t.dryOutcome}）` : ''}`;
     }
+    const act = (t.targetAction === 'pause' || t.targetAction === 'enable') ? t.targetAction : null;
+    const dataBits = [];
+    if (t.costText !== undefined) dataBits.push(`费用 ${t.costText}`);
+    if (t.orders !== undefined) dataBits.push(`订单 ${t.orders} 单`);
+    const dataText = dataBits.length ? `${dataBits.join('，')}，` : '';
+    const actionText = act === 'pause'
+      ? `将暂停 ${t.targetCount || 0} 条乘方计划`
+      : (act === 'enable'
+        ? `将开启 ${t.targetCount || 0} 条乘方计划`
+        : `未知动作/待核实（targetAction ${t.targetAction === undefined ? '缺失' : `为未识别值 ${JSON.stringify(t.targetAction)}`}，未按结果文本猜测），目标 ${t.targetCount || 0} 条乘方计划`);
     if (t.mode === 'dry') {
-      return `命中（演练）：费用 ${t.costText}，订单 ${t.orders} 单，`
-        + `将暂停 ${t.targetCount || 0} 条乘方计划（演练不点击）${t.note ? `；${t.note}` : ''}`;
+      return `命中（演练）：${dataText}${actionText}（演练不点击）${t.note ? `；${t.note}` : ''}`;
     }
-    return `命中（真实）：费用 ${t.costText}，订单 ${t.orders} 单，`
-      + `目标 ${t.targetCount || 0} 条乘方计划${t.note ? `；${t.note}` : ''}`;
+    return `命中（真实）：${dataText}${actionText}`
+      + (t.blocked ? `（未执行：${t.reason || '被门槛/窗口拦下'}）` : '')
+      + (t.note ? `；${t.note}` : '');
   }
 
   /** 错误事件（失败原因，界面必须可见）。 */

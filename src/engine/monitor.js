@@ -873,8 +873,9 @@ class Monitor {
     });
     if (batch.outcome === 'blocked_window') {
       this.schedule.lastWindowBlockReason = batch.reason;
-      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason, targetCount: 0 }, undefined, 'trigger');
-      this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason });
+      // 真实 trigger 也必须带显式动作标签（值守侧 describeTrigger 只认 targetAction，不猜）
+      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason: batch.reason, targetCount: 0 }, undefined, 'trigger');
+      this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason: batch.reason });
       return { status: 'window_blocked', reason: batch.reason };
     }
     if (batch.outcome === 'blocked_stopped') {
@@ -1017,8 +1018,9 @@ class Monitor {
     if (batch.outcome === 'blocked_window') {
       this.schedule.lastWindowBlockReason = batch.reason;
       this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'execute', reason: batch.reason, blocked: 'window' });
-      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason, targetCount: 0 }, undefined, 'trigger');
-      this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason });
+      // 真实 trigger 也必须带显式动作标签（值守侧 describeTrigger 只认 targetAction，不猜）
+      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', targetAction: 'enable', blocked: 'window', reason: batch.reason, targetCount: 0 }, undefined, 'trigger');
+      this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', targetAction: 'enable', blocked: 'window', reason: batch.reason });
       return { status: 'window_blocked', reason: batch.reason };
     }
     if (batch.outcome === 'blocked_stopped') {
@@ -1084,6 +1086,8 @@ class Monitor {
       ];
       const triggerRec = {
         shopId: shopCfg.id, mode: 'dry',
+        // 与本路径批次的 actionType 词汇一致（legacy 关闭批次默认 actionType='pause'）
+        targetAction: 'pause',
         reason: data.evaluation.reason,
         businessDate: data.cost.businessDate,
         costText: `${centsToYuan(data.cost.valueCents)} 元`,
@@ -1111,8 +1115,8 @@ class Monitor {
       const hh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
       const reason = `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：已读取并记录，未执行真实关闭（手动检查不绕过时间限制）`;
       this.schedule.lastWindowBlockReason = reason;
-      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', blocked: 'window', reason, targetCount: activeTargets.length }, undefined, 'trigger');
-      this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', blocked: 'window', reason });
+      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason, targetCount: activeTargets.length }, undefined, 'trigger');
+      this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason });
       return { status: 'window_blocked', reason };
     }
     this.schedule.lastWindowBlockReason = null;

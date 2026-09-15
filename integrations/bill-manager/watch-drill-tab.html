@@ -7,7 +7,7 @@
     #tab-watchdrill .wd-waiting08 { background: #ede9fe; color: #6d28d9; }
     #tab-watchdrill .wd-failed { background: #fee2e2; color: #dc2626; }
     #tab-watchdrill .wd-stopping { background: #ffedd5; color: #c2410c; }
-    #tab-watchdrill .wd-lock { font-size: 12px; color: #16a34a; background: #ecfdf5; border: 1px solid #bbf7d0; border-radius: 6px; padding: 4px 10px; display: inline-block; }
+    #tab-watchdrill .wd-lock { font-size: 12px; color: #4338ca; background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 6px; padding: 4px 10px; display: inline-block; }
     #tab-watchdrill .wd-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 16px; margin-top: 10px; }
     #tab-watchdrill .wd-cell { font-size: 13px; }
     #tab-watchdrill .wd-cell .k { color: #888; font-size: 12px; }
@@ -23,7 +23,7 @@
   </style>
   <div class="card">
     <div class="card-title">推广值守
-      <span class="wd-lock" id="wdModeBadge" style="margin-left:10px;">模式待核实</span>
+      <span id="wdModeBadge" class="wd-lock" style="margin-left:10px;">加载中…</span>
     </div>
     <div class="form-row">
       <span class="form-label">店铺</span>
@@ -34,9 +34,7 @@
       <button class="btn" style="background:#eee;color:#666;" onclick="wdRefreshAll()">🔄 刷新</button>
     </div>
     <div id="wdError" style="display:none;font-size:13px;color:#dc2626;margin:6px 0 0;padding:8px 12px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;"></div>
-    <div id="wdGateBox" style="font-size:12.5px;margin:8px 0 0;padding:8px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">
-      <div id="wdGateText">门槛：读取中…</div>
-    </div>
+    <div id="wdGates" style="font-size:12.5px;color:#555;margin:6px 0 0;padding:8px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;"></div>
     <div class="wd-grid">
       <div class="wd-cell"><div class="k">最近检查时间</div><div class="v" id="wdLastCheck">—</div></div>
       <div class="wd-cell"><div class="k">下次检查时间</div><div class="v" id="wdNextRun">—</div></div>
@@ -44,14 +42,14 @@
       <div class="wd-cell"><div class="k">全店订单数</div><div class="v" id="wdOrders">—</div></div>
       <div class="wd-cell"><div class="k">每单成本</div><div class="v" id="wdPerOrder">—</div></div>
       <div class="wd-cell"><div class="k">判断结果</div><div class="v" id="wdConclusion">—</div></div>
+      <div class="wd-cell"><div class="k">今日开启（乘方）</div><div class="v" id="wdEnableToday">—</div></div>
+      <div class="wd-cell"><div class="k">调度 / 下次触发</div><div class="v" id="wdPhase">—</div></div>
     </div>
     <div id="wdReason" style="font-size:12.5px;color:#666;margin-top:8px;"></div>
-    <div id="wdGap" style="display:none;font-size:12.5px;color:#b45309;margin-top:6px;"></div>
     <p style="font-size:12px;color:#999;margin:8px 0 0;">
-      规则：每天 07:00 开启全部乘方计划；08:00 后每 30 分钟检查，费用=千川「账户整体消耗」，
-      订单=罗盘经营概况「全店+实时」成交订单数；费用整数分 &gt; 订单数×100 分才超标
-      （恰好 1 元/单不超标）→ 暂停乘方。是否真的操作广告以「实际门槛」为准（上表如实显示），
-      本系统绝不存在删除广告的代码路径。
+      规则：费用=千川「账户整体消耗」，订单=罗盘经营概况「全店+实时」成交订单数；
+      费用整数分 &gt; 订单数×100 分才超标（恰好 1 元/单不超标）；每天 07:00 开启全部乘方计划，
+      08:00 后每 30 分钟检查一次，超标即暂停乘方（全店托管 + 商品自选）。<b>绝不删除广告。</b>
     </p>
   </div>
   <div class="card">
@@ -90,64 +88,17 @@
           return { text: '未启动', cls: 'wd-idle' };
         }
         switch (s.status) {
-          case 'reading': return { text: '读取中', cls: 'wd-reading' };
+          case 'reading': return { text: '检查中', cls: 'wd-reading' };
+          case 'enable_window': return { text: '每日开启中', cls: 'wd-reading' };
           case 'waiting': return { text: '等待下一轮', cls: 'wd-waiting' };
-          case 'waiting08': return { text: '等待08:00', cls: 'wd-waiting08' };
+          case 'waiting08': return { text: '等待下一轮', cls: 'wd-waiting08' };
           case 'failed': return { text: '读取失败', cls: 'wd-failed' };
           default: return { text: s.statusText || s.status, cls: 'wd-idle' };
         }
       }
 
-      function renderGates(s) {
-        var badge = $('wdModeBadge');
-        var box = $('wdGateText');
-        var g = s && s.gates;
-        if (!g) {
-          badge.textContent = '模式待核实';
-          badge.style.background = '#f1f5f9'; badge.style.color = '#64748b';
-          box.textContent = '门槛：尚未读取配置（待核实，不臆断为演练安全）。';
-          return;
-        }
-        // 模式徽标：未知 → 待核实（不得默认宣称演练安全）
-        if (g.modeKnown === false) {
-          badge.textContent = '模式待核实';
-          badge.style.background = '#fef3c7'; badge.style.color = '#b45309';
-        } else if (g.realMode === true) {
-          badge.textContent = '真实执行';
-          badge.style.background = '#fee2e2'; badge.style.color = '#dc2626';
-        } else {
-          badge.textContent = '演练模式 · 不操作广告';
-          badge.style.background = '#ecfdf5'; badge.style.color = '#16a34a';
-        }
-        // 门槛明细：两个 WillExecute 必须与真实许可（含 dryRun）一致
-        var pauseTxt = g.pauseWillExecute ? '会执行' : '不会执行';
-        var enableTxt = g.enableWillExecute ? '会执行' : '不会执行';
-        var parts = [
-          '实际门槛：真实暂停 ' + pauseTxt + '，真实开启 ' + enableTxt,
-          '（realMode=' + !!g.realMode + ' / 暂停开关=' + !!g.pauseEnabled
-            + ' / 开启开关=' + !!g.enableEnabled + ' / dryRun=' + !!g.dryRun + '）',
-        ];
-        if (!g.pauseWillExecute && g.pauseGateReason) parts.push('；暂停被拦：' + g.pauseGateReason);
-        if (!g.enableWillExecute && g.enableGateReason) parts.push('；开启被拦：' + g.enableGateReason);
-        parts.push('；删除广告=永不执行。');
-        box.textContent = parts.join('');
-      }
-
-      function renderGap(gap) {
-        var el = $('wdGap');
-        if (gap && gap.droppedCount > 0) {
-          el.style.display = 'block';
-          el.textContent = '⚠ 日志缺口：自上次同步后事件缓存发生裁剪，共丢失 ' + gap.droppedCount
-            + ' 条事件（后续事件继续同步；完整历史请查阅审计文件）。';
-        } else {
-          el.style.display = 'none';
-          el.textContent = '';
-        }
-      }
-
       function renderState(s) {
         if (!s) return;
-        renderGates(s);
         var st = statusMeta(s);
         $('wdShopName').textContent = s.shopName || '—';
         var badge = $('wdStatusBadge');
@@ -161,8 +112,57 @@
           btn.textContent = '启动值守';
           btn.className = 'btn btn-primary';
         }
+        // 模式徽标：让用户一眼看出此刻启动值守是否会真的操作广告
+        var mb = $('wdModeBadge');
+        var g = s.gates || {};
+        // 真实阻断原因（优先用后端 blockedBy；缺失时按同源规则在本地推导，不臆造）
+        var blockers = [];
+        if (Array.isArray(g.blockedBy) && g.blockedBy.length) {
+          blockers = g.blockedBy.slice();
+        } else if (s.realMode && !(g.pauseWillExecute || g.enableWillExecute)) {
+          if (g.dryRun === true) blockers.push('execution.dryRun=true（演练）');
+          if (g.pauseEnabled !== true || g.enableEnabled !== true) blockers.push('开关未全开');
+        }
+        if (s.realMode) {
+          mb.textContent = (g.pauseWillExecute || g.enableWillExecute)
+            ? '真实执行 · 会操作广告'
+            : ('真实执行 · 暂不会操作 · 阻断：' + (blockers.join('；') || '执行许可未通过（详见门槛明细）'));
+          mb.style.background = '#fee2e2'; mb.style.color = '#b91c1c'; mb.style.borderColor = '#fecaca';
+        } else {
+          mb.textContent = '演练模式 · 不操作广告';
+          mb.style.background = '#eef2ff'; mb.style.color = '#4338ca'; mb.style.borderColor = '#c7d2fe';
+        }
+        // 门槛明细（fail-closed 依据；必须含真实阻断原因，如 dryRun）
+        var fb = function (v) { return v === true ? 'true' : (v === false ? 'false' : '未知'); };
+        var why = function (will, reason) {
+          return will ? '会执行' : ('不会执行' + (reason ? '（' + esc(reason) + '）' : ''));
+        };
+        $('wdGates').innerHTML = s.gates
+          ? ('真实执行门槛：realMode=<b>' + esc(fb(g.realMode)) + '</b>'
+             + ' / dryRun=<b>' + esc(fb(g.dryRun)) + '</b>'
+             + ' / 暂停开关=<b>' + esc(fb(g.pauseEnabled)) + '</b>'
+             + ' / 开启开关=<b>' + esc(fb(g.enableEnabled)) + '</b>'
+             + ' ｜ 真实暂停：<b style="color:' + (g.pauseWillExecute ? '#b91c1c' : '#16a34a') + '">' + why(g.pauseWillExecute, g.pauseGateReason) + '</b>'
+             + ' · 真实开启：<b style="color:' + (g.enableWillExecute ? '#b91c1c' : '#16a34a') + '">' + why(g.enableWillExecute, g.enableGateReason) + '</b>'
+             + (blockers.length ? ' ｜ 当前阻断：' + esc(blockers.join('；')) : '')
+             + ' ｜ 控制范围：' + esc((g.scope || []).join(' + ') || '（未配置）')
+             + ' ｜ 删除广告：<b style="color:#16a34a">永不执行</b>')
+          : '真实执行门槛：加载中…';
         $('wdLastCheck').textContent = fmtTime(s.lastCheckAt);
         $('wdNextRun').textContent = fmtTime(s.nextRunAt);
+        // 今日开启相位（按店铺+上海日期，成功才算完成）
+        var ep = s.enablePhaseToday || [];
+        if (!ep.length) {
+          $('wdEnableToday').textContent = '—';
+        } else {
+          $('wdEnableToday').textContent = ep.map(function (it) {
+            var r = it.record || {};
+            var lbl = { in_progress: '执行中', success: '已成功', failed: '失败', unknown: '结果未知', dry_done: '演练完成' }[r.status] || r.status;
+            return it.shopId + '：' + lbl;
+          }).join('；');
+        }
+        $('wdPhase').textContent = (s.phase ? ('相位 ' + s.phase) : '—')
+          + (s.windowBlockReason ? ('（' + s.windowBlockReason + '）') : '');
         var r = s.lastRound;
         if (r) {
           $('wdCost').textContent = (r.costCents == null) ? '—' : (r.costCents / 100).toFixed(2) + ' 元';
@@ -171,7 +171,7 @@
             ? '约 ' + (r.costCents / r.orders / 100).toFixed(2) + ' 元/单（展示值，判定用整数分）'
             : '—';
           var concl = $('wdConclusion');
-          if (r.conclusion === 'over') { concl.textContent = '超标'; concl.className = 'v wd-concl-over'; }
+          if (r.conclusion === 'over') { concl.textContent = '超标（应暂停乘方）'; concl.className = 'v wd-concl-over'; }
           else if (r.conclusion === 'under') { concl.textContent = '未超标'; concl.className = 'v wd-concl-ok'; }
           else { concl.textContent = r.conclusionText || '本轮无法判断'; concl.className = 'v wd-concl-unknown'; }
           $('wdReason').textContent = r.reason ? ('依据：' + r.reason) : '';
@@ -209,8 +209,6 @@
           if (d && d.ok) renderState(d.state);
           return api('GET', '/api/watch-drill/logs?since=' + lastSeq).then(function (ld) {
             if (ld && ld.ok) {
-              // 缺口优先报告（真实 droppedCount），再追加日志
-              renderGap(ld.gap || (ld.droppedCount ? { droppedCount: ld.droppedCount } : null));
               lastSeq = ld.seq || lastSeq;
               renderLogs(ld.logs);
             }

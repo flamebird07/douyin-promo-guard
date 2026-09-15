@@ -711,6 +711,27 @@ test('自动开启调度：监控未启动 → 手动 pollOnce（07:00）也不�
   // 但绝不允许任何执行动作（开启/暂停均未发出）
   assert.ok(monitor.triggers.length >= 1, '暂停路径窗口阻止命中记录');
   assert.ok(monitor.triggers.every((t) => t.blocked === 'window' && t.mode === 'real'), '仅窗口阻止记录，无任何执行');
+  // 第三轮回归：真实 trigger 必须带显式动作标签（值守侧 describeTrigger 只认 targetAction，不猜）
+  assert.ok(monitor.triggers.every((t) => t.targetAction === 'pause'),
+    `真实暂停 trigger 必须带 targetAction='pause'，实际：${JSON.stringify(monitor.triggers.map((t) => t.targetAction))}`);
+});
+
+test('第三轮：真实开启路径被窗口拦下 → trigger 带 targetAction=enable（动作标签不得缺失）', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '08:30'));
+  const { monitor, track } = await setupChengfangMonitor(t, {
+    clock,
+    monitorChengfang: { pauseEnabled: true, enableEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
+  });
+  // 直接驱动 Monitor 的单店铺开启相位（08:30 已过开启窗口 [07:00,08:00)）→
+  // runner 集中门槛拦截 → blocked_window trigger（真实代码路径，非手工塞事件）
+  await monitor._runShopEnablePhase(monitor.config.shops[0], { aborted: false });
+  const tr = monitor.triggers.find((x) => x.mode === 'real' && x.blocked === 'window');
+  assert.ok(tr, `必须产生真实 blocked_window trigger，实际：${JSON.stringify(monitor.triggers)}`);
+  assert.strictEqual(tr.targetAction, 'enable', '真实开启 trigger 必须带 targetAction=enable');
+  assert.match(tr.reason || '', /时段|窗口|08:00|07:00/);
+  assert.strictEqual(track.sessions, 0, '窗口拦截零页面会话');
+  assert.strictEqual(monitor.actions.length, 0, '零动作');
 });
 
 test('自动开启调度：enableEnabled=false → 07:00 相位 blocked，零页面会话、零动作', async (t) => {

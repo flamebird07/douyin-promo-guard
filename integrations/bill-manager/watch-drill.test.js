@@ -23,14 +23,21 @@ const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
 
-const { createWatchDrill, scrub } = require('../watch-drill');
+// 被测模块：运行目录布局在上级（tests/ → ../watch-drill.js），
+// 公开仓库集成副本与测试同目录（→ ./watch-drill.js），按存在性探测。
+const WATCH_DRILL_MODULE = [
+  path.join(__dirname, '..', 'watch-drill.js'),
+  path.join(__dirname, 'watch-drill.js'),
+].find((p) => fs.existsSync(p));
+if (!WATCH_DRILL_MODULE) throw new Error('未找到被测模块 watch-drill.js');
+const { createWatchDrill, scrub } = require(WATCH_DRILL_MODULE);
 
 // 推广控制主项目根目录：优先环境变量，其次本机生产路径，最后公开仓库内相对位置
-// （integrations/bill-manager 向上三级 = 仓库根），保证公开仓库中的副本可自举运行。
+// （integrations/bill-manager 向上两级 = 仓库根），保证公开仓库中的副本可自举运行。
 const PROMO = [
   process.env.PROMO_GUARD_DIR,
   'C:/Users/Administrator/Documents/ChatGPT/推广广告控制',
-  path.join(__dirname, '..', '..', '..'),
+  path.join(__dirname, '..', '..'),
 ].filter(Boolean).find((p) => fs.existsSync(path.join(p, 'src/engine/monitor.js')));
 if (!PROMO) throw new Error('未找到推广控制主项目（src/engine/monitor.js）');
 const timeLib = require(path.join(PROMO, 'src/lib/time.js'));
@@ -195,7 +202,7 @@ test('创建后默认未启动、无日志、不安排任何定时器（不自�
 });
 
 test('watch-drill 模块自身不含删除广告的操作代码路径', () => {
-  const src = fs.readFileSync(require.resolve('../watch-drill'), 'utf-8');
+  const src = fs.readFileSync(WATCH_DRILL_MODULE, 'utf-8');
   // 去掉注释后再检查，避免把"本模块不含删除路径"这类说明文字误判为违规
   const code = src
     .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -209,7 +216,7 @@ test('watch-drill 模块自身不含删除广告的操作代码路径', () => {
 });
 
 test('watch-drill 委托推广控制 Monitor（不重复实现调度/乘方链路）', () => {
-  const src = fs.readFileSync(require.resolve('../watch-drill'), 'utf-8');
+  const src = fs.readFileSync(WATCH_DRILL_MODULE, 'utf-8');
   assert.ok(/src\/engine\/monitor\.js/.test(src), '应装配推广控制 Monitor');
   assert.ok(!/setTimeout\(.*fireRound/s.test(src), '不应保留自研轮次调度');
 });

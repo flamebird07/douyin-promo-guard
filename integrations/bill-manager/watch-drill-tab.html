@@ -22,8 +22,8 @@
     #tab-watchdrill .wd-logbox .lvl-info { color: #93c5fd; }
   </style>
   <div class="card">
-    <div class="card-title">推广值守演练
-      <span class="wd-lock" style="margin-left:10px;">只读演练 · 不操作广告</span>
+    <div class="card-title">推广值守
+      <span class="wd-lock" id="wdModeBadge" style="margin-left:10px;">模式待核实</span>
     </div>
     <div class="form-row">
       <span class="form-label">店铺</span>
@@ -34,6 +34,9 @@
       <button class="btn" style="background:#eee;color:#666;" onclick="wdRefreshAll()">🔄 刷新</button>
     </div>
     <div id="wdError" style="display:none;font-size:13px;color:#dc2626;margin:6px 0 0;padding:8px 12px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;"></div>
+    <div id="wdGateBox" style="font-size:12.5px;margin:8px 0 0;padding:8px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">
+      <div id="wdGateText">门槛：读取中…</div>
+    </div>
     <div class="wd-grid">
       <div class="wd-cell"><div class="k">最近检查时间</div><div class="v" id="wdLastCheck">—</div></div>
       <div class="wd-cell"><div class="k">下次检查时间</div><div class="v" id="wdNextRun">—</div></div>
@@ -43,9 +46,12 @@
       <div class="wd-cell"><div class="k">判断结果</div><div class="v" id="wdConclusion">—</div></div>
     </div>
     <div id="wdReason" style="font-size:12.5px;color:#666;margin-top:8px;"></div>
+    <div id="wdGap" style="display:none;font-size:12.5px;color:#b45309;margin-top:6px;"></div>
     <p style="font-size:12px;color:#999;margin:8px 0 0;">
-      规则：费用=千川「账户整体消耗」，订单=罗盘经营概况「全店+实时」成交订单数；
-      费用整数分 &gt; 订单数×100 分才超标（恰好 1 元/单不超标）。本页为强制演练：只评估数据，绝不暂停/开启/删除任何广告。
+      规则：每天 07:00 开启全部乘方计划；08:00 后每 30 分钟检查，费用=千川「账户整体消耗」，
+      订单=罗盘经营概况「全店+实时」成交订单数；费用整数分 &gt; 订单数×100 分才超标
+      （恰好 1 元/单不超标）→ 暂停乘方。是否真的操作广告以「实际门槛」为准（上表如实显示），
+      本系统绝不存在删除广告的代码路径。
     </p>
   </div>
   <div class="card">
@@ -92,8 +98,56 @@
         }
       }
 
+      function renderGates(s) {
+        var badge = $('wdModeBadge');
+        var box = $('wdGateText');
+        var g = s && s.gates;
+        if (!g) {
+          badge.textContent = '模式待核实';
+          badge.style.background = '#f1f5f9'; badge.style.color = '#64748b';
+          box.textContent = '门槛：尚未读取配置（待核实，不臆断为演练安全）。';
+          return;
+        }
+        // 模式徽标：未知 → 待核实（不得默认宣称演练安全）
+        if (g.modeKnown === false) {
+          badge.textContent = '模式待核实';
+          badge.style.background = '#fef3c7'; badge.style.color = '#b45309';
+        } else if (g.realMode === true) {
+          badge.textContent = '真实执行';
+          badge.style.background = '#fee2e2'; badge.style.color = '#dc2626';
+        } else {
+          badge.textContent = '演练模式 · 不操作广告';
+          badge.style.background = '#ecfdf5'; badge.style.color = '#16a34a';
+        }
+        // 门槛明细：两个 WillExecute 必须与真实许可（含 dryRun）一致
+        var pauseTxt = g.pauseWillExecute ? '会执行' : '不会执行';
+        var enableTxt = g.enableWillExecute ? '会执行' : '不会执行';
+        var parts = [
+          '实际门槛：真实暂停 ' + pauseTxt + '，真实开启 ' + enableTxt,
+          '（realMode=' + !!g.realMode + ' / 暂停开关=' + !!g.pauseEnabled
+            + ' / 开启开关=' + !!g.enableEnabled + ' / dryRun=' + !!g.dryRun + '）',
+        ];
+        if (!g.pauseWillExecute && g.pauseGateReason) parts.push('；暂停被拦：' + g.pauseGateReason);
+        if (!g.enableWillExecute && g.enableGateReason) parts.push('；开启被拦：' + g.enableGateReason);
+        parts.push('；删除广告=永不执行。');
+        box.textContent = parts.join('');
+      }
+
+      function renderGap(gap) {
+        var el = $('wdGap');
+        if (gap && gap.droppedCount > 0) {
+          el.style.display = 'block';
+          el.textContent = '⚠ 日志缺口：自上次同步后事件缓存发生裁剪，共丢失 ' + gap.droppedCount
+            + ' 条事件（后续事件继续同步；完整历史请查阅审计文件）。';
+        } else {
+          el.style.display = 'none';
+          el.textContent = '';
+        }
+      }
+
       function renderState(s) {
         if (!s) return;
+        renderGates(s);
         var st = statusMeta(s);
         $('wdShopName').textContent = s.shopName || '—';
         var badge = $('wdStatusBadge');
@@ -155,6 +209,8 @@
           if (d && d.ok) renderState(d.state);
           return api('GET', '/api/watch-drill/logs?since=' + lastSeq).then(function (ld) {
             if (ld && ld.ok) {
+              // 缺口优先报告（真实 droppedCount），再追加日志
+              renderGap(ld.gap || (ld.droppedCount ? { droppedCount: ld.droppedCount } : null));
               lastSeq = ld.seq || lastSeq;
               renderLogs(ld.logs);
             }

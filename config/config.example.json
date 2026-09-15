@@ -1,5 +1,5 @@
 {
-  "_说明": "首版配置（2026-09-13）。店铺与数据入口均为用户确认/页面实测值：费用=抖店首页顶部『巨量千川』→账户整体消耗(元)（统计周期=当天）；订单=首页『成交订单数』→电商罗盘经营概况（售卖类型=全店 且 日期=实时）。真实执行 realMode 默认关闭。",
+  "_说明": "示例配置（2026-09-15 更新）。店铺与数据入口均为用户确认/页面实测值：费用=抖店首页顶部『巨量千川』→账户整体消耗(元)（统计周期=当天）；订单=首页『成交订单数』→电商罗盘经营概况（售卖类型=全店 且 日期=实时）。乘方（推广值守）主链路：每天 07:00 开启全部乘方计划，08:00 后每 30 分钟检查，每单成本严格超过 1 元即暂停乘方；绝不删除广告。真实执行 realMode 默认关闭，且 dryRun 默认为 true（双重 fail-closed）。",
   "shops": [
     {
       "id": "瑾漂亮潮流服饰",
@@ -33,6 +33,7 @@
   "schedule": { "dailyStartHour": 8, "intervalMinutes": 30, "timezone": "Asia/Shanghai" },
   "execution": {
     "dryRun": true,
+    "dryRun_说明": "演练开关（fail-closed 第二道）：true 时即使 realMode 与开关全开，执行器仍零点击，页面门槛会如实显示『不会执行』",
     "realMode": false,
     "realMode_说明": "真实执行开关，默认关闭；开启前需人工确认且千川开关点击路径须先经真实验证",
     "maxRetries": 2,
@@ -52,7 +53,17 @@
     "adListDataSource": "qianchuan",
     "qianchuan": {
       "adTypes": ["uni_promotion", "standard", "brand"],
-      "adTypes_说明": "已接入只读读取的投放类型。brand 已实测为空清单（共0条，确认无对象）；乘方（overall）控制对象未定位——覆盖缺口，阻止全店结论，待平台侧确认乘方托管计划的管理位置"
+      "adTypes_说明": "已接入只读读取的投放类型。brand 已实测为空清单（共0条，确认无对象）"
+    },
+    "chengfang": {
+      "scope": ["全店托管", "商品自选"],
+      "scope_说明": "乘方控制范围（推广值守主链路）。页面实测两个 Tab：全店托管 / 商品自选；两者逐页读取并核验身份",
+      "pauseEnabled": false,
+      "pauseEnabled_说明": "真实暂停开关（fail-closed 第一道）：false 时真实暂停被拦截，页面门槛如实显示『不会执行』",
+      "enableEnabled": false,
+      "enableEnabled_说明": "真实开启开关（每日 07:00 相位）：false 时真实开启被拦截",
+      "enableHour": 7,
+      "enableHour_说明": "每日开启相位起始小时（Asia/Shanghai）；开启窗口为 enableHour 起至 dailyStartHour 前"
     }
   },
   "login": {

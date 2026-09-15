@@ -85,6 +85,7 @@ function createWatchDrill(opts = {}) {
     _now: opts.nowFn || (() => Date.now()),
     _monitor: null,
     _unsubscribe: null,
+    _config: opts.config || null,   // 只读配置缓存（供首次启动前展示真实模式）
     // ── 增量游标（2026-09-15 修复第 1 项）──────────────────────────────
     // 旧行为：`_lastActionsSeen = list.length` 这类**基于有界数组长度**的游标。
     // 数组会被 Monitor 裁剪（长度封顶），一旦被裁剪，`list.length` 不再增长，
@@ -144,23 +145,74 @@ function createWatchDrill(opts = {}) {
    */
   function computeGates() {
     const m = drill._monitor;
-    const cfg = (m && m.config) || {};
+    // 未启动（无 Monitor）时也要读配置展示真实模式与门槛；
+    // 但读取配置**绝不**启动调度/浏览器/广告动作（这里只做纯函数式读取）。
+    const cfg = (m && m.config) || drill._config || {};
     const cf = (cfg.monitor && cfg.monitor.chengfang) || {};
+    const exec = cfg.execution || {};
+
+    // 2026-09-15 修复第 2 项（第二轮）：复用**与执行器完全一致**的许可判断。
+    // 旧行为：`pauseWillExecute = realMode && pauseEnabled` —— 只看 realMode 与开关，
+    // **不含 dryRun**。于是"三开关全开 + dryRun=true"时页面显示"会执行"，
+    // 而执行器（chengfang-gate）实际以 dryRun 拒绝 → 展示与执行不一致（危险误导）。
+    // 修复：直接调用 chengfang-gate 的 resolveChengfang*Allowed（含 dryRun 检查），
+    // 与 buildChengfangRequestGate 同源，杜绝两套近似逻辑漂移。
+    const gate = (m && typeof m.gatePreview === 'function') ? m.gatePreview() : null;
+    // 未装配 Monitor 时，直接调用**生产同一份**许可判断（chengfang-gate），
+    // 保证「首次启动前的展示」与「运行中执行器」也是同一套逻辑（含 dryRun）。
+    let realAllowedRes;
+    let enableAllowedRes;
+    if (gate) {
+      realAllowedRes = { ok: gate.pauseAllowed, reason: gate.pauseReason };
+      enableAllowedRes = { ok: gate.enableAllowed, reason: gate.enableReason };
+    } else {
+      try {
+        const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed } = require(path.join(PROMO_GUARD_DIR, 'src/engine/chengfang-gate.js'));
+        realAllowedRes = resolveChengfangRealAllowed(cfg);
+        enableAllowedRes = resolveChengfangEnableAllowed(cfg);
+      } catch (_) {
+        realAllowedRes = { ok: false, reason: '无法读取执行许可（未装配 Monitor 且 chengfang-gate 不可用）' };
+        enableAllowedRes = { ok: false, reason: '无法读取执行许可（未装配 Monitor 且 chengfang-gate 不可用）' };
+      }
+    }
+    const realAllowed = realAllowedRes.ok === true;
+    const enableAllowed = enableAllowedRes.ok === true;
+
     // 真实模式以 Monitor 的实时 getter 为准（而非装配时的快照）
-    const realMode = m ? m.realMode === true : (cfg.execution && cfg.execution.realMode === true);
+    const realMode = m ? m.realMode === true : exec.realMode === true;
     const pauseEnabled = cf.pauseEnabled === true;
     const enableEnabled = cf.enableEnabled === true;
+    const dryRun = exec.dryRun === true;
+
     return {
       realMode,
       pauseEnabled,
       enableEnabled,
+      dryRun,
+      // 配置里声明的模式（供"首次启动前"如实展示；未知不臆断）
+      configuredRealMode: exec.realMode === true,
+      modeKnown: typeof exec.realMode === 'boolean',
+      // 未知模式 → 待核实（不得默认宣称演练安全）
+      modeText: (typeof exec.realMode !== 'boolean')
+        ? '待核实（配置缺少 execution.realMode，不得据此认为安全）'
+        : (realMode ? '真实执行' : '演练模式（不操作广告）'),
       scope: Array.isArray(cf.scope) ? cf.scope.slice() : [],
       enableHour: Number.isInteger(cf.enableHour) ? cf.enableHour : 7,
       dailyStartHour: (cfg.schedule && cfg.schedule.dailyStartHour) || 8,
       intervalMinutes: (cfg.schedule && cfg.schedule.intervalMinutes) || 30,
-      // 真实暂停/开启是否**当前**会落地（两个开关同时为真）
-      pauseWillExecute: realMode && pauseEnabled,
-      enableWillExecute: realMode && enableEnabled,
+      // 真实暂停/开启是否**当前**会落地 —— 由真实许可（含 dryRun）决定，与执行器一致
+      pauseWillExecute: realAllowed,
+      enableWillExecute: enableAllowed,
+      // 拦截原因（展示层可直接显示"为什么不会执行"）
+      pauseGateReason: realAllowed ? null : (realAllowedRes.reason || '未满足执行许可'),
+      enableGateReason: enableAllowed ? null : (enableAllowedRes.reason || '未满足执行许可'),
+      // 具体是哪一道门槛拦住的（界面必须可见）
+      blockedBy: [
+        exec.realMode !== true ? 'realMode 未开启' : null,
+        dryRun ? 'execution.dryRun=true（演练）' : null,
+        pauseEnabled !== true ? '暂停开关未开启' : null,
+        enableEnabled !== true ? '开启开关未开启' : null,
+      ].filter(Boolean),
       deleteAdEnabled: false, // 常量：本系统不存在删除广告的代码路径
     };
   }
@@ -183,6 +235,28 @@ function createWatchDrill(opts = {}) {
   }
 
   // ── Monitor 装配（延迟到首次 start，避免加载即触网/建状态）────────────────
+  /**
+   * 只读加载配置（2026-09-15 修复第 2 项，第二轮）。
+   *
+   * 用途：**首次启动前**也要能如实展示真实模式与门槛，否则用户看到的是默认 false，
+   * 误以为"必然是演练、安全"。此函数只 `loadConfig()` 读磁盘并缓存到 `drill._config`，
+   * **绝不** new Monitor、绝不 start 调度、绝不打开浏览器、绝不做任何广告动作。
+   */
+  function loadConfigReadOnly() {
+    if (drill._config) return drill._config;
+    if (opts.config) { drill._config = opts.config; return drill._config; }
+    try {
+      const { loadConfig } = promo('src/config.js');
+      const r = loadConfig();
+      drill._config = r.config;
+    } catch (e) {
+      // 读配置失败不阻塞：标记为未知（展示"待核实"），不得默认宣称演练安全
+      pushLog('warn', `读取配置失败（模式待核实，不臆断为演练安全）：${(e && e.message) || String(e)}`);
+      drill._config = {};
+    }
+    return drill._config;
+  }
+
   function ensureMonitor() {
     if (drill._monitor) return drill._monitor;
     const { Monitor } = promo('src/engine/monitor.js');
@@ -248,11 +322,24 @@ function createWatchDrill(opts = {}) {
       bits.push(isPause ? `仍未暂停 ${a.remaining.total}` : (isEnable ? `仍未开启 ${a.remaining.total}` : `仍未落地 ${a.remaining.total}`));
     }
     const targetIds = Array.isArray(a.targets) ? a.targets : [];
+    // 2026-09-15 修复第 1 项（第二轮）：targets 是**对象数组** [{view, planId}]，
+    // 旧代码直接 `targets.join(',')` → 界面出现 "ID [object Object]"。
+    // 修复：从对象里提取稳定 ID（planId / adId），无法提取时退回字符串化。
+    const idOf = (t) => {
+      if (t === null || t === undefined) return null;
+      if (typeof t === 'string' || typeof t === 'number') return String(t);
+      if (typeof t === 'object') {
+        const v = t.planId !== undefined ? t.planId : (t.adId !== undefined ? t.adId : (t.id !== undefined ? t.id : null));
+        return v === null ? null : String(v);
+      }
+      return String(t);
+    };
+    const ids = targetIds.map(idOf).filter((v) => v !== null && v !== '');
     // 动作标签：显式字段优先；未知则如实标注（绝不按 outcome 文本猜测）
     const label = ACTION_LABEL[kind] || '未知动作';
     const verb = kind === 'unknown' ? '将操作' : `将${label}`;
     return `${label}批次结果：${a.outcome || 'unknown'}（${bits.join('，') || '无明细'}）`
-      + `；目标 ${targetIds.length} 条${targetIds.length ? `（ID ${targetIds.slice(0, 5).join(',')}${targetIds.length > 5 ? '…' : ''}）` : ''}`
+      + `；目标 ${targetIds.length} 条${ids.length ? `（ID ${ids.slice(0, 5).join(',')}${ids.length > 5 ? '…' : ''}）` : ''}`
       + (isPause || isEnable ? `；本次动作=${label}` : `；本次动作=未知（actionType 未提供，未按结果文本猜测）`)
       + (a.confirmReason ? `；回读核验：${a.confirmReason}` : '')
       + (a.error ? `；失败原因：${a.error}` : '')
@@ -293,6 +380,52 @@ function createWatchDrill(opts = {}) {
   /** 错误事件（失败原因，界面必须可见）。 */
   function describeError(e) {
     return `失败原因：${e.error}${e.code ? ` [${e.code}]` : ''}${e.scope ? `（${e.scope}）` : ''}`;
+  }
+
+  /**
+   * 过程事件转译（2026-09-15 修复第 1 项，第二轮）。
+   *
+   * 这些事件来自 runner/executor 的 `_audit`（原仅写审计文件），现已双写进事件流。
+   * 按**明确 event 名**转译，覆盖用户点名的「重试 / 回读 / 暂停 / 开启相位」：
+   *   - retry            → 重试
+   *   - paused / plan    → 暂停（含回读确认结果）
+   *   - view / readback  → 回读核验
+   *   - identity         → 身份核验
+   *   - abort / done     → 停止 / 完成
+   *   - step / *enable*  → 开启相位
+   * 未识别的 event 名按原样透出（绝不臆造语义、绝不静默丢弃）。
+   */
+  const PROCESS_LABEL = {
+    retry: { label: '重试', level: 'warn' },
+    paused: { label: '暂停', level: 'info' },
+    plan: { label: '暂停计划', level: 'info' },
+    view: { label: '回读核验', level: 'info' },
+    readback: { label: '回读核验', level: 'info' },
+    identity: { label: '身份核验', level: 'info' },
+    abort: { label: '已停止', level: 'warn' },
+    done: { label: '批次完成', level: 'info' },
+    step: { label: '执行步骤', level: 'info' },
+    enable: { label: '开启相位', level: 'info' },
+    enable_phase: { label: '开启相位', level: 'info' },
+    enable_done: { label: '开启相位完成', level: 'info' },
+  };
+  function describeProcess(p) {
+    const ev = String(p.event || p.kind || 'unknown');
+    // "*enable*" 家族一律归入开启相位（不逐字枚举）
+    const meta = PROCESS_LABEL[ev] || (/enable/i.test(ev) ? { label: '开启相位', level: 'info' } : null);
+    const name = meta ? meta.label : `过程事件（${ev}）`;
+    const bits = [];
+    if (p.view) bits.push(`视图 ${p.view}`);
+    if (p.attempt !== undefined) bits.push(`第 ${p.attempt} 次`);
+    if (p.confirmed !== undefined) {
+      const c = Array.isArray(p.confirmed) ? p.confirmed.map((x) => (x && typeof x === 'object' ? (x.planId || x.adId || '') : x)).filter(Boolean) : p.confirmed;
+      bits.push(`已确认 ${Array.isArray(c) ? c.length : c}`);
+    }
+    if (p.note) bits.push(String(p.note));
+    if (p.reason) bits.push(`说明：${p.reason}`);
+    if (p.error) bits.push(`失败原因：${p.error}`);
+    const level = p.failed === true || p.error ? 'error' : (meta ? meta.level : 'info');
+    return `过程：${name}${bits.length ? `（${bits.join('，')}）` : ''}` + (meta ? '' : '；未识别事件名，按原样透出');
   }
 
   /**
@@ -374,20 +507,28 @@ function createWatchDrill(opts = {}) {
         for (const evt of stream.events) {
           if (!evt || typeof evt.evtSeq !== 'number') continue;
           if (evt.evtSeq <= drill._lastEvtSeq) continue; // 幂等：绝不重复
-          // 分类必须按**显式结构字段**判定，顺序为先具体后宽泛；
-          // 注意：批次结果里 `error: null` 是合法值，不能用 `!== undefined` 误判为错误事件。
-          const isJudgement = evt.kind === 'judgement';
-          const isBatch = !isJudgement && (
+          // 2026-09-15 修复第 1 项（第二轮）：**按显式 evtType 分派**。
+          // 旧行为：靠字段形状猜类型（`evt.actionType !== undefined` 判批次），
+          // 于是开启演练的 trigger（原携带 actionType:'enable'）被误判为批次，
+          // 显示成"开启批次结果：unknown"——用户看到的是错的结论。
+          // 修复：Monitor 为每条事件打上显式 evtType，消费方无歧义分派；
+          // 仅当 evtType 缺失（旧 Monitor/兼容路径）才回退到形状推断。
+          const type = evt.evtType || null;
+          const isJudgement = type ? type === 'judgement' : (evt.kind === 'judgement');
+          const isBatch = type ? type === 'batch' : (!isJudgement && (
             evt.actionType !== undefined || evt.action !== undefined
             || evt.outcome !== undefined || evt.counts !== undefined
             || evt.allPausedConfirmed !== undefined || evt.allEnabledConfirmed !== undefined
             || evt.allClosedConfirmed !== undefined
-          );
-          const isTrigger = !isJudgement && !isBatch && (
+          ));
+          const isTrigger = type ? type === 'trigger' : (!isJudgement && !isBatch && (
             evt.mode !== undefined || evt.failed !== undefined
             || evt.costText !== undefined || evt.targetCount !== undefined
-          );
-          const isError = !isJudgement && !isBatch && !isTrigger && typeof evt.error === 'string';
+          ));
+          const isProcess = type ? type === 'process' : false;
+          const isError = type
+            ? type === 'error'
+            : (!isJudgement && !isBatch && !isTrigger && !isProcess && typeof evt.error === 'string');
 
           if (isJudgement) {
             // 每个完整周期一条；超出缓存后仍能继续接收（evtSeq 游标）
@@ -400,6 +541,9 @@ function createWatchDrill(opts = {}) {
             pushLog(ok ? 'info' : 'warn', describeBatch(evt, kind));
           } else if (isTrigger) {
             pushLog(evt.failed ? 'error' : (evt.mode === 'dry' ? 'info' : 'warn'), describeTrigger(evt));
+          } else if (isProcess) {
+            // 真实过程事件（runner/executor 的 retry/paused/view/identity/abort/done/step…）
+            pushLog((evt.failed === true || evt.error) ? 'error' : 'info', describeProcess(evt));
           } else if (isError) {
             pushLog('error', describeError(evt));
           }
@@ -523,9 +667,28 @@ function createWatchDrill(opts = {}) {
       } catch (_) { /* 时钟异常不阻塞快照 */ }
     }
     const m = drill._monitor;
+    // 2026-09-15 修复第 2 项（第二轮）：**首次启动前**也读取配置展示真实模式。
+    // 旧行为：未启动时 gates=null、realMode 回落到构造时的 false → 用户误以为
+    // "必然是演练、安全"。修复：未启动时只读加载配置（不启动调度/浏览器/广告），
+    // 用 computeGates() 如实展示 configuredRealMode 与门槛；未知模式显示"待核实"。
+    let gates = st.gates;
+    if (!m) {
+      try {
+        loadConfigReadOnly();
+        gates = computeGates();
+        st.gates = gates;
+        drill.realMode = gates.realMode === true;
+        drill.shopName = (drill._config && Array.isArray(drill._config.shops))
+          ? (drill._config.shops.map((s) => s.name || s.id).join('、') || '—')
+          : drill.shopName;
+      } catch (_) { /* 读配置失败：保留 null/未知，不臆断 */ }
+    }
     return {
       shopName: drill.shopName,
-      realMode: m ? m.realMode === true : drill.realMode,
+      realMode: m ? m.realMode === true : (gates ? gates.realMode === true : drill.realMode),
+      // 首次启动前也如实告知：模式是否已知、配置声明的模式是什么
+      realModeKnown: gates ? gates.modeKnown !== false : false,
+      modeText: gates ? gates.modeText : '待核实（尚未读取配置）',
       running: st.running,
       status: st.status,
       statusText: STATUS_TEXT[st.status] || st.status,
@@ -537,7 +700,7 @@ function createWatchDrill(opts = {}) {
       nextRunAt: st.nextRunAt,
       lastError: st.lastError,
       lastRound: st.lastRound,
-      gates: st.gates,
+      gates,
       phase: st.phase,
       windowBlockReason: st.windowBlockReason,
       enablePhaseToday: st.enablePhaseToday,
@@ -549,11 +712,29 @@ function createWatchDrill(opts = {}) {
     };
   }
 
+  /**
+   * 最近一次日志缺口（2026-09-15 修复第 3 项，第二轮）。
+   *
+   * 旧行为：从日志文本正则回读 "共丢失 N 条"，只能反映**最后一条**缺口日志，
+   * 且与 Monitor 的真实计数脱节（写 1000 留 300 时只报 50）。
+   * 修复：直接用 Monitor 的 `getEventStream().droppedCount`（= 累计裁剪 + 未消费区段），
+   * 这才是当前消费游标之后的**真实**缺口；日志文本仅作为兜底（无 Monitor 时）。
+   */
   function latestGap() {
-    // 供界面/排障查询：最近一次明确记录的日志缺口条数
+    const m = drill._monitor;
+    if (m && typeof m.getEventStream === 'function') {
+      try {
+        const s = m.getEventStream(drill._lastEvtSeq);
+        if (typeof s.droppedCount === 'number') {
+          // 无缺口时返回 null（与既有 HTTP 契约一致：gap=null 表示"未发生裁剪"）
+          if (s.droppedCount === 0) return null;
+          return { droppedCount: s.droppedCount, trimmedTotal: s.trimmedTotal || 0, source: 'eventStream' };
+        }
+      } catch (_) { /* 回退到日志文本 */ }
+    }
     for (let i = drill._logs.length - 1; i >= 0; i -= 1) {
-      const m = /日志缺口：.*共丢失 (\d+) 条事件/.exec(drill._logs[i].msg);
-      if (m) return { at: drill._logs[i].t, droppedCount: Number(m[1]) };
+      const mm = /日志缺口：.*共丢失 (\d+) 条事件/.exec(drill._logs[i].msg);
+      if (mm) return { at: drill._logs[i].t, droppedCount: Number(mm[1]), source: 'logText' };
     }
     return null;
   }
@@ -587,11 +768,13 @@ function createWatchDrill(opts = {}) {
         syncFromMonitor();
         const since = parseInt(url.searchParams.get('since') || '0', 10) || 0;
         const logs = drill._logs.filter((l) => l.seq > since);
+        const gap = latestGap();
         return send(200, {
           ok: true,
           seq: drill._seq,
           logs,
-          gap: latestGap(),           // 明确的日志缺口（如发生过裁剪）
+          gap,                                        // 明确的日志缺口（真实 droppedCount）
+          droppedCount: gap ? gap.droppedCount : 0,   // 顶层直供：当前消费游标之后的真实缺口
           evtSeq: drill._monitor ? (drill._monitor._evtSeq || 0) : 0,
           consumedEvtSeq: drill._lastEvtSeq,
           confirmDialogs: CONFIRM_DIALOG_MEASURED, // 未实测的确认弹窗仍为阻断
@@ -612,6 +795,8 @@ function createWatchDrill(opts = {}) {
     sync() { syncFromMonitor(); return snapshot(); },
     /** 重读门槛快照（运行中配置变更后立即反映）。 */
     refreshGates,
+    /** 门槛快照（未启动时也只读读配置，不启动调度/浏览器/广告）。 */
+    gates() { loadConfigReadOnly(); return computeGates(); },
     /** 事件流游标（排障/测试用）。 */
     get cursor() { return { evtSeq: drill._lastEvtSeq, cycleNo: drill._lastCycleNo }; },
     get state() { return drill.state; },

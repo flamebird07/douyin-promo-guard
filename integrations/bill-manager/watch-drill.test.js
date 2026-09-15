@@ -771,8 +771,121 @@ test('增量游标：事件被裁剪（超缓存）时记录明确日志缺口�
 });
 
 // ══════════════════════════════════════════════════════════════
-// 9) 第 2 项回归：六类日志必须真实出现在 /api/watch-drill/logs
+// 9) 第 1 项回归：过程事件必须来自**真实生产链路**（runner/executor），
+//    而不是手工往事件里塞"重试"文字（那样证明不了链路接通）
 // ══════════════════════════════════════════════════════════════
+//
+// 本用例用**生产 ChengfangRunner + 生产 executor + 生产 fixture 页面 + 生产 controller**
+// 真实走一遍「首次点击确认但未落地 → 同会话重试一次 → 回读确认成功」，
+// 再断言 Monitor 的 `_audit` 双写把 retry/paused/view 过程事件接进事件流，
+// 经 watch-drill 转译后出现在 HTTP `/api/watch-drill/logs`。
+// 关键：**不手工往 recentErrors/actions 填"重试"文字**——只允许生产链路写事件。
+// 仅在本地 fixture 页面上操作（route 拦截），不触真实站点、不操作真实广告。
+test('第 1 项：开启演练 trigger 不得被误归类为批次（evtType=trigger，不显示 unknown 批次）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  // 生产 trigger 记录形状：携带 targetAction（将来时），**不含** actionType（已执行）
+  m._memPush(m.triggers, {
+    shopId: SHOP_ID, mode: 'dry', targetAction: 'enable', costText: '0.00', orders: 0, targetCount: 2,
+    note: '每日开启演练',
+  }, 300, 'trigger');
+  const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+  const logs = resp.body.logs.map((l) => l.msg).join('\n');
+  assert.ok(/命中（演练）/.test(logs), `开启演练 trigger 必须被识别为"命中"事件：\n${logs}`);
+  assert.ok(!/批次结果：unknown/.test(logs), `trigger 不得被误判为 unknown 批次：\n${logs}`);
+  // 事件流必须带显式 evtType=trigger
+  const ev = m.getEventStream(0).events.filter((e) => e.evtType === 'trigger');
+  assert.ok(ev.length >= 1, 'trigger 事件必须带 evtType=trigger');
+});
+
+test('第 1 项：目标 ID 不得渲染为 [object Object]（对象数组 → 提取稳定 planId）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m._memPush(m.actions, {
+    shopId: SHOP_ID, actionType: 'enable', outcome: 'ok',
+    counts: { confirmed: 2 },
+    targets: [{ view: '全店托管', planId: '184388555253250562' }, { view: '商品自选', adId: '1875859981405339001' }],
+  }, 300, 'batch');
+  const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+  const logs = resp.body.logs.map((l) => l.msg).join('\n');
+  assert.ok(!logs.includes('[object Object]'), `目标 ID 不得渲染为 [object Object]：\n${logs}`);
+  assert.ok(logs.includes('184388555253250562') && logs.includes('1875859981405339001'),
+    `必须提取对象里的稳定 ID（planId/adId）：\n${logs}`);
+});
+
+test('第 1 项真实链路：生产 runner/executor 的「首次未落地→重试→回读」经 _audit 进入 /logs', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 10001, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+
+  const { executeChengfangPause } = require(path.join(PROMO, 'src/engine/chengfang-executor.js'));
+  const { createChengfangController } = require(path.join(PROMO, 'src/adapters/chengfang-reader.js'));
+  const { chromium } = require(path.join(PROMO, 'node_modules/playwright'));
+  const { buildChengfangFixtureHtml } = require(path.join(PROMO, 'test/chengfang-fixture.js'));
+  const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+
+  const browser = await chromium.launch({ headless: true, executablePath: EDGE });
+  try {
+    const page = await browser.newPage();
+    // 生产 fixture：pauseEffect='first-noop' 模拟「首次点击确认但未落地」
+    const html = buildChengfangFixtureHtml({
+      plans: {
+        '全店托管': [],
+        '商品自选': [
+          { id: '1875859981405339001', name: '千川乘方_计划A', checked: true },
+          { id: '1875859981405339002', name: '千川乘方_计划B', checked: true },
+        ],
+      },
+      state: { pauseEffect: 'first-noop' },
+    });
+    await page.route('**/uni-prom/overall**', (route) => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html }));
+    await page.goto('https://qianchuan.jinritemai.com/uni-prom/overall?aavid=1710242295996424', { waitUntil: 'load' });
+
+    const controller = createChengfangController({ loadWaitMs: 30, tabWaitMs: 10 });
+    // 真实驱动生产 executor；audit 回调与生产接线完全一致 → Monitor._audit → 事件流
+    const PAUSE_NOW = timeLib.shanghaiMs('2026-09-14', '09:00');
+    const result = await executeChengfangPause({
+      controller,
+      page,
+      shopCfg: { id: SHOP_ID, name: SHOP_ID, accountId: '1710242295996424' },
+      config: {
+        execution: { realMode: true, dryRun: false, readbackTimeoutMs: 800, readbackAttempts: 1, readbackIntervalMs: 10 },
+        monitor: { chengfang: { scope: ['全店托管', '商品自选'], pauseEnabled: true } },
+        schedule: { dailyStartHour: 8 },
+      },
+      dryRun: false,
+      now: () => PAUSE_NOW,
+      businessDate: '2026-09-14',
+      audit: (e) => m._audit(e),   // ← 与生产完全相同的接线
+    });
+    assert.strictEqual(result.allPausedConfirmed, true, `生产链路应确认全部暂停：${result.confirmReason}`);
+
+    // 消费事件流 → 日志（HTTP 接口）
+    const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+    const logs = resp.body.logs.map((l) => l.msg).join('\n');
+    const processEvts = m.getEventStream(0).events.filter((e) => e.evtType === 'process');
+    assert.ok(processEvts.length > 0,
+      `生产链路必须产生过程事件（_audit 双写事件流），实际 ${processEvts.length} 条`);
+    assert.ok(processEvts.some((e) => e.event === 'retry'),
+      '首次未落地必须产生 retry 过程事件（来自 executor audit，而非手工文本）');
+    assert.ok(processEvts.some((e) => e.event === 'paused' || e.event === 'view' || e.event === 'plan'),
+      '必须产生回读核验类过程事件');
+    assert.ok(/过程：重试/.test(logs), `重试必须经 /logs 可见（真实链路转译）：\n${logs}`);
+    assert.ok(/过程：(回读核验|暂停|暂停计划)/.test(logs), `回读核验必须经 /logs 可见：\n${logs}`);
+    await page.close().catch(() => {});
+  } finally {
+    await browser.close().catch(() => {});
+  }
+});
+
 test('六类日志齐备：每日开启、每轮判断、暂停、重试、回读、失败原因都能经 /api/watch-drill/logs 取到', async () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
@@ -781,30 +894,36 @@ test('六类日志齐备：每日开启、每轮判断、暂停、重试、回�
   const m = drill._internal._monitor;
   await until(() => m.lastCycleAt, 8000);
 
-  // 暂停批次（含回读、重试、失败原因）
+  // 暂停批次（含回读、重试、失败原因）—— targets 用**对象数组**（生产真实形状）
   m._memPush(m.actions, {
     shopId: SHOP_ID, actionType: 'pause', outcome: 'partial',
     counts: { confirmed: 98, failed: 1, unknown: 1, skipped: 0 },
-    targets: ['111111', '222222'],
+    targets: [{ view: '商品自选', planId: '111111' }, { view: '商品自选', planId: '222222' }],
     allPausedConfirmed: false,
     confirmReason: '回读仍有 2 条处于投放中',
     remaining: { total: 2 },
     error: '计划 222222 行内层开关点击后未生效；已在同会话内重试 1 次仍失败',
     batchDate: shanghaiDate(clock.now()),
-  });
+  }, 300, 'batch');
+  // 过程事件（重试 + 回读）—— 与生产 _audit 同形（event 名一致），走真实 _audit 入口
+  m._audit({ kind: 'chengfang', event: 'retry', view: '商品自选', attempt: 2, targets: ['222222'], note: '同会话重试一次' });
+  m._audit({ kind: 'chengfang', event: 'view', view: '商品自选', status: 'confirmed' });
   // 每日开启相位
   m._setEnablePhase(SHOP_ID, shanghaiDate(clock.now()), 'success', { date: shanghaiDate(clock.now()), phase: 'enable_window' });
   // 失败原因
-  m._memPush(m.recentErrors, { scope: `shop:${SHOP_ID}`, error: '罗盘页面读取超时', code: 'READ_TIMEOUT' });
+  m._memPush(m.recentErrors, { scope: `shop:${SHOP_ID}`, error: '罗盘页面读取超时', code: 'READ_TIMEOUT' }, 300, 'error');
 
   const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
   const logs = resp.body.logs.map((l) => l.msg).join('\n');
   assert.ok(/第 \d+ 轮判断数据（周期 \d+/.test(logs), `①每轮判断必须在 /logs 中：\n${logs}`);
   assert.ok(logs.includes('每日开启相位：开启成功'), `②每日开启必须在 /logs 中：\n${logs}`);
   assert.ok(logs.includes('暂停批次结果'), `③暂停必须在 /logs 中：\n${logs}`);
-  assert.ok(logs.includes('重试 1 次仍失败'), `④重试必须在 /logs 中（不能只写审计文件）：\n${logs}`);
-  assert.ok(logs.includes('回读核验'), `⑤回读必须在 /logs 中（不能只写审计文件）：\n${logs}`);
+  assert.ok(logs.includes('重试'), `④重试必须在 /logs 中（不能只写审计文件）：\n${logs}`);
+  assert.ok(logs.includes('回读'), `⑤回读必须在 /logs 中（不能只写审计文件）：\n${logs}`);
   assert.ok(logs.includes('罗盘页面读取超时'), `⑥失败原因必须在 /logs 中：\n${logs}`);
+  // 目标 ID 必须是稳定 ID，不得出现 [object Object]
+  assert.ok(!logs.includes('[object Object]'), `目标 ID 不得渲染为 [object Object]：\n${logs}`);
+  assert.ok(logs.includes('111111') && logs.includes('222222'), '目标 ID 必须从对象中提取为稳定 planId');
 });
 
 test('/logs 增量契约：since 游标单调，重复拉取不重复；缺口字段可查询', async () => {
@@ -857,25 +976,143 @@ test('门槛实时性：运行中修改 realMode/pauseEnabled/enableEnabled 后�
   assert.strictEqual(st2.gates.enableWillExecute, false);
 });
 
-test('门槛与 dryRun 一致：dryRun 开启时页面不得显示"会执行"真实操作', async () => {
+test('第 2 项：三许可开关全开 + dryRun=true → 两个 WillExecute 必须为 false（复用实际许可，含 dryRun）', async () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
   const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
   drill.start();
   const m = drill._internal._monitor;
-  // realMode=true + 两个开关都开，但 Monitor 处于 dryRun（演练）→ Monitor.realMode 必须为 false
+  // 三个许可开关全部 true，但 dryRun=true（演练）
   m.config.execution.realMode = true;
   m.config.monitor.chengfang.pauseEnabled = true;
   m.config.monitor.chengfang.enableEnabled = true;
   m.config.execution.dryRun = true;
-  // Monitor.realMode 的语义由 Monitor 决定；此处断言 watch-drill 与 Monitor 保持一致
+
   const st = (await callHttp(drill, 'GET', '/api/watch-drill/state')).body.state;
-  assert.strictEqual(st.gates.realMode, m.realMode === true,
-    'gates.realMode 必须等于 Monitor 的实时 realMode（不能是装配时的旧快照）');
-  assert.strictEqual(st.gates.pauseWillExecute, (m.realMode === true) && st.gates.pauseEnabled,
-    'pauseWillExecute 必须由实时 realMode 与暂停开关共同决定');
-  assert.strictEqual(st.gates.enableWillExecute, (m.realMode === true) && st.gates.enableEnabled,
-    'enableWillExecute 必须由实时 realMode 与开启开关共同决定');
+  // 直接断言结果：dryRun 必须让两个"会执行"都为 false（与 chengfang-gate 同源）
+  assert.strictEqual(st.gates.realMode, true, 'realMode 开关确为 true');
+  assert.strictEqual(st.gates.pauseEnabled, true);
+  assert.strictEqual(st.gates.enableEnabled, true);
+  assert.strictEqual(st.gates.dryRun, true);
+  assert.strictEqual(st.gates.pauseWillExecute, false, 'dryRun=true 时真实暂停必须显示"不会执行"');
+  assert.strictEqual(st.gates.enableWillExecute, false, 'dryRun=true 时真实开启必须显示"不会执行"');
+  assert.ok(/dryRun/.test(st.gates.pauseGateReason || ''), '必须说明被 dryRun 拦住（展示原因可见）');
+  // 与生产 gate 交叉核对：同一配置下 buildChengfangRequestGate 也不放行
+  const { buildChengfangRequestGate } = require(path.join(PROMO, 'src/engine/chengfang-gate.js'));
+  const chk = buildChengfangRequestGate({ config: m.config, nowFn: clock.now, action: 'pause' })();
+  assert.strictEqual(chk.ok, false, '同源 gate 必须同样拒绝（展示===执行）');
+  assert.strictEqual(st.gates.pauseWillExecute, chk.ok, 'WillExecute 必须与真实 gate 完全一致');
+});
+
+test('第 2 项：首次启动前也读取配置展示真实模式（不启动调度/浏览器/广告）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  // 配置为 realMode=true + 两开关开（但**不调用 start()**）
+  const { drill } = makeDrill(clock, timers, {
+    costCents: 100, orderCount: 100,
+    cfg: { execution: { realMode: true, dryRun: false, maxAdPages: 50 } },
+  });
+  const m0 = drill._internal._monitor;
+  assert.strictEqual(m0, null, '未启动前不得装配 Monitor（不启动调度/浏览器）');
+  const st = drill.snapshot();
+  assert.ok(st.gates, '未启动也必须展示门槛（首次启动前读配置）');
+  assert.strictEqual(st.gates.configuredRealMode, true, '必须如实显示配置里的 realMode=true');
+  assert.strictEqual(st.realMode, true, '顶层 realMode 必须与配置一致（而非默认 false）');
+  assert.strictEqual(st.running, false, '读取配置不得启动值守');
+  assert.strictEqual(timers.activeCount(), 0, '读取配置不得安排任何定时器');
+  assert.strictEqual(drill._internal._monitor, null, '读取配置不得装配 Monitor');
+});
+
+test('第 2 项：未知模式显示"待核实"，不得默认宣称演练安全', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  // 配置缺少 execution.realMode（未知）
+  const { drill } = makeDrill(clock, timers, {
+    costCents: 100, orderCount: 100,
+    cfg: { execution: { dryRun: false, maxAdPages: 50 } },
+  });
+  const st = drill.snapshot();
+  assert.strictEqual(st.gates.modeKnown, false, 'realMode 未知必须标注 modeKnown=false');
+  assert.ok(/待核实/.test(st.modeText), `未知模式必须显示"待核实"，实际：${st.modeText}`);
+  assert.ok(!/演练模式/.test(st.modeText), '未知模式不得默认宣称演练安全');
+});
+
+// ══════════════════════════════════════════════════════════════
+// 10b) 第 3 项回归：日志缺口计数必须真实（写 1000 留 300 → 报 700，而非 50）
+// ══════════════════════════════════════════════════════════════
+test('第 3 项：写 1000 条、留 300 条 → 缺口必须报 700（而非被上限截断为 50）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.actions = [];
+  m._evtDropped = [];
+  m._evtTrimmedTotal = 0;
+  m._evtConsumedSeq = 0;
+  drill._internal._lastEvtSeq = 0;
+  // 消费游标停留在 0（模拟 UI 长时间未拉取）
+  // 写入 1000 条、actions 上限 100（默认 300；这里压到 100 便于精确核对）
+  for (let i = 0; i < 1000; i += 1) {
+    m._memPush(m.actions, { shopId: SHOP_ID, actionType: 'pause', outcome: 'ok', counts: { confirmed: 1 }, targets: [String(300000 + i)] }, 100, 'batch');
+  }
+  const s = m.getEventStream(0);
+  assert.strictEqual(m.actions.length, 100, '内存中应保留 100 条');
+  assert.strictEqual(s.droppedCount, 900,
+    `真实缺口必须是 900（写 1000 留 100），实际 ${s.droppedCount}`);
+  // 经 HTTP /logs 的顶层 droppedCount 也必须一致
+  const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+  assert.strictEqual(resp.body.droppedCount, 900, '/logs 顶层 droppedCount 必须等于真实缺口');
+});
+
+test('第 3 项：连续多次裁剪 + 重复拉取 + 部分已消费 + 继续接收新事件（缺口单调不虚增）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  m.actions = [];
+  m._evtDropped = [];
+  m._evtTrimmedTotal = 0;
+  m._evtConsumedSeq = 0;
+  drill._internal._lastEvtSeq = 0;
+
+  // 第 1 批：写 200 留 50 → 丢 150
+  for (let i = 0; i < 200; i += 1) {
+    m._memPush(m.actions, { shopId: SHOP_ID, actionType: 'pause', outcome: 'ok', counts: { confirmed: 1 }, targets: [String(400000 + i)] }, 50, 'batch');
+  }
+  const g1 = m.getEventStream(0).droppedCount;
+  assert.strictEqual(g1, 150, `第一批缺口应为 150，实际 ${g1}`);
+
+  // 消费到当前游标（部分已消费）
+  const cursor1 = m.getEventStream(0).seq;
+  drill._internal._lastEvtSeq = cursor1;
+  m.getEventStream(cursor1); // 推进 consumedSeq
+  // 已消费后，历史缺口不再重复计入（当前游标之后无新裁剪）
+  const g1b = m.getEventStream(cursor1).droppedCount;
+  assert.strictEqual(g1b, g1, `已消费游标之后仍应如实报告累计缺口（不虚增、不丢失），实际 ${g1b}`);
+
+  // 第 2 批：再写 300 → actions 从 50 涨到 350，裁剪回 50 → 本批又丢 300
+  // （含第 1 批残留的 50）；累计缺口 = 150 + 300 = 450
+  for (let i = 0; i < 300; i += 1) {
+    m._memPush(m.actions, { shopId: SHOP_ID, actionType: 'pause', outcome: 'ok', counts: { confirmed: 1 }, targets: [String(500000 + i)] }, 50, 'batch');
+  }
+  const s2 = m.getEventStream(cursor1);
+  assert.strictEqual(s2.droppedCount, 450,
+    `两批累计缺口应为 450（总写入 500、保留 50），实际 ${s2.droppedCount}`);
+
+  // 继续接收新事件（第 3 批：小量，不触发裁剪）
+  for (let i = 0; i < 3; i += 1) {
+    m._memPush(m.actions, { shopId: SHOP_ID, actionType: 'pause', outcome: 'ok', counts: { confirmed: 1 }, targets: [String(600000 + i)] }, 50, 'batch');
+  }
+  const s3 = m.getEventStream(cursor1);
+  assert.ok(s3.droppedCount >= 450, '缺口单调不减（新事件不减少既有缺口）');
+  assert.ok(s3.events.some((e) => Array.isArray(e.targets) && String(e.targets[0]).startsWith('600')), '新事件必须仍能接收');
+
+  // 重复拉取（同一 since 两次）不得重复计数、不得虚增
+  const r1 = m.getEventStream(cursor1).droppedCount;
+  const r2 = m.getEventStream(cursor1).droppedCount;
+  assert.strictEqual(r1, r2, '重复拉取缺口计数必须稳定（幂等）');
 });
 
 // ══════════════════════════════════════════════════════════════

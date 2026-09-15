@@ -30,6 +30,7 @@ const { createPromoReaderNotConnected, createMockPromoReader } = require('../ada
 const { createAdControllerNotConnected, createMockAdController } = require('../adapters/ad-controller');
 const { WholeShopCloseCoordinator } = require('./close-coordinator');
 const { ChengfangRunner, defaultChengfangOpener } = require('./chengfang-runner');
+const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed } = require('./chengfang-gate');
 const { perOrderDisplayText } = require('./rules');
 const guard = require('./guard');
 const { NotConnectedError } = require('../lib/errors');
@@ -82,10 +83,26 @@ class Monitor {
     this.actions = [];           // 真实执行批次结果
     this.recentErrors = [];
 
+    // 过程事件流（2026-09-15 修复第 1 项，第二轮）：
+    // runner/executor 的审计回调（_audit）此前**只写文件**，retry/paused/回读等
+    // 真实过程事件不会进入 getEventStream，值守日志因此看不到重试与回读。
+    // 现在 _audit 同时把事件写入这里（带明确 evtType），与 triggers/actions/
+    // recentErrors/judgements 一起进入统一事件流。
+    this.processEvents = [];
+
     // 事件序号（2026-09-15 修复第 1 项）：单调递增、永不回退，供外部增量消费。
-    // 消费方以 evtSeq 为游标，不再依赖有界数组长度；裁剪区段记录在 _evtDropped。
+    // 消费方以 evtSeq 为游标，不再依赖有界数组长度。
     this._evtSeq = 0;
+    // 事件总数与该序号区间的实际缺失数（2026-09-15 修复第 3 项，第二轮）：
+    // 旧实现只保留最近 50 条裁剪区段 → 报告"最近缺口数"而非真实缺口总数
+    // （写 1000 条、留 300 条，真缺 700 条却只报 50）。改为：
+    //   - _evtTrimmedTotal：累计被裁剪的事件总数（单调，永不自减）
+    //   - _evtDropped 仅作为"未合并的尾部区段"滚动记录，合并时累加进 total
     this._evtDropped = [];
+    this._evtTrimmedTotal = 0;
+    // 已被消费到的序号（由消费方通过 getEventStream(since) 上报；
+    // 用于在消费方游标落后于裁剪点时才计入缺口，避免把"已消费"误报为缺口）
+    this._evtConsumedSeq = 0;
 
     // 巡查周期序号（2026-09-15 修复第 3 项）：每个完整周期 +1，用于"每周期必记一条判断"。
     this.cycleNo = 0;
@@ -124,7 +141,7 @@ class Monitor {
       }
     }
     if (recovered.length > 0) {
-      this._memPush(this.recentErrors, { scope: 'enable-phase', error: `重启回读：${recovered.length} 条开启相位记录由 in_progress 转为 unknown（先回读，不盲重发）`, recovered });
+      this._memPush(this.recentErrors, { scope: 'enable-phase', error: `重启回读：${recovered.length} 条开启相位记录由 in_progress 转为 unknown（先回读，不盲重发）`, recovered }, undefined, 'error');
       try { log.warn(`重启回读开启相位：${recovered.length} 条 in_progress → unknown`); } catch (_) {}
     }
     return recovered;
@@ -177,7 +194,7 @@ class Monitor {
           const backup = `${this.stateFile}.corrupt-${Date.now()}`;
           fs.renameSync(this.stateFile, backup);
           log.warn(`状态文件损坏已隔离: ${backup}（${e.message}）`);
-          this._memPush(this.recentErrors, { scope: 'state', error: `状态文件损坏已隔离重建: ${e.message}` });
+          this._memPush(this.recentErrors, { scope: 'state', error: `状态文件损坏已隔离重建: ${e.message}` }, undefined, 'error');
         } catch (_) { /* 隔离失败则忽略，按空状态继续 */ }
       }
       return { version: STATE_VERSION, batches: {}, enablePhase: {} };
@@ -215,11 +232,31 @@ class Monitor {
     if (!fs.existsSync(this.dataDir)) fs.mkdirSync(this.dataDir, { recursive: true });
   }
 
+  /**
+   * 审计写入（2026-09-15 修复第 1 项，第二轮）。
+   *
+   * 旧行为：`_audit` **只**追加审计文件。runner/executor 的所有过程审计
+   * （retry/paused/view/identity/abort/done/step…）都指向这里，因此这些真实
+   * 过程事件从未进入 `getEventStream` → 值守日志看不到重试与回读。
+   *
+   * 修复：同一条记录**同时**写入进程内 `processEvents` 事件流（带显式
+   * `evtType: 'process'` 与原始 `event` 名），consumer 可据此区分：
+   *   - retry        → 重试
+   *   - paused/plan  → 暂停与回读
+   *   - readback/view→ 回读核验
+   *   - enable*      → 开启相位
+   * **不重复**：文件与事件流是同一份记录的两个出口；事件流本身有界，
+   * 消费方以 evtSeq 去重。
+   */
   _audit(entry) {
     try {
       this._ensureDataDir();
       fs.appendFileSync(this.auditFile, JSON.stringify({ ts: new Date(this.nowFn()).toISOString(), ...log.sanitize(entry) }) + '\n');
     } catch (_) { /* 审计落盘失败不阻塞 */ }
+    // 过程事件接入事件流（与审计文件同源，不编造、不丢字段）
+    try {
+      this._memPush(this.processEvents, { evtType: 'process', ...entry }, 500, 'process');
+    } catch (_) { /* 事件流写入失败不影响业务 */ }
   }
 
   /**
@@ -229,61 +266,162 @@ class Monitor {
    * 从头部裁剪，长度停止增长 → 消费方永远看不到新事件（永久漏日志）；
    * 或者裁剪后长度回退 → 重复消费。
    *
-   * 修复：每条事件附加单调递增的 `evtSeq`（进程内全局唯一、永不回退），
-   * 并在裁剪时把被丢弃的区段记入 `this._evtDropped`（供消费方报告日志缺口）。
-   * 消费方以 `evtSeq > lastSeq` 判定增量，与数组长度无关。
+   * 修复：每条事件附加单调递增的 `evtSeq`（进程内全局唯一、永不回退）与显式
+   * `evtType`（事件种类，供消费方按类型分派，不再靠字段形状猜测）。
    *
-   * @param {Array} arr   有界数组（triggers/actions/recentErrors）
+   * 缺口计数（第二轮修复第 3 项）：被裁剪的事件总数累加进 `_evtTrimmedTotal`
+   * （单调），`_evtDropped` 只保留"尚未与消费游标合并"的尾部区段；两者合并后
+   * 才能得出**真实缺口**（写 1000 条留 300 条 → 真缺 700 条）。
+   *
+   * @param {Array} arr   有界数组（triggers/actions/recentErrors/judgements/processEvents）
    * @param {object} entry 事件体
    * @param {number} [limit] 数组上限
+   * @param {string} [evtType] 显式事件种类（供消费方无歧义分派）
    */
-  _memPush(arr, entry, limit) {
+  _memPush(arr, entry, limit, evtType = null) {
     const cap = limit || 300;
     this._evtSeq = (this._evtSeq || 0) + 1;
     const ts = new Date(this.nowFn()).toISOString();
-    arr.push({ evtSeq: this._evtSeq, ts, ...log.sanitize(entry) });
+    const type = evtType || (entry && entry.evtType) || null;
+    const rec = { evtSeq: this._evtSeq, ts, ...log.sanitize(entry) };
+    if (type && rec.evtType === undefined) rec.evtType = type;
+    arr.push(rec);
     if (arr.length > cap) {
       const removed = arr.splice(0, arr.length - cap);
-      // 记录被裁剪的序号区段，供消费方在游标落后时报告明确缺口（而非静默漏日志）
+      // 记录被裁剪的序号区段（供消费方在游标落后时报告明确缺口，而非静默漏日志）
       const firstSeq = removed[0] && removed[0].evtSeq;
       const lastSeq = removed[removed.length - 1] && removed[removed.length - 1].evtSeq;
       if (typeof firstSeq === 'number' && typeof lastSeq === 'number') {
         this._evtDropped.push({ firstSeq, lastSeq, count: removed.length, at: ts });
-        if (this._evtDropped.length > 50) this._evtDropped.splice(0, this._evtDropped.length - 50);
+        this._mergeDroppedRanges();
       }
     }
     return this._evtSeq;
   }
 
   /**
+   * 合并裁剪区段（2026-09-15 修复第 3 项，第二轮）。
+   *
+   * 旧的 `_evtDropped.length > 50 → splice` 会直接丢弃更早的区段计数，
+   * 导致"写 1000 条、留 300 条"只报最近 50 条缺口。改为：
+   *   - 相邻/重叠区段合并（保持区间数不膨胀）
+   *   - 被挤出上限的**最旧**区段，其 count 累加进 `_evtTrimmedTotal`（不丢失）
+   * 这样 total + 未合并区段 = 真实裁剪总数。
+   */
+  _mergeDroppedRanges() {
+    const ranges = this._evtDropped;
+    if (ranges.length < 2) return;
+    ranges.sort((a, b) => a.firstSeq - b.firstSeq);
+    const merged = [ranges[0]];
+    for (let i = 1; i < ranges.length; i += 1) {
+      const last = merged[merged.length - 1];
+      const cur = ranges[i];
+      // 序号连续或重叠 → 合并为一段（count 相加，区间取并）
+      if (cur.firstSeq <= last.lastSeq + 1) {
+        last.lastSeq = Math.max(last.lastSeq, cur.lastSeq);
+        last.count += cur.count;
+        last.at = cur.at || last.at;
+      } else {
+        merged.push(cur);
+      }
+    }
+    // 上限 50：超出的**最旧**区段计数累加进 _evtTrimmedTotal，绝不静默丢弃
+    while (merged.length > 50) {
+      const dropped = merged.shift();
+      this._evtTrimmedTotal = (this._evtTrimmedTotal || 0) + (dropped.count || 0);
+    }
+    this._evtDropped = merged;
+  }
+
+  /**
    * 事件流快照（供外部增量消费）。
    *
-   * - `events`：当前仍保留在内存中的事件（按 evtSeq 升序，跨 triggers/actions/recentErrors 合并）
+   * - `events`：当前仍保留在内存中的事件（按 evtSeq 升序，跨全部事件数组合并），
+   *   每条带显式 `evtType`（judgement/trigger/batch/process/error）。
    * - `seq`：当前最大 evtSeq（进程内单调，永不回退）
-   * - `dropped`：因有界裁剪而丢失的序号区段（消费方可据此报告"日志缺口 N 条"）
+   * - `dropped` / `droppedCount`：**真实**日志缺口（见 _mergeDroppedRanges）
+   *
+   * 缺口语义（2026-09-15 修复第 3 项，第二轮）：
+   *   `droppedCount` = 该消费者**从未收到过**的事件总数 =
+   *     历史合并进 `_evtTrimmedTotal` 的裁剪数
+   *   + 当前仍记录、且消费者游标**尚未越过其末端**的区段计数。
+   *   一个区段只有在消费者游标已推进到 `lastSeq` 之后（`since > lastSeq`）时
+   *   才算"已跨越"，不再计入——但它已经**被报告过**，因此不会因后续 `since`
+   *   增大而消失（用 `_evtAckSeq` 记录每个区段的报告/跨越状态）。
+   *   这样"写 1000 留 300"在任何读取顺序下都报 700，且不重复计数。
    *
    * 消费方应保存上次的 `seq`，下次以 `since=seq` 拉取；即使期间发生裁剪，
-   * 也能通过 `dropped` 如实告知缺口，而不是永久漏日志或静默错位。
+   * 也能通过 `droppedCount` 如实告知缺口总数，而不是永久漏日志或静默错位。
    */
   getEventStream(since = 0) {
     const all = [];
-    for (const arr of [this.triggers, this.actions, this.recentErrors, this.judgements]) {
+    for (const arr of [this.triggers, this.actions, this.recentErrors, this.judgements, this.processEvents]) {
       for (const e of arr) if (e && typeof e.evtSeq === 'number') all.push(e);
     }
     all.sort((a, b) => a.evtSeq - b.evtSeq);
-    const dropped = (this._evtDropped || []).filter((d) => d.lastSeq > since && d.firstSeq > since);
+    // 消费游标推进（单调）
+    if (typeof since === 'number' && since > (this._evtConsumedSeq || 0)) {
+      this._evtConsumedSeq = since;
+    }
+    const cur = this._evtConsumedSeq || 0;
+    // 区段计数：仅当消费游标尚未越过其末端时计入（未被消费者跨越 = 消费者确实没收到）
+    // `_evtAckSeq` 记录每个区段的首报游标，确保"报告后不因游标前进而消失"
+    if (!this._evtAckSeq) this._evtAckSeq = new WeakMap();
+    const pending = (this._evtDropped || []).filter((d) => {
+      if (!this._evtAckSeq.has(d)) this._evtAckSeq.set(d, cur); // 首次见到 → 记录当时游标
+      const reportedAt = this._evtAckSeq.get(d);
+      // 消费者跨越该区段（cur > lastSeq）**且**该区段已在其后报告过 → 视为已交付
+      // 否则仍计入（从未收到的真实缺口）
+      return !(cur > d.lastSeq && reportedAt >= d.lastSeq);
+    });
+    const dropped = pending.map((d) => ({ ...d }));
+    const droppedCount = (this._evtTrimmedTotal || 0) + pending.reduce((n, d) => n + (d.count || 0), 0);
     return {
       seq: this._evtSeq || 0,
       cycleNo: this.cycleNo || 0,
       events: all.filter((e) => e.evtSeq > since),
       dropped,
-      droppedCount: dropped.reduce((n, d) => n + d.count, 0),
+      droppedCount,
+      // 诊断字段：便于排障核对（裁剪总数 / 已合并进 total 的部分）
+      trimmedTotal: this._evtTrimmedTotal || 0,
+      consumedSeq: this._evtConsumedSeq || 0,
     };
   }
 
   // ── 模式 ─────────────────────────────────────────────────────────
   get realMode() { return this.config.execution.realMode === true; }
   get modeLabel() { return this.realMode ? '真实执行' : '演练模式（只记录不关闭）'; }
+
+  /**
+   * 可执行门槛（2026-09-15 修复第 2 项，第二轮）。
+   *
+   * 展示层（bill-manager 值守页）必须复用**与执行器完全一致**的许可判断，
+   * 否则会出现"界面说会执行、执行器实际拒绝（dryRun）"的不一致。
+   * 这里直接调用 chengfang-gate 的 resolveChengfang*Allowed（含 dryRun 检查），
+   * 不另写一套近似逻辑。
+   *
+   * 典型：三个许可开关全为 true、但 execution.dryRun === true 时，
+   * pauseAllowed/enableAllowed 均为 false（演练模式下 dryRun 优先拒绝真实动作）。
+   *
+   * @returns {{ok:boolean, allowed:boolean, reason:string|null, config:object}}
+   *   config 为构造门槛所用的配置快照（供展示层显示真实模式来源）
+   */
+  gatePreview() {
+    const cfg = this.config || {};
+    const real = resolveChengfangRealAllowed(cfg);
+    const enable = resolveChengfangEnableAllowed(cfg);
+    return {
+      ok: real.ok && enable.ok,
+      pauseAllowed: real.ok,
+      pauseReason: real.ok ? null : real.reason,
+      enableAllowed: enable.ok,
+      enableReason: enable.ok ? null : enable.reason,
+      dryRun: cfg.execution && cfg.execution.dryRun === true,
+      configuredRealMode: cfg.execution && cfg.execution.realMode === true,
+      pauseEnabled: !!(cfg.monitor && cfg.monitor.chengfang && cfg.monitor.chengfang.pauseEnabled === true),
+      enableEnabled: !!(cfg.monitor && cfg.monitor.chengfang && cfg.monitor.chengfang.enableEnabled === true),
+    };
+  }
 
   // ── 启动/停止 ────────────────────────────────────────────────────
   start() {
@@ -362,7 +500,7 @@ class Monitor {
           try {
             await this._runEnablePhase(gen, today);
           } catch (e) {
-            this._memPush(this.recentErrors, { scope: 'cycle', error: `乘方自动开启相位失败：${e.message}` });
+            this._memPush(this.recentErrors, { scope: 'cycle', error: `乘方自动开启相位失败：${e.message}` }, undefined, 'error');
           }
         }
         // 第 4 项：相位执行完毕，用**执行后的当前时间**重算，而不是相位前的 now。
@@ -409,7 +547,7 @@ class Monitor {
       try {
         await this.pollOnce('interval');
       } catch (e) {
-        this._memPush(this.recentErrors, { scope: 'cycle', error: e.message });
+        this._memPush(this.recentErrors, { scope: 'cycle', error: e.message }, undefined, 'error');
       }
       if (gen !== this._gen || !this.running) return;
       const lastRun = this.nowFn();
@@ -596,7 +734,7 @@ class Monitor {
     };
     // 每个周期一条（同一个 cycleNo 只记一次，防止重入重复）
     if (this.lastJudgementCycleNo !== cycleNo) {
-      this._memPush(this.judgements, { kind: 'judgement', ...rec });
+      this._memPush(this.judgements, { kind: 'judgement', ...rec }, undefined, 'judgement');
       this.lastJudgementCycleNo = cycleNo;
     }
     return rec;
@@ -619,7 +757,7 @@ class Monitor {
       } catch (e) {
         if (e instanceof NotConnectedError) {
           rt.lastError = '推广数据读取尚未接入（等待用户提供推广页面）';
-          this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: rt.lastError });
+          this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: rt.lastError }, undefined, 'error');
           this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: rt.lastError });
           return { status: 'blocked', reason: rt.lastError };
         }
@@ -652,13 +790,13 @@ class Monitor {
       }
       const scopeBlockedReason = '未配置乘方控制范围（monitor.chengfang.scope）且未显式开启历史全店路径：监控不执行任何关闭';
       rt.lastData.blockedReason = scopeBlockedReason;
-      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: scopeBlockedReason });
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: scopeBlockedReason }, undefined, 'error');
       this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: scopeBlockedReason });
       return { status: 'blocked', reason: scopeBlockedReason };
     } catch (e) {
       const reason = e.reason || e.message;
       rt.lastError = reason;
-      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason, code: e.code || null });
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason, code: e.code || null }, undefined, 'error');
       this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'stopped', reason, code: e.code || null });
       log.warn(`店铺 ${shopCfg.id} 本轮停止: ${reason}`);
       return { status: 'stopped', reason, code: e.code || null };
@@ -685,28 +823,28 @@ class Monitor {
       } catch (e) {
         const reason = `乘方演练周期失败：${e.reason || e.message}`;
         rt.lastError = reason;
-        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason });
+        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'stopped', reason });
         return { status: 'stopped', reason };
       }
       if (res.outcome === 'dry_failed') {
         const reason = res.error || res.reason || '乘方演练未完成（身份/读取/分页/选择范围失败）';
         rt.lastError = reason;
-        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: `乘方演练失败：${reason}` });
+        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: `乘方演练失败：${reason}` }, undefined, 'error');
         this._memPush(this.triggers, {
-          shopId: shopCfg.id, mode: 'dry', actionType: 'pause', action: 'pause', failed: true, reason,
+          shopId: shopCfg.id, mode: 'dry', targetAction: 'pause', failed: true, reason,
           businessDate: data.cost.businessDate,
           costText: `${centsToYuan(data.cost.valueCents)} 元`,
           orders: data.orders.valueCount,
           targetCount: 0, targets: [],
           dryOutcome: 'dry_failed',
           note: `演练未完成（失败），不计为"正常枚举"：${reason}`,
-        });
+        }, undefined, 'trigger');
         this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'dry', failed: true, reason });
         return { status: 'ok', over: true, dryRun: true, targetCount: 0, chengfang: { outcome: 'dry_failed', error: reason } };
       }
       const triggerRec = {
-        shopId: shopCfg.id, mode: 'dry', actionType: 'pause', action: 'pause',
+        shopId: shopCfg.id, mode: 'dry', targetAction: 'pause',
         scope: '乘方(全店托管+商品自选)',
         reason: data.evaluation.reason,
         businessDate: data.cost.businessDate,
@@ -720,7 +858,7 @@ class Monitor {
           ? `演练模式：命中乘方超额条件，但演练未完成（${res.error}）`
           : '演练模式：命中乘方超额条件，以下为将暂停的乘方目标（未点击任何开关/暂停/删除）',
       };
-      this._memPush(this.triggers, triggerRec);
+      this._memPush(this.triggers, triggerRec, undefined, 'trigger');
       this._audit({ kind: 'trigger', ...triggerRec, targets: (res.targets || []).map((t) => t.planId || t.adId) });
       return { status: 'ok', over: true, dryRun: true, targetCount: (res.targets || []).length, chengfang: { outcome: res.outcome, error: res.error } };
     }
@@ -735,7 +873,7 @@ class Monitor {
     });
     if (batch.outcome === 'blocked_window') {
       this.schedule.lastWindowBlockReason = batch.reason;
-      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason, targetCount: 0 });
+      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason, targetCount: 0 }, undefined, 'trigger');
       this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason });
       return { status: 'window_blocked', reason: batch.reason };
     }
@@ -747,7 +885,7 @@ class Monitor {
     if (batch.outcome === 'blocked') {
       const reason = batch.reason || '乘方执行被门槛阻止，未发出任何请求';
       rt.lastData.blockedReason = reason;
-      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason });
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
       this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason });
       return { status: 'blocked', reason, batch: this._summarizeBatch(batch) };
     }
@@ -755,7 +893,7 @@ class Monitor {
     // 第 4 项：显式声明动作类型，下游禁止从 outcome 推断
     batch.actionType = batch.actionType || 'pause';
     this._recordBatch(shopCfg.id, batch);
-    this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) });
+    this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) }, undefined, 'batch');
     this._audit({ kind: 'action', shopId: shopCfg.id, ...this._summarizeBatch(batch) });
     return { status: 'ok', over: true, batch: this._summarizeBatch(batch) };
   }
@@ -819,7 +957,7 @@ class Monitor {
         const reason = `乘方开启演练周期失败：${e.reason || e.message}`;
         rt.lastError = reason;
         this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'dry', reason });
-        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason });
+        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'stopped', reason });
         return { status: 'stopped', reason };
       }
@@ -827,19 +965,18 @@ class Monitor {
         const reason = res.error || res.reason || '乘方开启演练未完成（身份/读取/分页/选择范围失败）';
         rt.lastError = reason;
         this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'dry', reason });
-        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: `乘方开启演练失败：${reason}` });
+        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: `乘方开启演练失败：${reason}` }, undefined, 'error');
         this._memPush(this.triggers, {
-          shopId: shopCfg.id, mode: 'dry', actionType: 'enable', action: 'enable',
-          scope: '乘方(全店托管+商品自选)', failed: true, reason,
+          shopId: shopCfg.id, mode: 'dry', targetAction: 'enable', failed: true, reason,
           businessDate: today, targetCount: 0, targets: [],
           dryOutcome: 'dry_failed',
           note: `每日开启相位演练未完成（失败），不计为"正常枚举"：${reason}`,
-        });
+        }, undefined, 'trigger');
         this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'dry', failed: true, reason });
         return { status: 'ok', dryRun: true, targetCount: 0, enable: { outcome: 'dry_failed', error: reason } };
       }
       const triggerRec = {
-        shopId: shopCfg.id, mode: 'dry', actionType: 'enable', action: 'enable',
+        shopId: shopCfg.id, mode: 'dry', targetAction: 'enable',
         scope: '乘方(全店托管+商品自选)',
         reason: `每日 ${enableHour}:00 自动开启相位`,
         businessDate: today,
@@ -850,7 +987,7 @@ class Monitor {
           ? `演练模式：每日开启相位演练未完成（${res.error}）`
           : `演练模式：每日开启相位将开启以下乘方目标（未点击任何开关/开启/删除）`,
       };
-      this._memPush(this.triggers, triggerRec);
+      this._memPush(this.triggers, triggerRec, undefined, 'trigger');
       this._audit({ kind: 'trigger', ...triggerRec, targets: (res.targets || []).map((t) => t.planId || t.adId) });
       // 演练不计入"已开启成功"——保留为 dry_done（不阻塞当日真实窗口，但也不谎报成功）
       this._setEnablePhase(shopCfg.id, today, res.error ? 'unknown' : 'dry_done', {
@@ -873,14 +1010,14 @@ class Monitor {
       const reason = `乘方开启批次异常：${e.reason || e.message}`;
       // 异常可能已发出部分请求 → unknown（不盲重发，等待回读）
       this._setEnablePhase(shopCfg.id, today, 'unknown', { phase: 'execute', reason });
-      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason });
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
       this._audit({ kind: 'action', shopId: shopCfg.id, status: 'unknown', reason });
       return { status: 'unknown', reason };
     }
     if (batch.outcome === 'blocked_window') {
       this.schedule.lastWindowBlockReason = batch.reason;
       this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'execute', reason: batch.reason, blocked: 'window' });
-      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason, targetCount: 0 });
+      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason, targetCount: 0 }, undefined, 'trigger');
       this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', blocked: 'window', reason: batch.reason });
       return { status: 'window_blocked', reason: batch.reason };
     }
@@ -896,7 +1033,7 @@ class Monitor {
       rt.lastData = rt.lastData || {};
       rt.lastData.blockedReason = reason;
       this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'execute', reason });
-      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason });
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
       this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason });
       return { status: 'blocked', reason, batch: this._summarizeBatch(batch) };
     }
@@ -904,7 +1041,7 @@ class Monitor {
     // 第 4 项：显式声明动作类型，下游禁止从 outcome 推断
     batch.actionType = batch.actionType || 'enable';
     this._recordBatch(shopCfg.id, batch);
-    this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) });
+    this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) }, undefined, 'batch');
     this._audit({ kind: 'action', shopId: shopCfg.id, ...this._summarizeBatch(batch) });
     // 全部确认开启 → success；部分确认 → unknown（不谎报成功，不阻塞已确认部分）
     const okStatus = batch.allEnabledConfirmed === true ? 'success' : 'unknown';
@@ -931,7 +1068,7 @@ class Monitor {
     } catch (e) {
       const reason = `广告清单读取失败：${e.reason || e.message}`;
       rt.lastData.blockedReason = reason;
-      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason });
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
       this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason });
       return { status: 'blocked', reason };
     }
@@ -964,7 +1101,7 @@ class Monitor {
           ? '演练模式：命中超额条件；但存在覆盖缺口——真实执行将被阻止，不得宣称全店可关闭'
           : '演练模式：命中全店超额条件，真实执行时将关闭以下全部投放侧广告',
       };
-      this._memPush(this.triggers, triggerRec);
+      this._memPush(this.triggers, triggerRec, undefined, 'trigger');
       this._audit({ kind: 'trigger', ...triggerRec, targets: triggerRec.targets.map((t) => t.adId) });
       return { status: 'ok', over: true, dryRun: true, targetCount: activeTargets.length, coverageGaps, sideUnknown };
     }
@@ -974,7 +1111,7 @@ class Monitor {
       const hh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
       const reason = `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：已读取并记录，未执行真实关闭（手动检查不绕过时间限制）`;
       this.schedule.lastWindowBlockReason = reason;
-      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', blocked: 'window', reason, targetCount: activeTargets.length });
+      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', blocked: 'window', reason, targetCount: activeTargets.length }, undefined, 'trigger');
       this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', blocked: 'window', reason });
       return { status: 'window_blocked', reason };
     }
@@ -984,7 +1121,7 @@ class Monitor {
     const batch = await coord.executeWholeShopCloseBatch({ shopCfg, cycleToken, todayStatus, trigger: { reason: data.evaluation.reason } });
     batch.actionType = batch.actionType || 'pause';
     this._recordBatch(shopCfg.id, batch);
-    this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) });
+    this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) }, undefined, 'batch');
     this._audit({ kind: 'action', shopId: shopCfg.id, ...this._summarizeBatch(batch) });
     return { status: 'ok', over: true, batch: this._summarizeBatch(batch) };
   }
@@ -1173,6 +1310,8 @@ class Monitor {
       actions: this.actions.slice(-100).reverse(),
       judgements: this.judgements.slice(-100).reverse(),
       recentErrors: this.recentErrors.slice(-50).reverse(),
+      // 过程事件（retry/paused/view/identity/abort/done/step…，2026-09-15 修复第 1 项第二轮）
+      processEvents: this.processEvents.slice(-100).reverse(),
       promoReaderConnected: this._injectedReader ? this._injectedReader.connected : false,
     };
   }

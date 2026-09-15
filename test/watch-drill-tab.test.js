@@ -32,7 +32,7 @@ function extractWatchScript(htmlSrc) {
 async function renderFragment(state, opts = {}) {
   const elements = {};
   const mkEl = () => ({ textContent: '', className: '', innerHTML: '', style: {} });
-  for (const id of ['wdShopName', 'wdStatusBadge', 'wdToggleBtn', 'wdModeBadge', 'wdGates', 'wdGap', 'wdLastCheck', 'wdNextRun', 'wdEnableToday', 'wdPhase', 'wdCost', 'wdOrders', 'wdPerOrder', 'wdConclusion', 'wdReason', 'wdError', 'wdLog']) {
+  for (const id of ['wdShopName', 'wdStatusBadge', 'wdToggleBtn', 'wdModeBadge', 'wdGates', 'wdGap', 'wdEnableTaskState', 'wdEnableTaskNext', 'wdEnableTaskMissed', 'wdEnableTaskBtn', 'wdToggleHint', 'wdLastCheck', 'wdNextRun', 'wdEnableToday', 'wdPhase', 'wdCost', 'wdOrders', 'wdPerOrder', 'wdConclusion', 'wdReason', 'wdError', 'wdLog']) {
     elements[id] = mkEl();
   }
   // /logs 响应盒：测试可在多次刷新之间改写，模拟接口语义变化（缺口出现/消失）
@@ -215,4 +215,24 @@ test('日志缺口：/logs 无新日志但 gap.droppedCount=700 → 展示缺口
   await r.settle();
   assert.strictEqual(r.els.wdGap.style.display, 'none', `缺口消失后必须隐藏提示，实际：${JSON.stringify(r.els.wdGap)}`);
   assert.strictEqual(r.els.wdGap.textContent, '', '缺口消失后必须清空提示文本');
+});
+
+test('独立每日开启任务行：running → 已登记待命+下次时间+停用按钮；stoppedByUser → 恢复按钮', async () => {
+  // 运行中（已登记）
+  const r1 = await renderFragment({
+    shopName: '瑾漂亮潮流服饰', realMode: true, running: false, status: 'idle',
+    enableTask: { running: true, configEnabled: true, stoppedByUser: false, nextRunAt: '2026-09-16T23:00:00.000Z', lastMissedReason: null },
+    gates: { realMode: true, pauseEnabled: true, enableEnabled: true, dryRun: false, pauseWillExecute: true, enableWillExecute: true, blockedBy: [], scope: ['全店托管', '商品自选'], deleteAdEnabled: false },
+  });
+  assert.ok(r1.els.wdEnableTaskState.textContent.includes('已登记待命'), `实际：${r1.els.wdEnableTaskState.textContent}`);
+  assert.ok(r1.els.wdEnableTaskNext.textContent.includes('下次开启'), `必须显示下次开启时间，实际：${r1.els.wdEnableTaskNext.textContent}`);
+  assert.strictEqual(r1.els.wdEnableTaskBtn.textContent, '停用每日开启');
+  // 用户独立停用
+  const r2 = await renderFragment({
+    shopName: '瑾漂亮潮流服饰', realMode: true, running: false, status: 'idle',
+    enableTask: { running: false, configEnabled: true, stoppedByUser: true, nextRunAt: null, lastMissedReason: null },
+    gates: { realMode: true, pauseEnabled: true, enableEnabled: true, dryRun: false, pauseWillExecute: true, enableWillExecute: true, blockedBy: [], scope: ['全店托管', '商品自选'], deleteAdEnabled: false },
+  });
+  assert.ok(r2.els.wdEnableTaskState.textContent.includes('已独立停用'), `实际：${r2.els.wdEnableTaskState.textContent}`);
+  assert.strictEqual(r2.els.wdEnableTaskBtn.textContent, '恢复每日开启');
 });

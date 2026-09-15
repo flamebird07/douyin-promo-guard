@@ -53,6 +53,10 @@ const DEFAULTS = {
       pauseEnabled: false,            // 乘方暂停动作真实执行开关（默认关闭；realMode 为总闸）
       enableEnabled: false,           // 乘方开启动作真实执行开关（默认关闭；realMode 为总闸）
       enableHour: 7,                  // 每日自动开启时段起点（Asia/Shanghai；当天一次，跨日重置）
+      // 独立每日开启调度器（2026-09-15 上线）：true = 服务启动即登记每日 enableHour 的
+      // 自动开启任务，不依赖"启动值守"（超额暂停巡查独立启停）。执行仍受 enableEnabled+
+      // realMode+dryRun 门禁约束；页面提供独立停用控制（按用户+日期持久化）。
+      enableSchedulerEnabled: false,
     },
     qianchuan: {
       adTypes: ['uni_promotion', 'standard'], // 仅只读清单透明性；本轮动作范围 = chengfang.scope
@@ -181,6 +185,9 @@ function collectPending(cfg) {
   }
   if (cf.enableEnabled !== undefined && typeof cf.enableEnabled !== 'boolean') {
     push('monitor.chengfang.enableEnabled: 必须是布尔值（乘方开启动作真实执行开关，默认 false）');
+  }
+  if (cf.enableSchedulerEnabled !== undefined && typeof cf.enableSchedulerEnabled !== 'boolean') {
+    push('monitor.chengfang.enableSchedulerEnabled: 必须是布尔值（独立每日开启调度器，默认 false）');
   }
   if (cf.enableHour !== undefined) {
     const enableHourErr = intInRange(cf.enableHour, 0, 23, 'monitor.chengfang.enableHour');

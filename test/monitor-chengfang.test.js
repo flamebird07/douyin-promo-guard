@@ -23,7 +23,7 @@ const fs = require('fs');
 const { chromium } = require('playwright');
 const { Monitor } = require('../src/engine/monitor');
 const { makeTempDir, writeTempCookie, makeCfgResult, makeLinkedReader, makeStatefulController, makeClock, waitFor } = require('./helpers');
-const { shanghaiMs } = require('../src/lib/time');
+const { shanghaiMs, shanghaiWall } = require('../src/lib/time');
 const { buildChengfangFixtureHtml } = require('./chengfang-fixture');
 const { createChengfangController } = require('../src/adapters/chengfang-reader');
 const { ChengfangRunner } = require('../src/engine/chengfang-runner');
@@ -57,6 +57,8 @@ async function setupChengfangMonitor(t, {
   const cookieDir = makeTempDir('pg-ck-');
   const dataDir = makeTempDir('pg-data-');
   t.after(() => {
+    try { monitorRef.stopEnableScheduler({ byUser: false, reason: 'test-cleanup' }); } catch (_) {}
+    try { monitorRef.stop(); } catch (_) {}
     fs.rmSync(cookieDir, { recursive: true, force: true });
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
@@ -104,7 +106,7 @@ async function setupChengfangMonitor(t, {
     },
   });
   monitorRef = monitor;
-  return { monitor, controller, reader, track, dataDir, cookieDir };
+  return { monitor, controller, reader, track, dataDir, cookieDir, cfgResult };
 }
 
 const pauseClicks = (log) => (log || []).filter((c) => c.type === 'pause');
@@ -767,4 +769,137 @@ test('自动开启调度：realMode=false → 开启相位为演练（枚举目�
   assert.strictEqual(deleteClicks(track.clickLog).length, 0);
   assert.strictEqual(monitor.actions.length, 0, '演练不产生真实动作记录');
   monitor.stop();
+});
+
+// ══════════════════════════════════════════════════════════════
+// 上线（2026-09-15）：独立每日开启调度器——生命周期与"启动值守"完全分离
+// ══════════════════════════════════════════════════════════════
+
+test('上线：未启动值守也到 07:00 自动开启（独立调度器驱动，演练零点击）', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '06:30'));
+  const { monitor, track } = await setupChengfangMonitor(t, {
+    clock,
+    execution: { realMode: false, dryRun: true },
+    monitorChengfang: { enableSchedulerEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(5) } },
+  });
+  const r = monitor.startEnableScheduler({ reason: 'test' });
+  assert.strictEqual(r.ok, true, `调度器应登记成功：${r.reason || ''}`);
+  assert.strictEqual(monitor.running, false, '值守（暂停巡查）必须仍未启动');
+  assert.strictEqual(monitor.enableRunning, true);
+  assert.ok(monitor.getStatus().monitor.enableScheduler.nextRunAt, '必须立即登记下次开启时间');
+  await waitFor(() => clock.pending() >= 1, 8000, '调度器挂起等待 07:00');
+  clock.releaseAll(); // 06:30 → 07:00
+  await waitFor(() => monitor.triggers.length >= 1, 15000, '开启演练 trigger');
+  const tr = monitor.triggers[0];
+  assert.strictEqual(tr.mode, 'dry');
+  assert.strictEqual(tr.targetAction, 'enable', '开启 trigger 必须带显式动作标签');
+  assert.strictEqual(tr.targetCount, 6, '枚举 1 托管 + 5 商品自选');
+  assert.strictEqual(monitor.running, false, '全程值守仍未启动');
+  assert.strictEqual((track.clickLog || []).length, 0, '演练零业务点击');
+  assert.strictEqual(deleteClicks(track.clickLog).length, 0, '删除零点击');
+});
+
+test('上线：停止值守不取消每日开启；值守运行标志与开启调度器标志互不影响', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '06:30'));
+  const { monitor, track } = await setupChengfangMonitor(t, {
+    clock,
+    execution: { realMode: false, dryRun: true },
+    monitorChengfang: { enableSchedulerEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
+  });
+  await monitor.startEnableScheduler({ reason: 'test' });
+  monitor.start(); // 启动值守（暂停巡查）
+  assert.strictEqual(monitor.running, true);
+  assert.strictEqual(monitor.enableRunning, true);
+  monitor.stop(); // 停止值守 → 只中止 kind!=='enable' 的令牌与暂停循环
+  assert.strictEqual(monitor.running, false, '值守已停止');
+  assert.strictEqual(monitor.enableRunning, true, '每日开启任务必须仍运行');
+  await waitFor(() => clock.pending() >= 1, 8000, '调度器仍挂起等待');
+  clock.releaseAll(); // → 07:00
+  await waitFor(() => monitor.triggers.length >= 1, 15000, '停止值守后开启仍执行');
+  assert.strictEqual(monitor.triggers[0].targetAction, 'enable');
+  assert.strictEqual((track.clickLog || []).length, 0);
+});
+
+test('上线：独立停用每日开启 → 07:00 零请求；持久化停用标记，恢复后才可运行', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '06:30'));
+  const { monitor, track, dataDir, cfgResult, controller, reader } = await setupChengfangMonitor(t, {
+    clock,
+    execution: { realMode: false, dryRun: true },
+    monitorChengfang: { enableSchedulerEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
+  });
+  monitor.stopEnableScheduler({ byUser: true, reason: 'test' });
+  assert.strictEqual(monitor.enableRunning, false);
+  clock.releaseAll(); // 即便时间推进过 07:00（无挂起门则直接推进）
+  clock.advance(60 * 60 * 1000);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.strictEqual(track.sessions, 0, '独立停用后零页面会话');
+  assert.strictEqual(monitor.triggers.length, 0, '零开启记录');
+  assert.strictEqual(monitor.getStatus().monitor.enableScheduler.stoppedByUser, true, '停用标记可见');
+  // 重启（新实例，同一状态目录）：停用标记持久化 → 自动恢复被拒；resume 后可运行
+  const monitor2 = new Monitor(cfgResult, { reader, controller }, { dataDir, nowFn: clock.nowFn, delayFn: clock.delayFn });
+  assert.strictEqual(monitor2.startEnableScheduler({ reason: 'boot' }).ok, false, '重启不得复活用户独立停用的任务');
+  const rr = monitor2.resumeEnableScheduler({ reason: 'user-resume' });
+  assert.strictEqual(rr.ok, true, '恢复后可运行');
+  assert.strictEqual(monitor2.enableRunning, true);
+  monitor2.stopEnableScheduler({ byUser: false, reason: 'test-cleanup' });
+});
+
+test('上线：08:00 后启动调度器 → 记录"错过窗口"原因，不擅自补开，下次=明日 07:00', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '08:05'));
+  const { monitor, track } = await setupChengfangMonitor(t, {
+    clock,
+    execution: { realMode: false, dryRun: true },
+    monitorChengfang: { enableSchedulerEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
+  });
+  const r = monitor.startEnableScheduler({ reason: 'test' });
+  assert.strictEqual(r.ok, true);
+  await waitFor(() => clock.pending() >= 1, 8000, '调度器登记明日窗口');
+  const es = monitor.getStatus().monitor.enableScheduler;
+  assert.match(es.lastMissedReason || '', /错过|不擅自补开/, '必须记录错过窗口原因');
+  assert.strictEqual(track.sessions, 0, '08:00 后零页面会话（不补开）');
+  assert.strictEqual(monitor.triggers.length, 0);
+  const next = new Date(es.nextRunAt);
+  const wall = shanghaiWall(next.getTime());
+  assert.strictEqual(wall.hour, 7, '下次开启必须是明日 07:00（上海）');
+  assert.strictEqual(wall.date, '2026-09-13');
+});
+
+test('上线：当日已 success 后窗口内重启 → 不重复开启（真实模式，零新会话）', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '07:00'));
+  const { monitor, track, dataDir, cfgResult, controller, reader } = await setupChengfangMonitor(t, {
+    clock,
+    monitorChengfang: { enableSchedulerEnabled: true, enableEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
+  });
+  await monitor.startEnableScheduler({ reason: 'test' });
+  await waitFor(() => clock.pending() >= 1, 8000, '挂起等待（07:00 已在窗口内，应立即处理）');
+  // 07:00 在窗口内：循环先处理今日开启再挂起等待 08:00
+  await waitFor(() => monitor.actions.length >= 1 && monitor.actions[0].allEnabledConfirmed === true, 20000, "真实开启批次执行");
+  await waitFor(() => (monitor.getStatus().shops[0].enablePhase || {}).status === 'success', 15000, '开启成功持久化');
+  const sessionsAfterFirst = track.sessions;
+  assert.ok(sessionsAfterFirst >= 1, '首轮真实开启应打开页面');
+  // 窗口内重启（同一 dataDir）：success 记录 → 不重复
+  const monitor2 = new Monitor(cfgResult, { reader, controller }, { dataDir, nowFn: clock.nowFn, delayFn: clock.delayFn });
+  const sessionsBefore2 = track.sessions;
+  await monitor2.startEnableScheduler({ reason: 'restart' });
+  await new Promise((r) => setTimeout(r, 120));
+  assert.strictEqual(track.sessions, sessionsBefore2, '重启后当日已 success → 零新会话、零重复开启');
+  monitor2.stopEnableScheduler({ byUser: false, reason: 'test-cleanup' });
+});
+
+test('上线：两相位互斥——暂停周期进行中，开启相位请求被拒（不并发执行）', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '07:00'));
+  const { monitor } = await setupChengfangMonitor(t, {
+    clock,
+    execution: { realMode: false, dryRun: true },
+    fixture: { plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(1) } },
+  });
+  monitor._cycleRunning = true; // 模拟暂停/其他周期占用互斥锁
+  const r = await monitor._runEnablePhase(undefined, '2026-09-12');
+  assert.strictEqual(r.skipped, true, '互斥期间开启相位必须跳过');
+  monitor._cycleRunning = false;
 });

@@ -1,3 +1,31 @@
+# HANDOFF — 正式上线：独立每日开启 + 真实开启接线 + 生产切换 · 第十五轮（2026-09-15 上线轮）
+
+> **本轮为用户明确授权的实操上线轮**（"补齐吧，我要直接能用，不需要演练了"）。基线 `e665c73`（=origin/main）。
+> **生产配置已切换并重启加载**：`execution.realMode=true`、`execution.dryRun=false`、`monitor.chengfang.pauseEnabled=true`、`monitor.chengfang.enableEnabled=true`、`monitor.chengfang.enableSchedulerEnabled=true`（新增）。3443 已精确重启（旧 PID 18920 → 新 PID，入口 `node start-server.js`），重启前核验全部业务状态接口为空闲。
+
+## 0.1 独立每日开启调度器（生命周期分离）
+
+- **Monitor**（`src/engine/monitor.js`）：新增 `enableRunning/_enableGen/_enableSchedule` 与 `startEnableScheduler/stopEnableScheduler/resumeEnableScheduler`、专属 `_enableLoop`（等待每日 `[enableHour, dailyStartHour)` 窗口 → 复用 `_runEnablePhase`）与 `_chunkedEnableDelay`（只随开启调度器中断）。停止令牌按动作区分（`kind:'pause'|'enable'`）：`stop()`（停止值守）只中止暂停令牌，绝不取消每日开启；`stopEnableScheduler` 只中止开启令牌。`_intervalLoop` 的开启窗口分支在调度器运行时跳过（防双循环重复开启）；`_runEnablePhase` 入口加 `_cycleRunning` 互斥（两相位绝不并发）。`getStatus().monitor.enableScheduler` 如实透出 running/nextRunAt/stoppedByUser/lastMissedReason。
+- **错过窗口**：08:00 后启动且当日无任何开启记录 → 记录"今日开启窗口已过且未执行开启：不擅自补开广告"（按日期去重），下次登记明日 07:00。窗口内重启按当日记录处理（success 不重复；unknown/failed 先回读）。
+- **持久化**：`stoppedByUser` 写入 state.json（用户独立停用后重启不自动复活）；enablePhase 沿用 店铺+上海日期 持久化与重启回读（in_progress→unknown）。
+- **watch-drill/服务**（`bill-manager/watch-drill.js` + `server.js`）：新增 `boot()`——服务进程启动即装配 Monitor、按配置自动登记每日开启任务（写日志）、启动 60s 后台同步（无人打开页面也转译事件流并落盘 JSONL）。新增 HTTP `POST /api/watch-drill/daily-enable/start|stop`（独立停用/恢复）。快照新增 `enableTask` 块，与 `running`（暂停值守）完全分离。
+- **页面**：值守卡片新增"独立每日开启任务"行（已登记待命+下次时间+错过原因 / 已独立停用+恢复按钮），启动按钮旁明确标注"启动值守只控制超额暂停巡查"；规则文案更新为双任务独立语义。上轮全部修复（未知模式待核实、日志缺口、dryRun 阻断原因、动作标签）保留。
+
+## 0.2 真实开启接线（真机实测证据）
+
+- **真机可视测量**（headed Edge，抖店首页→巨量千川→乘方，同一 browser/context/Cookie，账户核验 1710242295996424/伊人美）：
+  - **商品自选批量开启：无确认弹窗**——勾选 1 条（ID 187585998140533930）点击批量"开启"直接生效；回读 `投放中/switchChecked=true`（一次成功）。
+  - **全店托管行内开关开启：实测确认弹窗**——「为保证投放的唯一性…受到互斥影响的放量投放-全域投放计划、标准投放计划将会暂停（如有）。同时小店随心推订单将被终止，终止后不可恢复。」按钮【再想想】【确定】。首轮按 fail-closed 取消并回读确认未变化；实现精确句式后二轮实测确认 → 回读托管（ID 184388555253250584）`投放中/switchChecked=true`。
+  - 测试对象最终状态：上述 2 个对象均为开启侧（与上线后的预期稳态一致）；未新建计划、未开启无关广告；平台互斥副作用（全域/标准计划暂停、随心推终止）已如实记录在测量证据（evidence/，不入库）。
+- **接线**（`src/adapters/chengfang-reader.js`）：双锚点（`为保证投放的唯一性`+`受到互斥影响`+`乘方投放`）识别 `shop_enable_confirm`，同步全部 4 个浏览器内联副本；`submitConfirmIfPresent`/`clickChengfangConfirmOkInPage`/`clickRowSwitch` 阻断过滤/`detectDanger` 白名单加入 shop_enable；`batch_enable` 保持无句式声明（实测无弹窗；若未来出现任何弹窗仍按未知阻断）。`watch-drill` 的 `CONFIRM_DIALOG_MEASURED` 四项全部 true（batch_enable=true 注明"实测无弹窗"）。
+
+## 0.3 测试与部署验证
+
+- 新增回归：monitor 调度分离 6 用例（未启动值守仍 07:00 开启/停止值守不取消开启/独立停用零请求且持久化/08:00 后错过窗口不补开/当日 success 重启不重复/两相位互斥）+ chengfang-confirm-switch 托管开启弹窗 5 用例 + watch-drill boot 独立性与 daily-enable 端点 2 用例 + 片段 enable-task 渲染 1 用例。
+- 3443 重启后实测：state `realMode=true, gates 全过（pauseWillExecute/enableWillExecute=true）`、`enableTask.running=true, nextRunAt=2026-09-15T23:00:00Z（=09-16 07:00 上海）`、值守 running=false；日志含"独立每日开启任务已登记/每日开启任务登记/每日开启错过窗口"；页面含独立任务行与全部历史修复。
+- 服务自启动：修复 Startup 内既有 VBS（原指向已不存在的旧目录 `5uFU㏑Kb`），现指向当前 bill-manager 目录与 `start-server.js`，未安装重复启动项。
+- **待观察**：2026-09-16 07:00 首次定时真实开启的结果未实际观察（按用户要求不为证明部署而夜间开启整店）；"启动值守"页上按钮的实点验证未执行（为避免夜间触发真实巡查轮），其独立性已由两层自动化测试覆盖。
+
 # HANDOFF — 页面同步回退修复 + 测试确定性 · 第十四轮（2026-09-15 第四轮定点收尾）
 
 > 交付日期：2026-09-15。**realMode=false、dryRun=true、pauseEnabled=false、enableEnabled=false 全程未变；未重启 3443（PID 18920）、未启动值守、未操作真实广告；删除零点击；测试仅用隔离数据。**

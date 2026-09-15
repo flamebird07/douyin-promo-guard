@@ -89,6 +89,7 @@ function createWatchDrill(opts = {}) {
       lastError: null,
       lastRound: null,       // 转译后的最近一轮（供界面展示）
       gates: null,           // 真实执行门槛快照（界面必须让用户看到是否真的会操作广告）
+      enableTask: null,      // 独立每日开启任务状态（与 running 完全分离的生命周期）
       phase: null,           // Monitor 调度相位
       windowBlockReason: null,
       enablePhaseToday: [],
@@ -212,6 +213,7 @@ function createWatchDrill(opts = {}) {
         : (realMode ? '真实执行' : '演练模式（不操作广告）'),
       scope: Array.isArray(cf.scope) ? cf.scope.slice() : [],
       enableHour: Number.isInteger(cf.enableHour) ? cf.enableHour : 7,
+      enableSchedulerEnabled: cf.enableSchedulerEnabled === true,
       dailyStartHour: (cfg.schedule && cfg.schedule.dailyStartHour) || 8,
       intervalMinutes: (cfg.schedule && cfg.schedule.intervalMinutes) || 30,
       // 真实暂停/开启是否**当前**会落地 —— 由真实许可（含 dryRun）决定，与执行器一致
@@ -246,6 +248,16 @@ function createWatchDrill(opts = {}) {
         + `；真实暂停${next.pauseWillExecute ? '会执行' : '不会执行'}，真实开启${next.enableWillExecute ? '会执行' : '不会执行'}。`);
     }
     return next;
+  }
+
+  /** 从 Monitor getStatus 提取独立每日开启任务状态（无 Monitor 时 null）。 */
+  function syncEnableTask() {
+    const m = drill._monitor;
+    if (!m || typeof m.getStatus !== 'function') return null;
+    const ms = m.getStatus().monitor || {};
+    return ms.enableScheduler
+      ? { ...ms.enableScheduler, enableHour: ms.enableHour, dailyStartHour: ms.dailyStartHour }
+      : null;
   }
 
   // ── Monitor 装配（延迟到首次 start，避免加载即触网/建状态）────────────────
@@ -442,7 +454,23 @@ function createWatchDrill(opts = {}) {
     enable_phase: { label: '开启相位', level: 'info' },
     enable_done: { label: '开启相位完成', level: 'info' },
   };
+  // 独立每日开启调度器的审计事件（kind='enable-scheduler'，按 kind 精确分派）
+  const ENABLE_SCHEDULER_LABEL = {
+    registered: { label: '每日开启任务登记', level: 'info' },
+    stopped: { label: '每日开启任务停止', level: 'warn' },
+    window_missed: { label: '每日开启错过窗口', level: 'warn' },
+  };
   function describeProcess(p) {
+    if (p.kind === 'enable-scheduler' && p.event) {
+      const em = ENABLE_SCHEDULER_LABEL[p.event] || null;
+      const en = em ? em.label : `每日开启任务事件（${p.event}）`;
+      const eb = [];
+      if (p.nextRunAt) eb.push(`下次 ${p.nextRunAt}`);
+      if (p.date) eb.push(`日期 ${p.date}`);
+      if (p.reason) eb.push(p.reason);
+      if (p.byUser !== undefined) eb.push(p.byUser ? '用户独立停用' : '非用户操作');
+      return `过程：${en}${eb.length ? `（${eb.join('，')}）` : ''}` + (em ? '' : '；未识别事件名，按原样透出');
+    }
     const ev = String(p.event || p.kind || 'unknown');
     // "*enable*" 家族一律归入开启相位（不逐字枚举）
     const meta = PROCESS_LABEL[ev] || (/enable/i.test(ev) ? { label: '开启相位', level: 'info' } : null);
@@ -481,6 +509,10 @@ function createWatchDrill(opts = {}) {
       const status = m.getStatus();
 
       // 1) 调度相位 / 下次执行 / 今日开启相位
+      // 独立每日开启任务状态（与 running=暂停值守 完全分离，界面分别展示）
+      st.enableTask = status.monitor.enableScheduler
+        ? { ...status.monitor.enableScheduler, enableHour: status.monitor.enableHour, dailyStartHour: status.monitor.dailyStartHour }
+        : null;
       st.phase = status.monitor.phase;
       st.nextRunAt = status.monitor.nextRunAt;
       st.windowBlockReason = status.monitor.windowBlockReason;
@@ -642,6 +674,69 @@ function createWatchDrill(opts = {}) {
   }
 
   // ── 对外操作 ─────────────────────────────────────────────────────────────
+  /**
+   * 服务启动装配（2026-09-15 上线）：3443 进程启动即调用，不依赖任何页面访问。
+   * - 装配 Monitor（只读装配，不启动暂停巡查/值守）；
+   * - 按配置自动登记独立每日开启任务（重启自动恢复；用户独立停用除外）；
+   * - 启动后台周期同步：无人打开页面也持续转译事件流并落盘值守日志。
+   */
+  function boot() {
+    try {
+      ensureMonitor();
+    } catch (e) {
+      pushLog('error', `值守装配失败（服务启动）：${(e && e.message) || String(e)}`);
+      return snapshot();
+    }
+    const m = drill._monitor;
+    if (m.enableSchedulerShouldRun()) {
+      const r = m.startEnableScheduler({ reason: '服务启动自动恢复' });
+      if (r && r.ok === false) {
+        pushLog('warn', `每日开启任务登记失败：${r.reason}`);
+      } else {
+        const t = (drill.state.enableTask = syncEnableTask()) || {};
+        pushLog('info', `独立每日开启任务已登记：每日 ${String(t.enableHour).padStart(2, '0')}:00（上海）自动开启全部乘方计划（含人工暂停的）；`
+          + `下次开启 ${t.nextRunAt || '—'}；与"启动值守"相互独立（停止值守不取消本任务）。`);
+      }
+    } else {
+      const cf = (m.config.monitor && m.config.monitor.chengfang) || {};
+      pushLog('info', cf.enableSchedulerEnabled === true
+        ? '每日开启任务保持"用户独立停用"状态（服务重启不自动恢复，可在页面手动恢复）'
+        : '独立每日开启任务未启用（monitor.chengfang.enableSchedulerEnabled=false）');
+    }
+    if (!drill._syncTimer) {
+      drill._syncTimer = setInterval(() => { try { syncFromMonitor(); } catch (_) { /* 后台同步失败不影响运行 */ } }, 60 * 1000);
+      if (typeof drill._syncTimer.unref === 'function') drill._syncTimer.unref();
+    }
+    syncFromMonitor();
+    return snapshot();
+  }
+
+  /** 独立每日开启任务：停用（页面控制；持久化，重启不自动恢复）。 */
+  function stopEnableScheduler() {
+    try {
+      const m = ensureMonitor();
+      const r = m.stopEnableScheduler({ byUser: true, reason: '页面独立停用' });
+      pushLog(r && r.wasRunning ? 'warn' : 'info', `每日开启任务已停用（${r && r.wasRunning ? '此前运行中，已中止未派发的开启' : '此前未在运行'}）；暂停值守不受影响。`);
+    } catch (e) {
+      pushLog('error', `停用每日开启任务失败：${(e && e.message) || String(e)}`);
+    }
+    syncFromMonitor();
+    return snapshot();
+  }
+
+  /** 独立每日开启任务：恢复（清除独立停用标记并重新登记）。 */
+  function startEnableScheduler() {
+    try {
+      const m = ensureMonitor();
+      const r = m.resumeEnableScheduler({ reason: '页面手动恢复' });
+      if (r && r.ok === false) pushLog('warn', `每日开启任务恢复失败：${r.reason}`);
+    } catch (e) {
+      pushLog('error', `恢复每日开启任务失败：${(e && e.message) || String(e)}`);
+    }
+    syncFromMonitor();
+    return snapshot();
+  }
+
   function start() {
     const st = drill.state;
     if (st.running && drill._monitor && drill._monitor.running) {
@@ -714,6 +809,16 @@ function createWatchDrill(opts = {}) {
         drill.shopName = (drill._config && Array.isArray(drill._config.shops))
           ? (drill._config.shops.map((s) => s.name || s.id).join('、') || '—')
           : drill.shopName;
+        // 未装配 Monitor（boot 前）：如实展示"调度器未运行"；配置开关与停用标记未知不臆断
+        if (!st.enableTask) {
+          const cf = (drill._config && drill._config.monitor && drill._config.monitor.chengfang) || {};
+          st.enableTask = {
+            running: false, configEnabled: cf.enableSchedulerEnabled === true,
+            stoppedByUser: null, phase: null, nextRunAt: null, lastRunAt: null,
+            lastMissedReason: null,
+            enableHour: gates.enableHour, dailyStartHour: gates.dailyStartHour,
+          };
+        }
       } catch (_) { /* 读配置失败：保留 null/未知，不臆断 */ }
     }
     return {
@@ -734,6 +839,7 @@ function createWatchDrill(opts = {}) {
       lastError: st.lastError,
       lastRound: st.lastRound,
       gates,
+      enableTask: st.enableTask || null,
       phase: st.phase,
       windowBlockReason: st.windowBlockReason,
       enablePhaseToday: st.enablePhaseToday,
@@ -780,9 +886,9 @@ function createWatchDrill(opts = {}) {
    */
   const CONFIRM_DIALOG_MEASURED = {
     batch_pause: true,   // 实测「确定要暂停N条计划吗？」
-    batch_enable: false, // 未实测 → 出现确认弹窗即阻断
+    batch_enable: true,  // 2026-09-15 真机实测：商品自选批量开启**无确认弹窗**（点击即生效，回读确认）
     shop_disable: true,  // 实测「确定关闭乘方投放吗？」
-    shop_enable: false,  // 未实测 → 出现确认弹窗即阻断
+    shop_enable: true,   // 2026-09-15 真机实测：「为保证投放的唯一性…受到互斥影响…」【再想想】【确定】
   };
 
   async function serveHttp(req, res) {
@@ -796,6 +902,9 @@ function createWatchDrill(opts = {}) {
     try {
       if (p === '/api/watch-drill/start' && req.method === 'POST') return send(200, { ok: true, state: start() });
       if (p === '/api/watch-drill/stop' && req.method === 'POST') return send(200, { ok: true, state: stop() });
+      // 独立每日开启任务控制（与"启动值守"完全分离；页面提供独立按钮）
+      if (p === '/api/watch-drill/daily-enable/start' && req.method === 'POST') return send(200, { ok: true, state: startEnableScheduler() });
+      if (p === '/api/watch-drill/daily-enable/stop' && req.method === 'POST') return send(200, { ok: true, state: stopEnableScheduler() });
       if (p === '/api/watch-drill/state' && req.method === 'GET') { syncFromMonitor(); return send(200, { ok: true, state: snapshot() }); }
       if (p === '/api/watch-drill/logs' && req.method === 'GET') {
         syncFromMonitor();
@@ -822,6 +931,11 @@ function createWatchDrill(opts = {}) {
   return {
     start,
     stop,
+    /** 服务启动装配：登记独立每日开启任务 + 后台周期同步（不启动暂停值守）。 */
+    boot,
+    /** 独立每日开启任务控制（与 start/stop 值守相互独立）。 */
+    startEnableScheduler,
+    stopEnableScheduler,
     snapshot,
     serveHttp,
     /** 显式同步（测试/调试用；HTTP 各接口内部已自动调用）。 */

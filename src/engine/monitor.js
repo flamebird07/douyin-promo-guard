@@ -34,7 +34,7 @@ const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed } = require('
 const { perOrderDisplayText } = require('./rules');
 const guard = require('./guard');
 const { NotConnectedError } = require('../lib/errors');
-const { shanghaiDate, shanghaiClockText, shanghaiWall, isAfterDailyStart, msUntilDailyStart, msUntilHour, nextIntervalDelayMs } = require('../lib/time');
+const { shanghaiDate, shanghaiClockText, shanghaiWall, shanghaiMs, isAfterDailyStart, msUntilDailyStart, msUntilHour, nextIntervalDelayMs } = require('../lib/time');
 const { centsToYuan } = require('../lib/money');
 const log = require('../lib/log');
 
@@ -56,6 +56,7 @@ class Monitor {
     this.auditFile = path.join(this.dataDir, 'audit.jsonl');
     this.nowFn = opts.nowFn || (() => Date.now());
     this.delayFn = opts.delayFn || ((ms) => this._chunkedDelay(ms));
+    this._injectedDelayFn = opts.delayFn || null; // 测试可控时钟：开启调度循环复用同一时钟门
 
     this.adapters = adapters || null;
     this._injectedReader = (adapters && adapters.reader) || null;
@@ -65,10 +66,28 @@ class Monitor {
     this._chengfangOpener = opts.chengfangOpener || null; // 测试注入：本地 DOM fixture 会话开启器
 
     this.running = false;
-    this._gen = 0;               // 代数：stop/start 快速切换时防止多循环
+    this._gen = 0;               // 代数：stop/start 快速切换时防止多循环（暂停巡查）
     this._loopPromise = null;
     this._cycleRunning = false;
     this._activeTokens = new Set();
+
+    // ── 独立每日开启调度器（2026-09-15 上线）────────────────────────
+    // 生命周期与"启动值守"（超额暂停巡查）完全分离：
+    //   - enableRunning/_enableGen 只属于每日开启循环，不随 watch start/stop 变化；
+    //   - 停止令牌按动作区分（kind:'pause' | 'enable'），停止值守绝不取消每日开启；
+    //   - 恢复语义：服务重启后按配置自动恢复（除非用户独立停用，持久化于状态文件）。
+    this.enableRunning = false;
+    this._enableGen = 0;
+    this._enableLoopPromise = null;
+    this._enableSchedule = {
+      phase: 'idle',            // idle | waiting_window | enable_window | stopped
+      nextRunAt: null,          // 下一次开启窗口起点（上海时间，ISO）
+      lastRunAt: null,
+      lastMissedReason: null,   // 最近一次错过窗口的原因（按日期去重记录）
+      lastMissedDate: null,
+      stoppedByUser: false,     // 用户独立停用（持久化；重启不自动恢复）
+      stoppedAt: null,
+    };
 
     this.startedAt = null;
     this.lastCycleAt = null;
@@ -114,6 +133,11 @@ class Monitor {
     const loaded = this._loadState();
     this.batches = loaded.batches || {}; // shopId -> date -> { runs:[], totals:{} }
     this.enablePhase = loaded.enablePhase || {};
+    // 独立停用标记持久化（重启后不得"复活"用户明确停用的每日开启任务）
+    if (loaded.enableScheduler && typeof loaded.enableScheduler === 'object') {
+      this._enableSchedule.stoppedByUser = loaded.enableScheduler.stoppedByUser === true;
+      this._enableSchedule.stoppedAt = loaded.enableScheduler.stoppedAt || null;
+    }
     // 重启回读：上次进程遗留的 in_progress 视为 unknown（进程已中断，结果未确认），
     // 交由 _runEnablePhase 先回读实际状态再决定，绝不盲目重发。
     this._reconcileEnablePhaseOnBoot();
@@ -209,6 +233,10 @@ class Monitor {
         version: STATE_VERSION,
         batches: this.batches,
         enablePhase: this.enablePhase || {},
+        enableScheduler: {
+          stoppedByUser: this._enableSchedule.stoppedByUser === true,
+          stoppedAt: this._enableSchedule.stoppedAt || null,
+        },
         savedAt: new Date(this.nowFn()).toISOString(),
       }, null, 2));
       fs.renameSync(tmp, this.stateFile);
@@ -440,15 +468,192 @@ class Monitor {
   }
 
   stop() {
-    this._gen += 1;          // 使旧循环退出、旧 delay 中断
+    this._gen += 1;          // 使旧循环退出、旧 delay 中断（仅暂停巡查循环）
     this.running = false;
-    // 停止所有在途轮询周期：周期内不再发起新的关闭请求（已发出的继续回读确认）
-    for (const t of this._activeTokens) t.aborted = true;
+    // 停止在途**暂停巡查**周期：周期内不再发起新的关闭请求（已发出的继续回读确认）。
+    // 按动作区分令牌：每日开启（kind:'enable'）不受"停止值守"影响——它是独立任务。
+    for (const t of this._activeTokens) if (t.kind !== 'enable') t.aborted = true;
     this.schedule.phase = 'stopped';
     this.schedule.nextRunAt = null;
-    log.info('监控已停止（已发出的关闭请求将继续回读确认）');
-    this._audit({ kind: 'monitor', event: 'stop' });
+    log.info('监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）');
+    this._audit({ kind: 'monitor', event: 'stop', scope: 'pause-patrol', enableSchedulerStillRunning: this.enableRunning });
     return { ok: true };
+  }
+
+  // ── 独立每日开启调度器（与"启动值守"完全分离）────────────────────
+  /** 配置是否允许调度器运行，且用户未独立停用。 */
+  enableSchedulerShouldRun() {
+    const cf = (this.config.monitor && this.config.monitor.chengfang) || {};
+    return cf.enableSchedulerEnabled === true && this._enableSchedule.stoppedByUser !== true;
+  }
+
+  /**
+   * 启动独立每日开启调度器（服务启动时自动调用；页面可独立停用/恢复）。
+   * 不启动暂停巡查、不依赖 this.running；与 _intervalLoop 共享执行器/事件流/持久化。
+   */
+  startEnableScheduler(opts = {}) {
+    if (this.pending.length > 0) {
+      return { ok: false, reason: `存在待配置/非法配置项，不允许启动每日开启任务: ${this.pending.join('；')}` };
+    }
+    const cf = (this.config.monitor && this.config.monitor.chengfang) || {};
+    if (cf.enableSchedulerEnabled !== true) {
+      return { ok: false, reason: 'monitor.chengfang.enableSchedulerEnabled 未开启（每日自动开启任务未启用）' };
+    }
+    if (this._enableSchedule.stoppedByUser === true) {
+      return { ok: false, reason: '每日开启任务已被用户独立停用（恢复后才可启动）' };
+    }
+    if (this.enableRunning) return { ok: true, alreadyRunning: true };
+    this._enableGen += 1;
+    this.enableRunning = true;
+    this._enableSchedule.stoppedAt = null;
+    this._enableSchedule.phase = 'waiting_window';
+    const gen = this._enableGen;
+    const nextMs = this._nextEnableWindowStartMs(this.nowFn());
+    this._enableSchedule.nextRunAt = new Date(nextMs).toISOString();
+    const nextClock = shanghaiClockText(nextMs);
+    this._audit({ kind: 'enable-scheduler', event: 'registered', nextRunAt: this._enableSchedule.nextRunAt, reason: opts.reason || null });
+    log.info(`独立每日开启任务已登记（每日 ${String(this._enableHour()).padStart(2, '0')}:00 自动开启全部乘方；下次 ${nextClock}；与"启动值守"相互独立）`);
+    this._enableLoopPromise = this._enableLoop(gen);
+    return { ok: true, nextRunAt: this._enableSchedule.nextRunAt };
+  }
+
+  /**
+   * 停止独立每日开启调度器。只中止 kind:'enable' 的令牌（绝不波及暂停巡查）。
+   * byUser=true 时持久化停用标记（重启不自动恢复）。
+   */
+  stopEnableScheduler({ byUser = false, reason = null } = {}) {
+    this._enableGen += 1;
+    const wasRunning = this.enableRunning;
+    this.enableRunning = false;
+    for (const t of this._activeTokens) if (t.kind === 'enable') t.aborted = true;
+    this._enableSchedule.phase = 'stopped';
+    this._enableSchedule.nextRunAt = null;
+    if (byUser) {
+      this._enableSchedule.stoppedByUser = true;
+      this._enableSchedule.stoppedAt = new Date(this.nowFn()).toISOString();
+      this._saveState();
+    }
+    log.info(`独立每日开启任务已停止${byUser ? '（用户独立停用，服务重启后不会自动恢复）' : ''}${wasRunning ? '' : '（此前未在运行）'}；暂停巡查不受影响。`);
+    this._audit({ kind: 'enable-scheduler', event: 'stopped', byUser, wasRunning, reason });
+    return { ok: true, wasRunning };
+  }
+
+  /** 用户恢复每日开启：清除独立停用标记并重新登记（配置未启用则拒绝）。 */
+  resumeEnableScheduler(opts = {}) {
+    const cf = (this.config.monitor && this.config.monitor.chengfang) || {};
+    if (cf.enableSchedulerEnabled !== true) {
+      return { ok: false, reason: 'monitor.chengfang.enableSchedulerEnabled 未开启（每日自动开启任务未启用）' };
+    }
+    this._enableSchedule.stoppedByUser = false;
+    this._enableSchedule.stoppedAt = null;
+    this._saveState();
+    return this.startEnableScheduler({ ...opts, reason: opts.reason || '用户恢复每日开启' });
+  }
+
+  /** 下一次开启窗口起点（上海 enableHour 整点）的绝对毫秒时间。 */
+  _nextEnableWindowStartMs(nowMs) {
+    const w = shanghaiWall(nowMs);
+    const eh = this._enableHour();
+    const hm = `${String(eh).padStart(2, '0')}:00`;
+    let target = shanghaiMs(w.date, hm);
+    if (target <= nowMs) {
+      // 今日窗口起点已过 → 明日同一时刻（上海 +24h，用日期串推，避免时区歧义）
+      const [y, m, d] = w.date.split('-').map(Number);
+      const tomorrow = new Date(Date.UTC(y, m - 1, d + 1));
+      const tDate = `${tomorrow.getUTCFullYear()}-${String(tomorrow.getUTCMonth() + 1).padStart(2, '0')}-${String(tomorrow.getUTCDate()).padStart(2, '0')}`;
+      target = shanghaiMs(tDate, hm);
+    }
+    return target;
+  }
+
+  /**
+   * 错过窗口记录（按上海日期去重）：窗口已过且当日无任何开启相位记录 →
+   * 如实记录"错过原因"，不擅自补开（08:00 后绝不开广告）。
+   */
+  _noteMissedEnableWindowIfNeeded(date) {
+    if (this._enableSchedule.lastMissedDate === date) return;
+    const anyRecord = (this.config.shops || []).some((s) => this.getEnablePhaseRecord(s.id, date));
+    if (anyRecord) return; // 今日已执行过（success/failed/unknown 均有记录），非"错过"
+    this._enableSchedule.lastMissedDate = date;
+    const dh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
+    const eh = String(this._enableHour()).padStart(2, '0');
+    const reason = `今日开启窗口（上海 ${eh}:00–${dh}:00）已过且当日未执行开启：不擅自补开广告，等待明日窗口`;
+    this._enableSchedule.lastMissedReason = `${date} ${reason}`;
+    this._audit({ kind: 'enable-scheduler', event: 'window_missed', date, reason });
+    log.warn(`每日开启：${reason}`);
+  }
+
+  /** 开启调度循环专用可中断延时（只随 _enableGen/enableRunning 中断，不随值守启停）。 */
+  async _chunkedEnableDelay(ms, gen) {
+    const step = 250;
+    let waited = 0;
+    while (waited < ms) {
+      if (gen !== undefined && gen !== this._enableGen) return;
+      if (!this.enableRunning) return;
+      const chunk = Math.min(step, ms - waited);
+      await new Promise((r) => setTimeout(r, chunk));
+      waited += chunk;
+    }
+  }
+
+  _enableDelay(ms, gen) {
+    // 测试注入 delayFn 时直接复用（可控时钟）；生产走开启专属分片延时
+    if (this._injectedDelayFn) return this._injectedDelayFn(ms);
+    return this._chunkedEnableDelay(ms, gen);
+  }
+
+  /**
+   * 独立每日开启循环：等待每日 [enableHour, dailyStartHour) 窗口 → 执行开启相位
+   * （复用 _runEnablePhase：按店铺+日期持久化、成功不重复、unknown 先回读）。
+   * 与暂停巡查循环（_intervalLoop）并存：共享 _cycleRunning 互斥与执行器，
+   * 但生命周期独立——"停止值守"不影响本循环。
+   */
+  async _enableLoop(gen) {
+    const sch = this.config.schedule;
+    while (gen === this._enableGen && this.enableRunning) {
+      const now = this.nowFn();
+      const w = shanghaiWall(now);
+      if (w.hour >= this._enableHour() && w.hour < sch.dailyStartHour) {
+        const today = w.date;
+        const shopsToRun = (this.config.shops || []).filter(
+          (s) => s.enabled !== false && !this._enablePhaseDone(s.id, today),
+        );
+        if (shopsToRun.length > 0) {
+          this._enableSchedule.phase = 'enable_window';
+          if (this._cycleRunning) {
+            // 与暂停/其他周期互斥：绝不并发执行，稍后重试（仍在窗口内会继续处理）
+            await this._enableDelay(5000, gen);
+            continue;
+          }
+          try {
+            await this._runEnablePhase(gen, today);
+            this._enableSchedule.lastRunAt = new Date(this.nowFn()).toISOString();
+          } catch (e) {
+            this._memPush(this.recentErrors, { scope: 'enable-scheduler', error: `每日开启任务异常：${e.message}` }, undefined, 'error');
+          }
+        } else {
+          // 今日全部店铺已 success → 等窗口结束（不重复开启）
+          this._enableSchedule.phase = 'enable_window';
+        }
+        const afterMs = this.nowFn();
+        const afterWall = shanghaiWall(afterMs);
+        if (afterWall.date !== w.date) continue; // 执行中跨日：回环重判
+        if (afterWall.hour < sch.dailyStartHour) {
+          const waitMs = msUntilDailyStart(afterMs, sch.dailyStartHour);
+          if (waitMs > 0) { await this._enableDelay(waitMs, gen); }
+          continue;
+        }
+        continue; // 已过 dailyStartHour（慢执行跨窗）→ 回环按窗口外逻辑登记明日
+      }
+      // ── 窗口外 ──
+      if (w.hour >= sch.dailyStartHour) {
+        this._noteMissedEnableWindowIfNeeded(w.date);
+      }
+      const targetMs = this._nextEnableWindowStartMs(now);
+      this._enableSchedule.phase = 'waiting_window';
+      this._enableSchedule.nextRunAt = new Date(targetMs).toISOString();
+      await this._enableDelay(Math.max(0, targetMs - now), gen);
+    }
   }
 
   /** 默认可中断延时：分片睡眠，代数变化或停止时提前返回。 */
@@ -488,7 +693,9 @@ class Monitor {
       const w = shanghaiWall(now);
 
       // ── 开启窗口：[enableHour, dailyStartHour)，每天一次（按店铺+日期持久化）──
-      if (enableWindow && w.hour >= enableHour && w.hour < sch.dailyStartHour) {
+      // 独立每日开启调度器运行中（enableRunning）→ 窗口由专属循环处理，
+      // 值守循环在本窗口内只等待到 dailyStartHour（避免双循环重复开启）。
+      if (enableWindow && w.hour >= enableHour && w.hour < sch.dailyStartHour && !this.enableRunning) {
         const today = w.date;
         // 仅当所有启用店铺当日均为 success 时才算"已完成"
         const shopsToRun = (this.config.shops || []).filter(
@@ -498,7 +705,7 @@ class Monitor {
           this.schedule.phase = 'enable_window';
           this.schedule.waitingFor08 = false;
           try {
-            await this._runEnablePhase(gen, today);
+            await this._runEnablePhase(gen, today, { scope: 'pause' });
           } catch (e) {
             this._memPush(this.recentErrors, { scope: 'cycle', error: `乘方自动开启相位失败：${e.message}` }, undefined, 'error');
           }
@@ -568,7 +775,7 @@ class Monitor {
     if (this._cycleRunning) {
       return { ok: false, reason: '已有轮询周期进行中，本次已跳过（防并发）' };
     }
-    const token = { aborted: false };
+    const token = { aborted: false, kind: 'pause' };
     this._activeTokens.add(token);
     this._cycleRunning = true;
     // 巡查周期序号（2026-09-15 修复第 3 项）：一次 pollOnce = 一个完整周期，序号明确递增。
@@ -902,14 +1109,27 @@ class Monitor {
   // ── 每日自动开启相位（07:00 窗口，每天一次；独立于费用/订单阈值）────
 
   /** 每日开启相位：遍历启用的店铺执行开启（真实=executeChengfangEnableBatch；演练=runDryEnableCycle）。 */
-  async _runEnablePhase(gen, businessDate = null) {
-    const token = { aborted: false };
+  async _runEnablePhase(gen, businessDate = null, { scope = 'scheduler' } = {}) {
+    // 互斥：暂停巡查或其他周期进行中 → 绝不并发开启（同一店铺执行互斥），调用方稍后重试
+    if (this._cycleRunning) {
+      return { skipped: true, reason: '已有周期进行中（暂停/开启互斥），本轮开启相位跳过' };
+    }
+    // scope='scheduler'：独立每日开启调度器驱动（默认）。生命周期只随 _enableGen/
+    // enableRunning 终止，令牌 kind='enable'——"停止值守"绝不取消每日开启。
+    // scope='pause'：值守循环的历史回退路径（未启用独立调度器时，开启窗口由值守循环
+    // 驱动）；随 this.running/_gen 终止，令牌 kind='pause'（停止值守一并中止）。
+    const schedScope = scope !== 'pause';
+    const token = { aborted: false, kind: schedScope ? 'enable' : 'pause' };
     this._activeTokens.add(token);
     this._cycleRunning = true;
     const today = businessDate || shanghaiDate(this.nowFn());
     try {
       for (const shopCfg of this.config.shops) {
-        if (gen !== this._gen || !this.running) break;
+        if (schedScope) {
+          if (gen !== this._enableGen || !this.enableRunning) break;
+        } else if (gen !== this._gen || !this.running) {
+          break;
+        }
         if (token.aborted) break;
         if (shopCfg.enabled === false) continue;
         if (this._enablePhaseDone(shopCfg.id, today)) continue;
@@ -919,6 +1139,7 @@ class Monitor {
       this._activeTokens.delete(token);
       this._cycleRunning = false;
     }
+    return { skipped: false };
   }
 
   /**
@@ -1276,26 +1497,37 @@ class Monitor {
         batchToday: dateRec ? { runs: dateRec.runs.length, totals: { confirmed: dateRec.totals.confirmed.length, failed: dateRec.totals.failed.length, unknown: dateRec.totals.unknown.length, skipped: dateRec.totals.skipped.length }, allClosedConfirmed: dateRec.allClosedConfirmed, allPausedConfirmed: dateRec.allPausedConfirmed === true, allEnabledConfirmed: dateRec.allEnabledConfirmed === true, lastBatchAt: dateRec.lastBatchAt, lastRuns: dateRec.runs.slice(-3) } : null,
       };
     });
-    return {
-      mode: this.modeLabel,
-      realMode: this.realMode,
-      ready: this.cfgResult.ready,
-      pending: this.pending,
-      configSource: this.cfgResult.sourcePath,
-      clock: shanghaiClockText(nowMs),
-      businessDate: today,
-      monitor: {
-        running: this.running,
-        phase: this.schedule.phase,
-        cycleNo: this.cycleNo || 0,
-        startedAt: this.startedAt,
-        lastCycleAt: this.lastCycleAt,
-        nextRunAt: this.schedule.nextRunAt,
-        waitingFor08: this.schedule.waitingFor08,
-        windowBlockReason: this.schedule.lastWindowBlockReason,
-        dailyStartHour: this.config.schedule.dailyStartHour,
-        intervalMinutes: this.config.schedule.intervalMinutes,
-        enableHour: this._enableHour(),
+      return {
+        mode: this.modeLabel,
+        realMode: this.realMode,
+        ready: this.cfgResult.ready,
+        pending: this.pending,
+        configSource: this.cfgResult.sourcePath,
+        clock: shanghaiClockText(nowMs),
+        businessDate: today,
+        monitor: {
+          running: this.running,
+          phase: this.schedule.phase,
+          cycleNo: this.cycleNo || 0,
+          startedAt: this.startedAt,
+          lastCycleAt: this.lastCycleAt,
+          nextRunAt: this.schedule.nextRunAt,
+          waitingFor08: this.schedule.waitingFor08,
+          windowBlockReason: this.schedule.lastWindowBlockReason,
+          dailyStartHour: this.config.schedule.dailyStartHour,
+          intervalMinutes: this.config.schedule.intervalMinutes,
+          enableHour: this._enableHour(),
+          // 独立每日开启调度器（与"启动值守"完全分离的生命周期；界面必须分别展示）
+          enableScheduler: {
+            running: this.enableRunning,
+            configEnabled: !!((this.config.monitor && this.config.monitor.chengfang || {}).enableSchedulerEnabled),
+            stoppedByUser: this._enableSchedule.stoppedByUser === true,
+            stoppedAt: this._enableSchedule.stoppedAt || null,
+            phase: this._enableSchedule.phase,
+            nextRunAt: this._enableSchedule.nextRunAt,
+            lastRunAt: this._enableSchedule.lastRunAt || null,
+            lastMissedReason: this._enableSchedule.lastMissedReason || null,
+          },
         // 第 3 项：按店铺+上海日期的持久化开启相位状态（界面展示"今日是否已开启"及失败/未知原因）
         enablePhaseToday: shops.map((s) => ({ shopId: s.id, record: s.enablePhase })).filter((x) => x.record),
         // 兼容字段：任一启用店铺今日 success 即视为该日期已完成（不再是纯内存值）

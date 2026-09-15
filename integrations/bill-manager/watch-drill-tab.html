@@ -32,10 +32,17 @@
       <span id="wdStatusBadge" class="wd-badge wd-idle">未启动</span>
       <button class="btn btn-primary" id="wdToggleBtn" onclick="wdToggle()">启动值守</button>
       <button class="btn" style="background:#eee;color:#666;" onclick="wdRefreshAll()">🔄 刷新</button>
+      <span id="wdToggleHint" style="font-size:12px;color:#888;margin-left:6px;">「启动值守」只控制超额暂停巡查；每日 07:00 开启任务独立运行（见下行）</span>
     </div>
     <div id="wdError" style="display:none;font-size:13px;color:#dc2626;margin:6px 0 0;padding:8px 12px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;"></div>
     <div id="wdGates" style="font-size:12.5px;color:#555;margin:6px 0 0;padding:8px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;"></div>
     <div id="wdGap" style="display:none;font-size:12.5px;color:#b45309;margin-top:6px;"></div>
+    <div style="font-size:12.5px;color:#555;margin:6px 0 0;padding:8px 12px;background:#ecfdf5;border:1px solid #bbf7d0;border-radius:6px;">
+      <b>独立每日开启任务</b>：<span id="wdEnableTaskState">加载中…</span>
+      <span id="wdEnableTaskNext" style="color:#16a34a;font-weight:600;"></span>
+      <span id="wdEnableTaskMissed" style="color:#b45309;"></span>
+      <button id="wdEnableTaskBtn" class="btn" style="font-size:12px;padding:2px 10px;margin-left:8px;" onclick="wdEnableTaskToggle()">—</button>
+    </div>
     <div class="wd-grid">
       <div class="wd-cell"><div class="k">最近检查时间</div><div class="v" id="wdLastCheck">—</div></div>
       <div class="wd-cell"><div class="k">下次检查时间</div><div class="v" id="wdNextRun">—</div></div>
@@ -48,9 +55,10 @@
     </div>
     <div id="wdReason" style="font-size:12.5px;color:#666;margin-top:8px;"></div>
     <p style="font-size:12px;color:#999;margin:8px 0 0;">
-      规则：费用=千川「账户整体消耗」，订单=罗盘经营概况「全店+实时」成交订单数；
-      费用整数分 &gt; 订单数×100 分才超标（恰好 1 元/单不超标）；每天 07:00 开启全部乘方计划，
-      08:00 后每 30 分钟检查一次，超标即暂停乘方（全店托管 + 商品自选）。<b>绝不删除广告。</b>
+      规则：每天 07:00（上海）自动开启全部乘方计划（含人工暂停的；<b>独立任务，无需启动值守，重启自动恢复</b>）；
+      08:00 后由「启动值守」控制超额巡查：立即检查一次，再每 30 分钟检查，费用=千川「账户整体消耗」，
+      订单=罗盘经营概况「全店+实时」成交订单数，整数分 &gt; 订单数×100 才暂停乘方（恰好 1 元/单不暂停）。
+      「停止值守」只停止超额巡查，不影响每日开启。<b>绝不删除广告。</b>
     </p>
   </div>
   <div class="card">
@@ -111,6 +119,56 @@
         }
       }
 
+      // 独立每日开启任务（与"启动值守"完全分离的状态与控制）
+      function renderEnableTask(s) {
+        var t = s.enableTask;
+        var stEl = $('wdEnableTaskState');
+        var nextEl = $('wdEnableTaskNext');
+        var missedEl = $('wdEnableTaskMissed');
+        var btn = $('wdEnableTaskBtn');
+        if (!t) { stEl.textContent = '状态未知'; btn.style.display = 'none'; return; }
+        if (t.configEnabled === false) {
+          stEl.textContent = '未启用（monitor.chengfang.enableSchedulerEnabled=false，每日 07:00 不自动开启）';
+          nextEl.textContent = ''; missedEl.textContent = '';
+          btn.style.display = 'none';
+          return;
+        }
+        if (t.running) {
+          stEl.textContent = '已登记待命';
+          nextEl.textContent = t.nextRunAt ? (' · 下次开启：' + fmtTime(t.nextRunAt)) : '';
+          btn.textContent = '停用每日开启';
+          btn.style.background = '#fee2e2'; btn.style.color = '#b91c1c';
+        } else if (t.stoppedByUser === true) {
+          stEl.textContent = '已独立停用（服务重启也不会自动恢复）';
+          nextEl.textContent = '';
+          btn.textContent = '恢复每日开启';
+          btn.style.background = '#ecfdf5'; btn.style.color = '#047857';
+        } else {
+          stEl.textContent = '未在运行';
+          nextEl.textContent = '';
+          btn.textContent = '启用每日开启';
+          btn.style.background = '#ecfdf5'; btn.style.color = '#047857';
+        }
+        missedEl.textContent = t.lastMissedReason ? (' · ' + t.lastMissedReason) : '';
+        btn.style.display = '';
+      }
+
+      function wdEnableTaskToggle() {
+        var btn = $('wdEnableTaskBtn');
+        var stopping = String(btn.textContent || '').indexOf('停用') === 0;
+        btn.disabled = true;
+        api('POST', stopping ? '/api/watch-drill/daily-enable/stop' : '/api/watch-drill/daily-enable/start').then(function (d) {
+          if (d && d.ok) {
+            setError('');
+            renderState(d.state);
+          } else {
+            setError('操作失败：' + (d && d.error ? d.error : '未知错误'));
+          }
+        }).catch(function (e) {
+          setError('操作失败：' + String(e).slice(0, 120));
+        }).finally(function () { btn.disabled = false; });
+      }
+
       function renderState(s) {
         if (!s) return;
         var st = statusMeta(s);
@@ -164,8 +222,10 @@
              + ' · 真实开启：<b style="color:' + (g.enableWillExecute ? '#b91c1c' : '#16a34a') + '">' + why(g.enableWillExecute, g.enableGateReason) + '</b>'
              + (blockers.length ? ' ｜ 当前阻断：' + esc(blockers.join('；')) : '')
              + ' ｜ 控制范围：' + esc((g.scope || []).join(' + ') || '（未配置）')
+             + (g.enableSchedulerEnabled === false ? ' ｜ 独立每日开启任务：<b style="color:#b45309">未启用</b>' : '')
              + ' ｜ 删除广告：<b style="color:#16a34a">永不执行</b>')
           : '真实执行门槛：加载中…';
+        renderEnableTask(s);
         $('wdLastCheck').textContent = fmtTime(s.lastCheckAt);
         $('wdNextRun').textContent = fmtTime(s.nextRunAt);
         // 今日开启相位（按店铺+上海日期，成功才算完成）

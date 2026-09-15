@@ -311,10 +311,13 @@ function findChengfangBatchDeleteButtonInPage() {
  *
  * 严格原则：**只确认与当前动作、数量精确一致的弹窗**；未知结构一律阻断（不猜测、不兜底）。
  *
- * 实测已确认的合法弹窗（仅此两类，文本来自真实页面）：
+ * 实测已确认的合法弹窗（仅此三类，文本来自真实页面）：
  *   - 批量暂停：「确定要暂停 N 条计划吗？暂停后将停止投放，请谨慎操作。 取消 确定」
  *   - 托管关闭：「确定关闭乘方投放吗？」（另有"其他推商品计划需手动恢复"的提示，用户已同意）
- * 开启弹窗结构**未实测** → 不在此声明，一律走 `unknown_confirm` 阻断，等待实测后补充。
+ *   - 托管开启（2026-09-15 真机实测）：「为保证投放的唯一性，温馨提示您乘方投放时，
+ *     受到互斥影响的放量投放-全域投放计划、标准投放计划将会暂停（如有）。同时小店随心推
+ *     订单将被终止，终止后不可恢复。」按钮【再想想】【确定】；实测批量开启（商品自选）
+ *     无确认弹窗（点击即生效），故 batch_enable 不声明文本句式——出现任何弹窗仍按未知阻断。
  *
  * 注意：本函数同时以文本形式内联进 page.evaluate 的执行体（浏览器序列化不支持闭包引用），
  * 因此必须保持**自包含**（不引用模块级常量/函数）。
@@ -346,6 +349,15 @@ function classifyDialogText(text, expectedAction) {
     return { kind: 'unexpected_confirm', text: t.slice(0, 200) };
   }
 
+  // 3b) 全店托管开启确认（2026-09-15 真机实测：互斥提示，按钮【再想想】【确定】）。
+  // 双锚点精确匹配，任一不满足 → 落入未知阻断；含"删除"字样已被上面分支拦截。
+  if (t.includes('为保证投放的唯一性') && t.includes('受到互斥影响') && t.includes('乘方投放')) {
+    if (expectedAction === 'shop_enable') {
+      return { kind: 'shop_enable_confirm', text: t.slice(0, 200), count: null };
+    }
+    return { kind: 'unexpected_confirm', text: t.slice(0, 200) };
+  }
+
   // 4) 含"确定/确认"但结构未知：不得编造，一律阻断
   if (t.includes('确定') || t.includes('确认')) {
     return { kind: 'unknown_confirm', text: t.slice(0, 200) };
@@ -370,6 +382,10 @@ function classifyDialogTextInPage(text, expectedAction) {
   }
   if (/确定关闭乘方投放吗/.test(t)) {
     if (expectedAction === 'shop_disable') return { kind: 'shop_disable_confirm', text: t.slice(0, 200), count: null };
+    return { kind: 'unexpected_confirm', text: t.slice(0, 200) };
+  }
+  if (t.includes('为保证投放的唯一性') && t.includes('受到互斥影响') && t.includes('乘方投放')) {
+    if (expectedAction === 'shop_enable') return { kind: 'shop_enable_confirm', text: t.slice(0, 200), count: null };
     return { kind: 'unexpected_confirm', text: t.slice(0, 200) };
   }
   if (t.includes('确定') || t.includes('确认')) return { kind: 'unknown_confirm', text: t.slice(0, 200) };
@@ -413,6 +429,10 @@ function detectChengfangDangerDialogInPage(expectedAction) {
         c = (expectedAction === 'shop_disable')
           ? { kind: 'shop_disable_confirm', text: t.slice(0, 200) }
           : { kind: 'unexpected_confirm', text: t.slice(0, 200) };
+      } else if (t.includes('为保证投放的唯一性') && t.includes('受到互斥影响') && t.includes('乘方投放')) {
+        c = (expectedAction === 'shop_enable')
+          ? { kind: 'shop_enable_confirm', text: t.slice(0, 200) }
+          : { kind: 'unexpected_confirm', text: t.slice(0, 200) };
       } else if (t.includes('确定') || t.includes('确认')) {
         c = { kind: 'unknown_confirm', text: t.slice(0, 200) };
       } else {
@@ -452,6 +472,8 @@ function readChengfangConfirmDialogInPage(expectedAction) {
         kind = (expectedAction === 'batch_pause') ? 'batch_pause_confirm' : 'unexpected_confirm';
       } else if (/确定关闭乘方投放吗/.test(t)) {
         kind = (expectedAction === 'shop_disable') ? 'shop_disable_confirm' : 'unexpected_confirm';
+      } else if (t.includes('为保证投放的唯一性') && t.includes('受到互斥影响') && t.includes('乘方投放')) {
+        kind = (expectedAction === 'shop_enable') ? 'shop_enable_confirm' : 'unexpected_confirm';
       } else if (t.includes('确定') || t.includes('确认')) {
         kind = 'unknown_confirm';
       } else {
@@ -491,7 +513,8 @@ function clickChengfangConfirmOkInPage({ action, expectedCount }) {
   const expectedAction = action;
   const wantKind = expectedAction === 'batch_pause' ? 'batch_pause_confirm'
     : (expectedAction === 'shop_disable' ? 'shop_disable_confirm'
-      : (expectedAction === 'batch_enable' ? 'batch_enable_confirm' : null));
+      : (expectedAction === 'batch_enable' ? 'batch_enable_confirm'
+        : (expectedAction === 'shop_enable' ? 'shop_enable_confirm' : null)));
   if (!wantKind) return { ok: false, reason: `动作 ${expectedAction} 无确认弹窗结构定义，零点击` };
   const cands = [...document.querySelectorAll('[role="dialog"], [class*="modal"], [class*="dialog"], [class*="confirm"], [class*="popconfirm"]')]
     .filter((el) => {
@@ -507,6 +530,7 @@ function clickChengfangConfirmOkInPage({ action, expectedCount }) {
       const mPause = /确定要暂停\s*(\d+)\s*条计划吗/.exec(t);
       if (mPause) { count = Number(mPause[1]); kind = (expectedAction === 'batch_pause') ? 'batch_pause_confirm' : 'unexpected_confirm'; }
       else if (/确定关闭乘方投放吗/.test(t)) kind = (expectedAction === 'shop_disable') ? 'shop_disable_confirm' : 'unexpected_confirm';
+      else if (t.includes('为保证投放的唯一性') && t.includes('受到互斥影响') && t.includes('乘方投放')) kind = (expectedAction === 'shop_enable') ? 'shop_enable_confirm' : 'unexpected_confirm';
       else if (t.includes('确定') || t.includes('确认')) kind = 'unknown_confirm';
       else kind = 'other';
     }
@@ -863,7 +887,7 @@ function createChengfangController(p) {
    *   - 任何时刻读到弹窗即立即处理，不再白等。
    */
   const submitConfirmIfPresent = async ({ page, expectedAction, expectedCount, timeoutMs = 800 }) => {
-    const KNOWN_ACTIONS = ['batch_pause', 'batch_enable', 'shop_disable'];
+    const KNOWN_ACTIONS = ['batch_pause', 'batch_enable', 'shop_disable', 'shop_enable'];
     const deadline = Date.now() + timeoutMs;
     let dlg = null;
     while (true) {
@@ -895,7 +919,8 @@ function createChengfangController(p) {
       throw new DataGuardError(`动作 ${expectedAction} 的确认弹窗结构未实测，检测到弹窗即阻断（不盲点确定）：${dlg.kind}:${dlg.text}`);
     }
     const wantKind = expectedAction === 'batch_pause' ? 'batch_pause_confirm'
-      : (expectedAction === 'shop_disable' ? 'shop_disable_confirm' : 'batch_enable_confirm');
+      : (expectedAction === 'shop_disable' ? 'shop_disable_confirm'
+        : (expectedAction === 'shop_enable' ? 'shop_enable_confirm' : 'batch_enable_confirm'));
     if (dlg.kind !== wantKind) {
       throw new DataGuardError(`确认弹窗类型与当前动作不符，停止提交：期望 ${wantKind}，实际 ${dlg.kind}（${dlg.text}）`);
     }
@@ -1131,7 +1156,10 @@ function createChengfangController(p) {
         throw new DataGuardError('点击前危险弹窗检测返回非列表，零点击阻断（无法确认无弹窗）');
       }
       {
-        const blocking = danger.filter((d) => !(expectAction === 'shop_disable' && d.kind === 'shop_disable_confirm'));
+        // 与当前动作精确一致的确认弹窗（托管关闭/托管开启实测句式）不算阻断
+        const isExpectedConfirm = (d) => (expectAction === 'shop_disable' && d.kind === 'shop_disable_confirm')
+          || (expectAction === 'shop_enable' && d.kind === 'shop_enable_confirm');
+        const blocking = danger.filter((d) => !isExpectedConfirm(d));
         if (blocking.length > 0) {
           throw new DataGuardError(`检测到阻断性弹窗，停止点击行内开关：${blocking.map((d) => `${d.kind}:${d.text}`).join('；')}`);
         }
@@ -1182,7 +1210,8 @@ function createChengfangController(p) {
       if (!expectedAction) return list.filter((d) => d.kind !== 'other' && d.kind !== 'empty');
       const allow = expectedAction === 'batch_pause' ? 'batch_pause_confirm'
         : (expectedAction === 'shop_disable' ? 'shop_disable_confirm'
-          : (expectedAction === 'batch_enable' ? 'batch_enable_confirm' : null));
+          : (expectedAction === 'batch_enable' ? 'batch_enable_confirm'
+            : (expectedAction === 'shop_enable' ? 'shop_enable_confirm' : null)));
       return list.filter((d) => d.kind !== allow);
     },
 

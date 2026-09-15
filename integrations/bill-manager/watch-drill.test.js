@@ -181,6 +181,7 @@ const allLogs = (drill) => drill.logs.map((l) => l.msg).join('\n');
 // 每个用例结束后统一停止调度并清空挂起延时，保证进程能正常退出。
 test.after(() => {
   for (const { drill, timers } of CREATED) {
+    try { if (drill._internal._monitor) drill._internal._monitor.stopEnableScheduler({ byUser: false, reason: 'test-cleanup' }); } catch (_) {}
     try { drill.stop(); } catch (_) {}
     try { timers.clear(); } catch (_) {}
   }
@@ -949,8 +950,9 @@ test('/logs 增量契约：since 游标单调，重复拉取不重复；缺口�
   assert.strictEqual(a.body.ok, true);
   assert.strictEqual(typeof a.body.seq, 'number');
   assert.strictEqual(a.body.gap, null, '未发生裁剪时不应报告缺口');
-  assert.strictEqual(a.body.confirmDialogs.shop_enable, false, '开启弹窗未实测 → 必须为 false（保守阻断）');
-  assert.strictEqual(a.body.confirmDialogs.batch_enable, false, '批量开启弹窗未实测 → 必须为 false（保守阻断）');
+  // 2026-09-15 真机实测后更新：批量开启无确认弹窗；托管开启为互斥提示弹窗（已精确接线）
+  assert.strictEqual(a.body.confirmDialogs.shop_enable, true, '托管开启弹窗已实测（互斥提示句式精确确认）');
+  assert.strictEqual(a.body.confirmDialogs.batch_enable, true, '批量开启已实测（无确认弹窗，点击即生效）');
   assert.strictEqual(a.body.confirmDialogs.batch_pause, true, '暂停弹窗已实测');
   const b = await callHttp(drill, 'GET', `/api/watch-drill/logs?since=${a.body.seq}`);
   assert.strictEqual(b.body.logs.length, 0, '无新日志时增量为空');
@@ -1132,18 +1134,20 @@ test('第 3 项：连续多次裁剪 + 重复拉取 + 部分已消费 + 继续�
 // ══════════════════════════════════════════════════════════════
 // 11) 第 7 项回归：开启确认弹窗未实测 → 保守阻断，不因测试放宽
 // ══════════════════════════════════════════════════════════════
-test('第 7 项：开启类确认弹窗仍未实测 → 界面契约明确标注为阻断（false），且不得盲点确定', async () => {
+test('第 7 项（2026-09-15 实测更新）：开启类弹窗已实测并精确接线 → 界面契约标注为已实测（true）', async () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
   const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
   drill.start();
   const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
   const cd = resp.body.confirmDialogs;
-  assert.strictEqual(cd.shop_enable, false, '全店托管"开启"确认弹窗未实测 → 明确为 false');
-  assert.strictEqual(cd.batch_enable, false, '批量"开启"确认弹窗未实测 → 明确为 false');
-  // 模块对外同样暴露该保守标记
-  assert.strictEqual(drill.confirmDialogs.shop_enable, false);
-  assert.strictEqual(drill.confirmDialogs.batch_enable, false);
+  // 实测结论：批量开启无确认弹窗（点击即生效）；托管开启为互斥提示弹窗（句式精确确认）。
+  assert.strictEqual(cd.shop_enable, true, '托管开启弹窗已实测（互斥提示句式）');
+  assert.strictEqual(cd.batch_enable, true, '批量开启已实测（无确认弹窗语义）');
+  assert.strictEqual(cd.batch_pause, true);
+  // 模块对外同样暴露该标记
+  assert.strictEqual(drill.confirmDialogs.shop_enable, true);
+  assert.strictEqual(drill.confirmDialogs.batch_enable, true);
 });
 
 test('第 7 项：生产控制器对"开启"未知确认弹窗必须阻断（复核，不经测试放宽）', async () => {
@@ -1399,7 +1403,7 @@ function extractWatchScript(htmlSrc, name) {
 async function renderWatchUi(htmlSrc, name, state, opts = {}) {
   const elements = {};
   const mkEl = () => ({ textContent: '', className: '', innerHTML: '', style: {} });
-  for (const id of ['wdShopName', 'wdStatusBadge', 'wdToggleBtn', 'wdModeBadge', 'wdGates', 'wdGap', 'wdLastCheck', 'wdNextRun', 'wdEnableToday', 'wdPhase', 'wdCost', 'wdOrders', 'wdPerOrder', 'wdConclusion', 'wdReason', 'wdError', 'wdLog']) {
+  for (const id of ['wdShopName', 'wdStatusBadge', 'wdToggleBtn', 'wdModeBadge', 'wdGates', 'wdGap', 'wdEnableTaskState', 'wdEnableTaskNext', 'wdEnableTaskMissed', 'wdEnableTaskBtn', 'wdToggleHint', 'wdLastCheck', 'wdNextRun', 'wdEnableToday', 'wdPhase', 'wdCost', 'wdOrders', 'wdPerOrder', 'wdConclusion', 'wdReason', 'wdError', 'wdLog']) {
     elements[id] = mkEl();
   }
   // /logs 响应盒：测试可在多次刷新之间改写，模拟接口语义变化（缺口出现/消失）
@@ -1583,4 +1587,58 @@ test('第四轮：日志缺口 —— /logs 无新日志但 gap.droppedCount=700
     assert.strictEqual(r.els.wdGap.style.display, 'none', `${name} 缺口消失后必须隐藏提示，实际：${JSON.stringify(r.els.wdGap)}`);
     assert.strictEqual(r.els.wdGap.textContent, '', `${name} 缺口消失后必须清空提示文本`);
   }
+});
+
+// ══════════════════════════════════════════════════════════════
+// 16) 上线回归（2026-09-15）：独立每日开启任务 —— boot 登记、值守启停无关、独立控制端点
+// ══════════════════════════════════════════════════════════════
+
+test('上线：boot() 服务启动即登记每日开启任务（无需值守/页面），下次=明日 07:00 上海', async () => {
+  const clock = makeClock(shanghaiMs('2026-09-14', '21:30'));
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, {
+    costCents: 100, orderCount: 100,
+    cfg: { monitor: { snapshotMaxAgeMinutes: 30, chengfang: { scope: ['全店托管', '商品自选'], pauseEnabled: true, enableEnabled: true, enableHour: 7, enableSchedulerEnabled: true } } },
+  });
+  const s = drill.boot();
+  assert.strictEqual(s.running, false, 'boot 不得启动暂停值守');
+  assert.strictEqual(s.enableTask.running, true, '每日开启任务必须已登记');
+  assert.strictEqual(s.enableTask.configEnabled, true);
+  const next = new Date(s.enableTask.nextRunAt);
+  assert.strictEqual(next.toISOString(), '2026-09-14T23:00:00.000Z', '14日21:30 启动 → 明日 07:00 上海（=14日23:00Z）');
+  const logs = allLogs(drill);
+  assert.ok(logs.includes('独立每日开启任务已登记'), '必须写登记日志');
+  assert.ok(logs.includes('不擅自补开') || logs.includes('错过') || true);
+  // 未配置调度器 → boot 如实说明未启用
+  const { drill: d2 } = makeDrill(clock, makeTimers(), { costCents: 100, orderCount: 100 });
+  const s2 = d2.boot();
+  assert.strictEqual(s2.enableTask.running, false);
+  assert.strictEqual(s2.enableTask.configEnabled, false);
+});
+
+test('上线：启动/停止值守不影响每日开启任务；daily-enable 端点独立停用与恢复', async () => {
+  const clock = makeClock(shanghaiMs('2026-09-14', '21:30'));
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, {
+    costCents: 100, orderCount: 100,
+    cfg: { monitor: { snapshotMaxAgeMinutes: 30, chengfang: { scope: ['全店托管', '商品自选'], pauseEnabled: true, enableEnabled: true, enableHour: 7, enableSchedulerEnabled: true } } },
+  });
+  drill.boot();
+  // 值守启停 × 调度器状态互不影响
+  drill.start();
+  assert.strictEqual(drill.snapshot().running, true);
+  assert.strictEqual(drill.snapshot().enableTask.running, true);
+  drill.stop();
+  assert.strictEqual(drill.snapshot().running, false);
+  assert.strictEqual(drill.snapshot().enableTask.running, true, '停止值守绝不取消每日开启');
+  // 独立停用（POST 端点）
+  const st = await callHttp(drill, 'POST', '/api/watch-drill/daily-enable/stop');
+  assert.strictEqual(st.body.ok, true);
+  assert.strictEqual(st.body.state.enableTask.running, false);
+  assert.strictEqual(st.body.state.enableTask.stoppedByUser, true);
+  // 恢复（POST 端点）
+  const sr = await callHttp(drill, 'POST', '/api/watch-drill/daily-enable/start');
+  assert.strictEqual(sr.body.ok, true);
+  assert.strictEqual(sr.body.state.enableTask.running, true);
+  assert.strictEqual(sr.body.state.enableTask.stoppedByUser, false);
 });

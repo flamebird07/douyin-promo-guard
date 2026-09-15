@@ -56,6 +56,26 @@ test('弹窗分类：结构未知的确认弹窗 → unknown_confirm（不编造
   assert.strictEqual(r.kind, 'unknown_confirm');
 });
 
+// ── 2026-09-15 真机实测：托管开启确认弹窗（互斥提示，【再想想】【确定】）──
+const SHOP_ENABLE_MEASURED = '为保证投放的唯一性，温馨提示您乘方投放时，受到互斥影响的放量投放-全域投放计划、标准投放计划将会暂停（如有）。同时小店随心推订单将被终止，终止后不可恢复。 再想想 确定';
+
+test('弹窗分类：托管开启实测互斥提示 + shop_enable → shop_enable_confirm', () => {
+  const r = classifyDialogText(SHOP_ENABLE_MEASURED, 'shop_enable');
+  assert.strictEqual(r.kind, 'shop_enable_confirm');
+});
+
+test('弹窗分类：托管开启互斥提示出现在其他动作上下文 → unexpected_confirm（阻断）', () => {
+  for (const act of ['shop_disable', 'batch_pause', 'batch_enable', null]) {
+    const r = classifyDialogText(SHOP_ENABLE_MEASURED, act);
+    assert.strictEqual(r.kind, 'unexpected_confirm', `动作 ${act} 不得放行托管开启弹窗`);
+  }
+});
+
+test('弹窗分类：锚点不全的近似文本 → unknown_confirm（双锚点防误匹配）', () => {
+  const r = classifyDialogText('为保证投放的唯一性，温馨提示您相关计划将受到影响。 取消 确定', 'shop_enable');
+  assert.strictEqual(r.kind, 'unknown_confirm', '缺少"受到互斥影响+乘方投放"锚点不得确认为托管开启弹窗');
+});
+
 // ── 浏览器内联函数（page.evaluate 语义）────────────────────────────
 test('danger 检测对暂停弹窗按动作判定；删除弹窗始终阻断', async (t) => {
   const browser = await launch();
@@ -512,4 +532,40 @@ test('fail-closed：detectDanger/hasDeleteDialog 读取异常必须抛出，不�
   await assert.rejects(() => ctrl.detectDanger({ page: wrapped }), (e) => /boom|injected/.test(e.message || ''));
   const { wrapped: w2 } = makeThrowingPage(page, { throwOnFn: hasChengfangDeleteDialogInPage, message: 'boom2' });
   await assert.rejects(() => ctrl.hasDeleteDialog({ page: w2 }), (e) => /boom2|injected/.test(e.message || ''));
+});
+
+// ── 2026-09-15 上线：托管开启实测互斥弹窗 → 精确提交闭环 ─────────────
+test('托管开启：实测互斥弹窗（shop_enable）→ 点击行内开关后精确提交「确定」一次', async (t) => {
+  const browser = await launch();
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  await page.setContent(SWITCH_PAGE(`<div role="dialog" style="position:fixed;top:100px;left:0;width:400px;height:200px">
+      为保证投放的唯一性，温馨提示您乘方投放时，受到互斥影响的放量投放-全域投放计划、标准投放计划将会暂停（如有）。
+      同时小店随心推订单将被终止，终止后不可恢复。
+      <button>再想想</button><button id="ok">确定</button></div>
+    <script>document.getElementById('ok').onclick = () => { window.__okClicks++; };</script>`));
+  const ctrl = createChengfangController({ loadWaitMs: 20, tabWaitMs: 10 });
+  const r = await ctrl.clickRowSwitch({ page, planId: '123456', expectAction: 'shop_enable' });
+  assert.strictEqual(r.clicked, true);
+  assert.strictEqual(r.confirm.submitted, true, '实测互斥弹窗必须被精确识别并提交');
+  assert.strictEqual(r.confirm.kind, 'shop_enable_confirm');
+  const c = await readClicks(page);
+  assert.strictEqual(c.switchClicks, 1, '行内开关点击一次');
+  assert.strictEqual(c.okClicks, 1, '确认弹窗"确定"点击一次');
+  assert.strictEqual(c.deleteClicks, 0, '删除零点击');
+});
+
+test('托管开启：互斥弹窗出现在 batch_pause 上下文 → 阻断不提交（不得借道确认）', async (t) => {
+  const browser = await launch();
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  await page.setContent(SWITCH_PAGE(`<div role="dialog" style="position:fixed;top:100px;left:0;width:400px;height:200px">
+      为保证投放的唯一性，温馨提示您乘方投放时，受到互斥影响的放量投放-全域投放计划、标准投放计划将会暂停（如有）。
+      <button>再想想</button><button id="ok">确定</button></div>
+    <script>document.getElementById('ok').onclick = () => { window.__okClicks++; };</script>`));
+  const ctrl = createChengfangController({ loadWaitMs: 20, tabWaitMs: 10 });
+  await assert.rejects(() => ctrl.clickBatchPause({ page, expectedCount: 1 }), (e) => /阻断|unexpected/.test(e.message || ''));
+  const c = await readClicks(page);
+  assert.strictEqual(c.pauseClicks, 0, '暂停零点击');
+  assert.strictEqual(c.okClicks, 0, '不得点击确定');
 });

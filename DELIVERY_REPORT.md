@@ -351,38 +351,86 @@ status           : 检查中（演练模式（只记录不关闭））
 
 ## 6. 变更文件清单
 
-**推广控制项目（未提交，工作区改动）**
+### 6.1 第二轮修复（已提交并推送到公开仓库）
+
+**提交记录（origin/main，`https://github.com/flamebird07/douyin-promo-guard`）**
 ```
- M src/adapters/chengfang-reader.js   (+555/-…   真实开关 + 确认弹窗闭环)
- M src/engine/chengfang-executor.js   (+140/-…   恢复核验 + 有限重试)
- M src/engine/monitor.js              (+207/-…   开启持久化 + 调度修复)
- M test/chengfang-dom.test.js         (+6/-3     契约同步)
- M package.json                       (test 脚本加入新测试文件)
-?? test/chengfang-confirm-switch.test.js   (新建 357 行，21 用例)
-?? test/probe-enable.js / probe-restore.js (预存探针，未提交/未删除)
-?? DELIVERY_REPORT.md                      (本报告)
-?? .workbuddy-ai/                          (工作记忆)
+4afaa18 docs(handoff): append round-2 fix summary (7 items + test totals)
+6ac1d77 chore(handoff): sync 3443 watch-drill backend + tests (round 2)
+1996e15 fix(guard): fail-closed dialog detection + event-seq cursors + live gates
 ```
-合计：5 文件改动，`809 insertions(+), 99 deletions(-)`，+1 新建测试文件。
+
+**推广控制项目**
+```
+ M .gitignore                          (+9 排除探针与工作记忆目录)
+ M src/adapters/chengfang-reader.js    (第 5 项 fail-closed：submitConfirmIfPresent / clickRowSwitch)
+ M src/engine/chengfang-runner.js      (第 4 项 dry 路径显式 actionType)
+ M src/engine/monitor.js               (第 1/3/4 项 evtSeq + cycleNo + judgements + actionType)
+ M src/engine/chengfang-executor.js    (上一轮恢复核验 + 有限重试)
+ M test/chengfang-dom.test.js          (上一轮契约同步)
+ A test/chengfang-confirm-switch.test.js (21 → 28 用例，新增 fail-closed 7 例)
+ A DELIVERY_REPORT.md                  (本报告)
+ M package.json                        (test 脚本纳入新测试文件)
+```
+**3443 后端（bill-manager）—— 同步副本入 `integrations/bill-manager/` 供复核**
+```
+ M watch-drill.js                 (第 1/2/3/4/6/7 项：evtSeq 游标 + 六类日志 + actionType + 门槛实时 + confirmDialogs)
+ M tests/watch-drill.test.js      (20 → 38 用例)
+ M WORK_BUDDY_HANDOFF.md          (追加第二轮交接说明)
+```
+
+**未入库（本地只读/敏感，已由 `.gitignore` 排除）**
+```
+config/config.json、data/、logs/、evidence/、cookies/*.json、*.jsonl
+test/probe-*.js（本地探针）、.workbuddy-ai/（工作记忆）
+```
+
+合计（第二轮）：`9 files changed, 1903 insertions(+), 108 deletions(-)`（核心修复提交）。
+
+---
+
+### 6.2 上一轮（交接 6 项）变更（当时状态）
+
+**推广控制项目**
+```
+ M src/adapters/chengfang-reader.js   (真实开关 + 确认弹窗闭环)
+ M src/engine/chengfang-executor.js   (恢复核验 + 有限重试)
+ M src/engine/monitor.js              (开启持久化 + 调度修复)
+ M test/chengfang-dom.test.js         (契约同步)
+ M package.json                       (test 脚本)
+ A test/chengfang-confirm-switch.test.js
+```
 
 **电商助手 bill-manager**
 ```
- M watch-drill.js     (重写为真实操作模式，装配 Monitor)
- M server.js          (3 处注释/说明)
- M index.html         (Tab 改名 + 模式徽标 + 门槛明细 + 新增状态格)
- M tests/watch-drill.test.js (重写，20 用例)
-备份：
- backups/watch-drill.js.bak-20260915-124526
- backups/watch-drill.test.js.bak-20260915-*（重写前）
+ M watch-drill.js                     (装配 Monitor，真实操作模式)
+ M server.js                          (3 处注释/说明)
+ M index.html                        (Tab 改名 + 模式徽标 + 门槛明细)
+ M tests/watch-drill.test.js          (重写)
+备份：backups/watch-drill.js.bak-20260915-124526 等
 ```
 
 ---
 
 ## 7. 遵守的约束
 
-- ✅ 未启动值守、未自行开启真实广告（全程未调用 `start` 真实链路；测试用注入适配器）。
+### 第二轮（用户明确禁止清单）—— 全部遵守
+
+- ✅ **未重启 3443**：仍为 PID `18916`，`netstat` 实测 `0.0.0.0:3443 LISTENING 18916`；
+  接口实测仍返回 `forcedDrill:true` 且**无 `gates`**（确证仍是旧只读版，未加载新代码）。
+- ✅ **未启动值守**：全程未调用真实 `start` 链路；`Monitor.start()` 仅在测试进程内、用注入只读适配器。
+- ✅ **未修改生产三开关**：`config.json` 未改动（`realMode=false` / `pauseEnabled=false` / `enableEnabled=false`，
+  `npm run check` 复核为「演练模式」）。
+- ✅ **未点击真实广告**：所有 `page.evaluate` 点击均作用于 `page.setContent` 注入的本地 HTML fixture；
+  测试结束后 `browser.close()`，无残留浏览器实例（仅有 IDE 自带的 `msedgewebview2.exe` 与用户自有 Edge 窗口）。
+- ✅ **未点击删除**：删除弹窗检测为 fail-closed，且测试断言 `deleteClicks === 0`、`okClicks === 0`。
+- ✅ **未通过批量结束 node/Edge 清理**（未终止任何进程）。
+- ✅ **推送仅含安全源码与交接文档**：远端已复核**不含** Cookie、token、运行日志、真实配置
+  （仅 `config/config.example.json` 模板）、证据文件、`.bak`、探针脚本。
+
+### 上一轮同时遵守
+
 - ✅ 未删除任何广告（`deleteAdEnabled: false` 为常量；删除弹窗零点击有测试覆盖）。
 - ✅ 未上传秘密（Cookie 未记录、未提交；日志统一 scrub）。
 - ✅ 重启共享 3443 前先检查业务状态并报告影响（第 5 节），未擅自重启。
-- ✅ 未通过批量结束 node/Edge 清理（未终止任何进程）。
-- ✅ 保留工作区已有未提交文件（2 个探针未动）。
+- ✅ 保留工作区已有未提交文件（探针脚本未动，仅加入 `.gitignore`）。

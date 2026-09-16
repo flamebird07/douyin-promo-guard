@@ -9,6 +9,104 @@
 
 ---
 
+## 0-R17. 第十七轮定点修复（2026-09-16）：有界读取 / Cookie 异步空隙 / 服务启动稳定性
+
+> 基线 `4efe5a725f0a3f3e9787c29013b18d366a54ef03`（开工核对 = origin/main，工作区干净）。
+> 只修 Codex 独立复现的两个缺陷 + 服务启动稳定性收尾，不重做项目。
+> **本轮未发生任何真实广告动作**；未启动暂停值守；生产门槛配置未改动。
+
+### 1) 修复证据与旧代码失败的回归
+
+**① `src/lib/bounded-poll.js` —— 单次读取必须有界**
+
+- 旧缺陷：`await read()` 本身无上界；deadline 只决定"两次读取之间是否继续"。
+- 隔离复现（生产函数，`timeoutMs=20` / `intervalMs=0`，read 永不落定）：旧代码 100ms 后仍未返回。
+- 修复要点：
+  - 每次读取登记为 `{done, result}`，结果永远以 `{ok, value|error}` 落定 → 被放弃的读取不产生未处理拒绝。
+  - `waitSettle(rec, ms)`：等待上界 = 剩余预算；内部先用 0ms 宏任务刷新微任务队列，
+    避免把"已完成但 `.then` 未执行"的读取误判为在途。
+  - 超时未释放 → `abort()` 取消 + `cancelGraceMs` 确认释放；确认不了 → `inFlight:true` + `abandonedReads++`，
+    调用方不得启动新任务与旧读取重叠。迟到结果不改写已返回结果、不成为下一轮输入。
+  - 新增 `inFlight` / `abandonedReads` / `lastReadFailed` / `valueStale` / `peakInFlight`。
+- 执行器新增 `landingStateTrustworthy(poll)`：`inFlight || lastReadFailed || valueStale` → **禁止重发**，
+  绝不据此前"仍关闭"的旧快照重试（暂停 + 开启两条路径）。
+
+**② `src/login/cookie-writeback.js` —— 指纹检查的异步时间空隙**
+
+- 旧缺陷：指纹检查在 `await context.cookies()` **之前**，之后直接写入 → 异步期间用户重新登录被旧会话覆盖，
+  且返回 `ok=true`；初始指纹缺失时 `if (start && ...)` **静默跳过**冲突保护；`loginOk` **默认 true**。
+- 修复：初始指纹缺失/无效 → 拒绝；`context.cookies()` 之后**再取一次快照**比对，变化即保留较新文件；
+  回滚改为 `rollbackIfUnchanged`（仅当文件仍是本次写入的那份才回滚）；`loginOk` fail-closed（必须严格 true）。
+- runner 配套：`_writebackSessionCookies` + `_currentLoginEvidence` —— 回写前用
+  `controller.verifyIdentity({page, shopCfg})` 取**当前**只读登录/身份证据；缺参/失败/异常 → 不覆盖。
+- **竞争保护的实际边界**：sha256 比对-后-写 + 原子 rename 只保证"不出现半写文件"，**不是**完整并发互斥。
+
+**旧代码回归对照**（`git worktree add --detach C:/tmp/oldbase17 4efe5a7`，只替换新测试文件）：
+
+| 测试文件 | 基线 `4efe5a7` | 当前 |
+|---|---|---|
+| `test/bounded-poll.test.js` + `test/cookie-writeback.test.js` | **18 项 not ok**（44 项中，EXIT=1） | 44/44 通过 |
+| `test/chengfang-executor.test.js` | 见 `evidence/old-code-executor-regression-r17.log` | 63/63 通过 |
+
+### 2) 实际生效轮询配置
+
+未改动：`config/config.json` 与 `src/config.js` 均为 `readbackTimeoutMs=30000` / `readbackIntervalMs=3000`，
+生产 `/api/watch-drill/state` 的 `gates.polling` 与执行器同源。本轮只改**读取的等待语义**（有界），未改数值。
+
+### 3) Cookie 保存/冲突保护与下次加载结果（不含值）
+
+- 保护升级为"**两次快照 + 有条件的回滚 + fail-closed 登录证据**"（见上）。
+- 页面「Cookie 回写」栏仍只显示条数/域名，**绝不显示任何 Cookie 值**。
+- 测试全部使用**临时假凭据**（`test-shop` / `dummy-not-a-real-credential`），未触碰真实店铺文件。
+
+### 4) 测试数量与退出码
+
+| 项目 | 结果 |
+|---|---|
+| `npm run check` | 通过（退出码 0） |
+| `npm test`（16 个测试文件） | **348/348 通过，退出码 0**（上一轮 329 → +19） |
+| `test/bounded-poll.test.js` | 20/20（11 → 20，+9） |
+| `test/cookie-writeback.test.js` | 24/24（16 → 24，+8） |
+| `test/chengfang-executor.test.js` | 63/63（61 → 63，+2） |
+| `integrations/bill-manager/watch-drill.test.js` | **62/62**（退出码 0） |
+| 运行位置 `电商助手/bill-manager/tests/watch-drill.test.js` | **62/62**（退出码 0） |
+| 旧代码回归对照 | 基线 `4efe5a7`：**44 项中 18 项 not ok**（EXIT=1）、**63 项中 2 项 not ok**（EXIT=1） |
+
+**一处测试稳定性修复**：`test/bounded-poll.test.js` 的「真实时钟：小预算下有界结束」原本断言
+`reads >= 3`（250ms 预算）。该用例使用**真实定时器**，在全量并行满载时首次 `sleep` 被拉长到
+数百毫秒 → 预算内只剩 1 次读取 → 抖动失败（`读取次数合理，实际 1`）。这是负载现象，不是行为缺陷。
+现改为与机器快慢无关的断言：有界结束（`elapsed < 3000`）、`attempts === reads`、`reads >= 2`、
+`reads <= 30`、`peak === 1`。
+
+### 5) 服务实际加载状态与生命周期
+
+- **重启前**：3443 在跑 PID **25788**（`netstat` + `.server.lock` 双源一致），`/api/watch-drill/state` HTTP 200。
+- **修复了两个真实缺陷**（`电商助手/bill-manager/server.js`，非公开仓库）：
+  - 陈旧锁判定失效（时间戳从不刷新 → 服务跑满 5 分钟后锁被新实例窃取）；
+  - EADDRINUSE 只打印不退出 → 僵尸实例（还会重复登记进程内每日 07:00 任务）。
+- **重启以加载修复**（先确认业务空闲：`running=false` / `cycleNo=0` / 无进行中周期；
+  精确停止 PID 25788，未批量结束进程）→ **新 PID 31324**：
+  - 陈旧锁被正确接管；`/api/watch-drill/state` HTTP 200；
+  - **锁心跳实测**：`.server.lock` 时间戳 60.5s 内刷新（`...115150 → ...175724`）→ 新代码确实已加载；
+  - **单实例保护实测**：再次启动第二份 → `服务已在运行中 (PID: 31324)`、`rc=1`、锁未被窃取、服务仍 HTTP 200；
+  - 状态无损：`realMode=true` / `dryRun=false` / `pauseEnabled=true` / `enableEnabled=true`；
+    `polling = 30000/3000`（同源）；`cookieWriteback=null`。
+- **脱离会话生命周期：本环境明确拒绝**（WMI/任务计划/explorer/Python `CREATE_BREAKAWAY_FROM_JOB`
+  全被拒，最后一项 **WinError 5**）。这是环境限制，不是业务要求。
+
+### 6) 下一次定时任务状态
+
+`enableTask.running=true`，`nextRunAt=2026-09-16T23:00:00Z`（= 2026-09-17 07:00 上海）；
+`enablePhaseToday` 保留 2026-09-16 的 `unknown` 记录；暂停值守 `running=false`。
+
+### 7) 仍待观察
+
+- **真实 Cookie 回写**（真实店铺文件上的保存/冲突保护/下次复用）—— 未实测。
+- **「点击 → 异步落地 → 确认」真实链路** —— 未实测。
+- 2026-09-17 07:00 若对象本已开启，幂等跳过只证明调度与回读有效。
+
+---
+
 ## 0-R16. 第十六轮定点收尾（2026-09-16）：轮询语义 / 停止语义 / 暂停侧核查 / 会话 Cookie 回写
 
 > 基线 `7416d2aab57dd1b60960238c6cdb25ce73f0ebf5`（= origin/main，`git ls-remote origin main` 已核验）。

@@ -472,8 +472,38 @@ function pollingSummary(polling, poll, extra = {}) {
     settled: poll.settled,
     stopped: poll.stopped,
     timedOut: poll.timedOut,
+    // 2026-09-16 第二轮：有界读取的完整性信息（供页面/日志与"是否允许重发"判断）
+    abandonedReads: poll.abandonedReads,
+    inFlight: poll.inFlight,
+    lastReadFailed: poll.lastReadFailed,
+    valueStale: poll.valueStale,
     ...extra,
   };
+}
+
+/**
+ * 落地确认结束后的"最新状态是否可信"判定（2026-09-16 第二轮定点修复）。
+ *
+ * 旧缺陷：轮询结束时若**最后一次读取失败**，调用方仍会用此前那次成功读取的旧快照
+ * （往往显示"仍未落地/仍关闭"）去走重试分支 —— 用陈旧状态重发请求。
+ * 判定为不可信的情形：
+ *  - `inFlight`：返回时仍有无法取消的在途读取，平台真实状态尚未确定；
+ *  - `lastReadFailed`：最后一次读取失败，快照是更早的；
+ *  - `valueStale`：轮询层给出的综合标记（含"从未读成功"）。
+ * @returns {{trustworthy:boolean, reason:string|null}}
+ */
+function landingStateTrustworthy(poll) {
+  if (!poll) return { trustworthy: false, reason: '无轮询结果' };
+  if (poll.inFlight) {
+    return { trustworthy: false, reason: '落地确认超时后仍有一个无法取消的在途读取（最新状态未知）' };
+  }
+  if (poll.lastReadFailed) {
+    return { trustworthy: false, reason: '落地确认的最后一次读取失败（最新状态未知，不得据旧快照重发）' };
+  }
+  if (poll.valueStale) {
+    return { trustworthy: false, reason: '落地确认未取得可信的最新快照' };
+  }
+  return { trustworthy: true, reason: null };
 }
 
 /**
@@ -657,6 +687,14 @@ async function pausePageTargets({ controller, page, shopCfg, targets, rows, resu
     // 现改为：仍有失败目标且本次未重试过 → 以回读为准只对失败目标重试一次。
     // 2026-09-16 修复（本轮第 4 项）：重试前必须**重新核验真实状态、身份、停止与时间门槛**。
     if (retryAttempt === 0 && failed.length <= targetIds.length) {
+      // 2026-09-16 第二轮：最新状态不可信（最后一次读取失败 / 仍有无法取消的在途读取）时，
+      // 绝不用此前的"仍关闭"旧快照去重发 —— 那会把已经落地的目标再点一次。
+      const trust = landingStateTrustworthy(landing.poll);
+      if (!trust.trustworthy) {
+        fail('zixuan', V_PARTIAL_FAILED,
+          `${trust.reason}：不据旧快照重发（已确认 ${landing.confirmed.length}/${targetIds.length} 个关闭）`);
+        return false;
+      }
       // 未知状态（notFound/开关状态未知）不参与重试：无法确认目标当前实际状态，避免盲重发。
       if (notFound.length > 0) {
         fail('zixuan', V_PARTIAL_FAILED,
@@ -1436,6 +1474,13 @@ async function enablePageTargets({ controller, page, shopCfg, targets, rows, res
     // 2026-09-15 修复（交接第 6 项）：原实现仅在"全部失败"时重试，部分成功/未知状态一律直接失败。
     // 2026-09-16 修复（本轮第 4 项）：重试前必须**重新核验真实状态、身份、停止与时间门槛**。
     if (retryAttempt === 0 && failed.length <= targetIds.length) {
+      // 2026-09-16 第二轮：最新状态不可信时不得据旧快照重发（与暂停侧同一原则）。
+      const trust = landingStateTrustworthy(landing.poll);
+      if (!trust.trustworthy) {
+        fail('zixuan', V_PARTIAL_FAILED,
+          `${trust.reason}：不据旧快照重发（已确认 ${landing.confirmed.length}/${targetIds.length} 个开启）`);
+        return false;
+      }
       if (notFound.length > 0) {
         fail('zixuan', V_PARTIAL_FAILED,
           `开启回读存在 ${notFound.length} 个目标行消失（状态未知），不盲目重发；失败目标 ${failed.length} 个：${failed.slice(0, 5).join(',')}`);

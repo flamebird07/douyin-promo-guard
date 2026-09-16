@@ -1349,3 +1349,93 @@ test('停止语义优先：点击后收到停止 → 不再重试（走停止路
   assert.ok(result.stoppedAfterDispatch, '必须记录已派发请求的真实回读结果');
   assert.strictEqual(result.allPausedConfirmed, false);
 });
+
+// ══════════════════════════════════════════════════════════════════
+// 第二轮定点修复：单次读取必须有界 + 最新状态未知禁止重发
+//
+// 旧缺陷：boundedLandingPoll 的截止时间只决定"两次读取之间是否继续"，`await read()`
+// 本身没有上界 → 真实页面上一次卡住的回读会让整个任务永久挂起；
+// 且轮询结束时若最后一次读取失败，调用方仍会用此前"仍关闭"的旧快照去走重试分支。
+// ══════════════════════════════════════════════════════════════════
+
+test('落地轮询永久挂起：有界返回未知、绝不重发、真实并发峰值 ≤1', { timeout: 30000 }, async () => {
+  let started = 0;
+  let live = 0;
+  let peak = 0;
+  let releaseHang = null;
+  let hangUsed = false;
+  const t0 = Date.now();
+  const { result, state } = await run({
+    fixture: { plans: { '全店托管': [], '商品自选': ZIXUAN_PLANS(3) } },
+    dryRun: false,
+    controllerOverride: async (controller) => {
+      const origClick = controller.clickBatchPause.bind(controller);
+      let clicked = false;
+      controller.clickBatchPause = async (p) => { const r = await origClick(p); clicked = true; return r; };
+      const orig = controller.readView.bind(controller);
+      controller.readView = (p) => {
+        if (clicked && p.tab === '商品自选' && !hangUsed) {
+          hangUsed = true;
+          started += 1;
+          live += 1;
+          peak = Math.max(peak, live);
+          return new Promise((res) => { releaseHang = res; }); // 永不主动落定（模拟卡住的回读）
+        }
+        return orig(p);
+      };
+      return controller;
+    },
+  });
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 20000, `必须真正有界返回，实际 ${elapsed}ms（旧代码在此永久挂起）`);
+  assert.strictEqual(pauseClicks(state).length, 1, '读取挂起绝不得触发重试/第二次点击');
+  assert.strictEqual(deleteClicks(state).length, 0);
+  assert.strictEqual(result.allPausedConfirmed, false, '状态未知绝不得宣称已确认关闭');
+  const poll = result.polling['商品自选'];
+  assert.ok(poll, '必须留下轮询结果');
+  assert.strictEqual(poll.inFlight, true, '必须如实登记"仍有无法取消的在途读取"');
+  assert.ok(poll.abandonedReads >= 1, '必须记录被放弃的在途读取数');
+  assert.strictEqual(poll.valueStale, true, '最新状态未知 → 禁止据旧快照重发');
+  assert.strictEqual(started, 1, '在途读取未释放前绝不启动第二次读取');
+  assert.strictEqual(peak, 1, '真实并发峰值必须 ≤1（不与在途读取重叠）');
+  assert.match(result.confirmReason, /结果未知|未知/);
+  // 迟到落定：不得改写已结束批次的结果，也不得产生未处理拒绝
+  if (releaseHang) releaseHang({ tab: '商品自选', rows: { error: 'late' }, pagination: null });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.strictEqual(result.allPausedConfirmed, false, '迟到结果不得改写已结束批次');
+});
+
+test('最后一次读取失败：不得据此前"仍关闭"的旧快照重发（旧代码会误用旧快照）', async () => {
+  let readsAfterClick = 0;
+  const { result, state, audits } = await run({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_PLANS(5) },
+      state: { pauseEffect: 'noop' }, // 平台未落地 → 快照一直显示"仍开启"
+    },
+    dryRun: false,
+    controllerOverride: async (controller) => {
+      const origClick = controller.clickBatchPause.bind(controller);
+      let clicked = false;
+      controller.clickBatchPause = async (p) => { const r = await origClick(p); clicked = true; return r; };
+      const orig = controller.readView.bind(controller);
+      controller.readView = async (p) => {
+        if (clicked && p.tab === '商品自选') {
+          readsAfterClick += 1;
+          // 第 1 次成功（留下"5 个仍开启"的旧快照），随后持续失败 → 最后一次读取失败
+          if (readsAfterClick === 1) return orig(p);
+          return { tab: '商品自选', rows: { error: 'fixture 注入：回读持续失败' }, pagination: null };
+        }
+        return orig(p);
+      };
+      return controller;
+    },
+  });
+  const poll = result.polling['商品自选'];
+  assert.strictEqual(poll.lastReadFailed, true, '必须标记"最后一次读取失败"（旧代码无此字段）');
+  assert.strictEqual(poll.valueStale, true, '旧快照不可信（旧代码无此字段）');
+  assert.match(result.confirmReason, /最新状态未知|旧快照/, '必须明确以"最新状态未知"为由拒绝重发');
+  assert.strictEqual(pauseClicks(state).length, 1, '绝不得据旧快照重发（第二次点击）');
+  assert.ok(!audits.some((a) => a.event === 'retry'), '不得进入重发分支');
+  assert.strictEqual(deleteClicks(state).length, 0);
+  assert.strictEqual(result.allPausedConfirmed, false);
+});

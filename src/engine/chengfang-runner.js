@@ -97,16 +97,7 @@ class ChengfangRunner {
       && session.cookieSession && session.cookieSession.filePath && session.context;
     if (shouldWriteback) {
       try {
-        const { writebackSessionCookies } = require('../login/cookie-writeback');
-        writeback = await writebackSessionCookies({
-          context: session.context,
-          cookieFilePath: session.cookieSession.filePath,
-          sessionStartFingerprint: session.cookieSession.startFingerprint,
-          identityOk: ctx.identityOk === true,
-          loginOk: ctx.loginOk !== false,
-          shopId: ctx.shopId || null,
-          audit: this.audit,
-        });
+        writeback = await this._writebackSessionCookies(session, ctx);
       } catch (e) {
         // 回写异常绝不冒泡：单独记录，广告动作结果保持原样
         writeback = { ok: false, skipped: false, reason: `Cookie 回写异常（旧文件保留）: ${e.message}` };
@@ -119,6 +110,60 @@ class ChengfangRunner {
       else if (session.browser) await session.browser.close();
     } catch (_) { /* 关闭失败不阻塞批次结果 */ }
     return writeback;
+  }
+
+  /**
+   * 回写装配（2026-09-16 第二轮定点修复）：**先取得当前有效的登录/身份证据**，再交给
+   * `cookie-writeback` 落盘。旧实现把 `loginOk` 默认成 true —— 操作开始时身份正确，
+   * 并不等于结束（回写）时登录仍然有效，这会让一个已失效的会话把 Cookie 覆盖回去。
+   * 现改为 fail-closed：任何一项证据缺失/失败/异常都**不覆盖**。
+   * 该核验是只读的（verifyIdentity 只读页面账户信息），不产生任何业务点击。
+   * @returns {Promise<object>} 回写结果（不含任何 Cookie 值）
+   */
+  async _writebackSessionCookies(session, ctx) {
+    const shopId = ctx.shopId || null;
+    const { writebackSessionCookies } = require('../login/cookie-writeback');
+    if (ctx.identityOk !== true) {
+      const reason = '店铺/账户身份核验未通过：不覆盖 Cookie 文件';
+      this.audit({ kind: 'cookie-writeback', shopId, ok: false, skipped: true, reason });
+      return { ok: false, skipped: true, reason };
+    }
+    const ev = await this._currentLoginEvidence(session, ctx);
+    if (ev.loginOk !== true) {
+      const reason = `回写前未取得当前有效的登录/身份证据（fail-closed，不覆盖）：${ev.reason}`;
+      this.audit({ kind: 'cookie-writeback', shopId, ok: false, skipped: true, reason });
+      return { ok: false, skipped: true, reason };
+    }
+    return writebackSessionCookies({
+      context: session.context,
+      cookieFilePath: session.cookieSession.filePath,
+      sessionStartFingerprint: session.cookieSession.startFingerprint,
+      identityOk: true,
+      loginOk: true,
+      shopId,
+      audit: this.audit,
+    });
+  }
+
+  /**
+   * 回写前的**当前**登录/身份只读证据。
+   * 缺少 controller/page/shopCfg、核验未通过或抛错 → loginOk=false（fail-closed，不覆盖）。
+   * @returns {Promise<{loginOk:boolean, reason:string|null}>}
+   */
+  async _currentLoginEvidence(session, ctx) {
+    const shopCfg = ctx.shopCfg || null;
+    const controller = session.controller;
+    const page = session.page;
+    if (!shopCfg || !page || !controller || typeof controller.verifyIdentity !== 'function') {
+      return { loginOk: false, reason: '缺少可用的 controller/page/shopCfg，无法在回写前取得当前登录证据' };
+    }
+    try {
+      const id = await controller.verifyIdentity({ page, shopCfg });
+      if (id && id.ok === true) return { loginOk: true, reason: null };
+      return { loginOk: false, reason: (id && id.reason) || '回写前身份核验未通过' };
+    } catch (e) {
+      return { loginOk: false, reason: `回写前身份核验异常：${e.reason || e.message}` };
+    }
   }
 
   /**
@@ -331,6 +376,7 @@ class ChengfangRunner {
         identityOk: !!(batchResult && batchResult.executor && batchResult.executor.identity
           && batchResult.executor.identity.ok === true),
         shopId: shopCfg.id,
+        shopCfg,
       });
       if (wb && batchResult) batchResult.cookieWriteback = wb;
     }
@@ -400,6 +446,7 @@ class ChengfangRunner {
         identityOk: !!(batchResult && batchResult.executor && batchResult.executor.identity
           && batchResult.executor.identity.ok === true),
         shopId: shopCfg.id,
+        shopCfg,
       });
       if (wb && batchResult) batchResult.cookieWriteback = wb;
     }

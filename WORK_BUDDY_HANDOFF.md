@@ -105,3 +105,44 @@
 - **未验证（不得当成已验证）**：本轮**无任何真实广告动作**，「点击→异步落地→确认」真实链路与
   真实店铺文件上的 Cookie 回写**均未实测**。下一次 07:00 若对象本来已开启，幂等跳过只证明
   调度与回读有效。
+
+## 第十七轮定点修复（2026-09-16，基线 4efe5a7）
+
+Codex 独立复现的两个缺陷 + 服务启动稳定性收尾。**本轮未发生任何真实广告动作**。
+
+### 一、`src/lib/bounded-poll.js`：单次读取必须有界
+- 旧缺陷：deadline 只决定"两次读取之间是否继续"，`await read()` 本身无上界 →
+  read 返回永不落定的 Promise 时函数**永久挂起**（隔离复现：timeoutMs=20/intervalMs=0，100ms 未返回）。
+- 修复：每次读取登记为 `{done,result}`（结果永远以 `{ok,value|error}` 落定，不产生未处理拒绝）；
+  `waitSettle` 的等待上界 = 剩余预算（内部先用 0ms 宏任务刷新微任务队列）；
+  超时未释放 → `abort()` + `cancelGraceMs` 确认释放，确认不了 → `inFlight:true` + `abandonedReads++`；
+  迟到结果只写本地登记对象，不改写已返回结果。
+- 新增字段：`inFlight` / `abandonedReads` / `lastReadFailed` / `valueStale` / `peakInFlight`。
+- 执行器新增 `landingStateTrustworthy(poll)`：`inFlight || lastReadFailed || valueStale` → **禁止重发**。
+- **不要**退回 `Promise.race` 丢弃旧任务，也不要单纯加大超时——那既会让读取重叠，也解决不了挂起。
+
+### 二、`src/login/cookie-writeback.js`：指纹检查的异步空隙
+- 旧缺陷：指纹检查在 `await context.cookies()` **之前** → 异步期间用户重新登录被旧会话覆盖且 `ok=true`。
+- 修复：初始指纹缺失/无效 → 拒绝；`context.cookies()` 之后**再取一次快照**比对；
+  回滚改为 `rollbackIfUnchanged`（仅当文件仍是本次写入的那份才回滚）；`loginOk` **fail-closed**。
+- runner：`_writebackSessionCookies` + `_currentLoginEvidence`，回写前必须取得**当前**只读登录/身份证据。
+- 边界：比对-后-写 + 原子 rename 只保证不出现半写文件，**不是**完整并发互斥。
+
+### 三、服务启动稳定性（`电商助手/bill-manager/server.js`，**非公开仓库**）
+- 修了两个真实缺陷：①陈旧锁判定失效（时间戳从不刷新 → 跑满 5 分钟后锁被新实例窃取）；
+  ②EADDRINUSE 只打印不退出 → 僵尸实例。
+- 修复后：`isLockStale` 先看 PID 存活；`tryCreateLock`（temp + `linkSync`）原子互斥；60s 锁心跳；
+  `releaseLock` 只删自己的锁；EADDRINUSE → 退出。
+- 备份 `server.js.bak-pre-lockfix-20260916-193410`。
+- **已重启加载修复**（业务空闲后精确停止旧实例，未批量结束进程）：旧 PID 25788 → **新 PID 31324**。
+  实测：陈旧锁正确接管、锁心跳 60.5s 刷新时间戳、单实例保护拒绝第二份（`rc=1` 且不窃锁）、
+  3443 HTTP 200、状态无损（`enableTask.nextRunAt=2026-09-16T23:00:00Z`、`enablePhaseToday` 保留）。
+- **脱离会话生命周期在本环境被明确拒绝**（WMI / 任务计划 / explorer / Python
+  `CREATE_BREAKAWAY_FROM_JOB` → WinError 5）。这是环境限制，不是业务要求。
+
+### 四、接手注意事项
+- 公开副本只有 `watch-drill.js` / `watch-drill-tab.html` / `watch-drill.test.js` / `README.md`；
+  `server.js` 属电商助手自身，改动**不需要**同步到公开仓库。
+- 旧代码回归对照：`evidence/old-code-executor-regression-r17.log`（基线 `4efe5a7`）。
+  改动上述源码后请重新生成。
+- **未验证（不得当成已验证）**：真实店铺文件上的 Cookie 回写、「点击→异步落地→确认」真实链路。

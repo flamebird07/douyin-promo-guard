@@ -22,6 +22,20 @@
  *
  * 返回结果刻意区分 `ok`（已收敛）/`stopped`（因停止而在期限内结束）/`timedOut`（超时未收敛）/
  * `readFailures`（读取失败次数），调用方据此决定是否允许"同会话重试一次"。
+ *
+ * 2026-09-16 第二轮定点修复（Codex 独立复现）：
+ *  旧实现的截止时间**只**用于决定"两次读取之间是否继续"，`await read()` 本身没有任何上界。
+ *  隔离复现：timeoutMs=20、intervalMs=0，read 返回永不落定的 Promise → 100ms 后仍未返回；
+ *  真实页面上一次卡住的读取会让整个任务永久挂起。
+ *  现补齐（不是简单地 `Promise.race` 丢弃，也不是单纯加大超时）：
+ *   a) **单次读取也在预算内被等待**：等待上界 = 剩余预算；超时即返回，绝不无限等待。
+ *   b) **优先取消并确认释放**：提供 `abort` 时先请求取消，再用 `cancelGraceMs` 确认读取已释放。
+ *   c) **无法取消 → 保留在途登记**：返回 `inFlight: true`，调用方据此**不得**启动新的
+ *      浏览器任务与旧读取重叠；在途读取未释放前本函数也不会发起下一次读取。
+ *   d) **迟到结果被隔离**：被放弃的读取落定后只写入本地登记对象，既不改写已返回的结果，
+ *      也不会成为下一轮的输入；同时挂接错误处理，不产生未处理拒绝。
+ *   e) **最新状态未知必须可识别**：`lastReadFailed`（最后一次读取失败）与 `valueStale`
+ *      （旧快照不可信）供调用方判断"是否禁止重发"——绝不拿此前的"仍关闭"旧快照去重试。
  */
 
 /** 与 src/config.js DEFAULTS.execution 保持同一份数字（唯一来源）。 */
@@ -64,9 +78,15 @@ function resolvePollingConfig(executionCfg) {
  * @param {(ms:number) => Promise<void>} [p.sleep]
  * @param {() => boolean} [p.stopRequested]
  * @param {number|null} [p.stopGraceMs]          停止后允许的只读确认余量；null/缺省 = 用尽原预算
+ * @param {() => (void|Promise<void>)} [p.abort] 请求取消当前在途读取（可选；调用后仍需确认释放）
+ * @param {number} [p.cancelGraceMs]             取消后等待"确认释放"的余量（默认 0，即有界不额外等待）
  * @param {(info:object) => void} [p.onAttempt]
  * @returns {Promise<{ok:boolean, settled:boolean, value:any, attempts:number, readFailures:number,
- *                    stopped:boolean, timedOut:boolean, lastError:any, elapsedMs:number}>}
+ *                    abandonedReads:number, inFlight:boolean, lastReadFailed:boolean, valueStale:boolean,
+ *                    peakInFlight:number, stopped:boolean, timedOut:boolean, lastError:any, elapsedMs:number}>}
+ *          `inFlight=true` 表示返回时仍有一个**无法取消**的在途读取（调用方不得据此启动新任务）；
+ *          `valueStale=true` 表示 `value` 可能已过期（最后一次读取失败 / 仍有在途读取 / 从未读成功），
+ *          调用方**不得**据此快照重发请求。
  */
 async function boundedLandingPoll(p) {
   const read = p.read;
@@ -78,6 +98,8 @@ async function boundedLandingPoll(p) {
   const stopRequested = p.stopRequested || (() => false);
   const stopGraceMs = (p.stopGraceMs === undefined || p.stopGraceMs === null) ? null : Math.max(0, p.stopGraceMs);
   const onAttempt = p.onAttempt || (() => {});
+  const abort = typeof p.abort === 'function' ? p.abort : null;
+  const cancelGraceMs = Number.isFinite(p.cancelGraceMs) && p.cancelGraceMs >= 0 ? p.cancelGraceMs : 0;
 
   const startMs = now();
   const deadline = startMs + timeoutMs;
@@ -86,8 +108,14 @@ async function boundedLandingPoll(p) {
   let stoppedAt = null;
   let attempts = 0;
   let readFailures = 0;
+  let abandonedReads = 0;
   let lastValue = null;
   let lastError = null;
+  let lastReadFailed = false;
+  let unreleased = false;   // 返回时是否仍有无法取消的在途读取
+  let inFlightCount = 0;
+  let peakInFlight = 0;
+  let inflight = null;      // 当前在途读取的登记记录
 
   /** 当前允许读取到的最晚时刻（停止后收窄，但绝不超过原截止时间）。 */
   const limitOf = () => {
@@ -96,55 +124,118 @@ async function boundedLandingPoll(p) {
     return Math.min(deadline, stoppedAt + Math.max(0, grace));
   };
 
-  for (let i = 0; ; i += 1) {
+  /**
+   * 启动一次读取并登记在途状态。登记结果永远以 {ok, value|error} 落定（不抛出），
+   * 这样即使调用方最终放弃了这次读取，也不会产生未处理拒绝。
+   */
+  const startRead = () => {
+    attempts += 1;
+    inFlightCount += 1;
+    if (inFlightCount > peakInFlight) peakInFlight = inFlightCount;
+    const rec = { done: false, result: null };
+    let pr;
+    try {
+      pr = Promise.resolve(read());
+    } catch (e) {
+      pr = Promise.reject(e);
+    }
+    rec.promise = pr.then(
+      (value) => { inFlightCount -= 1; rec.done = true; rec.result = { ok: true, value }; return rec.result; },
+      (error) => { inFlightCount -= 1; rec.done = true; rec.result = { ok: false, error }; return rec.result; },
+    );
+    return rec;
+  };
+
+  /**
+   * 等待在途读取落定，最多 ms 毫秒；返回是否已落定。
+   *
+   * 这里的 race **只用来给等待设上界**：即使 race 先返回，被放弃的读取仍保留登记
+   * （inFlight / abandonedReads），绝不会因为"race 结束了"就并发发起下一次读取。
+   */
+  const waitSettle = async (rec, ms) => {
+    if (rec.done) return true;
+    // 让已落定 Promise 的微任务先跑完（读取可能已完成，只是 .then 尚未执行）。
+    // 用 0ms 宏任务确保微任务队列已刷新，避免把"已完成的读取"误判为在途。
+    await new Promise((r) => { setTimeout(r, 0); });
+    if (rec.done) return true;
+    if (!(ms > 0)) return false;
+    let timer = null;
+    const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve('__timeout__'), ms); });
+    const winner = await Promise.race([rec.promise.then(() => 'settled'), timeout]);
+    if (timer) clearTimeout(timer);
+    return winner === 'settled';
+  };
+
+  for (;;) {
     // 停止信号在**每次读取前**记录：一旦停止，就不再重试/不再发起新业务请求，
     // 但仍允许已派发请求在有限期限内完成只读确认（limitOf 据此收窄预算）。
     if (stoppedAt === null && stopRequested()) stoppedAt = now();
+
+    if (inflight) {
+      const settled = await waitSettle(inflight, Math.max(0, limitOf() - now()));
+      if (!settled) {
+        // 超时仍未释放：优先取消并确认释放；确认不了则保留在途登记后结束（返回未知）。
+        let released = false;
+        if (abort) {
+          try { await abort(); } catch (_) { /* 取消失败不致命，仍按在途处理 */ }
+          released = await waitSettle(inflight, cancelGraceMs);
+        }
+        if (!released) {
+          unreleased = true;
+          abandonedReads += 1;
+          inflight = null;
+          break;
+        }
+      }
+      // 已落定（或取消后确认释放）→ 消费结果；迟到的结果永远不会走到这里。
+      const r = inflight.result;
+      inflight = null;
+      if (r && r.ok === false) {
+        readFailures += 1;
+        lastError = r.error;
+        lastReadFailed = true;
+        onAttempt({ attempt: attempts, error: r.error && (r.error.reason || r.error.message || String(r.error)) });
+      } else if (r && r.ok) {
+        lastValue = r.value;
+        lastError = null;
+        lastReadFailed = false;
+        const pr = isPending(r.value) || {};
+        const pending = Number.isFinite(pr.pending) ? pr.pending : 0;
+        const unknown = Number.isFinite(pr.unknown) ? pr.unknown : 0;
+        onAttempt({ attempt: attempts, pending, unknown });
+        if (pending === 0 || unknown > 0) {
+          return {
+            ok: true, settled: true, value: r.value, attempts, readFailures, abandonedReads,
+            inFlight: false, lastReadFailed: false, valueStale: false, peakInFlight,
+            // 读取期间到达的停止信号同样必须如实上报（调用方据此禁止重试/新请求）
+            stopped: stoppedAt !== null || stopRequested(), timedOut: false, lastError: null,
+            elapsedMs: now() - startMs,
+          };
+        }
+      }
+      if (stoppedAt === null && stopRequested()) stoppedAt = now();
+      continue;
+    }
+
     const limit = limitOf();
     const remaining = limit - now();
-    // 至少读取一次（i === 0 不受预算限制）；之后只要预算耗尽就结束，不再发起新读取。
-    if (i > 0 && remaining <= 0) break;
+    // 至少读取一次（attempts === 0 不受预算限制）；之后只要预算耗尽就结束，不再发起新读取。
+    if (attempts > 0 && remaining <= 0) break;
     // 硬性兜底：时钟不推进等异常情况下也不会无限循环。
-    if (i >= maxAttempts) break;
+    if (attempts >= maxAttempts) break;
     const wait = Math.max(0, Math.min(intervalMs, remaining));
     if (wait > 0) await sleep(wait);
-    // 睡眠可能越过截止时间（分片抖动/系统休眠）：越界后不再发起新读取（不与上一轮重叠）。
-    if (i > 0 && now() >= limitOf()) break;
+    // 睡眠可能越过截止时间（分片抖动/系统休眠）：越界后不再发起新读取。
+    if (attempts > 0 && now() >= limitOf()) break;
 
-    attempts += 1;
-    let value = null;
-    let err = null;
-    try {
-      value = await read();
-    } catch (e) {
-      err = e;
-    }
-    if (err) {
-      readFailures += 1;
-      lastError = err;
-      onAttempt({ attempt: attempts, error: err.reason || err.message || String(err) });
-    } else {
-      lastValue = value;
-      lastError = null;
-      const r = isPending(value) || {};
-      const pending = Number.isFinite(r.pending) ? r.pending : 0;
-      const unknown = Number.isFinite(r.unknown) ? r.unknown : 0;
-      onAttempt({ attempt: attempts, pending, unknown });
-      if (pending === 0 || unknown > 0) {
-        return {
-          ok: true, settled: true, value, attempts, readFailures,
-          // 读取期间到达的停止信号同样必须如实上报（调用方据此禁止重试/新请求）
-          stopped: stoppedAt !== null || stopRequested(), timedOut: false, lastError: null,
-          elapsedMs: now() - startMs,
-        };
-      }
-    }
-    if (stoppedAt === null && stopRequested()) stoppedAt = now();
+    inflight = startRead();
   }
 
   const stoppedNow = stoppedAt !== null || stopRequested();
   return {
-    ok: false, settled: false, value: lastValue, attempts, readFailures,
+    ok: false, settled: false, value: lastValue, attempts, readFailures, abandonedReads,
+    inFlight: unreleased, lastReadFailed, peakInFlight,
+    valueStale: unreleased || lastReadFailed || lastValue === null,
     stopped: stoppedNow, timedOut: !stoppedNow, lastError, elapsedMs: now() - startMs,
   };
 }

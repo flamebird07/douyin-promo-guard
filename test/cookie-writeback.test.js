@@ -22,7 +22,8 @@ const os = require('os');
 const path = require('path');
 
 const {
-  fingerprintFile, validateCookieSet, atomicWriteJson, writebackSessionCookies, sameCookieShape,
+  fingerprintFile, validateCookieSet, atomicWriteJson, rollbackIfUnchanged,
+  writebackSessionCookies, sameCookieShape,
 } = require('../src/login/cookie-writeback');
 const { inspectCookieFile } = require('../src/login/session');
 
@@ -68,7 +69,7 @@ test('正常回写：原子写入成功；下次加载确实读到保存结果�
   const audits = [];
   const r = await writebackSessionCookies({
     context: ctxOf(next), cookieFilePath: file, sessionStartFingerprint: start,
-    identityOk: true, shopId: '瑾漂亮潮流服饰', audit: (e) => audits.push(e),
+    identityOk: true, loginOk: true, shopId: '瑾漂亮潮流服饰', audit: (e) => audits.push(e),
   });
   assert.strictEqual(r.ok, true, r.reason || '');
   assert.strictEqual(r.count, next.length);
@@ -103,7 +104,7 @@ test('原子写入失败（序列化异常）：旧文件保留、无临时文�
   const bad = prev.concat([circ]);
   const r = await writebackSessionCookies({
     context: ctxOf(bad), cookieFilePath: file, sessionStartFingerprint: fingerprintFile(file),
-    identityOk: true, audit: () => {},
+    identityOk: true, loginOk: true, audit: () => {},
   });
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.skipped, false, '这是"保存失败"，不是"按规则跳过"');
@@ -127,7 +128,7 @@ test('空 Cookie 集合：拒绝覆盖（登录态可疑）', async () => {
   const before = fs.readFileSync(file, 'utf-8');
   const r = await writebackSessionCookies({
     context: ctxOf([]), cookieFilePath: file, sessionStartFingerprint: fingerprintFile(file),
-    identityOk: true, audit: () => {},
+    identityOk: true, loginOk: true, audit: () => {},
   });
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.skipped, true);
@@ -143,10 +144,10 @@ test('非法条目（缺 name/domain、value 非字符串）：拒绝覆盖', as
     { value: 'v', domain: '.jinritemai.com' },
     { name: 'a', value: 'v', domain: '.jinritemai.com' },
   ];
-  const r1 = await writebackSessionCookies({ context: ctxOf(bad), cookieFilePath: file, sessionStartFingerprint: fingerprintFile(file), identityOk: true, audit: () => {} });
+  const r1 = await writebackSessionCookies({ context: ctxOf(bad), cookieFilePath: file, sessionStartFingerprint: fingerprintFile(file), identityOk: true, loginOk: true, audit: () => {} });
   assert.strictEqual(r1.ok, false);
   assert.match(r1.reason, /name|domain/);
-  const r2 = await writebackSessionCookies({ context: ctxOf([{ name: 'a', value: 1, domain: '.jinritemai.com' }]), cookieFilePath: file, sessionStartFingerprint: fingerprintFile(file), identityOk: true, audit: () => {} });
+  const r2 = await writebackSessionCookies({ context: ctxOf([{ name: 'a', value: 1, domain: '.jinritemai.com' }]), cookieFilePath: file, sessionStartFingerprint: fingerprintFile(file), identityOk: true, loginOk: true, audit: () => {} });
   assert.strictEqual(r2.ok, false);
   assert.match(r2.reason, /value/);
   fs.rmSync(dir, { recursive: true, force: true });
@@ -161,7 +162,7 @@ test('只保存千川域、丢掉抖店/罗盘域：拒绝覆盖（防止覆盖�
   const partial = synthCookies().filter((c) => c.domain === 'fxg.jinritemai.com' || c.domain === '.jinritemai.com');
   const r = await writebackSessionCookies({
     context: ctxOf(partial), cookieFilePath: file, sessionStartFingerprint: fingerprintFile(file),
-    identityOk: true, audit: () => {},
+    identityOk: true, loginOk: true, audit: () => {},
   });
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.skipped, true);
@@ -186,7 +187,7 @@ test('条数塌缩（域齐全但只剩极少条目）：拒绝覆盖', async ()
   assert.ok(collapsed.length < prev.length * 0.6, '构造的塌缩集合应低于保护线');
   const r = await writebackSessionCookies({
     context: ctxOf(collapsed), cookieFilePath: file, sessionStartFingerprint: fingerprintFile(file),
-    identityOk: true, audit: () => {},
+    identityOk: true, loginOk: true, audit: () => {},
   });
   assert.strictEqual(r.ok, false);
   assert.match(r.reason, /塌缩|拒绝覆盖/);
@@ -197,9 +198,9 @@ test('登录失效 / 身份不符：拒绝覆盖', async () => {
   const dir = tmpDir();
   const file = writeCookieFile(dir, synthCookies());
   const before = fs.readFileSync(file, 'utf-8');
-  const r1 = await writebackSessionCookies({ context: ctxOf(synthCookies()), cookieFilePath: file, sessionStartFingerprint: fingerprintFile(file), identityOk: true, loginOk: false, audit: () => {} });
+  const r1 = await writebackSessionCookies({ context: ctxOf(synthCookies()), cookieFilePath: file, sessionStartFingerprint: fingerprintFile(file), identityOk: true, loginOk: true, loginOk: false, audit: () => {} });
   assert.strictEqual(r1.ok, false);
-  assert.match(r1.reason, /登录态无效/);
+  assert.match(r1.reason, /登录态未确认当前有效/);
   const r2 = await writebackSessionCookies({ context: ctxOf(synthCookies()), cookieFilePath: file, sessionStartFingerprint: fingerprintFile(file), identityOk: false, audit: () => {} });
   assert.strictEqual(r2.ok, false);
   assert.match(r2.reason, /身份核验未通过/);
@@ -208,7 +209,7 @@ test('登录失效 / 身份不符：拒绝覆盖', async () => {
 });
 
 test('未提供路径 / 路径非法：拒绝写入任意路径', async () => {
-  const r = await writebackSessionCookies({ context: ctxOf(synthCookies()), cookieFilePath: null, identityOk: true, audit: () => {} });
+  const r = await writebackSessionCookies({ context: ctxOf(synthCookies()), cookieFilePath: null, identityOk: true, loginOk: true, audit: () => {} });
   assert.strictEqual(r.ok, false);
   assert.match(r.reason, /路径/);
 });
@@ -229,7 +230,7 @@ test('冲突保护：会话期间源文件被改变（用户重新登录）→ �
   const r = await writebackSessionCookies({
     context: ctxOf(prev.concat([{ name: 'stale', value: 'stale-session', domain: '.jinritemai.com' }])),
     cookieFilePath: file, sessionStartFingerprint: sessionStart,
-    identityOk: true, audit: (e) => audits.push(e),
+    identityOk: true, loginOk: true, audit: (e) => audits.push(e),
   });
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.conflict, true, '必须明确标记为冲突');
@@ -258,10 +259,119 @@ test('域完整性：非关键第三方域缺失允许写回，但如实记录�
   const next = prev.filter((c) => c.domain !== '.hm.baidu.com');
   const r = await writebackSessionCookies({
     context: ctxOf(next), cookieFilePath: file, sessionStartFingerprint: fingerprintFile(file),
-    identityOk: true, audit: () => {},
+    identityOk: true, loginOk: true, audit: () => {},
   });
   assert.strictEqual(r.ok, true, r.reason || '');
   assert.deepStrictEqual(r.droppedOther, ['hm.baidu.com'], '缺失的非关键域必须如实记录（规范化域名）');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ══════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
+// 第二轮定点修复：指纹检查的异步时间空隙
+//
+// 旧缺陷（Codex 独立复现）：writebackSessionCookies 在 `await context.cookies()` **之前**
+// 检查指纹，之后直接写入。`context.cookies()` 是异步的（真实浏览器上可达数百毫秒~数秒），
+// 期间用户重新登录写入新文件后，旧会话仍把旧 Cookie 覆盖回去，并返回 ok=true。
+// 同时：初始指纹缺失时旧实现 `if (start && ...)` 会**静默跳过**冲突保护；`loginOk` 默认 true。
+// ══════════════════════════════════════════════════════════════
+
+test('异步空隙：context.cookies() 期间用户重新登录写入新文件 → 拒绝覆盖，保留新文件', async () => {
+  const dir = tmpDir();
+  const prev = synthCookies();
+  const file = writeCookieFile(dir, prev);
+  const start = fingerprintFile(file);
+  const next = prev.concat([{ name: 'old_session_token', value: 'stale', domain: '.jinritemai.com', path: '/' }]);
+  // 用户重新登录：一份完全独立的新文件
+  const relogin = synthCookies().concat([{ name: 'relogin_token', value: 'fresh-login', domain: '.jinritemai.com', path: '/' }]);
+  const context = {
+    cookies: async () => {
+      fs.writeFileSync(file, JSON.stringify(relogin, null, 2)); // 异步空隙期间重新登录落盘
+      return next;
+    },
+  };
+  const r = await writebackSessionCookies({
+    context, cookieFilePath: file, sessionStartFingerprint: start,
+    identityOk: true, loginOk: true, shopId: '瑾漂亮潮流服饰',
+  });
+  assert.strictEqual(r.ok, false, '异步空隙期间源文件变化 → 绝不允许旧会话覆盖用户的新登录');
+  assert.strictEqual(r.conflict, true, '必须标记为冲突（保留较新文件），而不是普通失败');
+  assert.match(r.reason, /获取本次 Cookie 期间被改变/);
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  assert.ok(onDisk.some((c) => c.name === 'relogin_token'), '必须保留用户重新登录产生的新文件');
+  assert.ok(!onDisk.some((c) => c.name === 'old_session_token'), '旧会话内容绝不得写入');
+  assert.ok(!JSON.stringify(r).includes('fresh-login'), '返回结果不得含任何 Cookie 值');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('缺失/无效初始指纹：拒绝回写（旧实现会静默跳过冲突保护）', async () => {
+  const dir = tmpDir();
+  const file = writeCookieFile(dir, synthCookies());
+  const before = fs.readFileSync(file, 'utf-8');
+  const bad = [
+    undefined, null,
+    { exists: false, size: null, mtimeMs: null, sha256: null },
+    { exists: true, size: 10, mtimeMs: 1, sha256: null },
+  ];
+  for (const fp of bad) {
+    const r = await writebackSessionCookies({
+      context: ctxOf(synthCookies()), cookieFilePath: file, sessionStartFingerprint: fp,
+      identityOk: true, loginOk: true,
+    });
+    assert.strictEqual(r.ok, false, `初始指纹 ${JSON.stringify(fp)} 必须拒绝回写`);
+    assert.strictEqual(r.skipped, true);
+    assert.match(r.reason, /初始指纹/);
+  }
+  assert.strictEqual(fs.readFileSync(file, 'utf-8'), before, '旧文件必须原样保留');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('登录态 fail-closed：loginOk 非严格 true 一律拒绝覆盖（旧实现默认 true）', async () => {
+  const dir = tmpDir();
+  const prev = synthCookies();
+  const file = writeCookieFile(dir, prev);
+  const before = fs.readFileSync(file, 'utf-8');
+  const start = fingerprintFile(file);
+  for (const v of [undefined, false, null, 1, 'true']) {
+    const r = await writebackSessionCookies({
+      context: ctxOf(prev.concat([{ name: 'x', value: 'y', domain: '.jinritemai.com', path: '/' }])),
+      cookieFilePath: file, sessionStartFingerprint: start,
+      identityOk: true, loginOk: true, loginOk: v,
+    });
+    assert.strictEqual(r.ok, false, `loginOk=${JSON.stringify(v)} 必须拒绝覆盖`);
+    assert.match(r.reason, /登录态未确认当前有效/);
+  }
+  assert.strictEqual(fs.readFileSync(file, 'utf-8'), before, '旧文件必须原样保留');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('回滚竞争：自校验失败需回滚时，文件已被其他进程改写 → 放弃回滚（不覆盖新登录）', async () => {
+  const dir = tmpDir();
+  const prev = synthCookies();
+  const file = writeCookieFile(dir, prev);
+  const writtenSha = fingerprintFile(file).sha256;
+  // 模拟"本次写入之后，另一个进程（用户重新登录）又写了更新的内容"
+  const relogin = synthCookies().concat([{ name: 'relogin_token', value: 'fresh-login', domain: '.jinritemai.com', path: '/' }]);
+  fs.writeFileSync(file, JSON.stringify(relogin, null, 2));
+  const r = rollbackIfUnchanged(file, writtenSha, prev);
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.skipped, true, '必须放弃回滚');
+  assert.match(r.reason, /放弃回滚/);
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  assert.ok(onDisk.some((c) => c.name === 'relogin_token'), '其他进程的新登录结果必须保留');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('回滚：文件未被他人改写时正常回滚到写入前内容', async () => {
+  const dir = tmpDir();
+  const prev = synthCookies();
+  const file = writeCookieFile(dir, prev);
+  const next = prev.concat([{ name: 'newer', value: 'v', domain: '.jinritemai.com', path: '/' }]);
+  atomicWriteJson(file, next);
+  const writtenSha = fingerprintFile(file).sha256;
+  const r = rollbackIfUnchanged(file, writtenSha, prev);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf-8')).length, prev.length);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -283,6 +393,14 @@ function makeRunner(audits = []) {
   });
 }
 
+const SHOP = { id: '瑾漂亮潮流服饰', cookieFile: '店铺', accountId: '1710242295996424' };
+const PAGE = { url: () => 'https://qianchuan.jinritemai.com/uni-prom/overall?aavid=1710242295996424' };
+
+/** 回写前"当前登录/身份证据"桩：ok 决定只读核验是否通过（不产生任何业务点击）。 */
+function stubController(ok = true, reason = '登录已失效（页面账户信息不可读）') {
+  return { verifyIdentity: async () => (ok ? { ok: true, accountId: SHOP.accountId } : { ok: false, reason }) };
+}
+
 test('接线：真实执行批次在浏览器关闭前回写，且只写本次实际加载的精确路径', async () => {
   const dir = tmpDir();
   const prev = synthCookies();
@@ -293,9 +411,13 @@ test('接线：真实执行批次在浏览器关闭前回写，且只写本次�
   const session = {
     cookieSession: { filePath: file, dir, readOnly: true, startFingerprint: fingerprintFile(file) },
     context: ctxOf(next),
+    page: PAGE,
+    controller: stubController(true),
     close: async () => { order.push('close'); },
   };
-  const wb = await runner._closeSession(session, { writeback: true, mode: 'execute', identityOk: true, shopId: '瑾漂亮潮流服饰' });
+  const wb = await runner._closeSession(session, {
+    writeback: true, mode: 'execute', identityOk: true, shopId: '瑾漂亮潮流服饰', shopCfg: SHOP,
+  });
   assert.strictEqual(wb.ok, true, wb.reason || '');
   assert.strictEqual(wb.count, next.length);
   assert.strictEqual(order.length, 1, '必须关闭会话');
@@ -350,15 +472,91 @@ test('接线：回写异常绝不冒泡，广告动作结果不被改写', async
     cookieSession: { filePath: file, dir, startFingerprint: fingerprintFile(file) },
     // context.cookies 抛错 → 回写应被单独记录为失败，而不是让批次失败
     context: { cookies: async () => { throw new Error('context 已关闭'); } },
+    page: PAGE,
+    controller: stubController(true),
     close: async () => {},
   };
   const batchResult = { outcome: 'paused', counts: { confirmed: 2, failed: 0, unknown: 0 }, allPausedConfirmed: true };
-  const wb = await runner._closeSession(session, { writeback: true, mode: 'execute', identityOk: true, shopId: 's' });
+  const wb = await runner._closeSession(session, {
+    writeback: true, mode: 'execute', identityOk: true, shopId: 's', shopCfg: SHOP,
+  });
   if (wb) batchResult.cookieWriteback = wb;
   assert.strictEqual(wb.ok, false);
   assert.strictEqual(batchResult.outcome, 'paused', '回写失败不得把已确认的广告动作改写成失败');
   assert.strictEqual(batchResult.allPausedConfirmed, true);
   assert.deepStrictEqual(batchResult.counts, { confirmed: 2, failed: 0, unknown: 0 });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ── 接线：回写前的"当前登录/身份证据"（fail-closed）─────────────────
+// 旧实现 `loginOk: ctx.loginOk !== false` → 默认 true：操作开始时身份正确，
+// 并不等于结束（回写）时登录仍有效，失效会话会把 Cookie 覆盖回去。
+
+test('接线：回写前重新核验发现登录已失效 → 拒绝覆盖（旧实现默认 true 会写回）', async () => {
+  const dir = tmpDir();
+  const prev = synthCookies();
+  const file = writeCookieFile(dir, prev);
+  const before = fs.readFileSync(file, 'utf-8');
+  const runner = makeRunner();
+  const session = {
+    cookieSession: { filePath: file, dir, startFingerprint: fingerprintFile(file) },
+    context: ctxOf(prev.concat([{ name: 'stale', value: 'stale', domain: '.jinritemai.com', path: '/' }])),
+    page: PAGE,
+    controller: stubController(false, '页面已跳转登录页'),
+    close: async () => {},
+  };
+  const wb = await runner._closeSession(session, {
+    writeback: true, mode: 'execute', identityOk: true, shopId: SHOP.id, shopCfg: SHOP,
+  });
+  assert.strictEqual(wb.ok, false);
+  assert.strictEqual(wb.skipped, true);
+  assert.match(wb.reason, /未取得当前有效的登录\/身份证据|登录已失效|登录页/);
+  assert.strictEqual(fs.readFileSync(file, 'utf-8'), before, '登录失效时旧文件必须原样保留');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('接线：回写前身份核验抛错 → 拒绝覆盖（fail-closed，异常不冒泡）', async () => {
+  const dir = tmpDir();
+  const file = writeCookieFile(dir, synthCookies());
+  const before = fs.readFileSync(file, 'utf-8');
+  const runner = makeRunner();
+  const session = {
+    cookieSession: { filePath: file, dir, startFingerprint: fingerprintFile(file) },
+    context: ctxOf(synthCookies()),
+    page: PAGE,
+    controller: { verifyIdentity: async () => { throw new Error('页面已关闭'); } },
+    close: async () => {},
+  };
+  const wb = await runner._closeSession(session, {
+    writeback: true, mode: 'execute', identityOk: true, shopId: SHOP.id, shopCfg: SHOP,
+  });
+  assert.strictEqual(wb.ok, false);
+  assert.strictEqual(wb.skipped, true);
+  assert.match(wb.reason, /未取得当前有效的登录\/身份证据/);
+  assert.strictEqual(fs.readFileSync(file, 'utf-8'), before);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('接线：缺少 controller/page/shopCfg 无法取得当前证据 → 拒绝覆盖（旧实现会写回）', async () => {
+  const dir = tmpDir();
+  const file = writeCookieFile(dir, synthCookies());
+  const before = fs.readFileSync(file, 'utf-8');
+  const runner = makeRunner();
+  const mk = () => ({
+    cookieSession: { filePath: file, dir, startFingerprint: fingerprintFile(file) },
+    context: ctxOf(synthCookies()),
+    close: async () => {},
+  });
+  const a = await runner._closeSession(mk(), { writeback: true, mode: 'execute', identityOk: true, shopId: SHOP.id });
+  assert.strictEqual(a.ok, false);
+  assert.strictEqual(a.skipped, true);
+  assert.match(a.reason, /未取得当前有效的登录\/身份证据/);
+  const b = await runner._closeSession(
+    Object.assign(mk(), { page: PAGE, controller: {} }),
+    { writeback: true, mode: 'execute', identityOk: true, shopId: SHOP.id, shopCfg: SHOP },
+  );
+  assert.strictEqual(b.ok, false, 'controller 无 verifyIdentity 时也必须拒绝');
+  assert.strictEqual(fs.readFileSync(file, 'utf-8'), before, '旧文件必须原样保留');
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

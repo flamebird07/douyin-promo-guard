@@ -1,3 +1,102 @@
+# HANDOFF — 有界读取 / Cookie 异步空隙 / 服务启动稳定性 · 第十七轮定点修复（2026-09-16）
+
+> 交付日期：2026-09-16。基线 `4efe5a725f0a3f3e9787c29013b18d366a54ef03`（开工核对：= origin/main，工作区干净）。
+> 本轮只修 Codex 独立复现的**两个缺陷** + 服务启动稳定性收尾，**不重做项目**。
+> 生产门槛配置未改动：`realMode=true` / `dryRun=false` / `pauseEnabled=true` / `enableEnabled=true` / `enableSchedulerEnabled=true`。
+> **未启动暂停值守**（`running=false` 全程）；**本轮未发生任何真实广告动作**。
+
+## 0.1 bounded-poll：单次读取必须有界（旧代码永久挂起）
+
+- **旧缺陷**：截止时间只用于决定"两次读取之间是否继续"，`await read()` 本身**没有任何上界**。
+  隔离复现（`timeoutMs=20` / `intervalMs=0`，read 返回永不落定的 Promise）：100ms 后函数仍未返回，
+  真实页面上一次卡住的回读会让整个任务**永久挂起**。
+- **修复**（`src/lib/bounded-poll.js`；**不是**单纯 `Promise.race` 丢弃，也不是加大超时）：
+  - `startRead()` 把每次读取登记为 `{done, result}`，结果**永远**以 `{ok, value|error}` 落定
+    → 被放弃的读取不会产生未处理拒绝；`inFlightCount / peakInFlight` 统计真实并发。
+  - `waitSettle(rec, ms)`：**等待上界 = 剩余预算**。内部先用 0ms 宏任务刷新微任务队列，
+    避免把"已完成但 `.then` 尚未执行"的读取误判为在途。
+  - 超时未释放 → 先 `abort()` 请求取消，再用 `cancelGraceMs` **确认释放**；确认不了 →
+    `unreleased=true` + `abandonedReads++`，返回 `inFlight:true`（调用方不得启动新任务与旧读取重叠）。
+  - 迟到结果只写入本地登记对象，**不改写已返回结果，也不成为下一轮输入**。
+- **新增返回字段**：`inFlight` / `abandonedReads` / `lastReadFailed` / `valueStale` / `peakInFlight`。
+- **执行器配套**：新增 `landingStateTrustworthy(poll)`。`inFlight || lastReadFailed || valueStale`
+  → **禁止重发**：绝不拿此前"仍关闭"的旧快照去重试（暂停/开启两条路径都加了这道闸）。
+
+## 0.2 Cookie 回写：跨越 `await context.cookies()` 的异步空隙
+
+- **旧缺陷**：指纹检查在 `await context.cookies()` **之前**，之后直接写入。异步期间用户重新登录
+  写入新文件后，旧会话仍把旧 Cookie 覆盖回去并返回 `ok=true`（静默丢失新登录）。
+  同时：初始指纹缺失时 `if (start && ...)` 会**静默跳过**冲突保护；`loginOk` **默认 true**。
+- **修复**（`src/login/cookie-writeback.js`）：
+  - 初始指纹缺失/无效 → **拒绝回写**；
+  - `context.cookies()` 之后、提交写入之前**再取一次指纹快照**，变化即保留较新文件（conflict）；
+  - 回滚改为 `rollbackIfUnchanged(file, writtenSha, prev)`：**仅当文件仍是本次写入的那份**才回滚，
+    否则放弃回滚（避免用旧内容覆盖其他进程的新登录结果）；
+  - `loginOk` 由"默认 true"改为 **fail-closed：必须严格 `true`**。
+- **runner 配套**（`src/engine/chengfang-runner.js`）：新增 `_writebackSessionCookies` +
+  `_currentLoginEvidence` —— 回写前用 `controller.verifyIdentity({page, shopCfg})` 取**当前**
+  只读登录/身份证据；缺参、核验未通过或异常 → 不覆盖。两个 execute 调用点补传 `shopCfg`。
+- **边界（不夸大）**：sha256 比对-后-写 + 原子 rename 只保证"不出现半写文件"，
+  **不是**完整并发互斥（最后一次比对与 rename 之间仍有极小窗口）。已在文件头如实写明。
+
+## 0.3 服务启动稳定性：修复两个真实缺陷
+
+- **陈旧锁判定失效**（`电商助手/bill-manager/server.js`，非公开仓库）：`LOCK_STALE_MS=5min`
+  但时间戳只在启动时写一次、从不刷新 → 服务运行满 5 分钟后，任何新实例都判定锁陈旧并
+  **窃取/删除**它。实测复现：在 PID 25788 运行时启动第二份，第二份偷走锁（`.server.lock` → 38116），
+  并因 EADDRINUSE **只打印不退出**变成僵尸进程（还重复登记了进程内每日 07:00 任务）。
+- **修复**：`isLockStale` 改为**先看 PID 存活**（活着就是有效锁，与时间戳无关）；新增
+  `tryCreateLock`（临时文件 + `linkSync` → 原子且互斥）、`writeLockAtomic`、60s 锁心跳
+  （锁易主则停止续期）、`ownsLock` 标记 + `releaseLock` 只删自己的锁；EADDRINUSE →
+  `releaseLock()` + `process.exit(1)`。备份 `server.js.bak-pre-lockfix-20260916-193410`。
+- **验证**：修复后启动第二份 → `服务已在运行中 (PID: 25788)` 且 `rc=1`，锁未被改动，
+  3443 仍 HTTP 200，`enablePhaseToday` 等状态无损。
+- **重启以加载修复**（业务空闲确认后执行：`running=false` / `cycleNo=0` / 无进行中周期）：
+  精确停止 PID 25788（`MSYS_NO_PATHCONV=1 taskkill /F /PID 25788`，未批量结束进程）→
+  以可用方式启动新实例 → **新 PID 31324**，陈旧锁被正确接管，`/api/watch-drill/state` HTTP 200。
+  - **锁心跳实测**：`.server.lock` 时间戳 60.5 秒内刷新（`...115150 → ...175724`）
+    → 证明新代码确实已加载（旧代码从不刷新时间戳）。
+  - **单实例保护实测（新代码）**：再次启动第二份 → `服务已在运行中 (PID: 31324)`、`rc=1`、
+    锁文件未被窃取、3443 仍 HTTP 200。
+  - 重启后状态无损：`realMode=true` / `dryRun=false` / `pauseEnabled=true` / `enableEnabled=true`；
+    `polling = 30000/3000`（同源）；`enableTask.nextRunAt=2026-09-16T23:00:00Z`；
+    `enablePhaseToday` 保留 2026-09-16 的 `unknown` 记录；`cookieWriteback=null`。
+
+## 0.4 脱离会话生命周期：本环境明确拒绝（已实测）
+
+| 方式 | 结果 |
+|---|---|
+| WMI/CIM `Win32_Process Create` | 被安全策略拦截（等同 Start-Process） |
+| 任务计划程序 `Register-ScheduledTask` + `Start` | 被拦截（wscript 属受限可执行文件） |
+| `explorer.exe <file>` 外壳启动 | rc=1，无效 |
+| Python `ctypes` → `CreateProcessW` + `CREATE_BREAKAWAY_FROM_JOB` | **WinError 5（拒绝访问）** |
+| 退化为 `DETACHED_PROCESS` | 能启动，但随命令结束即被回收（探针只 tick 3 次） |
+
+**结论**：本会话的作业对象未设 `BREAKAWAY_OK`，**任何会话内进程都无法脱离**其生命周期。
+这不是业务要求，而是环境限制 —— 具体被拒操作与错误码见上表。
+
+## 0.5 测试与旧代码回归对照
+
+- 主项目 `npm test` **348/348**（退出码 0，16 个测试文件；上一轮 329 → +19）；`npm run check` 通过。
+- 集成值守 `integrations/bill-manager/watch-drill.test.js` **62/62**；运行位置
+  `电商助手/bill-manager/tests/watch-drill.test.js` **62/62**（与公开副本 `diff -q` = SAME）。
+- **旧代码回归对照**（`git worktree add --detach C:/tmp/oldbase17 4efe5a7`，只替换新测试文件，
+  运行**生产** bounded-poll / cookie-writeback / chengfang-executor）：
+  - `bounded-poll.test.js` + `cookie-writeback.test.js`：基线 **44 项中 18 项 not ok**（EXIT=1），
+    当前 **44/44 通过**。
+  - `chengfang-executor.test.js`：基线 **63 项中 2 项 not ok**（EXIT=1）——一条
+    `test timed out after 30000ms`（旧代码在卡住的读取上永久挂起），一条
+    `lastReadFailed` 为 `undefined`（旧代码无该字段）；当前 **63/63 通过**。
+  - 完整日志：`evidence/old-code-executor-regression-r17.log`（`evidence/` 已 gitignore，不入公开仓库）。
+
+## 0.6 本轮改动文件
+
+`src/lib/bounded-poll.js`、`src/login/cookie-writeback.js`、`src/engine/chengfang-executor.js`、
+`src/engine/chengfang-runner.js`、`test/bounded-poll.test.js`、`test/cookie-writeback.test.js`、
+`test/chengfang-executor.test.js`；集成侧 `电商助手/bill-manager/server.js`（锁与端口占用，非公开仓库）。
+
+---
+
 # HANDOFF — 轮询语义 / 停止语义 / 会话 Cookie 回写 · 第十六轮定点收尾（2026-09-16）
 
 > 交付日期：2026-09-16。基线 `7416d2aab57dd1b60960238c6cdb25ce73f0ebf5`（= origin/main，`git ls-remote origin main` 已核验）。

@@ -1,3 +1,73 @@
+# HANDOFF — 交接核验（第十八轮，2026-09-16）：09-16 开启缺口完整回读闭环 · 零修复收尾
+
+> 交接会话（接替 Work Buddy）。基线核对：本地 HEAD = `2a18390aebccabf0086d807f4df75b0b8aa6f64e` =
+> `origin/main`（fetch 后 `git rev-parse` 双侧一致），工作区干净 → 与前任报告一致，无未提交改动。
+> **本轮零代码修改、零真实广告动作、零服务重启**；只读核验 + 一次可视只读全量回读；未发现影响使用的问题。
+
+## 0.1 运行状态独立核验（2026-09-16 21:32–21:36 上海）
+
+- 3443：PID **31324**（`netstat` + `.server.lock` 双源一致），监听正常，`/api/watch-drill/state` HTTP 200；
+  锁心跳 80 秒内刷新（`2026-09-16T13:31:36Z`）→ r17 锁代码在跑。
+- **运行代码 = 当前 HEAD**：进程启动 2026-09-16 20:18:33（Get-Process），晚于全部 r17 源码落盘时间
+  （`bounded-poll.js` 19:24 / `cookie-writeback.js` 19:21 / `executor.js` 19:24 / `runner.js` 19:22 /
+  `server.js` 19:34）→ 启动即加载最新代码（`polling`/`cookieWriteback` 字段同证）。
+- 门槛（接口实读）：`realMode=true / realModeKnown=true / modeText=真实执行 / dryRun=false /
+  pauseEnabled=true / enableEnabled=true / enableSchedulerEnabled=true / blockedBy=[] /
+  pauseWillExecute=true / enableWillExecute=true / deleteAdEnabled=false`；`polling=30000/3000`（同源）。
+- 暂停值守 `running=false`（未启动，符合设计）；`enableTask.running=true / phase=waiting_window /
+  nextRunAt=2026-09-16T23:00:00Z`（= **2026-09-17 07:00 上海**）；服务时钟 `2026-09-16 21:33 (Asia/Shanghai)`
+  与权威时间一致。⚠️ 环境注意：git-bash 的 `TZ=Asia/Shanghai date` 会显示早 8 小时的错误时间，
+  以 node/`Intl` 或服务接口 `clock` 字段为准。
+- 集成副本：`integrations/bill-manager/watch-drill.js` 与运行位置 `电商助手/bill-manager/watch-drill.js` `diff -q` SAME；
+  `watch-drill.test.js` 同为 SAME。
+- Startup `电商助手服务.vbs`（UTF-16，node 解码核验，mtime 09-15 23:33）：`CurrentDirectory=...\电商助手\bill-manager`
+  + `cmd /c node start-server.js >> server-console.log 2>&1` → 正确。**核验教训**：终端按 GBK 显示 UTF-16 时
+  "电商助手"四字会渲染成 `5uFU㏑Kb` 样乱码，勿据此误判为旧目录。
+
+## 0.2 2026-09-16 07:00 任务复核（持久化 + 审计，非转述）
+
+- 计划 07:00；实际 **07:15:15** 开始（`23:15:15.501Z`，当时运行旧代码 `1996e15` 的名义休眠漂移）；
+  身份核验 07:15:53 → 托管视图 07:16:01（托管 `already_enabled` 幂等跳过）→ 商品自选 22 目标
+  `plan(23:16:20Z) → retry(23:16:48Z，再点一次) → abort(23:16:51Z)` → 批次 `partial / unknown=22`。
+- `data/state.json` 09-16 记录与 `enablePhase status=unknown` **原样保留**（设计行为，不为报成功改写）。
+- 07:16 之后 `data/audit.jsonl` 中**无任何 enable/pause 广告动作**（其后仅服务重启的调度器登记行）。
+
+## 0.3 完整只读回读（本轮新增真实验证，21:41 上海，可视浏览器，零业务点击）
+
+- 探针：`evidence/enable-failure-probe/full-readback-probe.js`（一次性，本地不入库；复用生产
+  `openChengfangShop` + controller 只读原语：子标签切换 / 100条每页下拉 / 翻页 / 回首页；
+  不勾选、不点开关/暂停/开启/删除、不走 Runner → **无 Cookie 回写**、不写 state/audit）。
+- 身份：accountId `1710242295996424` 精确匹配（页面账户名解析为"伊伊人美"，含邻字，仅展示字段，
+  比对依据是 accountId）；**09-12 的店铺 Cookie 会话当前仍有效**。
+- 结果：全店托管 `total=1`，计划 `184388555253250584` **开启（投放中）**；
+  商品自选切 100条/页后 `total=23`、单页全读 23 行、`分页总数=实读行数`、无重复 →
+  **23/23 全部开启，0 关闭、0 未知**。
+- **逐 ID 对账（07:16 批次 22 个 unknown 目标）：22/22 现已全部开启，0 关闭 / 0 状态未知 / 0 缺失**；
+  不在 22 清单内的额外自选计划仅 `187585998140533930`（r15 实测对象，也开启）。
+- 结论（证据链）：09:43 探针（第 1 页 9/9 已开启、stillClosed=0）+ 本次全量回读（22/22 + 托管开启）
+  + 07:16 后本项目零动作 → 与「07:16 开启当时已被受理、平台异步落地慢于旧代码的两次立即回读」
+  一致。仍无法 100% 排除 07:16–21:41 间人工/其他入口操作（无任何迹象）；当日 unknown 记录维持原样。
+- 证据：`evidence/enable-failure-probe/full-readback.json` / `full-readback-zixuan.png`（本地 evidence/，不入库）。
+
+## 0.4 Cookie 回写状态（如实：尚未发生）
+
+- `state.json` 批次与 `/api/watch-drill/state` 均 `cookieWriteback=null`；店铺 Cookie 文件
+  `电商助手/bill-manager/cookies/瑾漂亮潮流服饰.json` mtime **2026-09-12 20:26**（65 条、抖店/千川关键域齐全）
+  → **真实回写从未发生过**（09-16 批次跑在回写功能上线的旧代码上）。
+- 下一次真实机会：**2026-09-17 07:00 execute 批次**。注意：即使全部目标幂等跳过，
+  `_closeSession` 在 `mode==='execute' && identityOk===true` 时仍会尝试回写 → 届时应观察
+  `cookieWriteback` 字段与文件 mtime（不得以 fixture 冒充验证）。会话有效性已由本轮探针间接证实。
+
+## 0.5 备忘（不立项、不影响使用）
+
+- `logs/app.log` 尾部有 2026-09-16 20:54（上海）watch-drill **测试实例**（注入时钟）写入的
+  调度器登记/停止行（显示"下次 2026-09-12/13"）——测试痕迹混入生产日志文件，仅影响日志可读性；
+  生产调度以 `/api/watch-drill/state` 为准（实测 nextRunAt=09-17 07:00 上海，正确）。
+  未发现测试写 `data/state.json` / `audit.jsonl` / Cookie 的迹象（audit 最后一条为 20:20:05Z 真实登记）。
+- 本轮未做公开仓库脱敏（单独决策项，见 r16/r17 遗留记录）。
+
+---
+
 # HANDOFF — 有界读取 / Cookie 异步空隙 / 服务启动稳定性 · 第十七轮定点修复（2026-09-16）
 
 > 交付日期：2026-09-16。基线 `4efe5a725f0a3f3e9787c29013b18d366a54ef03`（开工核对：= origin/main，工作区干净）。

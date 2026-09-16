@@ -102,8 +102,40 @@
 ### 7) 仍待观察
 
 - **真实 Cookie 回写**（真实店铺文件上的保存/冲突保护/下次复用）—— 未实测。
-- **「点击 → 异步落地 → 确认」真实链路** —— 未实测。
+- **「点击 → 异步落地 → 确认」真实链路（本修复后）** —— 未实测；本轮修复前的一次真实执行见第 9 节。
 - 2026-09-17 07:00 若对象本已开启，幂等跳过只证明调度与回读有效。
+
+### 8) 公开仓库推送与最终核验
+
+- **推送完成**：`4efe5a7..e9ef4ae  main -> main`，`EXIT=0`；
+  `git ls-remote origin main` = 本地 `HEAD` = `e9ef4aeb8954f850d236b61dc02e75cb1aff9f68`（**MATCH**）。
+- **卡住 17 分钟的真实根因（已定位并绕开）**：系统级 gitconfig 配了
+  `credential.helper=helper-selector`（PortableGit 的**交互式**凭据选择器）。非交互会话下它一直等待输入，
+  推送永远不出结果（`--progress` 也只有 `Pushing to ...` 一行）。
+  解法：`git -c credential.helper= -c credential.helper=store ... push`（先用空值**清空**助手链，
+  再挂 `store`；`-c` 是追加而非替换，只写 `store` 无效）。已清理该次卡住遗留的 4 个进程
+  （3×`git.exe` + 1×`git-remote-https.exe`，精确按 PID，未批量结束）。
+- **推送内容筛查**：提交树 72 个文件中无 `config/config.json`、无 `cookies/`、无 `logs/`、无 `evidence/`、无 `data/`；
+  命中的 3 条为 `config/config.example.json`（模板）、`src/login/cookie-writeback.js`、`test/cookie-writeback.test.js`（源码/测试）。
+- **遗留（非本轮引入，建议单独一轮脱敏）**：`config/config.example.json` 内含**与真实 `config.json` 完全相同的
+  `accountId`**，且真实店铺名/账户名散见于 24 个已跟踪文件（含测试与 fixture）。
+  该状况在第十六轮已记录并明确「需单独一轮脱敏」，本轮未擅自改动 24 个文件。
+
+### 9) 生产实测观测（本轮新增，真实业务事实）
+
+**2026-09-16 07:16（Asia/Shanghai）每日开启相位：22/22 未落地。**
+
+- 证据：`data/state.json` → `batches.瑾漂亮潮流服饰.2026-09-16.runs[0]`，
+  `outcome=partial`、`counts={confirmed:0, failed:0, unknown:22, skipped:0, cancelled:0}`、
+  `allEnabledConfirmed=false`、`reason="开启未生效（开关仍关闭）：…（共 22 个）"`；
+  `data/audit.jsonl` 同一批次（`plan` → `retry` → `abort`/`chengfang-enable-batch`/`action`）。
+- 过程：`商品自选` 视图 22 个目标 → 首次开启 → 回读 **22/22 仍关闭** →
+  同会话仅对未落地目标重试一次（未反向切换、未扩范围）→ 回读仍 22/22 关闭 → 记 `partial` 并停止。
+- **判定**：这是一次**真实的开启未落地**，说明当时「点击 → 落地 → 回读确认」链路在真实页面上未生效；
+  代码按设计**如实拒绝**宣称成功（`allEnabledConfirmed=false`），没有误报。
+- **注意**：该次执行发生在**本轮修复之前**，不能据此判断修复后行为；本轮修复（有界读取 + `landingStateTrustworthy`）
+  的作用正是让这种「最新状态未知/未落地」的情况**不会被旧快照误判为重试依据**。
+- 本轮**未**为验证此事发起任何真实广告动作；下一次真实机会为 **2026-09-17 07:00**。
 
 ---
 

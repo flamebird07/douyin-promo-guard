@@ -95,6 +95,50 @@
 `src/engine/chengfang-runner.js`、`test/bounded-poll.test.js`、`test/cookie-writeback.test.js`、
 `test/chengfang-executor.test.js`；集成侧 `电商助手/bill-manager/server.js`（锁与端口占用，非公开仓库）。
 
+## 0.7 推送与收尾核验（2026-09-16 20:5x）
+
+- **推送完成**：`4efe5a7..e9ef4ae  main -> main`（`EXIT=0`）；
+  `git ls-remote origin main` = 本地 `HEAD` = `e9ef4aeb8954f850d236b61dc02e75cb1aff9f68`。
+- **推送卡住 17 分钟的真实根因（接手必读）**：系统级 gitconfig 有
+  `credential.helper=helper-selector`（PortableGit 的**交互式**凭据选择器）。非交互会话下它一直等输入，
+  push 永远不出结果。可用写法：
+
+  ```bash
+  git -c credential.helper= -c credential.helper=store \
+      -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 \
+      push --progress origin main
+  ```
+
+  注意：`-c` 是**追加**而非替换，只写 `-c credential.helper=store` 无效 —— 必须先 `-c credential.helper=`
+  用空值清空助手链。另：`http_proxy` 环境变量为 `127.0.0.1:50080`，而 git config 是 `127.0.0.1:7890`，两者都可用；
+  但**访问本机 3443 必须绕开代理**（`curl --noproxy '*'`），否则会得到 `HTTP 000` 的假故障。
+  3443 是 **HTTPS**（`https://127.0.0.1:3443`），用 http:// 打会「空响应」。
+- **运行服务加载状态（收尾实测）**：PID **31324** 存活并监听 3443，`.server.lock` = `{"pid":31324}`；
+  锁心跳二次采样 `...915947`，跨 50 秒未变、再过 25 秒仍为同值 → 确认 **60s 定时刷新**在跑（新代码已加载）。
+- **业务空闲确认**：`running=false` / `status=idle` / `cycleNo=0` / `roundNo=0` / `lastCheckAt=null` / `lastError=null`。
+- **生产门槛（未改动）**：`realMode=true`、`realModeKnown=true`、`modeText=真实执行`、`dryRun=false`、
+  `pauseEnabled=true`、`enableEnabled=true`、`pauseWillExecute=true`、`enableWillExecute=true`、
+  `deleteAdEnabled=false`、`blockedBy=[]`；`polling=30000/3000`（同源 `execution.readback*`）。
+- **下一次定时任务**：`enableTask.running=true`、`configEnabled=true`、`phase=waiting_window`、
+  `nextRunAt=2026-09-16T23:00:00Z` = **2026-09-17 07:00（Asia/Shanghai）**；`enablePhaseToday` 保留 09-16 `unknown` 记录。
+- **服务生命周期**：当前实例由本会话后台启动（非 Startup VBS）。Startup `电商助手服务.vbs` 已核对**正确**：
+  `CurrentDirectory=...\电商助手\bill-manager` + `cmd /c node start-server.js >> server-console.log 2>&1`（隐藏窗口），
+  下次登录即由它拉起，且单实例锁保证不会重复。会话内脱离手段仍全部被拒（见 0.4），**未要求用户注销**。
+- **遗留（非本轮引入，建议单独一轮脱敏）**：`config/config.example.json` 含与真实 `config.json` **完全相同**的
+  `accountId`；真实店铺名/账户名散见于 24 个已跟踪文件（含测试与 fixture）。第十六轮已记录「需单独一轮脱敏」。
+
+## 0.8 生产实测观测：2026-09-16 07:16 每日开启相位 22/22 未落地
+
+- 证据：`data/state.json` → `batches.瑾漂亮潮流服饰.2026-09-16.runs[0]`：
+  `outcome=partial`、`counts={confirmed:0, failed:0, unknown:22, skipped:0, cancelled:0}`、
+  `allEnabledConfirmed=false`、`reason="开启未生效（开关仍关闭）：…（共 22 个）"`；
+  `data/audit.jsonl` 同批次有 `plan → retry → abort / chengfang-enable-batch / action`。
+- 过程：`商品自选` 22 个目标 → 首次开启 → 回读 22/22 仍关闭 → 同会话仅对未落地目标重试一次
+  （未反向切换、未扩范围）→ 回读仍 22/22 关闭 → 记 `partial` 停止。
+- 代码**如实拒绝**宣称成功（没有误报）；该次发生在**本轮修复之前**，不能据此判断修复后行为。
+- 本轮**未**为验证此事发起任何真实广告动作；下一次真实机会 **2026-09-17 07:00**。
+  真实验证仍待观察：真实 Cookie 回写、修复后的「点击 → 异步落地 → 确认」链路。
+
 ---
 
 # HANDOFF — 轮询语义 / 停止语义 / 会话 Cookie 回写 · 第十六轮定点收尾（2026-09-16）

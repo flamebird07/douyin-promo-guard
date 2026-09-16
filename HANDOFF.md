@@ -1,6 +1,7 @@
 # HANDOFF — 轮询语义 / 停止语义 / 会话 Cookie 回写 · 第十六轮定点收尾（2026-09-16）
 
 > 交付日期：2026-09-16。基线 `7416d2aab57dd1b60960238c6cdb25ce73f0ebf5`（= origin/main，`git ls-remote origin main` 已核验）。
+> 本轮提交 `0972257b80e0add2eb6260e0990e003ba4df994b`（+ 文档补记），推送后 `git ls-remote origin main` 与本地 HEAD 一致。
 > **本轮不重做项目，只做四项定点收尾**（轮询配置与超时语义、停止语义、暂停侧同问题核查、Cookie 回写）。
 > 生产门槛配置未改动：`realMode=true` / `dryRun=false` / `pauseEnabled=true` / `enableEnabled=true` / `enableSchedulerEnabled=true`。
 > **未启动暂停值守**（`running=false` 全程）；**本轮未发生任何真实广告动作**（不在 07:00 窗口内补开整店，未为测试反复开关）。

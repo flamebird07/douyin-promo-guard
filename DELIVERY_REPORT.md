@@ -83,8 +83,10 @@
 ### 5) Git 提交与远端核验
 
 - 开工核验：本地 HEAD = `7416d2aa…`；`git ls-remote origin main` = `7416d2aa…` → 基线已推送、工作区干净，无需备份提交。
-- 本轮提交与推送结果见下方"本轮实测"。
-- 未上传：凭据、`config/config.json`（`.gitignore` 第 5 行）、日志、`data/`、`evidence/`、浏览器数据。
+- 本轮提交：`0972257b80e0add2eb6260e0990e003ba4df994b`（`7416d2a..0972257 main -> main`，24 个文件）。
+- 推送后核验：`git ls-remote origin main` = `0972257b80e0add2eb6260e0990e003ba4df994b` = 本地 HEAD ✔
+- 未上传：凭据、`config/config.json`（`.gitignore` 第 5 行）、日志、`data/`、`evidence/`、浏览器数据
+  （提交前已用 `git diff --cached --name-only` 逐项复核，无命中）。
 
 ### 6) 生产服务加载 / 独立每日任务 / 暂停值守
 

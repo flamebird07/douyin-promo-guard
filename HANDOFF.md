@@ -44,7 +44,7 @@
 - 新增测试文件：`test/bounded-poll.test.js`（11 用例）、`test/cookie-writeback.test.js`（16 用例，含 `ChengfangRunner._closeSession` 接线与 Monitor 记录）。
 - 扩充：`test/chengfang-executor.test.js` 52 → **61**（新增 9：暂停异步落地、暂停侧托管开关异步落地、停止语义 ×2、状态未知行消失、落地轮询读取失败、重试前重新核验、重试前门槛重新核验、停止语义优先）；`test/watch-drill-tab.test.js` 10 → **13**；`integrations/bill-manager/watch-drill.test.js` 58 → **62**（新增 polling 同源/缺省来源、Cookie 回写元信息、冲突不改写批次结果）。
 - **旧代码回归对照**（用 `git worktree` 检出基线 `7416d2aa`，只替换新测试文件与 fixture，运行**生产执行器**）：见 `evidence/old-code-executor-regression.log`。基线代码在「暂停异步落地」「停止语义 ×2」「状态未知行消失」「重试前核验证据」「落地轮询读取失败」等用例上**失败**，新代码全部通过。
-- 结果：主项目 `npm test`（见交付报告）、`npm run check` 通过；值守测试 `integrations/bill-manager/watch-drill.test.js` **62/62**（运行位置 `tests/watch-drill.test.js` 同步）。
+- 结果：主项目 `npm test` **329/329**（退出码 0，428.1s）、`npm run check` 通过；值守测试 `integrations/bill-manager/watch-drill.test.js` **62/62**（运行位置 `tests/watch-drill.test.js` 同步）。
 
 ## 0.6 部署与运行状态
 

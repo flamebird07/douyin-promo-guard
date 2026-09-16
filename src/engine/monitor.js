@@ -585,14 +585,18 @@ class Monitor {
 
   /** 开启调度循环专用可中断延时（只随 _enableGen/enableRunning 中断，不随值守启停）。 */
   async _chunkedEnableDelay(ms, gen) {
-    const step = 250;
-    let waited = 0;
-    while (waited < ms) {
+    // 2026-09-16 修复生产首次开启漂移（07:15 而非 07:00）：
+    // 旧实现 `waited += chunk` 累计名义等待——分片间实际延迟（setTimeout 抖动、GC、系统休眠）
+    // 会让名义累计 < 实际经过 → 总等待偏短或偏长，且无法覆盖休眠后恢复。
+    // 修复：以**实际墙钟**重算剩余等待。每次分片后取 nowFn() 与目标时刻比较，
+    // 已到点即返回；未到则按剩余重算。休眠唤醒后 nowFn 跳跃，剩余可能为 0 → 立即返回。
+    const targetMs = this.nowFn() + ms;
+    while (true) {
       if (gen !== undefined && gen !== this._enableGen) return;
       if (!this.enableRunning) return;
-      const chunk = Math.min(step, ms - waited);
-      await new Promise((r) => setTimeout(r, chunk));
-      waited += chunk;
+      const remaining = targetMs - this.nowFn();
+      if (remaining <= 0) return;
+      await new Promise((r) => setTimeout(r, Math.min(250, remaining)));
     }
   }
 
@@ -656,16 +660,16 @@ class Monitor {
     }
   }
 
-  /** 默认可中断延时：分片睡眠，代数变化或停止时提前返回。 */
+  /** 默认可中断延时：分片睡眠，代数变化或停止时提前返回。以实际墙钟重算剩余等待。 */
   async _chunkedDelay(ms, gen) {
-    const step = 250;
-    let waited = 0;
-    while (waited < ms) {
+    // 2026-09-16 修复：同 _chunkedEnableDelay，以实际时间重算剩余（防漂移/休眠后恢复）。
+    const targetMs = this.nowFn() + ms;
+    while (true) {
       if (gen !== undefined && gen !== this._gen) return;
       if (!this.running) return;
-      const chunk = Math.min(step, ms - waited);
-      await new Promise((r) => setTimeout(r, chunk));
-      waited += chunk;
+      const remaining = targetMs - this.nowFn();
+      if (remaining <= 0) return;
+      await new Promise((r) => setTimeout(r, Math.min(250, remaining)));
     }
   }
 

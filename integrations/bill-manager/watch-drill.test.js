@@ -1642,3 +1642,35 @@ test('上线：启动/停止值守不影响每日开启任务；daily-enable 端
   assert.strictEqual(sr.body.state.enableTask.running, true);
   assert.strictEqual(sr.body.state.enableTask.stoppedByUser, false);
 });
+
+// ══════════════════════════════════════════════════════════════
+// 17) 2026-09-16 修复：过程日志 plan 标签按动作类型区分（生产事件经接口到页面日志）
+// ══════════════════════════════════════════════════════════════
+
+test('过程日志：开启 phase 的 plan 事件显示"将开启目标"，绝不误译为"暂停计划"', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  // 生产真实形状：kind='chengfang-enable'（开启执行器）+ event='plan'
+  m._audit({ kind: 'chengfang-enable', event: 'plan', view: '商品自选', targets: ['111111', '222222'], mode: 'execute' });
+  const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+  const logs = resp.body.logs.map((l) => l.msg).join('\n');
+  assert.ok(/过程：将开启目标/.test(logs), `开启 plan 事件必须显示"将开启目标"，实际：\n${logs}`);
+  assert.ok(!/过程：暂停计划/.test(logs), `开启 plan 事件不得显示"暂停计划"，实际：\n${logs}`);
+});
+
+test('过程日志：暂停 phase 的 plan 事件显示"暂停计划"，未知动作明确待核实', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const m = drill._internal._monitor;
+  // 暂停真实形状：kind='chengfang' + event='plan'
+  m._audit({ kind: 'chengfang', event: 'plan', view: '商品自选', targets: ['333333'], mode: 'execute' });
+  const resp = await callHttp(drill, 'GET', '/api/watch-drill/logs?since=0');
+  const logs = resp.body.logs.map((l) => l.msg).join('\n');
+  assert.ok(/过程：暂停计划/.test(logs), `暂停 plan 事件必须显示"暂停计划"，实际：\n${logs}`);
+  assert.ok(!/过程：将开启目标/.test(logs), `暂停 plan 事件不得显示"将开启目标"，实际：\n${logs}`);
+});

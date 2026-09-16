@@ -443,7 +443,6 @@ function createWatchDrill(opts = {}) {
   const PROCESS_LABEL = {
     retry: { label: '重试', level: 'warn' },
     paused: { label: '暂停', level: 'info' },
-    plan: { label: '暂停计划', level: 'info' },
     view: { label: '回读核验', level: 'info' },
     readback: { label: '回读核验', level: 'info' },
     identity: { label: '身份核验', level: 'info' },
@@ -461,6 +460,19 @@ function createWatchDrill(opts = {}) {
     window_missed: { label: '每日开启错过窗口', level: 'warn' },
   };
   function describeProcess(p) {
+    // 2026-09-16 修复：event='plan' 同时来自暂停和开启执行器；旧 PROCESS_LABEL.plan
+    // 写死"暂停计划" → 开启事件也被翻译成暂停。改为按 kind 区分（kind 后缀 -enable=开启）。
+    if (p.event === 'plan') {
+      const isEnable = String(p.kind || '').endsWith('-enable');
+      const label = isEnable ? '将开启目标' : '暂停计划';
+      const bits = [];
+      if (p.view) bits.push(`视图 ${p.view}`);
+      if (p.mode) bits.push(`模式 ${p.mode}`);
+      const tCount = Array.isArray(p.targets) ? p.targets.length : p.targets;
+      if (tCount !== undefined) bits.push(`${tCount} 个目标`);
+      if (p.note) bits.push(String(p.note));
+      return `过程：${label}${bits.length ? `（${bits.join('，')}）` : ''}`;
+    }
     if (p.kind === 'enable-scheduler' && p.event) {
       const em = ENABLE_SCHEDULER_LABEL[p.event] || null;
       const en = em ? em.label : `每日开启任务事件（${p.event}）`;

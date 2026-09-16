@@ -878,7 +878,7 @@ async function executeChengfangEnable(p) {
     if (!tuoguanOk) return result;
 
     // ── 2. 商品自选 ──────────────────────────────────────────────
-    const zixuanOk = await enableZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit });
+    const zixuanOk = await enableZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit, config, stopRequested });
     if (!zixuanOk) return result;
     if (dryRun) {
       result.confirmReason = '演练模式：仅记录将执行的动作，未点击任何开关/开启，不得宣称已开启';
@@ -989,7 +989,7 @@ async function enableTuoguan({ controller, page, result, dryRun, requestGate, fa
 
 // ── 商品自选开启：100条/页 → 全选（实测范围）→ 批量开启 → 稳定ID去重翻页 ──
 
-async function enableZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit }) {
+async function enableZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit, config, stopRequested = () => false }) {
   await controller.switchView({ page, tab: '商品自选' });
   const firstView = await readViewFor(controller, page, '商品自选');
   if (!firstView) {
@@ -1059,7 +1059,7 @@ async function enableZixuan({ controller, page, shopCfg, result, dryRun, request
       continue;
     }
 
-    const pageOk = await enablePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit });
+    const pageOk = await enablePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, config, stopRequested });
     if (!pageOk) return false;
   }
 
@@ -1083,7 +1083,7 @@ async function enableZixuan({ controller, page, shopCfg, result, dryRun, request
  * 目标 = 当前关闭侧计划（switchChecked===false）；已开启行精确取消勾选。
  * 返回 true 继续；false 表示已 fail（调用方停止）。
  */
-async function enablePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, retryAttempt = 0 }) {
+async function enablePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, retryAttempt = 0, config, stopRequested = () => false }) {
   const targetIds = targets.map((t) => t.id);
   for (const id of targetIds) {
     if (retryAttempt === 0) {
@@ -1212,12 +1212,35 @@ async function enablePageTargets({ controller, page, shopCfg, targets, rows, res
     fail('zixuan', V_PARTIAL_FAILED, `批量开启后无法恢复乘方管理页回读：${recovered.reason}`);
     return false;
   }
-  const post = await readViewFor(controller, page, '商品自选');
+  // 落地等待轮询（2026-09-16 修复生产首次开启失败根因）：
+  // 平台异步落地可能延迟数秒到数十秒（实测 27 秒后仍未落地、稍后全部生效）。
+  // 旧代码单次立即回读 → 误判 partial_failed；改为轮询直到开关变化或超时。
+  // 超时后仍有未落地 → 才进入"同会话重试一次"路径（仅对确认未落地的目标重发）。
+  const landingTimeoutMs = (config.execution && config.execution.readbackTimeoutMs) || 30000;
+  const landingIntervalMs = Math.max(1000, (config.execution && config.execution.readbackIntervalMs) || 3000);
+  const landingMaxAttempts = Math.max(1, Math.ceil(landingTimeoutMs / landingIntervalMs));
+  let post = null;
+  let postRows = [];
+  for (let li = 0; li < landingMaxAttempts; li += 1) {
+    if (stopRequested()) {
+      fail('zixuan', V_PARTIAL_FAILED, '落地等待轮询期间收到停止信号，结果未知');
+      return false;
+    }
+    await sleep(landingIntervalMs);
+    post = await readViewFor(controller, page, '商品自选');
+    if (!post) { audit({ kind: 'chengfang-enable', event: 'landing-poll', view: '商品自选', attempt: li + 1, pending: -1 }); continue; }
+    postRows = post.rows || [];
+    const stillPending = targetIds.filter((id) => {
+      const row = postRows.find((x) => String(x.id) === String(id));
+      return !row || row.switchChecked !== true;
+    });
+    audit({ kind: 'chengfang-enable', event: 'landing-poll', view: '商品自选', attempt: li + 1, pending: stillPending.length, total: targetIds.length });
+    if (stillPending.length === 0) break;
+  }
   if (!post) {
-    fail('zixuan', V_PARTIAL_FAILED, `批量开启请求${clickError ? '可能已发出但' : ''}强制新扫描回读失败：结果未知，停止`);
+    fail('zixuan', V_PARTIAL_FAILED, `批量开启请求${clickError ? '可能已发出但' : ''}落地轮询回读失败：结果未知，停止`);
     return false;
   }
-  const postRows = post.rows || [];
   const failed = [];
   const notFound = [];
   for (const id of targetIds) {
@@ -1251,7 +1274,7 @@ async function enablePageTargets({ controller, page, shopCfg, targets, rows, res
       });
       return enablePageTargets({
         controller, page, shopCfg, targets: retryTargets, rows: postRows, result, dryRun,
-        processed, drySeen, requestGate, fail, audit, retryAttempt: 1,
+        processed, drySeen, requestGate, fail, audit, retryAttempt: 1, config, stopRequested,
       });
     }
     fail('zixuan', V_PARTIAL_FAILED, `开启未生效（开关仍关闭）：${failed.slice(0, 5).join(',')}...${failed.length > 5 ? `（共 ${failed.length} 个）` : ''}${clickError ? `（点击结果曾未知，以回读为准：${clickError.reason || clickError.message}）` : ''}`);

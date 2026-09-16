@@ -67,7 +67,7 @@ async function setupChengfangMonitor(t, {
   const cfgResult = makeCfgResult({
     cookieDir,
     shops: [SHOP],
-    execution: Object.assign({ realMode: true, dryRun: false }, execution),
+    execution: Object.assign({ realMode: true, dryRun: false, readbackTimeoutMs: 3000, readbackIntervalMs: 500 }, execution),
     monitor: Object.assign(
       {},
       noScope ? {} : { chengfang: Object.assign({ scope: ['全店托管', '商品自选'], pauseEnabled: true }, monitorChengfang) },
@@ -681,7 +681,7 @@ test('自动开启调度：跨日重置 → 次日 07:00 允许再次执行', as
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
   });
   await startLoopAndSettle(monitor, clock);
-  await waitFor(() => !!monitor.batches['shop-001'] && !!monitor.batches['shop-001']['2026-09-12'], 8000, '第一天开启批次落库');
+  await waitFor(() => !!monitor.batches['shop-001'] && !!monitor.batches['shop-001']['2026-09-12'], 20000, '第一天开启批次落库（含真实开启+落地轮询耗时）');
   assert.strictEqual(track.sessions, 1);
   // 释放到 08:00 → 暂停巡查（不超标，零会话）→ 挂起 30 分钟间隔
   clock.releaseOne();
@@ -690,7 +690,7 @@ test('自动开启调度：跨日重置 → 次日 07:00 允许再次执行', as
   // 直接推进虚拟时钟到次日 07:00，释放当前 30 分钟门 → 次日 07:30（仍在开启窗口）
   clock.advance(23 * 3600 * 1000);
   clock.releaseOne();
-  await waitFor(() => !!monitor.batches['shop-001'] && !!monitor.batches['shop-001']['2026-09-13'], 8000, '次日开启批次落库');
+  await waitFor(() => !!monitor.batches['shop-001'] && !!monitor.batches['shop-001']['2026-09-13'], 20000, '次日开启批次落库（含真实开启+落地轮询耗时）');
   assert.strictEqual(track.sessions, 2, '跨日重置后次日再次执行开启');
   assert.strictEqual(lastRunOutcome(monitor, 'shop-001', '2026-09-13'), 'all_enabled_confirmed');
   monitor.stop();
@@ -873,10 +873,11 @@ test('上线：当日已 success 后窗口内重启 → 不重复开启（真实
   const { monitor, track, dataDir, cfgResult, controller, reader } = await setupChengfangMonitor(t, {
     clock,
     monitorChengfang: { enableSchedulerEnabled: true, enableEnabled: true },
+    execution: { realMode: true, dryRun: false, readbackTimeoutMs: 3000, readbackIntervalMs: 500 },
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
   });
   await monitor.startEnableScheduler({ reason: 'test' });
-  await waitFor(() => clock.pending() >= 1, 8000, '挂起等待（07:00 已在窗口内，应立即处理）');
+  await waitFor(() => clock.pending() >= 1, 20000, '挂起等待（07:00 已在窗口内，应立即处理；含真实开启+落地轮询耗时）');
   // 07:00 在窗口内：循环先处理今日开启再挂起等待 08:00
   await waitFor(() => monitor.actions.length >= 1 && monitor.actions[0].allEnabledConfirmed === true, 20000, "真实开启批次执行");
   await waitFor(() => (monitor.getStatus().shops[0].enablePhase || {}).status === 'success', 15000, '开启成功持久化');
@@ -902,4 +903,45 @@ test('上线：两相位互斥——暂停周期进行中，开启相位请求�
   const r = await monitor._runEnablePhase(undefined, '2026-09-12');
   assert.strictEqual(r.skipped, true, '互斥期间开启相位必须跳过');
   monitor._cycleRunning = false;
+});
+
+test('上线修复（2026-09-16）：调度漂移——定时器额外延迟不累积；休眠时钟跳跃立即返回', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '06:50'));
+  const { monitor } = await setupChengfangMonitor(t, {
+    clock,
+    execution: { realMode: false, dryRun: true },
+    monitorChengfang: { enableSchedulerEnabled: true },
+    fixture: { plans: { '全店托管': [], '商品自选': [] } },
+  });
+  // 直接测生产等待方法（不绕过）：_chunkedEnableDelay(ms, gen) 以实际墙钟重算剩余。
+  // 场景 A：时钟跳跃（模拟电脑休眠后恢复）→ nowFn 越过目标 → 应立即返回。
+  monitor.enableRunning = true;
+  const t0 = Date.now();
+  const jumpTimer = setTimeout(() => clock.advance(60 * 60 * 1000), 80); // 80ms 后时钟从 06:50 跳到 07:50
+  await monitor._chunkedEnableDelay(10000, monitor._enableGen);
+  clearTimeout(jumpTimer);
+  const elapsedA = Date.now() - t0;
+  assert.ok(elapsedA < 3000, `时钟跳跃后应立即返回（旧代码会等满名义 10s），实际 ${elapsedA}ms`);
+  // 场景 B：enableRunning=false → 立即返回（停止语义）
+  const t1 = Date.now();
+  monitor.enableRunning = false;
+  await monitor._chunkedEnableDelay(60000, monitor._enableGen);
+  assert.ok(Date.now() - t1 < 500, '停止后应立即返回');
+  monitor.stopEnableScheduler({ byUser: false, reason: 'test-cleanup' });
+});
+
+test('上线修复（2026-09-16）：暂停巡查延时同样以实际墙钟重算（_chunkedDelay 防漂移）', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '06:50'));
+  const { monitor } = await setupChengfangMonitor(t, {
+    clock,
+    execution: { realMode: false, dryRun: true },
+    fixture: { plans: { '全店托管': [], '商品自选': [] } },
+  });
+  monitor.running = true;
+  const t0 = Date.now();
+  const jumpTimer = setTimeout(() => clock.advance(30 * 60 * 1000), 80);
+  await monitor._chunkedDelay(20000, monitor._gen);
+  clearTimeout(jumpTimer);
+  assert.ok(Date.now() - t0 < 3000, `时钟跳跃后 _chunkedDelay 应立即返回，实际 ${Date.now() - t0}ms`);
+  monitor.running = false;
 });

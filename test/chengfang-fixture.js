@@ -49,7 +49,7 @@ function planRowHtml({ id, name, checked, status, selected }) {
  */
 function buildChengfangFixtureHtml(opts = {}) {
   const plans = opts.plans || { '全店托管': [], '商品自选': [] };
-  const init = Object.assign({ view: '全店托管', pageSize: 10, shrink: false, pauseEffect: 'ok', enableEffect: 'ok', selectAllScope: 'page', crossPageClearable: false }, opts.state || {});
+  const init = Object.assign({ view: '全店托管', pageSize: 10, shrink: false, pauseEffect: 'ok', enableEffect: 'ok', slowLandingMs: 2500, selectAllScope: 'page', crossPageClearable: false }, opts.state || {});
   const navText = opts.navText !== undefined ? opts.navText : '首页 乘方 全域投放 品牌投放 数据 工具 财务 营销学堂 成长伙伴 99+ 伊人美 ID：1710242295996424';
   const batchOpen = (opts.batchButtons && opts.batchButtons.open !== undefined) ? opts.batchButtons.open : `<button data-auto-id="bar-groups-group-item-btn-open">开启</button>`;
   const batchPause = (opts.batchButtons && opts.batchButtons.pause !== undefined) ? opts.batchButtons.pause : `<button data-auto-id="bar-groups-group-item-btn-pause">暂停</button>`;
@@ -89,6 +89,7 @@ window.__CF = {
   pauseEffect: '${init.pauseEffect}',
   pauseAttempts: (__cfAttempts && __cfAttempts.pause) || 0,
   enableEffect: '${init.enableEffect}',
+  slowLandingMs: ${init.slowLandingMs || 2500},
   enableAttempts: (__cfAttempts && __cfAttempts.enable) || 0,
   selectAllScope: '${init.selectAllScope}',
   crossPageClearable: ${init.crossPageClearable},
@@ -239,6 +240,19 @@ function bind() {
         } else {
           for (const p of curPlans()) if (selSet.has(String(p.id))) p.checked = true;
         }
+      }
+      // 2026-09-16：模拟平台异步落地延迟——点击已成功派发，但开关稍后才变更
+      // （与今晨生产首次开启失败同因）。slow-landingMs 默认 2500ms。
+      if (/btn-open$/.test(autoId) && window.__CF.enableEffect === 'slow-landing') {
+        const landed = new Set(selSet);
+        setTimeout(() => {
+          if (window.__CF.shrink) {
+            window.__CF.plans[view] = curPlans().filter((p) => !landed.has(String(p.id)));
+          } else {
+            for (const p of curPlans()) if (landed.has(String(p.id))) p.checked = true;
+          }
+          render();
+        }, window.__CF.slowLandingMs || 2500);
       }
       window.__CF.selected = [];
       window.__CF.page = 1;

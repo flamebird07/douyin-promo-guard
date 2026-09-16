@@ -926,9 +926,11 @@ test('恢复乘方管理页失败（持续非管理页）→ 结果未知，不�
   assert.strictEqual(deleteClicks(state).length, 0);
 });
 
-test('开启：批量开启后强制新扫描回读失败 → 结果未知，不报告全部开启', async () => {
+test("开启：批量开启后强制新扫描回读失败 → 结果未知，不报告全部开启", async () => {
+  const SHORT_LANDING = { execution: { realMode:true, dryRun:false, readbackTimeoutMs: 4000, readbackIntervalMs: 1000 }, monitor: { chengfang: { scope:["全店托管","商品自选"], enableEnabled:true } } };
   const { result, state } = await runEnable({
     fixture: { plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(3) } },
+    config: SHORT_LANDING,
     controllerOverride: async (controller) => {
       const orig = controller.readView.bind(controller);
       let zixuanReads = 0;
@@ -937,7 +939,7 @@ test('开启：批量开启后强制新扫描回读失败 → 结果未知，不
         if (p.tab === '商品自选') {
           zixuanReads += 1;
           // 第 4 次商品自选读取 = 批量开启后的强制新扫描回读 → 注入失败
-          if (zixuanReads === 4) return { tab: '商品自选', rows: { error: 'fixture 注入回读失败' }, pagination: null };
+          if (zixuanReads >= 4) return { tab: '商品自选', rows: { error: 'fixture 注入回读失败' }, pagination: null };
         }
         return v;
       };
@@ -946,7 +948,7 @@ test('开启：批量开启后强制新扫描回读失败 → 结果未知，不
   });
   assert.strictEqual(enableClicks(state).length, 1, '开启点击已发出（结果以回读为准）');
   assert.strictEqual(result.allEnabledConfirmed, false, '回读失败不得判定全部开启');
-  assert.match(result.confirmReason, /回读失败|结果未知/);
+  assert.match(result.confirmReason, /回读失败|结果未知|落地/);
   assert.strictEqual(deleteClicks(state).length, 0);
 });
 
@@ -1074,4 +1076,25 @@ test('开启：最终身份复核期间关闭 enableEnabled → 复核返回后 
   assert.strictEqual(state.clickLog.length, 0, '零业务点击');
   assert.strictEqual(switchClicks(state).length, 0);
   assert.strictEqual(enableClicks(state).length, 0);
+});
+
+// ── 2026-09-16 生产首次开启失败回归：平台异步落地延迟 ──────────────
+// 旧代码点击后单次立即回读 → 开关尚未变更即误判 partial_failed（今晨 22 条
+// 实际稍后全部落地）。修复后落地轮询等待，直到开关变化或超时。
+test('开启异步落地延迟（slow-landing）：落地轮询等待到开关变更，不误判 partial_failed', async () => {
+  const { result, state } = await runEnable({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(5) },
+      state: { enableEffect: 'slow-landing', slowLandingMs: 5000 }, // 点击后 5 秒才落地
+    },
+    config: {
+      execution: { realMode: true, dryRun: false, readbackTimeoutMs: 10000, readbackIntervalMs: 1500 },
+      monitor: { chengfang: { scope: ['全店托管', '商品自选'], enableEnabled: true } },
+    },
+  });
+  assert.strictEqual(enableClicks(state).length, 1, '落地轮询生效后无需重试点击（一次成功）');
+  assert.strictEqual(result.allEnabledConfirmed, true, result.confirmReason);
+  assert.strictEqual(result.views.zixuan.processedCount, 5);
+  assert.ok(state.plansZixuan.every((p) => p.checked === true), '平台延迟落地后最终全部开启');
+  assert.strictEqual(deleteClicks(state).length, 0, '删除零点击');
 });

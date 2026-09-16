@@ -29,6 +29,7 @@
 
 const { DataGuardError } = require('../lib/errors');
 const { shanghaiDate } = require('../lib/time');
+const { boundedLandingPoll, resolvePollingConfig } = require('../lib/bounded-poll');
 const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed, buildChengfangRequestGate } = require('./chengfang-gate');
 
 const MAX_PAGE_VISITS = 20; // 商品自选分页处理/全量回读的翻页硬上限（防失控循环）
@@ -41,8 +42,6 @@ const V_PAUSED = 'paused';                   // 目标全部确认关闭
 const V_PARTIAL_FAILED = 'partial_failed';   // 部分目标未确认/未生效 → 不报告全部暂停
 const V_ALREADY_ENABLED = 'already_enabled'; // 全部已开启，幂等跳过（开启流程）
 const V_ENABLED = 'enabled';                 // 目标全部确认开启（开启流程）
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * 执行乘方暂停流程。
@@ -93,6 +92,8 @@ async function executeChengfangPause(p) {
     confirmReason: null,
     dryRunTargets: [],     // 演练：将暂停的对象（含动作说明）
     finalVerify: null,
+    polling: {},           // 各视图落地确认的**实际生效**轮询配置与结果（页面/日志可展示）
+    stoppedAfterDispatch: null, // 点击已派发后收到停止时的真实只读确认结果（不谎报失败/成功）
     // 仅在本次浏览器会话内使用：千川提交后若跳回首页，回到这里恢复读取/重试。
     // 不写入审计日志，也不跨批次复用 Cookie 或浏览器。
     managementUrl: null,
@@ -141,11 +142,11 @@ async function executeChengfangPause(p) {
     }
 
     // ── 1. 全店托管 ──────────────────────────────────────────────
-    const tuoguanOk = await pauseTuoguan({ controller, page, result, dryRun, requestGate, fail, audit });
+    const tuoguanOk = await pauseTuoguan({ controller, page, result, dryRun, requestGate, fail, audit, config, now, stopRequested });
     if (!tuoguanOk) return result;
 
     // ── 2. 商品自选 ──────────────────────────────────────────────
-    const zixuanOk = await pauseZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit });
+    const zixuanOk = await pauseZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit, config, now, stopRequested });
     if (!zixuanOk) return result;
     if (dryRun) {
       result.confirmReason = '演练模式：仅记录将执行的动作，未点击任何开关/暂停，不得宣称已暂停';
@@ -174,7 +175,7 @@ function zixuanCount(result) {
 
 // ── 全店托管：读取开关状态；已关闭跳过；开启才关闭 ──────────────────
 
-async function pauseTuoguan({ controller, page, result, dryRun, requestGate, fail, audit }) {
+async function pauseTuoguan({ controller, page, result, dryRun, requestGate, fail, audit, config, now = Date.now, stopRequested = () => false }) {
   await controller.switchView({ page, tab: '全店托管' });
   const view = await readViewFor(controller, page, '全店托管');
   if (!view) {
@@ -242,13 +243,18 @@ async function pauseTuoguan({ controller, page, result, dryRun, requestGate, fai
       fail('tuoguan', V_PARTIAL_FAILED, `托管开关未点击（零点击）：${clickError.reason || clickError.message}`);
       return false;
     }
-    // 点击异常（非定位类，如页面关闭）→ 可能已执行：强制回读实际状态，禁止盲点重试
-    const post = await readViewFor(controller, page, '全店托管');
-    if (!post) {
+    // 落地确认（有界轮询）：点击异常（非定位类，如页面关闭）也可能已执行 → 一律以回读为准。
+    // 托管开关是**切换**动作：超时/状态未知一律只回读，绝不重复点击（避免反向开启）。
+    const landing = await confirmLanding({
+      controller, page, view: '全店托管', targetIds: [r.id], wantChecked: false,
+      config, stopRequested, audit, eventKind: 'chengfang',
+    });
+    result.polling['全店托管'] = pollingSummary(landing.polling, landing.poll, { targetCount: 1 });
+    if (!landing.rows) {
       fail('tuoguan', V_PARTIAL_FAILED, `托管计划 ${r.id} 开关${clickError ? '点击可能已执行，' : ''}回读失败：结果未知${clickError ? '，禁止重复切换' : ''}`);
       return false;
     }
-    const row = post.rows.find((x) => x.id === r.id);
+    const row = landing.rows.find((x) => x.id === r.id);
     if (!row) {
       fail('tuoguan', V_PARTIAL_FAILED, `托管计划 ${r.id} 关闭后行消失，无法确认（不当作已关闭）`);
       return false;
@@ -260,6 +266,15 @@ async function pauseTuoguan({ controller, page, result, dryRun, requestGate, fai
       return false;
     }
     audit({ kind: 'chengfang', event: 'paused', view: '全店托管', planId: r.id, confirmed: true, note: clickError ? '点击结果曾未知，回读确认已关闭' : undefined });
+    if (landing.poll.stopped) {
+      // 停止信号：本次已派发请求已按真实回读确认；不再重试、不再发出任何新业务请求。
+      result.stoppedAfterDispatch = {
+        view: '全店托管', action: 'pause', planId: r.id, wantChecked: false, gotChecked: row.switchChecked,
+        note: '落地确认期间收到停止：已派发请求仅完成只读确认，不再发出新请求',
+      };
+      fail('tuoguan', V_PARTIAL_FAILED, `落地确认期间收到停止信号：托管计划 ${r.id} 已按真实回读确认（关闭侧），不再重试、不再发出任何新请求`);
+      return false;
+    }
   }
   result.views.tuoguan = { status: V_PAUSED, confirmedCount: open.length, note: `已确认关闭 ${open.length} 个开启中的托管计划` };
   return true;
@@ -267,7 +282,7 @@ async function pauseTuoguan({ controller, page, result, dryRun, requestGate, fai
 
 // ── 商品自选：100条/页 → 全选（实测范围）→ 批量暂停 → 稳定ID去重翻页 ──
 
-async function pauseZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit }) {
+async function pauseZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit, config, now = Date.now, stopRequested = () => false }) {
   await controller.switchView({ page, tab: '商品自选' });
   const firstView = await readViewFor(controller, page, '商品自选');
   if (!firstView) {
@@ -302,7 +317,6 @@ async function pauseZixuan({ controller, page, shopCfg, result, dryRun, requestG
   result.views.zixuan = { total: view0.pagination && view0.pagination.total, pageSize: view0.pagination && view0.pagination.pageSize, processedCount: 0 };
 
   while (true) {
-    if (stopRequestedSignal(requestGate, stopRequestedFor())) { /* 保持原有 stopRequested 语义 */ }
     // 每次决策前强制新扫描（绝不复用操作前缓存）
     const view = await readViewFor(controller, page, '商品自选');
     if (!view) {
@@ -342,7 +356,7 @@ async function pauseZixuan({ controller, page, shopCfg, result, dryRun, requestG
       continue;
     }
 
-    const pageOk = await pausePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit });
+    const pageOk = await pausePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, config, now, stopRequested });
     if (!pageOk) return false;
     // 处理完成继续循环：列表可能收缩/前移，重新扫描当前页
   }
@@ -361,10 +375,6 @@ async function pauseZixuan({ controller, page, shopCfg, result, dryRun, requestG
   return true;
 }
 
-// 保留循环顶部停止语义（原实现）；停止信号由 requestGate 在请求级兜底
-function stopRequestedSignal() { return false; }
-function stopRequestedFor() { return null; }
-
 async function readViewFor(controller, page, tab) {
   const v = await controller.readView({ page, tab }).catch((e) => ({ error: String(e.reason || e.message) }));
   if (!v || v.error) return null;
@@ -372,12 +382,106 @@ async function readViewFor(controller, page, tab) {
   return { rows: (v.rows && v.rows.rows) || [], pagination: v.pagination || {} };
 }
 
+// ── 落地确认（有界轮询，暂停/开启共用）──────────────────────────────
+//
+// 2026-09-16 定点修复：旧实现在"点击已派发"后只做**一次立即回读**（暂停侧），
+// 或按 ceil(timeout/interval) 次数轮询（开启侧）。真实平台存在数秒~数十秒的异步落地
+// （实测 27 秒后仍未落地、稍后全部生效），单次立即回读会把成功误判为失败；
+// 次数轮询则因未计入每次读取耗时而使总等待不可控。
+// 现统一为 boundedLandingPoll：按**实际截止时间**有界、读取串行不重叠，
+// 停止后不再重试/不再发新请求，但已派发请求继续在有限期限内只读确认。
+
+/** 判定是否仍有目标未落地：pending=明确未落地；unknown=状态无法判定（行消失）。 */
+function landingPending(rows, targetIds, wantChecked) {
+  const list = rows || [];
+  let pending = 0;
+  let unknown = 0;
+  for (const id of targetIds) {
+    const row = list.find((x) => String(x.id) === String(id));
+    if (!row) { unknown += 1; continue; }
+    if (row.switchChecked !== wantChecked) pending += 1;
+  }
+  return { pending, unknown };
+}
+
+/** 按期望开关状态归类回读结果（confirmed / failed / notFound）。 */
+function classifyLanding(rows, targetIds, wantChecked) {
+  const list = rows || [];
+  const confirmed = [];
+  const failed = [];
+  const notFound = [];
+  for (const id of targetIds) {
+    const row = list.find((x) => String(x.id) === String(id));
+    if (!row) notFound.push(id);
+    else if (row.switchChecked === wantChecked) confirmed.push(id);
+    else failed.push(id);
+  }
+  return { confirmed, failed, notFound };
+}
+
+/**
+ * 点击已派发后的落地确认（有界轮询）。
+ *
+ * 时钟说明（2026-09-16 定点修复）：轮询预算必须按**真实经过的时间**计算，因此这里
+ * 一律使用单调推进的真实时钟（`Date.now`），**绝不使用调用方的业务时钟 `now`**——
+ * 业务时钟在调用方是"当次检查时刻"的固定快照（用于上海时段/跨日判断），把它当轮询时钟
+ * 会让 deadline 永不耗尽（预算恒为正剩余），轮询退化为死循环。
+ * @param {object} o { controller, page, view, targetIds, wantChecked, config, stopRequested, audit, eventKind }
+ * @returns {Promise<{polling:object, poll:object, rows:Array|null, confirmed:string[], failed:string[], notFound:string[]}>}
+ *          rows === null 表示整个轮询期间没有一次成功读取（结果未知，绝不当作成功）。
+ */
+async function confirmLanding(o) {
+  const { controller, page, view, targetIds, wantChecked, config, stopRequested, audit, eventKind } = o;
+  const polling = resolvePollingConfig(config && config.execution);
+  const poll = await boundedLandingPoll({
+    read: async () => {
+      const v = await readViewFor(controller, page, view);
+      if (!v) {
+        const e = new Error(`${view}强制新扫描回读失败`);
+        e.reason = e.message;
+        throw e;
+      }
+      return v;
+    },
+    isPending: (v) => landingPending(v.rows, targetIds, wantChecked),
+    timeoutMs: polling.timeoutMs,
+    intervalMs: polling.intervalMs,
+    // 真实单调时钟：见上方说明。业务时钟 now 不得用于轮询预算。
+    now: Date.now,
+    stopRequested,
+    onAttempt: (info) => audit({
+      kind: eventKind, event: 'landing-poll', view,
+      timeoutMs: polling.timeoutMs, intervalMs: polling.intervalMs, ...info,
+    }),
+  });
+  const rows = poll.value ? (poll.value.rows || []) : null;
+  const cls = rows ? classifyLanding(rows, targetIds, wantChecked) : { confirmed: [], failed: [], notFound: [] };
+  return { polling, poll, rows, ...cls };
+}
+
+/** 落地轮询结果 → 结果对象的可展示摘要（不含 Cookie 值/敏感数据）。 */
+function pollingSummary(polling, poll, extra = {}) {
+  return {
+    timeoutMs: polling.timeoutMs,
+    intervalMs: polling.intervalMs,
+    timeoutSource: polling.timeoutSource,
+    intervalSource: polling.intervalSource,
+    attempts: poll.attempts,
+    elapsedMs: poll.elapsedMs,
+    readFailures: poll.readFailures,
+    settled: poll.settled,
+    stopped: poll.stopped,
+    timedOut: poll.timedOut,
+    ...extra,
+  };
+}
+
 /**
  * 单页处理：全选 → 实测选择范围（跨页则清除并改按当前页目标勾选）→ 精确校正 →
  * 请求级门槛 → 危险检测 → 暂停 → 强制新扫描回读。
  * 返回 true 继续；false 表示已 fail（调用方停止）。
  */
-async function pausePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, retryAttempt = 0 }) {
+async function pausePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, config, now = Date.now, stopRequested = () => false, retryAttempt = 0 }) {
   const targetIds = targets.map((t) => t.id);
   for (const id of targetIds) {
     if (retryAttempt === 0) {
@@ -516,25 +620,34 @@ async function pausePageTargets({ controller, page, shopCfg, targets, rows, resu
     fail('zixuan', V_PARTIAL_FAILED, `批量暂停后无法恢复乘方管理页回读：${recovered.reason}`);
     return false;
   }
-  const post = await readViewFor(controller, page, '商品自选');
-  if (!post) {
-    fail('zixuan', V_PARTIAL_FAILED, `批量暂停请求${clickError ? '可能已发出但' : ''}强制新扫描回读失败：结果未知，停止`);
+  // 落地确认（有界轮询，2026-09-16 补齐暂停侧）：平台异步落地可能延迟数秒~数十秒，
+  // 单次立即回读会把成功误判为失败。停止信号到达后不再重试/不再发新请求，
+  // 但已派发请求继续在有限期限内只读确认。
+  const landing = await confirmLanding({
+    controller, page, view: '商品自选', targetIds, wantChecked: false,
+    config, stopRequested, audit, eventKind: 'chengfang',
+  });
+  result.polling['商品自选'] = pollingSummary(landing.polling, landing.poll, { targetCount: targetIds.length });
+  if (!landing.rows) {
+    fail('zixuan', V_PARTIAL_FAILED, `批量暂停请求${clickError ? '可能已发出但' : ''}落地轮询回读失败：结果未知，停止`);
     return false;
   }
-  const postRows = post.rows || [];
-  const failed = [];
-  const notFound = [];
-  for (const id of targetIds) {
-    const row = postRows.find((x) => x.id === id);
-    if (row) {
-      if (row.switchChecked === false) processed.add(id);
-      else failed.push(id);
-    } else {
-      notFound.push(id);
-    }
-  }
+  const postRows = landing.rows;
+  const failed = landing.failed;
+  const notFound = landing.notFound;
+  for (const id of landing.confirmed) processed.add(id);
   for (const id of notFound) {
     if (!result.notFoundIds.includes(id)) result.notFoundIds.push(id);
+  }
+  if (landing.poll.stopped) {
+    // 停止信号：已派发请求仅完成只读确认；绝不重试、绝不发出新业务请求。
+    result.stoppedAfterDispatch = {
+      view: '商品自选', action: 'pause', confirmed: landing.confirmed, failed, notFound,
+      note: '落地确认期间收到停止：已派发请求仅完成只读确认，未重试、未发出新请求',
+    };
+    fail('zixuan', V_PARTIAL_FAILED,
+      `落地确认期间收到停止信号：已派发批量暂停仅完成只读确认（${landing.confirmed.length}/${targetIds.length} 个已确认关闭），不再重试、不再发出任何新请求`);
+    return false;
   }
   if (failed.length > 0) {
     // 千川实机限制：首次提交有时确认成功却未落地。保持同一页面/同一浏览器会话，
@@ -542,22 +655,36 @@ async function pausePageTargets({ controller, page, shopCfg, targets, rows, resu
     // 不关闭浏览器、不重新读取 Cookie、不反向切换、不扩范围。
     // 2026-09-15 修复（交接第 6 项）：原实现仅在"全部失败"时重试，部分成功/未知状态一律直接失败；
     // 现改为：仍有失败目标且本次未重试过 → 以回读为准只对失败目标重试一次。
-    if (retryAttempt === 0 && failed.length > 0 && failed.length <= targetIds.length) {
+    // 2026-09-16 修复（本轮第 4 项）：重试前必须**重新核验真实状态、身份、停止与时间门槛**。
+    if (retryAttempt === 0 && failed.length <= targetIds.length) {
       // 未知状态（notFound/开关状态未知）不参与重试：无法确认目标当前实际状态，避免盲重发。
       if (notFound.length > 0) {
         fail('zixuan', V_PARTIAL_FAILED,
           `暂停回读存在 ${notFound.length} 个目标行消失（状态未知），不盲目重发；失败目标 ${failed.length} 个：${failed.slice(0, 5).join(',')}`);
         return false;
       }
-      const retryTargets = targets.filter((t) => failed.includes(t.id));
+      const retryPlan = await prepareRetry({
+        controller, page, shopCfg, failed, wantChecked: false, requestGate, fail, audit, result, eventKind: 'chengfang',
+      });
+      if (!retryPlan.ok) return false;
+      if (retryPlan.landed.length > 0) {
+        for (const id of retryPlan.landed) processed.add(id);
+        audit({
+          kind: 'chengfang', event: 'retry-skipped', view: '商品自选',
+          note: `重试前重新核验：${retryPlan.landed.length} 个目标已落地（回读确认关闭），不再重发`,
+          targets: retryPlan.landed,
+        });
+      }
+      if (retryPlan.stillPending.length === 0) return true;
+      const retryTargets = targets.filter((t) => retryPlan.stillPending.includes(t.id));
       audit({
         kind: 'chengfang', event: 'retry', view: '商品自选', attempt: 2,
         targets: retryTargets.map((t) => t.id),
-        note: `首次暂停回读仍有 ${failed.length}/${targetIds.length} 个未落地，仅对未落地目标同会话重试一次（不反向切换、不扩范围）`,
+        note: `首次暂停回读仍有 ${failed.length}/${targetIds.length} 个未落地，仅对未落地目标同会话重试一次（已重新核验状态/身份/停止/时段，不反向切换、不扩范围）`,
       });
       return pausePageTargets({
         controller, page, shopCfg, targets: retryTargets, rows: postRows, result, dryRun,
-        processed, drySeen, requestGate, fail, audit, retryAttempt: 1,
+        processed, drySeen, requestGate, fail, audit, config, now, stopRequested, retryAttempt: 1,
       });
     }
     fail('zixuan', V_PARTIAL_FAILED, `暂停未生效（开关仍开启）：${failed.slice(0, 5).join(',')}...${failed.length > 5 ? `（共 ${failed.length} 个）` : ''}${clickError ? `（点击结果曾未知，以回读为准：${clickError.reason || clickError.message}）` : ''}`);
@@ -569,6 +696,49 @@ async function pausePageTargets({ controller, page, shopCfg, targets, rows, resu
     audit({ kind: 'chengfang', event: 'paused', view: '商品自选', confirmed: targetIds });
   }
   return true;
+}
+
+/**
+ * 同会话重试前的重新核验（2026-09-16 本轮第 4 项）。
+ * 重试前必须重新核验：停止/时段/跨日/配置门槛（requestGate）+ 页面身份 + **真实状态**
+ * （绝不复用旧缓存）。返回 {ok:false} 表示不得重试；landed=已落地目标（无需重发），
+ * stillPending=确实仍未落地的目标（才允许重试）。
+ * @param {object} o { controller, page, shopCfg, failed, wantChecked, requestGate, fail, audit, result, eventKind }
+ */
+async function prepareRetry(o) {
+  const { controller, page, shopCfg, failed, wantChecked, requestGate, fail, audit, eventKind } = o;
+  const g = requestGate();
+  if (!g.ok) {
+    fail('zixuan', V_PARTIAL_FAILED, `重试前门槛复核不通过（不再重发）：${g.reason}`);
+    return { ok: false };
+  }
+  const id = await controller.verifyIdentity({ page, shopCfg }).catch((e) => ({ ok: false, reason: e.reason || e.message }));
+  if (!id || id.ok !== true) {
+    fail('zixuan', V_PARTIAL_FAILED, `重试前身份复核不通过（不再重发）：${(id && id.reason) || '未知'}`);
+    return { ok: false };
+  }
+  const fresh = await readViewFor(controller, page, '商品自选');
+  if (!fresh) {
+    fail('zixuan', V_PARTIAL_FAILED, '重试前重新读取商品自选视图失败：结果未知，不重试');
+    return { ok: false };
+  }
+  const rows = fresh.rows || [];
+  const landed = [];
+  const stillPending = [];
+  const vanished = [];
+  for (const pid of failed) {
+    const row = rows.find((x) => String(x.id) === String(pid));
+    if (!row) vanished.push(pid);
+    else if (row.switchChecked === wantChecked) landed.push(pid);
+    else stillPending.push(pid);
+  }
+  if (vanished.length > 0) {
+    fail('zixuan', V_PARTIAL_FAILED,
+      `重试前核验发现 ${vanished.length} 个目标行消失（状态未知），不重发：${vanished.slice(0, 5).join(',')}`);
+    return { ok: false };
+  }
+  audit({ kind: eventKind, event: 'retry-precheck', view: '商品自选', landed, stillPending, note: '重试前已重新核验停止/时段/配置门槛、页面身份与真实开关状态' });
+  return { ok: true, landed, stillPending };
 }
 
 /**
@@ -832,6 +1002,8 @@ async function executeChengfangEnable(p) {
     confirmReason: null,
     dryRunTargets: [],     // 演练：将开启的对象（含动作说明）
     finalVerify: null,
+    polling: {},           // 各视图落地确认的**实际生效**轮询配置与结果（页面/日志可展示）
+    stoppedAfterDispatch: null, // 点击已派发后收到停止时的真实只读确认结果（不谎报失败/成功）
     // 仅在本次浏览器会话内使用：千川提交后若跳回首页，回到这里恢复读取/重试。
     // 不写入审计日志，也不跨批次复用 Cookie 或浏览器。
     managementUrl: null,
@@ -874,11 +1046,11 @@ async function executeChengfangEnable(p) {
     }
 
     // ── 1. 全店托管 ──────────────────────────────────────────────
-    const tuoguanOk = await enableTuoguan({ controller, page, result, dryRun, requestGate, fail, audit });
+    const tuoguanOk = await enableTuoguan({ controller, page, result, dryRun, requestGate, fail, audit, config, now, stopRequested });
     if (!tuoguanOk) return result;
 
     // ── 2. 商品自选 ──────────────────────────────────────────────
-    const zixuanOk = await enableZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit, config, stopRequested });
+    const zixuanOk = await enableZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit, config, now, stopRequested });
     if (!zixuanOk) return result;
     if (dryRun) {
       result.confirmReason = '演练模式：仅记录将执行的动作，未点击任何开关/开启，不得宣称已开启';
@@ -900,7 +1072,7 @@ async function executeChengfangEnable(p) {
 
 // ── 全店托管开启：读取开关状态；已开启跳过；关闭才开启 ──────────────
 
-async function enableTuoguan({ controller, page, result, dryRun, requestGate, fail, audit }) {
+async function enableTuoguan({ controller, page, result, dryRun, requestGate, fail, audit, config, now = Date.now, stopRequested = () => false }) {
   await controller.switchView({ page, tab: '全店托管' });
   const view = await readViewFor(controller, page, '全店托管');
   if (!view) {
@@ -964,13 +1136,18 @@ async function enableTuoguan({ controller, page, result, dryRun, requestGate, fa
       fail('tuoguan', V_PARTIAL_FAILED, `托管开关未点击（零点击）：${clickError.reason || clickError.message}`);
       return false;
     }
-    // 点击异常（非定位类）→ 可能已执行：强制回读实际状态，禁止盲点重试
-    const post = await readViewFor(controller, page, '全店托管');
-    if (!post) {
+    // 落地确认（有界轮询）：点击异常（非定位类）也可能已执行 → 一律以回读为准。
+    // 托管开关是**切换**动作：超时/状态未知一律只回读，绝不重复点击（避免反向暂停）。
+    const landing = await confirmLanding({
+      controller, page, view: '全店托管', targetIds: [r.id], wantChecked: true,
+      config, stopRequested, audit, eventKind: 'chengfang-enable',
+    });
+    result.polling['全店托管'] = pollingSummary(landing.polling, landing.poll, { targetCount: 1 });
+    if (!landing.rows) {
       fail('tuoguan', V_PARTIAL_FAILED, `托管计划 ${r.id} 开关${clickError ? '点击可能已执行，' : ''}回读失败：结果未知${clickError ? '，禁止重复切换' : ''}`);
       return false;
     }
-    const row = post.rows.find((x) => x.id === r.id);
+    const row = landing.rows.find((x) => x.id === r.id);
     if (!row) {
       fail('tuoguan', V_PARTIAL_FAILED, `托管计划 ${r.id} 开启后行消失，无法确认（不当作已开启）`);
       return false;
@@ -982,6 +1159,14 @@ async function enableTuoguan({ controller, page, result, dryRun, requestGate, fa
       return false;
     }
     audit({ kind: 'chengfang-enable', event: 'enabled', view: '全店托管', planId: r.id, confirmed: true, note: clickError ? '点击结果曾未知，回读确认已开启' : undefined });
+    if (landing.poll.stopped) {
+      result.stoppedAfterDispatch = {
+        view: '全店托管', action: 'enable', planId: r.id, wantChecked: true, gotChecked: row.switchChecked,
+        note: '落地确认期间收到停止：已派发请求仅完成只读确认，不再发出新请求',
+      };
+      fail('tuoguan', V_PARTIAL_FAILED, `落地确认期间收到停止信号：托管计划 ${r.id} 已按真实回读确认（开启侧），不再重试、不再发出任何新请求`);
+      return false;
+    }
   }
   result.views.tuoguan = { status: V_ENABLED, confirmedCount: closed.length, note: `已确认开启 ${closed.length} 个关闭中的托管计划` };
   return true;
@@ -989,7 +1174,7 @@ async function enableTuoguan({ controller, page, result, dryRun, requestGate, fa
 
 // ── 商品自选开启：100条/页 → 全选（实测范围）→ 批量开启 → 稳定ID去重翻页 ──
 
-async function enableZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit, config, stopRequested = () => false }) {
+async function enableZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit, config, now = Date.now, stopRequested = () => false }) {
   await controller.switchView({ page, tab: '商品自选' });
   const firstView = await readViewFor(controller, page, '商品自选');
   if (!firstView) {
@@ -1059,7 +1244,7 @@ async function enableZixuan({ controller, page, shopCfg, result, dryRun, request
       continue;
     }
 
-    const pageOk = await enablePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, config, stopRequested });
+    const pageOk = await enablePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, config, now, stopRequested });
     if (!pageOk) return false;
   }
 
@@ -1083,7 +1268,7 @@ async function enableZixuan({ controller, page, shopCfg, result, dryRun, request
  * 目标 = 当前关闭侧计划（switchChecked===false）；已开启行精确取消勾选。
  * 返回 true 继续；false 表示已 fail（调用方停止）。
  */
-async function enablePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, retryAttempt = 0, config, stopRequested = () => false }) {
+async function enablePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, retryAttempt = 0, config, now = Date.now, stopRequested = () => false }) {
   const targetIds = targets.map((t) => t.id);
   for (const id of targetIds) {
     if (retryAttempt === 0) {
@@ -1212,69 +1397,72 @@ async function enablePageTargets({ controller, page, shopCfg, targets, rows, res
     fail('zixuan', V_PARTIAL_FAILED, `批量开启后无法恢复乘方管理页回读：${recovered.reason}`);
     return false;
   }
-  // 落地等待轮询（2026-09-16 修复生产首次开启失败根因）：
+  // 落地等待轮询（2026-09-16 修复生产首次开启失败根因，2026-09-16 第二轮统一为有界截止时间）：
   // 平台异步落地可能延迟数秒到数十秒（实测 27 秒后仍未落地、稍后全部生效）。
-  // 旧代码单次立即回读 → 误判 partial_failed；改为轮询直到开关变化或超时。
-  // 超时后仍有未落地 → 才进入"同会话重试一次"路径（仅对确认未落地的目标重发）。
-  const landingTimeoutMs = (config.execution && config.execution.readbackTimeoutMs) || 30000;
-  const landingIntervalMs = Math.max(1000, (config.execution && config.execution.readbackIntervalMs) || 3000);
-  const landingMaxAttempts = Math.max(1, Math.ceil(landingTimeoutMs / landingIntervalMs));
-  let post = null;
-  let postRows = [];
-  for (let li = 0; li < landingMaxAttempts; li += 1) {
-    if (stopRequested()) {
-      fail('zixuan', V_PARTIAL_FAILED, '落地等待轮询期间收到停止信号，结果未知');
-      return false;
-    }
-    await sleep(landingIntervalMs);
-    post = await readViewFor(controller, page, '商品自选');
-    if (!post) { audit({ kind: 'chengfang-enable', event: 'landing-poll', view: '商品自选', attempt: li + 1, pending: -1 }); continue; }
-    postRows = post.rows || [];
-    const stillPending = targetIds.filter((id) => {
-      const row = postRows.find((x) => String(x.id) === String(id));
-      return !row || row.switchChecked !== true;
-    });
-    audit({ kind: 'chengfang-enable', event: 'landing-poll', view: '商品自选', attempt: li + 1, pending: stillPending.length, total: targetIds.length });
-    if (stillPending.length === 0) break;
-  }
-  if (!post) {
+  // 旧代码单次立即回读 → 误判 partial_failed；次数轮询 → 未计入读取耗时，总等待不可控。
+  // 现按**实际截止时间**有界轮询（串行读取、不重叠），生效值来自
+  // execution.readbackTimeoutMs / readbackIntervalMs（唯一来源，见 src/lib/bounded-poll.js）。
+  // 停止信号到达 → 不再重试、不再发新请求，但已派发请求继续在有限期限内只读确认。
+  const landing = await confirmLanding({
+    controller, page, view: '商品自选', targetIds, wantChecked: true,
+    config, stopRequested, audit, eventKind: 'chengfang-enable',
+  });
+  result.polling['商品自选'] = pollingSummary(landing.polling, landing.poll, { targetCount: targetIds.length });
+  if (!landing.rows) {
     fail('zixuan', V_PARTIAL_FAILED, `批量开启请求${clickError ? '可能已发出但' : ''}落地轮询回读失败：结果未知，停止`);
     return false;
   }
-  const failed = [];
-  const notFound = [];
-  for (const id of targetIds) {
-    const row = postRows.find((x) => x.id === id);
-    if (row) {
-      if (row.switchChecked === true) processed.add(id);
-      else failed.push(id);
-    } else {
-      notFound.push(id);
-    }
-  }
+  const postRows = landing.rows;
+  const failed = landing.failed;
+  const notFound = landing.notFound;
+  for (const id of landing.confirmed) processed.add(id);
   for (const id of notFound) {
     if (!result.notFoundIds.includes(id)) result.notFoundIds.push(id);
+  }
+  if (landing.poll.stopped) {
+    // 停止信号：已派发请求仅完成只读确认；绝不重试、绝不发出新业务请求。
+    result.stoppedAfterDispatch = {
+      view: '商品自选', action: 'enable', confirmed: landing.confirmed, failed, notFound,
+      note: '落地确认期间收到停止：已派发请求仅完成只读确认，未重试、未发出新请求',
+    };
+    fail('zixuan', V_PARTIAL_FAILED,
+      `落地确认期间收到停止信号：已派发批量开启仅完成只读确认（${landing.confirmed.length}/${targetIds.length} 个已确认开启），不再重试、不再发出任何新请求`);
+    return false;
   }
   if (failed.length > 0) {
     // 千川实机限制：首次提交有时确认成功却未落地。保持同一页面/同一浏览器会话，
     // 按**实际仍未落地**的目标（含部分成功场景）重新选择并仅重试一次；
     // 不关闭浏览器、不重新读取 Cookie、不反向切换、不扩范围。
     // 2026-09-15 修复（交接第 6 项）：原实现仅在"全部失败"时重试，部分成功/未知状态一律直接失败。
-    if (retryAttempt === 0 && failed.length > 0 && failed.length <= targetIds.length) {
+    // 2026-09-16 修复（本轮第 4 项）：重试前必须**重新核验真实状态、身份、停止与时间门槛**。
+    if (retryAttempt === 0 && failed.length <= targetIds.length) {
       if (notFound.length > 0) {
         fail('zixuan', V_PARTIAL_FAILED,
           `开启回读存在 ${notFound.length} 个目标行消失（状态未知），不盲目重发；失败目标 ${failed.length} 个：${failed.slice(0, 5).join(',')}`);
         return false;
       }
-      const retryTargets = targets.filter((t) => failed.includes(t.id));
+      const retryPlan = await prepareRetry({
+        controller, page, shopCfg, failed, wantChecked: true, requestGate, fail, audit, result, eventKind: 'chengfang-enable',
+      });
+      if (!retryPlan.ok) return false;
+      if (retryPlan.landed.length > 0) {
+        for (const id of retryPlan.landed) processed.add(id);
+        audit({
+          kind: 'chengfang-enable', event: 'retry-skipped', view: '商品自选',
+          note: `重试前重新核验：${retryPlan.landed.length} 个目标已落地（回读确认开启），不再重发`,
+          targets: retryPlan.landed,
+        });
+      }
+      if (retryPlan.stillPending.length === 0) return true;
+      const retryTargets = targets.filter((t) => retryPlan.stillPending.includes(t.id));
       audit({
         kind: 'chengfang-enable', event: 'retry', view: '商品自选', attempt: 2,
         targets: retryTargets.map((t) => t.id),
-        note: `首次开启回读仍有 ${failed.length}/${targetIds.length} 个未落地，仅对未落地目标同会话重试一次（不反向切换、不扩范围）`,
+        note: `首次开启回读仍有 ${failed.length}/${targetIds.length} 个未落地，仅对未落地目标同会话重试一次（已重新核验状态/身份/停止/时段，不反向切换、不扩范围）`,
       });
       return enablePageTargets({
         controller, page, shopCfg, targets: retryTargets, rows: postRows, result, dryRun,
-        processed, drySeen, requestGate, fail, audit, retryAttempt: 1, config, stopRequested,
+        processed, drySeen, requestGate, fail, audit, retryAttempt: 1, config, now, stopRequested,
       });
     }
     fail('zixuan', V_PARTIAL_FAILED, `开启未生效（开关仍关闭）：${failed.slice(0, 5).join(',')}...${failed.length > 5 ? `（共 ${failed.length} 个）` : ''}${clickError ? `（点击结果曾未知，以回读为准：${clickError.reason || clickError.message}）` : ''}`);

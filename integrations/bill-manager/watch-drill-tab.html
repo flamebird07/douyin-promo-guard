@@ -213,6 +213,21 @@
         var why = function (will, reason) {
           return will ? '会执行' : ('不会执行' + (reason ? '（' + esc(reason) + '）' : ''));
         };
+        // 落地确认/回读的实际生效轮询配置（与执行器同一份解析，页面值 === 执行器生效值）
+        var poll = (g && g.polling) || s.polling || null;
+        var pollText = (poll && poll.timeoutMs != null)
+          ? ('落地回读：超时 <b>' + esc(String(poll.timeoutMs)) + 'ms</b> / 间隔 <b>' + esc(String(poll.intervalMs)) + 'ms</b>'
+             + '（来源 ' + esc(poll.timeoutSource || 'execution.readbackTimeoutMs') + ' / ' + esc(poll.intervalSource || 'execution.readbackIntervalMs') + '，与执行器同源）')
+          : '落地回读：配置待读取';
+        // 会话 Cookie 回写结果（仅元信息，界面永不显示任何 Cookie 值）
+        var cw = s.cookieWriteback;
+        var cwText = cw
+          ? ('Cookie 回写：' + (cw.ok ? '<b style="color:#16a34a">已保存</b>'
+              : (cw.conflict ? '<b style="color:#b45309">冲突：保留较新文件</b>' : '<b style="color:#b45309">未保存</b>'))
+             + (cw.count ? ('，' + esc(String(cw.count)) + ' 条 / ' + esc(String((cw.domains || []).length)) + ' 个域') : '')
+             + (cw.reason ? '（' + esc(cw.reason) + '）' : '')
+             + (cw.at ? ' ｜ ' + fmtTime(cw.at) : ''))
+          : 'Cookie 回写：尚无记录';
         $('wdGates').innerHTML = s.gates
           ? ('真实执行门槛：realMode=<b>' + esc(fb(g.realMode)) + '</b>'
              + ' / dryRun=<b>' + esc(fb(g.dryRun)) + '</b>'
@@ -223,7 +238,8 @@
              + (blockers.length ? ' ｜ 当前阻断：' + esc(blockers.join('；')) : '')
              + ' ｜ 控制范围：' + esc((g.scope || []).join(' + ') || '（未配置）')
              + (g.enableSchedulerEnabled === false ? ' ｜ 独立每日开启任务：<b style="color:#b45309">未启用</b>' : '')
-             + ' ｜ 删除广告：<b style="color:#16a34a">永不执行</b>')
+             + ' ｜ 删除广告：<b style="color:#16a34a">永不执行</b>'
+             + '<br>' + pollText + ' ｜ ' + cwText)
           : '真实执行门槛：加载中…';
         renderEnableTask(s);
         $('wdLastCheck').textContent = fmtTime(s.lastCheckAt);

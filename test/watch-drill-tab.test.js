@@ -236,3 +236,74 @@ test('独立每日开启任务行：running → 已登记待命+下次时间+停
   assert.ok(r2.els.wdEnableTaskState.textContent.includes('已独立停用'), `实际：${r2.els.wdEnableTaskState.textContent}`);
   assert.strictEqual(r2.els.wdEnableTaskBtn.textContent, '恢复每日开启');
 });
+
+// ══════════════════════════════════════════════════════════════
+// 第五轮（2026-09-16 定点修复）：门槛明细必须展示**实际生效**的落地回读轮询配置
+// 与最近一次 Cookie 回写结果（仅元信息，界面永不显示任何 Cookie 值）。
+// ══════════════════════════════════════════════════════════════
+
+test('门槛明细：展示实际生效的落地回读配置（超时/间隔/来源），值取自 gates.polling', async () => {
+  const { gatesHtml } = await renderFragment({
+    shopName: '瑾漂亮潮流服饰', realMode: true, running: false, status: 'idle',
+    gates: {
+      realMode: true, pauseEnabled: true, enableEnabled: true, dryRun: false,
+      pauseWillExecute: true, enableWillExecute: true, blockedBy: [],
+      scope: ['全店托管', '商品自选'], deleteAdEnabled: false,
+      polling: { timeoutMs: 30000, intervalMs: 3000, timeoutSource: 'execution.readbackTimeoutMs', intervalSource: 'execution.readbackIntervalMs' },
+    },
+  });
+  assert.ok(gatesHtml.includes('落地回读'), `门槛明细必须展示落地回读配置，实际：${gatesHtml}`);
+  assert.ok(gatesHtml.includes('30000ms'), `必须展示实际生效超时值 30000ms，实际：${gatesHtml}`);
+  assert.ok(gatesHtml.includes('3000ms'), `必须展示实际生效间隔值 3000ms，实际：${gatesHtml}`);
+  assert.ok(gatesHtml.includes('execution.readbackTimeoutMs'), `必须展示配置来源（不得只显示猜测值），实际：${gatesHtml}`);
+});
+
+test('门槛明细：polling 缺失 → 明确显示"配置待读取"，不得编造数值', async () => {
+  const { gatesHtml } = await renderFragment({
+    shopName: '瑾漂亮潮流服饰', realMode: true, running: false, status: 'idle',
+    gates: {
+      realMode: true, pauseEnabled: true, enableEnabled: true, dryRun: false,
+      pauseWillExecute: true, enableWillExecute: true, blockedBy: [],
+      scope: ['全店托管', '商品自选'], deleteAdEnabled: false,
+    },
+  });
+  assert.ok(gatesHtml.includes('配置待读取'), `polling 缺失必须显示待读取，实际：${gatesHtml}`);
+  assert.ok(!gatesHtml.includes('30000ms'), `polling 缺失时不得编造数值，实际：${gatesHtml}`);
+});
+
+test('门槛明细：展示 Cookie 回写结果（已保存/冲突/失败），且绝不显示任何 Cookie 值', async () => {
+  const base = {
+    realMode: true, pauseEnabled: true, enableEnabled: true, dryRun: false,
+    pauseWillExecute: true, enableWillExecute: true, blockedBy: [],
+    scope: ['全店托管', '商品自选'], deleteAdEnabled: false,
+  };
+  const saved = await renderFragment({
+    shopName: '瑾漂亮潮流服饰', realMode: true, running: false, status: 'idle', gates: base,
+    cookieWriteback: { ok: true, skipped: false, count: 65, bytes: 20480, domains: ['fxg.jinritemai.com', 'compass.jinritemai.com'] },
+  });
+  assert.ok(saved.gatesHtml.includes('Cookie 回写'), `必须展示 Cookie 回写状态，实际：${saved.gatesHtml}`);
+  assert.ok(saved.gatesHtml.includes('已保存'), `成功回写必须显示已保存，实际：${saved.gatesHtml}`);
+
+  const conflict = await renderFragment({
+    shopName: '瑾漂亮潮流服饰', realMode: true, running: false, status: 'idle', gates: base,
+    cookieWriteback: { ok: false, skipped: true, conflict: true, reason: '源 Cookie 文件在本次会话期间已被改变' },
+  });
+  assert.ok(/冲突|保留较新文件/.test(conflict.gatesHtml), `冲突必须如实展示，实际：${conflict.gatesHtml}`);
+
+  const failed = await renderFragment({
+    shopName: '瑾漂亮潮流服饰', realMode: true, running: false, status: 'idle', gates: base,
+    cookieWriteback: { ok: false, skipped: false, reason: 'Cookie 回写失败（旧文件保留）: EACCES' },
+  });
+  assert.ok(/失败/.test(failed.gatesHtml), `保存失败必须如实展示，实际：${failed.gatesHtml}`);
+
+  const none = await renderFragment({
+    shopName: '瑾漂亮潮流服饰', realMode: true, running: false, status: 'idle', gates: base,
+  });
+  assert.ok(none.gatesHtml.includes('尚无记录'), `无记录时必须显示尚无记录，实际：${none.gatesHtml}`);
+
+  // 安全断言：界面绝不渲染任何 Cookie 值 / 敏感字段名
+  for (const r of [saved, conflict, failed, none]) {
+    assert.ok(!/value/i.test(r.gatesHtml), `界面不得出现 Cookie value 字段，实际：${r.gatesHtml}`);
+    assert.ok(!r.gatesHtml.includes('sessionid'), `界面不得出现会话凭据，实际：${r.gatesHtml}`);
+  }
+});

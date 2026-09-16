@@ -29,6 +29,12 @@ const PROJECT_COOKIES_DIR = path.join(__dirname, '..', '..', 'cookies');
 /**
  * 解析指定店铺的 Cookie 文件路径。
  * 优先本项目 cookies/（新登录），其次配置的只读来源目录（电商助手，只读）。
+ *
+ * 关于 readOnly（2026-09-16 更新）：来源目录仍标记 readOnly=true（本模块只读加载，
+ * 不做任何模糊匹配/兜底写入）。用户已明确授权**仅对本次实际加载的该店铺 Cookie 文件**
+ * 做回写，供下次复用——该写入由 `src/login/cookie-writeback.js` 独占承担
+ * （原子写入 + 域完整性 + 会话期冲突保护 + 身份/登录态校验），
+ * 不改动电商助手其他业务与其他文件。
  */
 function resolveCookieFile(loginCfg, cookieFile) {
   if (!cookieFile || typeof cookieFile !== 'string' || cookieFile.startsWith('TODO')) {

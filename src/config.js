@@ -31,9 +31,17 @@ const DEFAULTS = {
     maxRetries: 2,
     retryBackoffMs: 3000,
     closeTimeoutMs: 20000,
-    readbackTimeoutMs: 15000,
+    // 落地确认/回读的**唯一有效配置**（2026-09-16 统一）：
+    // - readbackTimeoutMs = 总预算，按实际截止时间计算（不是 次数×间隔）；
+    // - readbackIntervalMs = 两次回读之间的等待；读取串行，绝不与上一轮重叠；
+    // - 执行器不再持有独立 fallback 数值（同源：src/lib/bounded-poll.js 的 POLLING_DEFAULTS
+    //   与本处保持一致），避免"报告说 30 秒/3 秒、生产实际 15 秒/2 秒"的漂移。
+    // - 平台异步落地实测可延迟 27 秒以上 → 取 30 秒。
+    readbackTimeoutMs: 30000,
+    // readbackAttempts 为**次数语义**，仅关闭推广流程（close-flow.js）使用；
+    // 乘方落地确认不使用本项（按截止时间有界，见 src/lib/bounded-poll.js）。
     readbackAttempts: 3,
-    readbackIntervalMs: 2000,
+    readbackIntervalMs: 3000,
     zeroOrderRecheck: 1,      // 订单为 0/无效时的重新读取次数
     maxAdPages: 50,           // 广告清单分页上限（防失控）
   },

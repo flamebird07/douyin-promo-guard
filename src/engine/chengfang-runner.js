@@ -30,9 +30,11 @@ const { perOrderDisplayText } = require('./rules');
 /** 生产默认会话开启器：真实乘方管理页（openChengfangShop + 真实控制器）。 */
 async function defaultChengfangOpener({ loginCfg, shopCfg }) {
   const { openChengfangShop, createChengfangController } = require('../adapters/chengfang-reader');
-  const { browser, target, account } = await openChengfangShop({ loginCfg, shopCfg });
+  const { browser, target, account, context, cookieSession } = await openChengfangShop({ loginCfg, shopCfg });
   const controller = createChengfangController({});
-  return { browser, page: target, controller, account };
+  // context / cookieSession 一并透出：批次结束（浏览器关闭前）用于**本次实际加载的**
+  // 店铺 Cookie 文件回写（见 _closeSession → writebackSessionCookies）。
+  return { browser, page: target, controller, account, context, cookieSession };
 }
 
 /**
@@ -77,12 +79,46 @@ class ChengfangRunner {
     return session;
   }
 
-  async _closeSession(session) {
-    if (!session) return;
+  /**
+   * 关闭会话。关闭浏览器**之前**，在身份核验通过的前提下回写本次 context 的 Cookie
+   * （2026-09-16 用户明确授权的定点能力，见 src/login/cookie-writeback.js）。
+   *
+   * 安全边界：
+   * - 只写 `cookieSession.filePath`（= resolveCookieFile 返回的本次实际加载路径），不接受任意路径；
+   * - 身份未通过 / 登录失效 / 空或非法 Cookie / 会话期间源文件被改动 → 拒绝覆盖（保留旧文件）；
+   * - 回写结果**单独记录**（audit + 批次字段 cookieWriteback），绝不影响/改写已确认的广告动作结果；
+   * - 当前批次继续使用原 context，不回灌 Cookie、不刷新会话。
+   * @returns {Promise<object|null>} 回写结果（不含任何 Cookie 值）
+   */
+  async _closeSession(session, ctx = {}) {
+    if (!session) return null;
+    let writeback = null;
+    const shouldWriteback = ctx.writeback !== false && ctx.mode === 'execute'
+      && session.cookieSession && session.cookieSession.filePath && session.context;
+    if (shouldWriteback) {
+      try {
+        const { writebackSessionCookies } = require('../login/cookie-writeback');
+        writeback = await writebackSessionCookies({
+          context: session.context,
+          cookieFilePath: session.cookieSession.filePath,
+          sessionStartFingerprint: session.cookieSession.startFingerprint,
+          identityOk: ctx.identityOk === true,
+          loginOk: ctx.loginOk !== false,
+          shopId: ctx.shopId || null,
+          audit: this.audit,
+        });
+      } catch (e) {
+        // 回写异常绝不冒泡：单独记录，广告动作结果保持原样
+        writeback = { ok: false, skipped: false, reason: `Cookie 回写异常（旧文件保留）: ${e.message}` };
+        this.audit({ kind: 'cookie-writeback', shopId: ctx.shopId || null, ok: false, error: e.message });
+      }
+      this.lastCookieWriteback = writeback;
+    }
     try {
       if (typeof session.close === 'function') await session.close();
       else if (session.browser) await session.browser.close();
     } catch (_) { /* 关闭失败不阻塞批次结果 */ }
+    return writeback;
   }
 
   /**
@@ -145,7 +181,8 @@ class ChengfangRunner {
         reason,
       };
     } finally {
-      await this._closeSession(session);
+      // 演练周期不产生真实广告动作 → 不回写 Cookie（避免无业务依据地改动店铺凭据文件）
+      await this._closeSession(session, { writeback: false });
     }
   }
 
@@ -207,7 +244,7 @@ class ChengfangRunner {
         reason,
       };
     } finally {
-      await this._closeSession(session);
+      await this._closeSession(session, { writeback: false });
     }
   }
 
@@ -266,6 +303,7 @@ class ChengfangRunner {
 
     // ── 2) 打开乘方页并执行（executor 内部再做身份核验/每请求门槛/全量回读）──
     let session = null;
+    let batchResult = null;
     try {
       session = await this._openSession(pageOpener, shopCfg, loginCfg);
       const result = await executeChengfangPause({
@@ -278,13 +316,23 @@ class ChengfangRunner {
         audit: this.audit,
         stopRequested: () => !!(cycleToken && cycleToken.aborted),
       });
-      return this._summarizeExecutorResult({ result, counts, pre, batchDate, base });
+      batchResult = this._summarizeExecutorResult({ result, counts, pre, batchDate, base });
+      return batchResult;
     } catch (e) {
       const reason = `乘方暂停流程异常停止：${e.reason || e.message}。零新增请求`;
       this.audit({ ...base, step: 'executor', ok: false, error: reason });
       return { outcome: 'partial', reason, counts, pre, batchDate, error: e };
     } finally {
-      await this._closeSession(session);
+      // 浏览器关闭前回写本次实际加载的店铺 Cookie（身份通过 + 真实执行 + 回读已结束时）；
+      // 回写结果单独挂在批次上，绝不改写上面的 outcome/counts。
+      const wb = await this._closeSession(session, {
+        writeback: true,
+        mode: 'execute',
+        identityOk: !!(batchResult && batchResult.executor && batchResult.executor.identity
+          && batchResult.executor.identity.ok === true),
+        shopId: shopCfg.id,
+      });
+      if (wb && batchResult) batchResult.cookieWriteback = wb;
     }
   }
 
@@ -324,6 +372,7 @@ class ChengfangRunner {
 
     // ── 1) 打开乘方页并执行（executor 内部再做身份核验/每请求门槛/全量回读）──
     let session = null;
+    let batchResult = null;
     try {
       session = await this._openSession(pageOpener, shopCfg, loginCfg);
       const result = await executeChengfangEnable({
@@ -336,13 +385,23 @@ class ChengfangRunner {
         audit: this.audit,
         stopRequested: () => !!(cycleToken && cycleToken.aborted),
       });
-      return this._summarizeEnableResult({ result, counts, batchDate, base });
+      batchResult = this._summarizeEnableResult({ result, counts, batchDate, base });
+      return batchResult;
     } catch (e) {
       const reason = `乘方开启流程异常停止：${e.reason || e.message}。零新增请求`;
       this.audit({ ...base, step: 'executor', ok: false, error: reason });
       return { outcome: 'partial', reason, counts, batchDate, error: e };
     } finally {
-      await this._closeSession(session);
+      // 浏览器关闭前回写本次实际加载的店铺 Cookie（用户 2026-09-16 明确授权）：
+      // 仅在身份核验通过 + 真实执行模式下进行；失败/冲突单独记录，不改写批次结果。
+      const wb = await this._closeSession(session, {
+        writeback: true,
+        mode: 'execute',
+        identityOk: !!(batchResult && batchResult.executor && batchResult.executor.identity
+          && batchResult.executor.identity.ok === true),
+        shopId: shopCfg.id,
+      });
+      if (wb && batchResult) batchResult.cookieWriteback = wb;
     }
   }
 

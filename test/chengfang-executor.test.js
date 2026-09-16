@@ -67,14 +67,20 @@ function makeController() {
 const PAUSE_NOW = shanghaiMs('2026-09-12', '08:00');
 const PAUSE_DATE = '2026-09-12';
 
+// 落地确认/回读轮询：测试注入短预算（生产为 execution.readbackTimeoutMs=30000 /
+// readbackIntervalMs=3000，见 src/lib/bounded-poll.js 与 config/config.json）。
+// 测试只影响等待时长，不改变生产语义。
+const TEST_POLL = { readbackTimeoutMs: 2500, readbackIntervalMs: 250 };
+
 async function run(opts = {}) {
   const pageRef = await loadPage(opts.fixture || {});
   let controller = opts.controller || makeController();
   if (opts.controllerOverride) controller = await opts.controllerOverride(controller, pageRef);
   const config = opts.config || {
-    execution: { realMode: true, dryRun: false },
+    execution: { realMode: true, dryRun: false, ...TEST_POLL },
     monitor: { chengfang: { pauseEnabled: true } },
   };
+  const audits = [];
   const result = await executeChengfangPause({
     controller,
     page: pageRef,
@@ -85,7 +91,7 @@ async function run(opts = {}) {
     dryRun: opts.dryRun,
     now: opts.now || (() => PAUSE_NOW),
     businessDate: opts.businessDate !== undefined ? opts.businessDate : PAUSE_DATE,
-    audit: () => {},
+    audit: (e) => audits.push(e),
     stopRequested: opts.stopRequested || (() => false),
   });
   const state = await pageRef.evaluate(() => ({
@@ -95,7 +101,7 @@ async function run(opts = {}) {
     plansZixuan: (window.__CF.plans['商品自选'] || []).map((p) => ({ id: p.id, checked: p.checked })),
   }));
   await pageRef.close().catch(() => {});
-  return { result, state };
+  return { result, state, audits };
 }
 
 const pauseClicks = (state) => state.clickLog.filter((c) => c.type === 'pause');
@@ -632,7 +638,7 @@ async function runEnable(opts = {}) {
   let controller = opts.controller || makeController();
   if (opts.controllerOverride) controller = await opts.controllerOverride(controller, pageRef);
   const config = opts.config || {
-    execution: { realMode: true, dryRun: false },
+    execution: { realMode: true, dryRun: false, ...TEST_POLL },
     monitor: { chengfang: { scope: ['全店托管', '商品自选'], enableEnabled: true } },
   };
   const result = await executeChengfangEnable({
@@ -1097,4 +1103,249 @@ test('开启异步落地延迟（slow-landing）：落地轮询等待到开关�
   assert.strictEqual(result.views.zixuan.processedCount, 5);
   assert.ok(state.plansZixuan.every((p) => p.checked === true), '平台延迟落地后最终全部开启');
   assert.strictEqual(deleteClicks(state).length, 0, '删除零点击');
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 2026-09-16 第二轮定点收尾：有界落地确认（暂停侧补齐）+ 停止语义 + 重试前核验
+// ═══════════════════════════════════════════════════════════════════
+
+test('暂停异步落地延迟（slow-landing）：旧代码"单次立即回读"会误判失败，现等待落地后确认且只点一次', async () => {
+  const { result, state } = await run({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_PLANS(5) },
+      state: { pauseEffect: 'slow-landing', slowLandingMs: 1200 }, // 点击后 1.2 秒才落地
+    },
+    dryRun: false,
+  });
+  assert.strictEqual(result.allPausedConfirmed, true, result.confirmReason);
+  assert.strictEqual(result.views.zixuan.processedCount, 5);
+  assert.strictEqual(pauseClicks(state).length, 1, '落地确认生效后无需重试点击');
+  assert.ok(state.plansZixuan.every((p) => p.checked === false), '平台延迟落地后最终全部关闭');
+  assert.strictEqual(deleteClicks(state).length, 0);
+  // 实际生效轮询配置必须可观测（与执行器同源，不展示 fallback 猜测值）
+  assert.strictEqual(result.polling['商品自选'].timeoutMs, TEST_POLL.readbackTimeoutMs);
+  assert.strictEqual(result.polling['商品自选'].intervalMs, TEST_POLL.readbackIntervalMs);
+  assert.strictEqual(result.polling['商品自选'].timeoutSource, 'execution.readbackTimeoutMs');
+});
+
+test('暂停侧托管开关异步落地：等待真实翻转后确认关闭，绝不因超时不明反向切换', async () => {
+  // 旧代码在点击后做**一次立即回读**（约 0.2–0.5s）：此时平台尚未落地 → 直接判失败。
+  // 新代码按实际截止时间等待（这里 2s 落地、预算 6s），落地后才确认，且全程只点一次。
+  const { result, state } = await run({
+    fixture: {
+      plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': [] },
+      state: { switchEffect: 'slow-landing', slowLandingMs: 2000 },
+    },
+    config: {
+      execution: { realMode: true, dryRun: false, readbackTimeoutMs: 6000, readbackIntervalMs: 250 },
+      monitor: { chengfang: { pauseEnabled: true } },
+    },
+    dryRun: false,
+  });
+  assert.strictEqual(result.views.tuoguan.status, 'paused', result.confirmReason);
+  assert.strictEqual(result.views.tuoguan.confirmedCount, 1);
+  assert.strictEqual(switchClicks(state).length, 1, '托管开关恰好点击一次（绝不重复切换 → 不会反向开启）');
+  assert.strictEqual(result.allPausedConfirmed, true, result.confirmReason);
+  assert.strictEqual(result.polling['全店托管'].settled, true, '必须是"等待落地后收敛"，不是超时未知');
+  assert.strictEqual(result.polling['全店托管'].timedOut, false);
+});
+
+test('停止语义：开启点击已派发后收到停止，平台随后落地 → 无第二次点击，仍记录真实回读结果', async () => {
+  let stopped = false;
+  const { result, state } = await runEnable({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(5) },
+      state: { enableEffect: 'slow-landing', slowLandingMs: 900 },
+    },
+    stopRequested: () => stopped,
+    controllerOverride: async (controller) => {
+      const orig = controller.clickBatchEnable.bind(controller);
+      controller.clickBatchEnable = async (p) => {
+        const r = await orig(p);
+        stopped = true; // 点击已派发后立即收到停止
+        return r;
+      };
+      return controller;
+    },
+  });
+  assert.strictEqual(enableClicks(state).length, 1, '停止后绝不重试/绝不发出第二次点击');
+  assert.ok(result.stoppedAfterDispatch, '必须如实记录"停止后已派发请求的真实回读结果"');
+  assert.deepStrictEqual(result.stoppedAfterDispatch.confirmed.sort(), ZIXUAN_CLOSED(5).map((p) => p.id).sort(), '真实回读结果必须记录（平台已落地）');
+  assert.strictEqual(result.stoppedAfterDispatch.action, 'enable');
+  assert.match(result.confirmReason, /停止/);
+  assert.strictEqual(result.allEnabledConfirmed, false, '停止导致批次未走完全量回读 → 不宣称全部开启');
+  assert.ok(state.plansZixuan.every((p) => p.checked === true), '平台随后确实落地（停止不影响已派发请求的落地）');
+  assert.strictEqual(deleteClicks(state).length, 0);
+});
+
+test('停止语义：暂停点击已派发后收到停止，平台随后落地 → 无第二次点击，仍记录真实回读结果', async () => {
+  let stopped = false;
+  const { result, state } = await run({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_PLANS(5) },
+      state: { pauseEffect: 'slow-landing', slowLandingMs: 900 },
+    },
+    dryRun: false,
+    stopRequested: () => stopped,
+    controllerOverride: async (controller) => {
+      const orig = controller.clickBatchPause.bind(controller);
+      controller.clickBatchPause = async (p) => {
+        const r = await orig(p);
+        stopped = true; // 点击已派发后立即收到停止
+        return r;
+      };
+      return controller;
+    },
+  });
+  assert.strictEqual(pauseClicks(state).length, 1, '停止后绝不重试/绝不发出第二次点击');
+  assert.ok(result.stoppedAfterDispatch, '必须如实记录真实只读确认结果');
+  assert.deepStrictEqual(result.stoppedAfterDispatch.confirmed.sort(), ZIXUAN_PLANS(5).map((p) => p.id).sort());
+  assert.strictEqual(result.stoppedAfterDispatch.action, 'pause');
+  assert.match(result.confirmReason, /停止/);
+  assert.strictEqual(result.allPausedConfirmed, false);
+  assert.ok(state.plansZixuan.every((p) => p.checked === false));
+});
+
+test('状态未知：落地确认期间目标行消失 → 不视为确认关闭，且绝不重试', async () => {
+  const { result, state } = await run({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_PLANS(5) },
+      state: { pauseEffect: 'noop' }, // 平台未落地
+    },
+    dryRun: false,
+    controllerOverride: async (controller, pageRef) => {
+      const orig = controller.clickBatchPause.bind(controller);
+      controller.clickBatchPause = async (p) => {
+        const r = await orig(p);
+        // 点击后：2 条落地关闭、1 条行消失（状态未知）、其余仍未落地
+        await pageRef.evaluate(() => {
+          const ids = window.__CF.plans['商品自选'].map((x) => x.id);
+          window.__CF.setChecked(ids[1], false);
+          window.__CF.setChecked(ids[2], false);
+          window.__CF.removePlan(ids[0]);
+        });
+        return r;
+      };
+      return controller;
+    },
+  });
+  assert.strictEqual(pauseClicks(state).length, 1, '存在状态未知目标时绝不盲目重发');
+  assert.strictEqual(result.allPausedConfirmed, false, '未知不得视为确认关闭');
+  assert.match(result.confirmReason, /行消失|状态未知/);
+  assert.strictEqual(result.stoppedAfterDispatch, null, '这不是停止场景，不得误标');
+});
+
+test('落地确认期间读取失败：结果未知，不重试、不谎报成功', async () => {
+  const { result, state } = await run({
+    fixture: { plans: { '全店托管': [], '商品自选': ZIXUAN_PLANS(3) } },
+    dryRun: false,
+    controllerOverride: async (controller) => {
+      const orig = controller.readView.bind(controller);
+      let clicked = false;
+      const origClick = controller.clickBatchPause.bind(controller);
+      controller.clickBatchPause = async (p) => { const r = await origClick(p); clicked = true; return r; };
+      controller.readView = async (p) => {
+        if (clicked && p.tab === '商品自选') return { tab: '商品自选', rows: { error: 'fixture 注入落地回读失败' }, pagination: null };
+        return orig(p);
+      };
+      return controller;
+    },
+  });
+  assert.strictEqual(pauseClicks(state).length, 1, '回读失败不得触发重试（未知先回读，不盲重发）');
+  assert.strictEqual(result.allPausedConfirmed, false);
+  assert.match(result.confirmReason, /落地轮询回读失败|结果未知/);
+  assert.ok(result.polling['商品自选'].readFailures >= 1, '必须如实记录轮询期间的读取失败次数（旧代码无轮询结果）');
+  assert.strictEqual(result.polling['商品自选'].settled, false, '读取失败不得当作已收敛');
+  assert.strictEqual(deleteClicks(state).length, 0);
+});
+
+test('重试前重新核验真实状态：核验发现已落地 → 不再重发（并留有 retry-precheck 证据）', async () => {
+  const { result, state, audits } = await run({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_PLANS(5) },
+      state: { pauseEffect: 'noop' }, // 首次点击不落地 → 落地轮询超时
+    },
+    dryRun: false,
+    controllerOverride: async (controller, pageRef) => {
+      let clicked = false;
+      let idCalls = 0;
+      const origClick = controller.clickBatchPause.bind(controller);
+      controller.clickBatchPause = async (p) => { const r = await origClick(p); clicked = true; return r; };
+      const origId = controller.verifyIdentity.bind(controller);
+      // 点击后第 1 次身份复核来自"回读前确认仍在管理页"（旧代码同样会调用，此时平台还没落地）；
+      // 第 2 次复核才是"重试前核验"——就在这一刻平台落地，用来区分"先核验再决定"与"盲目重发"。
+      controller.verifyIdentity = async (p) => {
+        const r = await origId(p);
+        if (clicked) {
+          idCalls += 1;
+          if (idCalls >= 2) {
+            await pageRef.evaluate(() => { for (const x of window.__CF.plans['商品自选']) x.checked = false; window.__CF.setChecked(window.__CF.plans['商品自选'][0].id, false); });
+          }
+        }
+        return r;
+      };
+      return controller;
+    },
+  });
+  assert.strictEqual(pauseClicks(state).length, 1, '重试前核验发现已落地 → 绝不重发');
+  assert.strictEqual(result.allPausedConfirmed, true, result.confirmReason);
+  assert.ok(state.plansZixuan.every((p) => p.checked === false));
+  // 旧代码没有"重试前重新核验"这一层：这些审计事件在旧代码上不存在（回归判据）。
+  const precheck = audits.find((a) => a.event === 'retry-precheck');
+  assert.ok(precheck, '必须留下"重试前重新核验"的审计证据（旧代码无此步骤）');
+  assert.deepStrictEqual(precheck.landed.slice().sort(), ZIXUAN_PLANS(5).map((p) => p.id).sort(), '核验必须发现 5 个目标已落地');
+  assert.deepStrictEqual(precheck.stillPending, [], '没有仍未落地的目标');
+  assert.ok(audits.some((a) => a.event === 'retry-skipped'), '必须明确记录"因已落地而跳过重发"');
+});
+
+test('重试前门槛重新核验：点击后配置被关闭 → 不重发（旧代码只会走普通请求门槛）', async () => {
+  // 用"配置被关闭"而不是"停止信号"来测重试前门槛：停止会被落地轮询先捕获（属于停止语义），
+  // 配置变化则只会在"重试前重新核验门槛"这一步被发现 —— 这是旧代码完全没有的一层。
+  const cfg = {
+    execution: { realMode: true, dryRun: false, ...TEST_POLL },
+    monitor: { chengfang: { pauseEnabled: true } },
+  };
+  const { result, state, audits } = await run({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_PLANS(3) },
+      state: { pauseEffect: 'noop' },
+    },
+    config: cfg,
+    dryRun: false,
+    controllerOverride: async (controller) => {
+      const origClick = controller.clickBatchPause.bind(controller);
+      controller.clickBatchPause = async (p) => {
+        const r = await origClick(p);
+        cfg.monitor.chengfang.pauseEnabled = false; // 点击已派发后，真实执行许可被关闭
+        return r;
+      };
+      return controller;
+    },
+  });
+  assert.strictEqual(pauseClicks(state).length, 1, '门槛复核不通过不得重发');
+  assert.match(result.confirmReason, /重试前门槛复核不通过/, '必须是"重试前重新核验门槛"拦下的（旧代码无此步骤）');
+  assert.match(result.confirmReason, /pauseEnabled/, '必须如实说明真实原因');
+  assert.strictEqual(result.allPausedConfirmed, false);
+  assert.ok(!audits.some((a) => a.event === 'retry'), '绝不允许走到重发那一步');
+});
+
+test('停止语义优先：点击后收到停止 → 不再重试（走停止路径，不进入重试前核验）', async () => {
+  let stopped = false;
+  const { result, state } = await run({
+    fixture: {
+      plans: { '全店托管': [], '商品自选': ZIXUAN_PLANS(3) },
+      state: { pauseEffect: 'noop' },
+    },
+    dryRun: false,
+    stopRequested: () => stopped,
+    controllerOverride: async (controller) => {
+      const origClick = controller.clickBatchPause.bind(controller);
+      controller.clickBatchPause = async (p) => { const r = await origClick(p); stopped = true; return r; };
+      return controller;
+    },
+  });
+  assert.strictEqual(pauseClicks(state).length, 1, '停止后不得重试');
+  assert.match(result.confirmReason, /停止/, '必须如实说明是停止信号拦下的');
+  assert.ok(result.stoppedAfterDispatch, '必须记录已派发请求的真实回读结果');
+  assert.strictEqual(result.allPausedConfirmed, false);
 });

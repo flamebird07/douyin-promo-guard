@@ -796,7 +796,7 @@ function readChengfangAccountInPage() {
 // ── 页面驱动（真实页面；browserFactory 可注入供测试）────────────────
 
 async function openChengfangShop(p) {
-  const { browser, target } = await openQianchuanHome(p.loginCfg, p.shopCfg, p);
+  const { browser, context, target, cookieSession } = await openQianchuanHome(p.loginCfg, p.shopCfg, p);
   try {
     await target.waitForTimeout(2000);
     try { await target.getByText('我知道了', { exact: true }).first().click({ timeout: 3000 }); } catch (_) {}
@@ -843,7 +843,7 @@ async function openChengfangShop(p) {
     if (!hasTabs) {
       throw new DataGuardError('乘方页未找到"商品自选/全店托管"子标签（点击"商品"后仍未出现），拒绝继续');
     }
-    return { browser, target, account: st };
+    return { browser, target, account: st, context, cookieSession };
   } catch (e) {
     await closeBrowser(browser);
     throw e;

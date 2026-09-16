@@ -39,9 +39,9 @@
     "maxRetries": 2,
     "retryBackoffMs": 3000,
     "closeTimeoutMs": 20000,
-    "readbackTimeoutMs": 15000,
+    "readbackTimeoutMs": 30000,
     "readbackAttempts": 3,
-    "readbackIntervalMs": 2000,
+    "readbackIntervalMs": 3000,
     "zeroOrderRecheck": 1,
     "maxAdPages": 50
   },

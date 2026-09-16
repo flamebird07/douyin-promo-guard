@@ -9,6 +9,114 @@
 
 ---
 
+## 0-R16. 第十六轮定点收尾（2026-09-16）：轮询语义 / 停止语义 / 暂停侧核查 / 会话 Cookie 回写
+
+> 基线 `7416d2aab57dd1b60960238c6cdb25ce73f0ebf5`（= origin/main，`git ls-remote origin main` 已核验）。
+> **本轮不重做项目**；生产门槛配置未改动；**未启动暂停值守**；**本轮无任何真实广告动作**。
+> 完整背景与接手要点见 `HANDOFF.md` 第十六轮（最新段落）与 `WORK_BUDDY_HANDOFF.md` 末尾。
+
+### 1) 修复证据与旧代码失败的回归
+
+| 修复项 | 旧行为（基线 `7416d2aa`） | 回归用例（新代码 61/61，旧代码失败） |
+| --- | --- | --- |
+| 暂停侧落地确认 | 点击后**一次立即回读** → 平台异步落地（实测 27s+）被误判失败 | `暂停异步落地延迟（slow-landing）…` |
+| 暂停侧托管开关 | 同上；且超时未知后存在重复点击风险 | `暂停侧托管开关异步落地：等待真实翻转后确认关闭，绝不因超时不明反向切换` |
+| 停止语义 | 落地轮询检测到停止后**直接 return**，已派发请求不再确认 | `停止语义：开启…` / `停止语义：暂停…` / `停止语义优先：…` |
+| 状态未知 | 目标行消失未区分"未知"与"未落地" | `状态未知：落地确认期间目标行消失 → 不视为确认关闭，且绝不重试` |
+| 读取失败 | 无轮询结果可查，失败原因不可分辨 | `落地确认期间读取失败：结果未知，不重试、不谎报成功` |
+| 重试前核验 | 无此步骤（只走普通请求门槛） | `重试前重新核验真实状态…`（断言 `retry-precheck`/`retry-skipped` 审计） / `重试前门槛重新核验…` |
+
+- **回归方法**：`git worktree add <tmp> 7416d2aa` 检出基线，仅替换新测试文件与 fixture，
+  运行**生产执行器/控制器**（非替代实现）；不触碰生产 `data`/`state`/`audit`，不加载真实广告操作。
+- **结果**：基线代码 `test/chengfang-executor.test.js` **52/61（9 个新用例全部失败）**；
+  当前代码 **61/61**。日志：`evidence/old-code-executor-regression.log`。
+- **本轮自查修复的一处自身缺陷**：`confirmLanding` 最初把业务时钟 `now` 当轮询时钟 →
+  预算永不耗尽、轮询死循环（两个新用例曾挂死 70s+）。现轮询一律 `Date.now`，
+  业务 `now` 仅用于上海时段/跨日；`bounded-poll` 另加硬性迭代上限兜底。
+
+### 2) 实际生效的轮询配置
+
+- 唯一有效来源：`execution.readbackTimeoutMs` / `execution.readbackIntervalMs`，
+  **生产实际加载值 = 30000 / 3000**（`config/config.json` 与 `src/config.js` DEFAULTS 已对齐，
+  `config/config.example.json` 同步）。
+- 语义：**按实际截止时间**有界（不是 次数×间隔），读取串行不重叠，至少读取一次；
+  停止后不再重试/不再发新请求，已派发请求在有限期限内只读确认。
+- 页面/状态展示：`gates.polling = {timeoutMs:30000, intervalMs:3000, timeoutSource:'execution.readbackTimeoutMs', intervalSource:'execution.readbackIntervalMs'}`
+  （与执行器同源解析 `src/lib/bounded-poll.js`，**无独立 fallback 数值**）。
+  实测 `/api/watch-drill/state` 返回上述值（见第 5 节）。
+- 共享说明：`readbackAttempts`（次数语义）**仅** `close-flow.js` 使用；`readbackTimeoutMs` 同时被
+  close-flow 复用为**单次读取超时**（15s→30s 只会更耐心）。
+
+### 3) Cookie 保存 / 冲突保护 / 下次加载结果（不含任何值）
+
+- 新模块 `src/login/cookie-writeback.js`；接线 `qianchuan-reader` → `chengfang-reader` →
+  `defaultChengfangOpener` → `ChengfangRunner._closeSession` → `batch.cookieWriteback` →
+  `Monitor.lastCookieWriteback` → `getStatus().monitor.cookieWriteback` → 页面「Cookie 回写」栏。
+- 触发条件（全部满足才写）：`mode==='execute'` 且 `writeback!==false` 且身份核验通过，
+  且浏览器关闭**之前**。演练周期、无 context、身份未通过 → 不写。
+- 保护：原子写入（临时文件 + fsync + rename）；失败保留旧文件；登录失效/身份不符/空或非法
+  Cookie/缺少 `jinritemai.com` 关键域/条数塌缩（<60%）→ 拒绝覆盖；**冲突保护**（会话开始时记录
+  size+mtimeMs+sha256，回写前重比对，源文件在会话期间被改动 → 保留较新文件、不做无依据合并）；
+  写入后自校验（条数/域名形状）不一致 → 原子回滚。
+- **下次加载结果**：单测 `正常回写…` 断言"写入后按该文件加载读到的就是本次保存结果"
+  （`inspectCookieFile` 条数/域名一致）——**用临时文件与合成 Cookie 验证**，未触真实凭据。
+- **不含值**：返回值/审计/`/api/watch-drill/state`/页面只含结果、条数、域数、域名、字节数、时间；
+  测试对返回值与审计做了逐条 Cookie 值泄漏断言（`assert.ok(!dump.includes(c.value))`）。
+- **未实测**：真实店铺 Cookie 文件上的回写尚未发生（需真实 execute 批次）。
+
+### 4) 测试数量与退出码
+
+| 范围 | 结果 |
+| --- | --- |
+| 主项目 `npm test` | **329/329 通过，退出码 0**，428.1s（基线 290 → 329，+39） |
+| `test/chengfang-executor.test.js` | **61/61**，exit 0，432.1s |
+| `test/bounded-poll.test.js`（新） | **11/11** |
+| `test/cookie-writeback.test.js`（新） | **16/16** |
+| `test/watch-drill-tab.test.js` | **13/13**（10 → +3） |
+| `integrations/bill-manager/watch-drill.test.js` | **62/62**（58 → +4），exit 0，25.1s |
+| 基线 `7416d2aa` 上运行新执行器回归 | **52/61**（9 个新用例失败，作为修复证据） |
+| `npm run check` | 通过（真实执行模式；阈值 100 分/单；1 家店铺；Cookie 条数 65） |
+
+新增用例合计 **43** 个（执行器 +9、bounded-poll +11、cookie-writeback +16、watch-drill-tab +3、
+集成值守 +4）。
+
+### 5) Git 提交与远端核验
+
+- 开工核验：本地 HEAD = `7416d2aa…`；`git ls-remote origin main` = `7416d2aa…` → 基线已推送、工作区干净，无需备份提交。
+- 本轮提交与推送结果见下方"本轮实测"。
+- 未上传：凭据、`config/config.json`（`.gitignore` 第 5 行）、日志、`data/`、`evidence/`、浏览器数据。
+
+### 6) 生产服务加载 / 独立每日任务 / 暂停值守
+
+- 重启前：PID `37876`（`netstat` + `.server.lock` 双源一致），`running=false`、`cycleNo=0`、
+  开启相位 `waiting_window` → 业务空闲；旧进程**未**加载本轮 `src` 改动（`state` 无 `polling` 字段）。
+- 重启后：新 PID **25788**（双源一致），`/api/watch-drill/state` = 200，含
+  `polling {30000,3000,execution.readbackTimeoutMs,execution.readbackIntervalMs}` 与 `cookieWriteback: null`
+  → **确认新代码已加载**。
+- 独立每日开启：`enableTask.running=true / phase=waiting_window / nextRunAt=2026-09-16T23:00:00Z`
+  （= 2026-09-17 07:00 上海）；`enablePhaseToday` 沿用持久化的 2026-09-16 记录（status=unknown）。
+- 暂停值守：`running=false`（**本轮未启动**，按要求）。
+- ⚠️ 环境限制：沙箱禁止 `wscript`/`cmd`/`schtasks`，无法从会话内启动"脱离进程树"的服务；
+  当前 3443 由**会话后台任务**启动，**尚未交还给开机启动项**（`Startup\电商助手服务.vbs`）。
+  请注销/重新登录或手动双击该 VBS，使其恢复为常规常驻进程。
+
+### 7) 真实动作与回读结果
+
+- **本轮真实广告动作数 = 0**（未开启、未暂停、未删除；未在 07:00 窗口外补开整店；
+  未为测试反复开关整店）。所有测试均作用于本地 DOM fixture / 注入桩。
+- 因此**没有真实回读结果**可报告。
+
+### 8) 仍待观察（未发生的真实验证）
+
+- 「点击 → 异步落地 → 确认」的**真实链路**未实测（本轮零真实动作）。
+- **会话 Cookie 回写**在真实店铺文件上的效果未实测（无 execute 批次即不触发）。
+- 2026-09-17 07:00 的每日开启：若所有对象**本来已开启**，幂等跳过**只证明调度与回读有效**，
+  不能称为验证了「点击→异步落地→确认」，也不能验证 Cookie 回写。
+- 3443 进程的常驻性待用户确认（见第 6 节环境限制）。
+- 页面「落地回读 / Cookie 回写」两栏的真机显示未人工目视核对（静态片段已由 VM 测试覆盖）。
+
+---
+
 ## 0-R3. 第三轮 4 项定点修复（针对 CODEX_REVIEW_WORKBUDDY_R2，全部落地）
 
 > 复核输入：`evidence/CODEX_REVIEW_WORKBUDDY_R2.md`（+ `.cjs`/`.json` 复现脚本）。

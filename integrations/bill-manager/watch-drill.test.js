@@ -258,6 +258,90 @@ test('门槛快照：realMode + pauseEnabled 同开 → 真实暂停会执行；
 });
 
 // ══════════════════════════════════════════════════════════════
+// 2.1) 落地回读轮询配置 + 会话 Cookie 回写（2026-09-16 定点修复）
+//     页面展示的轮询值必须 === 执行器实际生效值（同一份解析），不得是 fallback 猜测；
+//     Cookie 回写只暴露元信息（条数/域数/结果），界面与状态里永不出现任何 Cookie 值。
+// ══════════════════════════════════════════════════════════════
+test('门槛快照必须暴露实际生效的落地回读轮询配置（与执行器同源解析）', () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, {
+    costCents: 100, orderCount: 100,
+    cfg: { execution: { realMode: true, dryRun: false, readbackTimeoutMs: 30000, readbackIntervalMs: 3000 } },
+  });
+  drill.start();
+  const p = drill.snapshot().gates.polling;
+  assert.ok(p, '门槛快照必须含 polling（页面据此展示真实生效值）');
+  assert.strictEqual(p.timeoutMs, 30000, '展示值必须等于配置的实际生效超时');
+  assert.strictEqual(p.intervalMs, 3000, '展示值必须等于配置的实际生效间隔');
+  assert.strictEqual(p.timeoutSource, 'execution.readbackTimeoutMs', '必须标注来源，杜绝 fallback 猜测');
+  assert.strictEqual(p.intervalSource, 'execution.readbackIntervalMs');
+});
+
+test('落地回读轮询配置：配置缺省 → 明确标注 builtin-default，不冒充用户配置', () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, {
+    costCents: 100, orderCount: 100,
+    cfg: { execution: { realMode: true, dryRun: false } },
+  });
+  drill.start();
+  const p = drill.snapshot().gates.polling;
+  assert.strictEqual(p.timeoutSource, 'builtin-default');
+  assert.strictEqual(p.intervalSource, 'builtin-default');
+  assert.strictEqual(typeof p.timeoutMs, 'number');
+});
+
+test('会话 Cookie 回写：状态默认无记录；记录后只暴露元信息，绝不含任何 Cookie 值', () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  assert.strictEqual(drill.snapshot().cookieWriteback, null, '尚未回写时必须为 null，不得编造');
+
+  const monitor = drill._internal._monitor;
+  monitor._recordBatch(SHOP_ID, {
+    batchDate: '2026-09-16', outcome: 'paused', counts: { confirmed: 2, failed: 0, unknown: 0 },
+    allPausedConfirmed: true,
+    cookieWriteback: {
+      ok: true, skipped: false, count: 65, bytes: 20480,
+      domains: ['fxg.jinritemai.com', 'compass.jinritemai.com', 'doudian-sso.jinritemai.com'],
+      droppedOther: ['hm.baidu.com'],
+    },
+  });
+  const cw = drill.sync().cookieWriteback;
+  assert.ok(cw, '记录后必须透出回写结果');
+  assert.strictEqual(cw.ok, true);
+  assert.strictEqual(cw.count, 65, '只暴露条数元信息');
+  assert.strictEqual(cw.domains.length, 3, '只暴露域名元信息');
+  assert.ok(cw.at, '必须带时间戳供界面展示');
+  const blob = JSON.stringify(cw);
+  assert.ok(!/"value"/.test(blob), `回写结果不得包含任何 Cookie value，实际：${blob}`);
+  assert.ok(!/sessionid|ttwid|passport/i.test(blob), `回写结果不得包含凭据字段，实际：${blob}`);
+});
+
+test('会话 Cookie 回写冲突：保留较新文件的结果如实透出，且不改写批次 outcome/counts', () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100 });
+  drill.start();
+  const monitor = drill._internal._monitor;
+  const batch = {
+    batchDate: '2026-09-16', outcome: 'paused', counts: { confirmed: 1, failed: 0, unknown: 0 },
+    allPausedConfirmed: true,
+    cookieWriteback: { ok: false, skipped: true, conflict: true, reason: '源 Cookie 文件在本次会话期间已被改变：保留较新文件，本次不回写' },
+  };
+  monitor._recordBatch(SHOP_ID, batch);
+  const cw = drill.sync().cookieWriteback;
+  assert.strictEqual(cw.conflict, true, '冲突必须如实标记');
+  assert.strictEqual(cw.skipped, true);
+  // 回写失败/冲突绝不改写广告动作结果
+  assert.strictEqual(batch.outcome, 'paused');
+  assert.deepStrictEqual(batch.counts, { confirmed: 1, failed: 0, unknown: 0 });
+  assert.strictEqual(batch.allPausedConfirmed, true);
+});
+
+// ══════════════════════════════════════════════════════════════
 // 3) 启停幂等与重启语义
 // ══════════════════════════════════════════════════════════════
 test('启动后 running=true 且记录已装配；重复启动不叠加循环', () => {

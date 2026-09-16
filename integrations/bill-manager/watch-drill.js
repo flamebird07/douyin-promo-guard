@@ -90,6 +90,8 @@ function createWatchDrill(opts = {}) {
       lastRound: null,       // 转译后的最近一轮（供界面展示）
       gates: null,           // 真实执行门槛快照（界面必须让用户看到是否真的会操作广告）
       enableTask: null,      // 独立每日开启任务状态（与 running 完全分离的生命周期）
+      polling: null,         // 落地确认/回读的实际生效轮询配置（与执行器同源）
+      cookieWriteback: null, // 最近一次会话 Cookie 回写结果（仅元信息，不含任何 Cookie 值）
       phase: null,           // Monitor 调度相位
       windowBlockReason: null,
       enablePhaseToday: [],
@@ -199,11 +201,23 @@ function createWatchDrill(opts = {}) {
     const enableEnabled = cf.enableEnabled === true;
     const dryRun = exec.dryRun === true;
 
+    // 落地确认/回读轮询的**实际生效值**（2026-09-16 统一）：
+    // 直接复用执行器同一份解析（src/lib/bounded-poll.js），页面展示值 === 执行器生效值，
+    // 杜绝"页面/报告说 30 秒/3 秒、生产实际 15 秒/2 秒"的漂移。
+    let polling;
+    try {
+      const { resolvePollingConfig } = require(path.join(PROMO_GUARD_DIR, 'src/lib/bounded-poll.js'));
+      polling = resolvePollingConfig(exec);
+    } catch (_) {
+      polling = { timeoutMs: null, intervalMs: null, timeoutSource: 'unavailable', intervalSource: 'unavailable' };
+    }
+
     return {
       realMode,
       pauseEnabled,
       enableEnabled,
       dryRun,
+      polling,
       // 配置里声明的模式（供"首次启动前"如实展示；未知不臆断）
       configuredRealMode: exec.realMode === true,
       modeKnown: typeof exec.realMode === 'boolean',
@@ -530,6 +544,9 @@ function createWatchDrill(opts = {}) {
       st.windowBlockReason = status.monitor.windowBlockReason;
       st.lastCheckAt = status.monitor.lastCycleAt;
       st.enablePhaseToday = status.monitor.enablePhaseToday || [];
+      // 最近一次会话 Cookie 回写结果（仅元信息，绝不含 Cookie 值）
+      st.cookieWriteback = status.monitor.cookieWriteback || null;
+      st.polling = status.monitor.polling || (drill.state.gates && drill.state.gates.polling) || null;
       st.running = m.running === true;
       // roundNo 取 Monitor 的真实周期号（每个完整 pollOnce 递增一次）
       const mCycleNo = (status.monitor && status.monitor.cycleNo) || m.cycleNo || 0;
@@ -852,6 +869,8 @@ function createWatchDrill(opts = {}) {
       lastRound: st.lastRound,
       gates,
       enableTask: st.enableTask || null,
+      polling: st.polling || (gates && gates.polling) || null,
+      cookieWriteback: st.cookieWriteback || null,
       phase: st.phase,
       windowBlockReason: st.windowBlockReason,
       enablePhaseToday: st.enablePhaseToday,

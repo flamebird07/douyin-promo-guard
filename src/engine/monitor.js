@@ -30,6 +30,7 @@ const { createPromoReaderNotConnected, createMockPromoReader } = require('../ada
 const { createAdControllerNotConnected, createMockAdController } = require('../adapters/ad-controller');
 const { WholeShopCloseCoordinator } = require('./close-coordinator');
 const { ChengfangRunner, defaultChengfangOpener } = require('./chengfang-runner');
+const { resolvePollingConfig } = require('../lib/bounded-poll');
 const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed } = require('./chengfang-gate');
 const { perOrderDisplayText } = require('./rules');
 const guard = require('./guard');
@@ -132,6 +133,9 @@ class Monitor {
 
     const loaded = this._loadState();
     this.batches = loaded.batches || {}; // shopId -> date -> { runs:[], totals:{} }
+    // 最近一次会话 Cookie 回写结果（仅元信息：条数/域名/冲突；绝不保存任何 Cookie 值）。
+    // 不持久化：重启后清空，避免把上一进程的凭据状态当作本次会话的事实。
+    this.lastCookieWriteback = null;
     this.enablePhase = loaded.enablePhase || {};
     // 独立停用标记持久化（重启后不得"复活"用户明确停用的每日开启任务）
     if (loaded.enableScheduler && typeof loaded.enableScheduler === 'object') {
@@ -1459,6 +1463,10 @@ class Monitor {
     rec.allPausedConfirmed = batch.allPausedConfirmed === true;
     if (isEnable) rec.allEnabledConfirmed = batch.allEnabledConfirmed === true;
     rec.lastBatchAt = new Date(this.nowFn()).toISOString();
+    // Cookie 回写结果（2026-09-16 用户明确授权的能力）：单独记录，绝不影响批次 outcome/counts。
+    if (batch.cookieWriteback) {
+      this.lastCookieWriteback = { ...batch.cookieWriteback, at: new Date(this.nowFn()).toISOString(), shopId };
+    }
     this.batches[shopId][date] = rec;
     this._pruneBatches();
     this._saveState();
@@ -1521,6 +1529,11 @@ class Monitor {
           dailyStartHour: this.config.schedule.dailyStartHour,
           intervalMinutes: this.config.schedule.intervalMinutes,
           enableHour: this._enableHour(),
+          // 落地确认/回读的**实际生效**轮询配置（唯一来源 execution.readbackTimeoutMs /
+          // readbackIntervalMs，与执行器同源解析）：页面必须展示真实生效值，不展示 fallback 猜测值。
+          polling: resolvePollingConfig(this.config.execution),
+          // 最近一次会话 Cookie 回写结果（仅元信息：数量/域名/是否冲突，绝不包含任何 Cookie 值）
+          cookieWriteback: this.lastCookieWriteback || null,
           // 独立每日开启调度器（与"启动值守"完全分离的生命周期；界面必须分别展示）
           enableScheduler: {
             running: this.enableRunning,

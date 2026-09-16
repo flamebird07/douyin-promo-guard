@@ -49,7 +49,7 @@ function planRowHtml({ id, name, checked, status, selected }) {
  */
 function buildChengfangFixtureHtml(opts = {}) {
   const plans = opts.plans || { '全店托管': [], '商品自选': [] };
-  const init = Object.assign({ view: '全店托管', pageSize: 10, shrink: false, pauseEffect: 'ok', enableEffect: 'ok', slowLandingMs: 2500, selectAllScope: 'page', crossPageClearable: false }, opts.state || {});
+  const init = Object.assign({ view: '全店托管', pageSize: 10, shrink: false, pauseEffect: 'ok', enableEffect: 'ok', switchEffect: 'ok', slowLandingMs: 2500, selectAllScope: 'page', crossPageClearable: false }, opts.state || {});
   const navText = opts.navText !== undefined ? opts.navText : '首页 乘方 全域投放 品牌投放 数据 工具 财务 营销学堂 成长伙伴 99+ 伊人美 ID：1710242295996424';
   const batchOpen = (opts.batchButtons && opts.batchButtons.open !== undefined) ? opts.batchButtons.open : `<button data-auto-id="bar-groups-group-item-btn-open">开启</button>`;
   const batchPause = (opts.batchButtons && opts.batchButtons.pause !== undefined) ? opts.batchButtons.pause : `<button data-auto-id="bar-groups-group-item-btn-pause">暂停</button>`;
@@ -89,6 +89,7 @@ window.__CF = {
   pauseEffect: '${init.pauseEffect}',
   pauseAttempts: (__cfAttempts && __cfAttempts.pause) || 0,
   enableEffect: '${init.enableEffect}',
+  switchEffect: '${init.switchEffect}',
   slowLandingMs: ${init.slowLandingMs || 2500},
   enableAttempts: (__cfAttempts && __cfAttempts.enable) || 0,
   selectAllScope: '${init.selectAllScope}',
@@ -117,6 +118,13 @@ window.__CF.setChecked = function (id, checked) {
   for (const view of Object.keys(window.__CF.plans)) {
     const p = window.__CF.plans[view].find((x) => String(x.id) === String(id));
     if (p) { p.checked = !!checked; }
+  }
+  render();
+};
+// 测试钩子：移除指定计划（模拟目标行消失 → 状态未知，绝不当作已落地）
+window.__CF.removePlan = function (id) {
+  for (const view of Object.keys(window.__CF.plans)) {
+    window.__CF.plans[view] = window.__CF.plans[view].filter((x) => String(x.id) !== String(id));
   }
   render();
 };
@@ -211,7 +219,23 @@ function bind() {
       const tr = sw.closest('tr');
       const id = tr.getAttribute('data-plan');
       const plan = curPlans().find((x) => String(x.id) === id);
-      if (plan) { plan.checked = !plan.checked; window.__CF.clickLog.push({ type: 'switch', id }); }
+      if (plan) {
+        // 2026-09-16：模拟平台异步落地——点击已派发，开关状态稍后才翻转。
+        // 用于验证"托管开关绝不因异步落地/超时不明而反向切换"。
+        if (window.__CF.switchEffect === 'slow-landing') {
+          window.__CF.clickLog.push({ type: 'switch', id });
+          window.__CF.selected = [];
+          setTimeout(() => {
+            const p2 = curPlans().find((x) => String(x.id) === id);
+            if (p2) p2.checked = !p2.checked;
+            render();
+          }, window.__CF.slowLandingMs || 2500);
+          render();
+          return;
+        }
+        plan.checked = !plan.checked;
+        window.__CF.clickLog.push({ type: 'switch', id });
+      }
       window.__CF.selected = [];
       render();
     };
@@ -250,6 +274,18 @@ function bind() {
             window.__CF.plans[view] = curPlans().filter((p) => !landed.has(String(p.id)));
           } else {
             for (const p of curPlans()) if (landed.has(String(p.id))) p.checked = true;
+          }
+          render();
+        }, window.__CF.slowLandingMs || 2500);
+      }
+      // 暂停侧同一语义（2026-09-16 本轮补齐暂停侧落地确认的回归用）
+      if (/btn-pause$/.test(autoId) && window.__CF.pauseEffect === 'slow-landing') {
+        const landed = new Set(selSet);
+        setTimeout(() => {
+          if (window.__CF.shrink) {
+            window.__CF.plans[view] = curPlans().filter((p) => !landed.has(String(p.id)));
+          } else {
+            for (const p of curPlans()) if (landed.has(String(p.id))) p.checked = false;
           }
           render();
         }, window.__CF.slowLandingMs || 2500);

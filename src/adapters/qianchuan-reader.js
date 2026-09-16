@@ -40,6 +40,7 @@ const { AuthError, DataGuardError } = require('../lib/errors');
 const { parseMoneyCents } = require('../lib/money');
 const { shanghaiDate } = require('../lib/time');
 const { resolveCookieFile } = require('../login/session');
+const { fingerprintFile } = require('../login/cookie-writeback');
 const { closableSideOfAd } = require('./ad-controller');
 
 const HOME_URL = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
@@ -178,6 +179,16 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
   let context = null;
   try {
     const resolved = resolveCookieFile(loginCfg, shopCfg.cookieFile);
+    // 会话 Cookie 回写所需的元信息（2026-09-16 用户明确授权）：
+    // 记录**本次实际加载的精确文件路径**与会话开始时的指纹（size/mtime/sha256）。
+    // 指纹用于回写前的冲突保护：会话期间用户重新登录/其他进程写入 → 保留较新文件。
+    // 这里只记录路径与指纹，不读取、不输出任何 Cookie 值。
+    const cookieSession = {
+      filePath: resolved.path,
+      dir: resolved.dir,
+      readOnly: resolved.readOnly,
+      startFingerprint: fingerprintFile(resolved.path),
+    };
     if (opts.browserFactory) {
       browser = await opts.browserFactory();
     } else {
@@ -211,7 +222,7 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     if (!target.url().includes(QC_HOME_MARKER)) {
       throw new DataGuardError(`点击"巨量千川"后未到达千川（当前: ${target.url()}）；若需额外登录/授权请先人工完成一次`);
     }
-    return { browser, context, page, target };
+    return { browser, context, page, target, cookieSession };
   } catch (e) {
     // 任意初始化失败：关闭本次创建的浏览器，再抛出原始错误
     if (browser) await browser.close().catch(() => {});

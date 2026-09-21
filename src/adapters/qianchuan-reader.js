@@ -168,7 +168,74 @@ function buildCoverage(results, configuredTypes, knownTypes = KNOWN_AD_TYPES) {
   return { coverage, coverageGaps: gaps, complete };
 }
 
+/** 千川首页地址（文档证据：入口新标签 = /home?aavid=<账户ID>）；仅账户ID已知时用于直连兜底。 */
+function qianchuanHomeUrl(shopCfg) {
+  const accountId = shopCfg && shopCfg.accountId ? String(shopCfg.accountId).trim() : '';
+  return `https://qianchuan.jinritemai.com/home${accountId ? `?aavid=${encodeURIComponent(accountId)}` : ''}`;
+}
+
+/** 是否已真正落在千川首页（排除登录/授权中转页，避免把登录页当成功）。 */
+function isQianchuanHomeUrl(u) {
+  return typeof u === 'string' && u.includes(QC_HOME_MARKER) && !/\/login|\/passport|\/signin|sso\.jinritemai/i.test(u);
+}
+
 // ── 页面导航胶水（实机验证；browserFactory 可注入用于测试）─────────
+
+/**
+ * 抖店首页 → 点"巨量千川" → 千川首页（只读导航，有界重试）。
+ *
+ * 2026-09-21 实测：入口点击偶发"点击已派发但既不弹新标签也不导航"（当晚 21:00 实录：
+ * target.url() 仍为 https://fxg.jinritemai.com/ffa/mshop/homepage/index → 整轮
+ * "操作前重新读取"作废、零请求）。同一入口 19:35/20:09/20:42 三轮均正常，属间歇性。
+ * 该步只读，因此：入口点击最多 3 次（每次回抖店首页重试，关掉非千川残留标签），
+ * 仍失败且配置了账户ID时，用文档证据地址直连兜底一次（同 Cookie 上下文）。
+ * 直连同样必须落在千川首页且非登录页；否则如实失败（绝不把空页/登录页当作千川）。
+ *
+ * @returns {{ok:boolean, target?:object, url:string, mode?:string, attempts?:number, reason?:string}}
+ */
+async function reachQianchuanHome({ page, context, shopCfg }) {
+  let lastUrl = null;
+  let lastReason = '点击"巨量千川"后未到达千川';
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (attempt > 1) {
+      await page.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await page.waitForTimeout(3000);
+    }
+    const popupPromise = context.waitForEvent('page', { timeout: 25000 }).catch(() => null);
+    const entry = page.getByText('巨量千川', { exact: false }).first();
+    if ((await entry.count()) === 0) {
+      lastUrl = page.url();
+      lastReason = '抖店首页未找到"巨量千川"入口';
+      continue;
+    }
+    let clickErr = null;
+    try {
+      await entry.click({ timeout: 15000 });
+    } catch (e) {
+      clickErr = e;
+    }
+    const popup = await popupPromise;
+    await page.waitForTimeout(2000);
+    const target = popup && !popup.isClosed() ? popup : page;
+    await target.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+    await target.waitForTimeout(8000);
+    const url = target.url();
+    if (isQianchuanHomeUrl(url)) return { ok: true, target, url, mode: 'entry-click', attempts: attempt };
+    lastUrl = url;
+    lastReason = clickErr ? `点击"巨量千川"未成功：${(clickErr && clickErr.message) || clickErr}` : '点击"巨量千川"后未到达千川';
+    // 非千川的残留标签先关掉，避免干扰下一次尝试（主页面保留）
+    if (target !== page) await target.close().catch(() => {});
+  }
+  if (shopCfg && shopCfg.accountId) {
+    await page.goto(qianchuanHomeUrl(shopCfg), { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    await page.waitForTimeout(6000);
+    const url = page.url();
+    if (isQianchuanHomeUrl(url)) return { ok: true, target: page, url, mode: 'direct-home-url', attempts: 4 };
+    lastUrl = url;
+    lastReason = `${lastReason}（直连千川首页兜底亦未到达）`;
+  }
+  return { ok: false, url: lastUrl || (page.url && page.url()) || '', reason: lastReason };
+}
 
 /**
  * Cookie → 抖店首页 → 登录检查 → 点"巨量千川" → 千川落地页。
@@ -208,21 +275,12 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     if (!page.url().includes('fxg.jinritemai.com/ffa/mshop/homepage')) {
       throw new AuthError(`登录失效：抖店主页面未进入登录后地址（当前 ${page.url()}），请重新扫码登录`);
     }
-    const popupPromise = context.waitForEvent('page', { timeout: 25000 }).catch(() => null);
-    const entry = page.getByText('巨量千川', { exact: false }).first();
-    if ((await entry.count()) === 0) {
-      throw new DataGuardError('抖店首页未找到"巨量千川"入口');
+    const reached = await reachQianchuanHome({ page, context, shopCfg });
+    if (!reached.ok) {
+      throw new DataGuardError(`${reached.reason}（当前: ${reached.url}）；若需额外登录/授权请先人工完成一次`);
     }
-    await entry.click({ timeout: 15000 });
-    const popup = await popupPromise;
-    await page.waitForTimeout(2000);
-    const target = popup && !popup.isClosed() ? popup : page;
-    await target.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-    await target.waitForTimeout(8000);
-    if (!target.url().includes(QC_HOME_MARKER)) {
-      throw new DataGuardError(`点击"巨量千川"后未到达千川（当前: ${target.url()}）；若需额外登录/授权请先人工完成一次`);
-    }
-    return { browser, context, page, target, cookieSession };
+    const target = reached.target;
+    return { browser, context, page, target, cookieSession, navMode: reached.mode };
   } catch (e) {
     // 任意初始化失败：关闭本次创建的浏览器，再抛出原始错误
     if (browser) await browser.close().catch(() => {});

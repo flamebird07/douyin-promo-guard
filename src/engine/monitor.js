@@ -137,6 +137,10 @@ class Monitor {
     // 不持久化：重启后清空，避免把上一进程的凭据状态当作本次会话的事实。
     this.lastCookieWriteback = null;
     this.enablePhase = loaded.enablePhase || {};
+    // 广告开/关状态标记（2026-09-21，每日 07:00 开启前置门依据）：
+    // 仅由**回读确认**的批次更新（暂停确认→off；开启确认→on），持久化跨重启。
+    // 未知/失败批次不更新（不臆断）；无记录 → 前置门不拦（照常执行开启，fail-closed）。
+    this.adBelief = loaded.adBelief || {};
     // 独立停用标记持久化（重启后不得"复活"用户明确停用的每日开启任务）
     if (loaded.enableScheduler && typeof loaded.enableScheduler === 'object') {
       this._enableSchedule.stoppedByUser = loaded.enableScheduler.stoppedByUser === true;
@@ -237,6 +241,7 @@ class Monitor {
         version: STATE_VERSION,
         batches: this.batches,
         enablePhase: this.enablePhase || {},
+        adBelief: this.adBelief || {},
         enableScheduler: {
           stoppedByUser: this._enableSchedule.stoppedByUser === true,
           stoppedAt: this._enableSchedule.stoppedAt || null,
@@ -456,6 +461,91 @@ class Monitor {
   }
 
   // ── 启动/停止 ────────────────────────────────────────────────────
+
+  /**
+   * 运行时调整 wholeShopCostPerOrder 阈值（2026-09-21 页面控制入口）。
+   * - 校验：整数分 1–1000000（0.01–10000 元/单）；
+   * - 内存立即生效（后续巡查/操作前复核用同一份 this.config.rules）；
+   * - 落盘回 cfgResult.sourcePath 指向的 config.json（保留 _说明 键）；
+   *   落盘失败不回滚内存值，但如实返回 persisted:false。
+   */
+  setRuleThreshold(thresholdCents) {
+    const n = Math.floor(Number(thresholdCents));
+    if (!Number.isFinite(n) || n < 1 || n > 1000000) {
+      return { ok: false, reason: '阈值无效：需为 0.01–10000 元/单（整数分 1–1000000）' };
+    }
+    const rules = this.config.rules || [];
+    const rule = rules.find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
+    if (!rule) return { ok: false, reason: '配置缺少启用的 wholeShopCostPerOrder 规则，无法调整' };
+    const old = rule.thresholdCents;
+    if (old === n) return { ok: true, thresholdCents: n, unchanged: true };
+    rule.thresholdCents = n;
+    let persisted = false;
+    const cfgPath = (this.cfgResult && this.cfgResult.sourcePath) || null;
+    if (cfgPath && typeof cfgPath === 'string' && cfgPath.endsWith('.json')) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+        const target = (raw.rules || []).find((r) => r.type === 'wholeShopCostPerOrder');
+        if (target) {
+          target.thresholdCents = n;
+          fs.writeFileSync(cfgPath, JSON.stringify(raw, null, 2) + '\n');
+          persisted = true;
+        }
+      } catch (e) {
+        this._memPush(this.recentErrors, { scope: 'rule', error: `阈值落盘失败（内存已生效）：${e.message}` }, undefined, 'error');
+      }
+    }
+    this._audit({ kind: 'rule', change: 'threshold', from: old, to: n, persisted });
+    try { log.info(`阈值调整：${old} 分 → ${n} 分${persisted ? '（已落盘）' : '（仅内存，未落盘）'}`); } catch (_) { /* 日志失败不影响 */ }
+    return { ok: true, thresholdCents: n, from: old, persisted };
+  }
+
+  /**
+   * 立即执行一次完整巡查并按当前时间重排下次检查（2026-09-21 阈值确认联动）。
+   *
+   * 与 pollOnce(trigger='manual') 的区别：手动轮询走独立路径，_intervalLoop 挂起的
+   * delay 定时不受影响——下一次定时检查仍在旧节奏上。本方法在 pollOnce 成功后
+   * **取消当前挂起的等待并以"本次巡查完成时刻"为新基准**重排：下次检查 = 完成 + 30 分钟
+   * （跨日仍按 enableHour/dailyStartHour 规则，由 nextIntervalDelayMs 统一处理）。
+   *
+   * 实现方式：发出 _rescheduleRequest 令牌后，_intervalLoop 当前挂起的 delayFn 以**缩短的
+   * 剩余时长**提前返回（delayFn 包装层监听令牌；生产 delayFn 为 setTimeout 链，直接缩短
+   * 无法取消，故采用"挂起前登记 deadline、令牌到达时 recompute"的方式不可行——
+   * 简化：巡查完成后把 nextRunAt 立即改写为完成+interval，并请求中断当前 delay：
+   * _intervalLoop 每次从 delayFn 返回后都会按 this.schedule.nextRunAt 重新校准（见
+   * _resyncAfterInterrupt），因此这里直接触发一次带触发标 pollOnce + 改写 nextRunAt 即可，
+   * 挂起的旧 delay 到期时循环发现 triggerPending 会跳过那次空转。
+   */
+  async pollNowAndReschedule(trigger = 'threshold-change') {
+    let r = await this.pollOnce(trigger);
+    // 2026-09-21：已有周期进行中（如首轮巡查刚被阈值确认触发）→ 等它结束后再执行
+    // 联动巡查，绝不静默跳过（用户点"确定"就是要求立刻按新阈值跑一轮）。
+    // 有界等待：最长等一个间隔周期，防止异常长周期把 HTTP 请求吊死。
+    if (!r.ok && /已有轮询周期进行中/.test(r.reason || '')) {
+      const sch = this.config.schedule;
+      const deadline = this.nowFn() + Math.max(2 * 60 * 1000, (sch.intervalMinutes || 30) * 60 * 1000);
+      while (!r.ok && this.nowFn() < deadline && this.running) {
+        await new Promise((res) => setTimeout(res, 1000));
+        r = await this.pollOnce(trigger);
+      }
+    }
+    if (!r.ok) return r;
+    // 以本次巡查**完成时刻**为新基准重排：下次 = 完成 + intervalMinutes
+    const lastRun = this.nowFn();
+    this.lastCycleAt = new Date(lastRun).toISOString();
+    const sch = this.config.schedule;
+    const enableHour = this._enableHour();
+    const nd = nextIntervalDelayMs(this.nowFn(), lastRun, sch.intervalMinutes, sch.dailyStartHour, this._enableWindowConfigured() ? enableHour : undefined);
+    this.schedule.lastRunAt = new Date(lastRun).toISOString();
+    this.schedule.nextRunAt = new Date(nd.nextRunAt).toISOString();
+    this.schedule.waitingFor08 = nd.crossDay;
+    this.schedule.phase = nd.crossDay ? 'waiting_window' : this.schedule.phase === 'running' ? 'running' : this.schedule.phase;
+    // 通知挂起的旧 delay：被本次重排取代。_intervalLoop 在 delay 返回后检查
+    // this._scheduleEpoch，不一致则丢弃本轮旧节奏、立即进入循环头重新计算。
+    this._scheduleEpoch = (this._scheduleEpoch || 0) + 1;
+    return { ...r, nextRunAt: this.schedule.nextRunAt, rescheduled: true };
+  }
+
   start() {
     if (this.pending.length > 0) {
       return { ok: false, reason: `存在待配置/非法配置项，不允许启动监控: ${this.pending.join('；')}` };
@@ -767,11 +857,25 @@ class Monitor {
       if (gen !== this._gen || !this.running) return;
       const lastRun = this.nowFn();
       this.schedule.lastRunAt = new Date(lastRun).toISOString();
+      const epochBefore = this._scheduleEpoch || 0;
       const nd = nextIntervalDelayMs(this.nowFn(), lastRun, sch.intervalMinutes, sch.dailyStartHour, enableWindow ? enableHour : undefined);
       this.schedule.nextRunAt = new Date(nd.nextRunAt).toISOString();
       this.schedule.waitingFor08 = nd.crossDay; // 跨日 → 等待次日 enableHour（或 startHour）
       if (nd.crossDay) this.schedule.phase = 'waiting_window';
       await this.delayFn(nd.delayMs, gen);
+      // 2026-09-21：挂起等待期间发生了阈值联动重排（pollNowAndReschedule 已自行执行过
+      // 一次完整巡查并改写 nextRunAt）→ 旧节奏作废：补等"当前时刻 → 新 nextRunAt"的
+      // 剩余时长后回循环头（绝不立即再执行一次多余巡查）。真实场景剩余 >0；
+      // 时钟快进已越过新 nextRunAt 时剩余 0 → 直接回头按到期处理（与定时巡查等价）。
+      if ((this._scheduleEpoch || 0) !== epochBefore) {
+        const targetMs = Date.parse(this.schedule.nextRunAt || '');
+        const remainMs = Number.isFinite(targetMs) ? Math.max(0, targetMs - this.nowFn()) : 0;
+        if (remainMs > 0) {
+          this.schedule.lastWindowBlockReason = `阈值联动重排生效：旧等待作废，改等新调度 ${this.schedule.nextRunAt}`;
+          await this.delayFn(remainMs, gen);
+        }
+        continue;
+      }
     }
   }
 
@@ -1165,6 +1269,19 @@ class Monitor {
     const enableHour = this._enableHour();
     const today = businessDate || shanghaiDate(this.nowFn());
 
+    // 2026-09-21 用户要求：每日 07:00 自动开启只在"未开启"时执行。已确认处于投放侧
+    //（上次回读确认开启后无暂停记录，adBelief.on=true）→ 跳过整个开启进程：
+    // 不开浏览器、不进乘方页、零请求；登记当日相位为 success（目标状态已达成，
+    // 页面/日志可见"跳过"原因）。无记录/已暂停/未知 → 照常执行（fail-closed）。
+    const belief = (this.adBelief || {})[shopCfg.id];
+    if (this.realMode && belief && belief.on === true) {
+      const reason = `已在投放中（${belief.evidence}，${belief.at || '—'}），无需开启：跳过开启进程（不打开浏览器、零请求）`;
+      this._setEnablePhase(shopCfg.id, today, 'success', { phase: 'precheck', reason });
+      this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-already-on', note: reason, beliefAt: belief.at });
+      try { log.info(`每日开启跳过（${shopCfg.id}）：${reason}`); } catch (_) { /* 日志失败不影响 */ }
+      return { status: 'ok', skipped: true, reason };
+    }
+
     // 第 3 项：执行前记录 in_progress（区分"执行中"），成功/失败/未知分别落状态。
     // 重启时 in_progress → unknown（见 _reconcileEnablePhaseOnBoot），不会重复开启。
     const prevRec = this.getEnablePhaseRecord(shopCfg.id, today);
@@ -1468,6 +1585,14 @@ class Monitor {
       this.lastCookieWriteback = { ...batch.cookieWriteback, at: new Date(this.nowFn()).toISOString(), shopId };
     }
     this.batches[shopId][date] = rec;
+    // 2026-09-21：广告开/关状态标记（每日 07:00 开启前置门依据）。
+    // 只有**回读确认**的批次才更新：暂停确认（含 nothing_to_pause 只读核验）→ 关；
+    // 开启确认（含 nothing_to_enable）→ 开。partial/unknown 不更新（不臆断）。
+    if (batch.allPausedConfirmed === true) {
+      this.adBelief[shopId] = { on: false, at: rec.lastBatchAt, evidence: batch.outcome === 'nothing_to_pause' ? '只读核验确认全部已暂停' : '暂停批次回读确认全部已暂停' };
+    } else if (batch.allEnabledConfirmed === true) {
+      this.adBelief[shopId] = { on: true, at: rec.lastBatchAt, evidence: batch.outcome === 'nothing_to_enable' ? '只读核验确认全部已开启' : '开启批次回读确认全部已开启' };
+    }
     this._pruneBatches();
     this._saveState();
   }

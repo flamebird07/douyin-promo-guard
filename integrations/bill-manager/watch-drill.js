@@ -48,6 +48,7 @@ const promo = (rel) => require(path.join(PROMO_GUARD_DIR, rel));
 
 const { shanghaiDate, shanghaiClockText } = promo('src/lib/time.js');
 const { centsToYuan } = promo('src/lib/money.js');
+const { compactUrls } = promo('src/lib/log.js');
 
 const STATUS_TEXT = {
   idle: '未启动',
@@ -63,12 +64,41 @@ const STATUS_TEXT = {
 
 // ── 敏感信息 scrubbing（与 server.js 同策略；日志永不写 Cookie 值）────────────
 // 值匹配要求"不是中文开头"，避免把「Cookie 过期」这类正常说明文本整段吞掉。
+// 2026-09-21：附带压缩超长 URL（千川管理页带大量 utm/埋点参数，单条可达数千字符）。
 function scrub(msg) {
   let s = typeof msg === 'string' ? msg : String(msg);
   s = s
     .replace(/((?:cookie|token|secret|password|passwd|pwd|app_secret|api_key|apikey)[=:\s"']+)(?![\u4e00-\u9fff])([^\s"',}{]{6,})/gi, '$1***')
     .replace(/(Bearer\s+)(?![\u4e00-\u9fff])[^\s]{20,}/gi, '$1***');
+  s = compactUrls(s);
   return s.replace(/[\r]/g, '').replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, '').slice(0, 2000);
+}
+
+/**
+ * 从今日暂停批次与每日开启记录推导广告当前开/关（2026-09-21 页面主信息）。
+ * 依据是**本系统的执行记录**：最近一次回读确认的全量暂停 → 已暂停；其后若每日开启
+ * 成功（跨日 07:00）→ 投放中；均无记录 → 未知。人工在千川端的开关不在此感知范围内
+ * （下一轮巡查/批次回读会重新核对）。导出供测试直接覆盖各分支。
+ */
+function deriveAdState(status, shop) {
+  const b = shop && shop.batchToday;
+  const pausedAt = b && b.allPausedConfirmed === true ? (b.lastBatchAt || null) : null;
+  let enabledAt = null;
+  let enabledTs = -Infinity;
+  for (const it of (status && status.monitor && status.monitor.enablePhaseToday) || []) {
+    const r = it.record || {};
+    if (r.status === 'success' && r.at) {
+      const t = Date.parse(r.at);
+      if (!Number.isNaN(t) && t > enabledTs) { enabledTs = t; enabledAt = r.at; }
+    }
+  }
+  const pt = pausedAt ? Date.parse(pausedAt) : NaN;
+  const et = enabledAt ? Date.parse(enabledAt) : NaN;
+  if (pausedAt && !Number.isNaN(pt) && (Number.isNaN(et) || pt >= et)) {
+    return { on: false, at: pausedAt, note: '已暂停' };
+  }
+  if (enabledAt && !Number.isNaN(et)) return { on: true, at: enabledAt, note: '投放中' };
+  return { on: null, at: null, note: '未知' };
 }
 
 function createWatchDrill(opts = {}) {
@@ -146,6 +176,107 @@ function createWatchDrill(opts = {}) {
       } catch (_) { /* 持久化失败不影响运行 */ }
     }
     return e;
+  }
+
+  // ── 飞书通知（Hermes send；每轮巡查判断数据一条）────────────────────────
+  // 链路：判断事件（每 30 分钟一轮，evtSeq 幂等去重）→ `hermes send --to <target>`
+  // → Hermes 用其已绑定的飞书机器人投递。只发费用/订单/判定的文本摘要，
+  // 绝不含 Cookie/密钥；发送失败只记 warn 日志并在 state.notify 如实展示，
+  // 绝不影响值守调度本身。
+  // 默认关闭：由生产装配方（server.js）显式开启，测试/公开仓库副本不触发真实发送。
+  // 目标与 hermes 路径可用环境变量覆盖（WATCH_NOTIFY_TARGET / HERMES_BIN）。
+  const notifyOverride = opts.notify || {};
+  const notifyCfg = Object.assign({
+    enabled: false,
+    target: process.env.WATCH_NOTIFY_TARGET || 'feishu:oc_3f06614a465eef6c86262bc33677d9c9',
+    timeoutMs: 20000,
+  });
+  for (const k of Object.keys(notifyOverride)) {
+    if (notifyOverride[k] !== undefined) notifyCfg[k] = notifyOverride[k];
+  }
+  function resolveHermesBin() {
+    const candidates = [process.env.HERMES_BIN, 'C:/Users/Administrator/.local/bin/hermes.exe'].filter(Boolean);
+    for (const c of candidates) {
+      try { if (fs.existsSync(c)) return c; } catch (_) { /* 换下一个 */ }
+    }
+    return 'hermes'; // 交给 PATH 解析（公开仓库副本的机器）
+  }
+  drill._notify = {
+    enabled: notifyCfg.enabled === true,
+    target: notifyCfg.target,
+    lastCycleNo: 0,
+    lastAt: null,
+    lastStatus: null, // 'ok' | 'failed'
+    lastError: null,
+  };
+
+  function defaultSpawnNotify(args, input) {
+    return new Promise((resolve) => {
+      let child;
+      try {
+        child = require('child_process').spawn(resolveHermesBin(), args, { windowsHide: true });
+      } catch (e) {
+        return resolve({ code: -1, stderr: String((e && e.message) || e) });
+      }
+      let err = '';
+      const timer = setTimeout(() => { try { child.kill(); } catch (_) { /* 已退出 */ } }, notifyCfg.timeoutMs);
+      child.stderr.on('data', (d) => { err += String(d); if (err.length > 4000) err = err.slice(-4000); });
+      child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, stderr: String((e && e.message) || e) }); });
+      child.on('close', (code) => { clearTimeout(timer); resolve({ code, stderr: err }); });
+      child.stdin.on('error', () => { /* hermes 提前退出时的 EPIPE：结果以 close 为准 */ });
+      child.stdin.end(input);
+    });
+  }
+  const spawnNotify = opts.notifySpawn || defaultSpawnNotify;
+
+  /** 组装一轮判断数据的推送文案（纯文本；只含业务数字，无敏感信息）。 */
+  function judgementNotify(j) {
+    const at = j.at ? shanghaiClockText(new Date(j.at).getTime()) : '—';
+    const lines = [];
+    if (j.status === 'blocked') {
+      lines.push(`第 ${j.cycleNo} 轮巡查被拦下，未得出费用/订单结论`);
+      lines.push(`原因：${j.reason || '未知'}`);
+    } else {
+      const cost = j.costCents == null ? '—' : `${centsToYuan(j.costCents)} 元`;
+      const orders = j.orders == null ? '—' : `${j.orders} 单`;
+      const perOrder = j.perOrderText || '—';
+      lines.push(`第 ${j.cycleNo} 轮巡查数据（业务日期 ${j.businessDate || '—'}）`);
+      lines.push(`店铺：${drill.shopName}`);
+      lines.push(`当天费用：${cost} ｜ 全店订单：${orders} ｜ 每单成本：${perOrder}`);
+      if (j.over === true) {
+        lines.push(`判定：超标（${j.costCents} 分 > ${j.orders}×${j.thresholdCents} 分）→ 触发暂停乘方`);
+      } else {
+        lines.push(`判定：未超标（${j.costCents} 分 ≤ ${j.orders}×${j.thresholdCents} 分），不暂停乘方`);
+      }
+    }
+    lines.push(`巡查时间：${at}`);
+    const head = j.status === 'blocked' ? '本轮被拦下' : (j.over === true ? '超标⚠' : '未超标');
+    return {
+      subject: `[推广值守] 第${j.cycleNo}轮 ${head}`,
+      body: lines.join('\n'),
+    };
+  }
+
+  async function notifyJudgement(j) {
+    const n = drill._notify;
+    if (!n.enabled || !j) return;
+    const cycleNo = typeof j.cycleNo === 'number' ? j.cycleNo : 0;
+    if (cycleNo && cycleNo <= n.lastCycleNo) return; // 幂等：同一轮只推一次
+    if (cycleNo) n.lastCycleNo = cycleNo;
+    const { subject, body } = judgementNotify(j);
+    const r = await spawnNotify(
+      ['send', '--to', n.target, '--subject', subject, '--file', '-'],
+      body + '\n'
+    );
+    n.lastAt = new Date(drill._now()).toISOString();
+    if (r && r.code === 0) {
+      n.lastStatus = 'ok';
+      n.lastError = null;
+    } else {
+      n.lastStatus = 'failed';
+      n.lastError = scrub(String((r && (r.stderr || r.error)) || `hermes send 退出码 ${r ? r.code : '未知'}`));
+      pushLog('warn', `飞书通知发送失败（第 ${j.cycleNo} 轮）：${n.lastError.slice(0, 200)}`);
+    }
   }
 
   // ── 真实执行门槛快照（fail-closed 依据；界面必须可见）─────────────────────
@@ -548,6 +679,11 @@ function createWatchDrill(opts = {}) {
       st.cookieWriteback = status.monitor.cookieWriteback || null;
       st.polling = status.monitor.polling || (drill.state.gates && drill.state.gates.polling) || null;
       st.running = m.running === true;
+      // 广告开/关状态（2026-09-21 页面主信息）：从今日暂停批次与每日开启记录推导
+      st.adState = deriveAdState(status, (status.shops || [])[0]);
+      // 当前生效阈值（wholeShopCostPerOrder，整数分；页面阈值控件回显）
+      const thrRule = (status.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
+      st.thresholdCents = thrRule ? thrRule.thresholdCents : null;
       // roundNo 取 Monitor 的真实周期号（每个完整 pollOnce 递增一次）
       const mCycleNo = (status.monitor && status.monitor.cycleNo) || m.cycleNo || 0;
       if (typeof mCycleNo === 'number' && mCycleNo >= 0) st.roundNo = mCycleNo;
@@ -627,6 +763,8 @@ function createWatchDrill(opts = {}) {
           if (isJudgement) {
             // 每个完整周期一条；超出缓存后仍能继续接收（evtSeq 游标）
             pushLog(evt.over === true ? 'warn' : 'info', describeJudgement(evt));
+            // 飞书通知：同一轮只推一次（cycleNo 幂等），失败只记日志不影响值守
+            notifyJudgement(evt).catch(() => {});
           } else if (isBatch) {
             // 批次结果事件（重试/回读结论随 outcome/confirmReason/remaining 一并进入日志）
             const kind = actionKindOf(evt);
@@ -735,6 +873,9 @@ function createWatchDrill(opts = {}) {
     if (!drill._syncTimer) {
       drill._syncTimer = setInterval(() => { try { syncFromMonitor(); } catch (_) { /* 后台同步失败不影响运行 */ } }, 60 * 1000);
       if (typeof drill._syncTimer.unref === 'function') drill._syncTimer.unref();
+    }
+    if (drill._notify.enabled) {
+      pushLog('info', `飞书通知已启用：每轮巡查数据经 Hermes（hermes send）推送至 ${drill._notify.target}；发送失败只记日志，不影响值守。`);
     }
     syncFromMonitor();
     return snapshot();
@@ -879,6 +1020,20 @@ function createWatchDrill(opts = {}) {
       // 事件流游标（供界面/排障核对"日志是否真的连续"）
       evtSeq: m ? (m._evtSeq || 0) : 0,
       consumedEvtSeq: drill._lastEvtSeq,
+      // 飞书通知（Hermes send）最近状态
+      notify: {
+        enabled: drill._notify.enabled,
+        target: drill._notify.target,
+        lastCycleNo: drill._notify.lastCycleNo,
+        lastAt: drill._notify.lastAt,
+        lastStatus: drill._notify.lastStatus,
+        lastError: drill._notify.lastError,
+      },
+      // 广告开/关状态（今日执行记录推导）与当前生效阈值（页面主信息/控件回显）
+      adState: st.adState || null,
+      threshold: st.thresholdCents != null
+        ? { cents: st.thresholdCents, yuan: st.thresholdCents / 100 }
+        : null,
     };
   }
 
@@ -927,6 +1082,12 @@ function createWatchDrill(opts = {}) {
       res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(obj));
     };
+    const readBody = (r) => new Promise((resolve) => {
+      let raw = '';
+      r.on('data', (c) => { raw += c; if (raw.length > 10000) r.destroy(); });
+      r.on('end', () => { try { resolve(raw ? JSON.parse(raw) : null); } catch (_) { resolve(null); } });
+      r.on('error', () => resolve(null));
+    });
     let url;
     try { url = new URL(req.url, 'http://localhost'); } catch (_) { return send(400, { error: 'URL 非法' }); }
     const p = url.pathname;
@@ -936,6 +1097,37 @@ function createWatchDrill(opts = {}) {
       // 独立每日开启任务控制（与"启动值守"完全分离；页面提供独立按钮）
       if (p === '/api/watch-drill/daily-enable/start' && req.method === 'POST') return send(200, { ok: true, state: startEnableScheduler() });
       if (p === '/api/watch-drill/daily-enable/stop' && req.method === 'POST') return send(200, { ok: true, state: stopEnableScheduler() });
+      // 阈值调整（2026-09-21）：body 为 { thresholdCents } 或 { yuan }；点「确定」后才生效并落盘
+      if (p === '/api/watch-drill/threshold' && req.method === 'POST') {
+        const body = await readBody(req);
+        let cents = null;
+        if (body && body.thresholdCents != null) cents = Number(body.thresholdCents);
+        else if (body && body.yuan != null) cents = Math.round(Number(body.yuan) * 100);
+        if (cents == null || !Number.isFinite(cents)) {
+          return send(400, { ok: false, error: '缺少有效阈值（thresholdCents 或 yuan）' });
+        }
+        const m2 = ensureMonitor();
+        const r = m2.setRuleThreshold(cents);
+        // 2026-09-21 用户要求：阈值确认后**立即**做一次数据抓取+判定+操作，并按当前
+        // 时间重排下次半小时检查（pollNowAndReschedule：完成+30 分钟，跨日规则不变）。
+        // 仅在阈值确实变化时触发（unchanged/失败不空跑巡查）；触发结果如实记日志，
+        // 巡查失败不影响阈值本身已生效。
+        let poll = null;
+        if (r.ok && !r.unchanged && m2.running) {
+          try {
+            poll = await m2.pollNowAndReschedule('threshold-change');
+            pushLog('info', `阈值变更联动巡查：${poll.ok ? `已完成（周期 ${poll.cycleNo}），下次检查 ${poll.nextRunAt ? poll.nextRunAt.replace('T', ' ').slice(0, 19) : '—'}（以本次完成时间为基准重排）` : `未执行：${poll.reason}`}`);
+          } catch (e) {
+            poll = { ok: false, reason: String((e && e.message) || e) };
+            pushLog('warn', `阈值变更联动巡查失败：${poll.reason}（定时巡查不受影响）`);
+          }
+        }
+        syncFromMonitor();
+        pushLog(r.ok ? 'info' : 'warn', `阈值调整${r.ok ? '成功' : '失败'}：${r.ok ? `${r.from}分 → ${r.thresholdCents}分（${r.persisted ? '已落盘，重启后保持' : '仅内存生效（未落盘）'}）` : r.reason}`);
+        return send(200, r.ok
+          ? { ok: true, result: r, poll: poll ? { ok: !!poll.ok, cycleNo: poll.cycleNo, nextRunAt: poll.nextRunAt, reason: poll.reason } : null, state: snapshot() }
+          : { ok: false, error: r.reason, state: snapshot() });
+      }
       if (p === '/api/watch-drill/state' && req.method === 'GET') { syncFromMonitor(); return send(200, { ok: true, state: snapshot() }); }
       if (p === '/api/watch-drill/logs' && req.method === 'GET') {
         syncFromMonitor();
@@ -984,4 +1176,4 @@ function createWatchDrill(opts = {}) {
   };
 }
 
-module.exports = { createWatchDrill, STATUS_TEXT, scrub };
+module.exports = { createWatchDrill, STATUS_TEXT, scrub, deriveAdState };

@@ -39,13 +39,13 @@ test('配置解析：存在 execution.readback* → 原样生效并标注来源�
 
 test('配置解析：缺失/非法 → 回落内置默认，并如实标注 builtin-default（与 src/config.js DEFAULTS 同值）', () => {
   const r = resolvePollingConfig({});
-  assert.strictEqual(r.timeoutMs, 30000);
+  assert.strictEqual(r.timeoutMs, 120000);
   assert.strictEqual(r.intervalMs, 3000);
   assert.strictEqual(r.timeoutSource, 'builtin-default');
   assert.strictEqual(r.intervalSource, 'builtin-default');
-  assert.deepStrictEqual(POLLING_DEFAULTS, { timeoutMs: 30000, intervalMs: 3000 });
+  assert.deepStrictEqual(POLLING_DEFAULTS, { timeoutMs: 120000, intervalMs: 3000 });
   const bad = resolvePollingConfig({ readbackTimeoutMs: -1, readbackIntervalMs: 'x' });
-  assert.strictEqual(bad.timeoutMs, 30000);
+  assert.strictEqual(bad.timeoutMs, 120000);
   assert.strictEqual(bad.intervalMs, 3000);
 });
 

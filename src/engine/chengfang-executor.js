@@ -31,6 +31,7 @@ const { DataGuardError } = require('../lib/errors');
 const { shanghaiDate } = require('../lib/time');
 const { boundedLandingPoll, resolvePollingConfig } = require('../lib/bounded-poll');
 const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed, buildChengfangRequestGate } = require('./chengfang-gate');
+const { compactUrls } = require('../lib/log');
 
 const MAX_PAGE_VISITS = 20; // 商品自选分页处理/全量回读的翻页硬上限（防失控循环）
 
@@ -92,18 +93,27 @@ async function executeChengfangPause(p) {
     confirmReason: null,
     dryRunTargets: [],     // 演练：将暂停的对象（含动作说明）
     finalVerify: null,
+    // 2026-09-21：已确认目标（`${view}:${planId}` 键）随流程**渐进记录**。
+    // 旧缺陷：finalVerify 只在全量回读（流程第 3 步）成功时才生成；若中途任一环节
+    // 失败（如 09-21 08:34 商品自选回读恢复失败），已确认的全店托管目标也被整体
+    // 记为 unknown（批次显示"已确认 0 / 未知 24"），既误导页面也不利于只对失败
+    // 部分补处理。全量回读成功时会以完整扫描结果覆盖本列表（全量更权威）。
+    targetsConfirmedKeys: [],
     polling: {},           // 各视图落地确认的**实际生效**轮询配置与结果（页面/日志可展示）
     stoppedAfterDispatch: null, // 点击已派发后收到停止时的真实只读确认结果（不谎报失败/成功）
     // 仅在本次浏览器会话内使用：千川提交后若跳回首页，回到这里恢复读取/重试。
     // 不写入审计日志，也不跨批次复用 Cookie 或浏览器。
     managementUrl: null,
   };
+  // 2026-09-21：失败原因统一压缩超长 URL（千川管理页带大量 utm/埋点参数，
+  // 原样进入日志单条可达数千字符，严重干扰阅读；见 src/lib/log.js compactUrls）
   const fail = (view, status, reason) => {
+    const text = compactUrls(reason);
     result.views[view] = result.views[view] || {};
     result.views[view].status = status;
-    result.views[view].reason = reason;
-    result.confirmReason = reason;
-    audit({ kind: 'chengfang', event: 'abort', view, status, reason });
+    result.views[view].reason = text;
+    result.confirmReason = text;
+    audit({ kind: 'chengfang', event: 'abort', view, status, reason: text });
   };
 
   // ── 0. 身份核验 ──────────────────────────────────────────────────
@@ -115,7 +125,7 @@ async function executeChengfangPause(p) {
   result.identity = identity;
   if (typeof page.url === 'function') {
     const currentUrl = page.url();
-    if (typeof currentUrl === 'string' && currentUrl.includes('/uni-prom/overall')) result.managementUrl = currentUrl;
+    if (typeof currentUrl === 'string' && /\/(uni-prom\/overall|overall-prom)/.test(currentUrl)) result.managementUrl = currentUrl;
   }
   audit({ kind: 'chengfang', event: 'identity', ok: true, accountId: identity.pageAccountId });
 
@@ -171,6 +181,13 @@ function tuoguanCount(result) {
 }
 function zixuanCount(result) {
   return (result.views.zixuan && result.views.zixuan.confirmedCount) || 0;
+}
+
+/** 渐进记录一个已确认目标（幂等；键 = `${view}:${planId}`，与 finalVerify 同构）。 */
+function markTargetConfirmed(result, view, planId) {
+  const key = `${view}:${planId}`;
+  if (!result.targetsConfirmedKeys) result.targetsConfirmedKeys = [];
+  if (!result.targetsConfirmedKeys.includes(key)) result.targetsConfirmedKeys.push(key);
 }
 
 // ── 全店托管：读取开关状态；已关闭跳过；开启才关闭 ──────────────────
@@ -266,6 +283,7 @@ async function pauseTuoguan({ controller, page, result, dryRun, requestGate, fai
       return false;
     }
     audit({ kind: 'chengfang', event: 'paused', view: '全店托管', planId: r.id, confirmed: true, note: clickError ? '点击结果曾未知，回读确认已关闭' : undefined });
+    markTargetConfirmed(result, '全店托管', r.id);
     if (landing.poll.stopped) {
       // 停止信号：本次已派发请求已按真实回读确认；不再重试、不再发出任何新业务请求。
       result.stoppedAfterDispatch = {
@@ -371,7 +389,12 @@ async function pauseZixuan({ controller, page, shopCfg, result, dryRun, requestG
 
   result.views.zixuan.status = V_PAUSED;
   result.views.zixuan.processedCount = processed.size;
-  result.views.zixuan.note = `已确认暂停 ${processed.size} 个商品自选计划（100条/页，稳定ID去重）`;
+  result.views.zixuan.note = processed.size > 0
+    ? `已确认暂停 ${processed.size} 个商品自选计划（100条/页，稳定ID去重）`
+    : `全部商品自选计划已处于关闭侧（本轮只读核验全部页，未点击任何开关/批量暂停）`;
+  if (processed.size === 0) {
+    audit({ kind: 'chengfang', event: 'view', view: '商品自选', status: V_ALREADY_PAUSED, note: '幂等跳过：无开启中的商品自选计划（成功之后不重复暂停）' });
+  }
   return true;
 }
 
@@ -433,8 +456,16 @@ function classifyLanding(rows, targetIds, wantChecked) {
 async function confirmLanding(o) {
   const { controller, page, view, targetIds, wantChecked, config, stopRequested, audit, eventKind } = o;
   const polling = resolvePollingConfig(config && config.execution);
-  const poll = await boundedLandingPoll({
-    read: async () => {
+  // 在途读取句柄：轮询超时是"截止时间到了就返回"，被放弃的读取其实仍在跑。
+  // 记下它，超时后**有界等待它落定**（而不是再起一个并发读取——并发峰值必须 ≤1）。
+  let pendingRead = null;
+  const readOnce = async () => {
+    const p = (async () => {
+      // 2026-09-21：新 UI 列表为 URL 快照，同页重复读取不会更新 → 回读前强制刷新
+      // （旧 UI/无该方法时为空操作，语义不变）。
+      if (controller.refreshView) {
+        await controller.refreshView({ page, tab: view });
+      }
       const v = await readViewFor(controller, page, view);
       if (!v) {
         const e = new Error(`${view}强制新扫描回读失败`);
@@ -442,7 +473,16 @@ async function confirmLanding(o) {
         throw e;
       }
       return v;
-    },
+    })();
+    pendingRead = p;
+    try {
+      return await p;
+    } finally {
+      if (pendingRead === p) pendingRead = null;
+    }
+  };
+  const poll = await boundedLandingPoll({
+    read: readOnce,
     isPending: (v) => landingPending(v.rows, targetIds, wantChecked),
     timeoutMs: polling.timeoutMs,
     intervalMs: polling.intervalMs,
@@ -454,9 +494,38 @@ async function confirmLanding(o) {
       timeoutMs: polling.timeoutMs, intervalMs: polling.intervalMs, ...info,
     }),
   });
+  // 截止时间恰好落在一次读取中间时，轮询会带着"在途读取未落定"返回 → 调用方的
+  // landingStateTrustworthy 判为"最新状态未知"，直接放弃重试（新 UI 每次回读都含页面刷新、
+  // 单次读取更慢，命中概率显著上升；09-21 21:32 实录）。这里在**不新增并发**的前提下，
+  // 有界等待那次在途读取落定，拿到最新完成快照后再交回调用方判定。
+  const trust0 = landingStateTrustworthy(poll);
+  let finalRead = null;
+  if ((!poll.value || !trust0.trustworthy) && !poll.stopped && pendingRead) {
+    const settleWaitMs = Math.min(Math.max(polling.intervalMs * 4, 5000), 15000);
+    const settled = await Promise.race([
+      pendingRead.then((v) => ({ ok: true, v })).catch((e) => ({ ok: false, reason: String(e.reason || e.message) })),
+      new Promise((r) => setTimeout(() => r({ ok: false, timeout: true }), settleWaitMs)),
+    ]);
+    if (settled.ok) {
+      poll.value = settled.v;
+      poll.inFlight = false;
+      poll.lastReadFailed = false;
+      poll.valueStale = false;
+      finalRead = { ok: true, mode: 'awaited-inflight' };
+    } else {
+      finalRead = { ok: false, reason: settled.timeout ? `在途读取未在 ${settleWaitMs}ms 内落定` : settled.reason };
+      if (!settled.timeout) poll.inFlight = false; // 读取确实以失败告终 → 如实登记
+    }
+    audit({
+      kind: eventKind, event: 'landing-final-read', view,
+      ok: !!(finalRead && finalRead.ok), reason: (finalRead && finalRead.reason) || null,
+      settleWaitMs, mode: (finalRead && finalRead.mode) || null,
+      note: '轮询结束后有界等待在途读取落定（不新增并发读取），以最新完成快照判定是否可重试',
+    });
+  }
   const rows = poll.value ? (poll.value.rows || []) : null;
   const cls = rows ? classifyLanding(rows, targetIds, wantChecked) : { confirmed: [], failed: [], notFound: [] };
-  return { polling, poll, rows, ...cls };
+  return { polling, poll, rows, finalRead, ...cls };
 }
 
 /** 落地轮询结果 → 结果对象的可展示摘要（不含 Cookie 值/敏感数据）。 */
@@ -665,7 +734,10 @@ async function pausePageTargets({ controller, page, shopCfg, targets, rows, resu
   const postRows = landing.rows;
   const failed = landing.failed;
   const notFound = landing.notFound;
-  for (const id of landing.confirmed) processed.add(id);
+  for (const id of landing.confirmed) {
+    processed.add(id);
+    markTargetConfirmed(result, '商品自选', id);
+  }
   for (const id of notFound) {
     if (!result.notFoundIds.includes(id)) result.notFoundIds.push(id);
   }
@@ -706,7 +778,10 @@ async function pausePageTargets({ controller, page, shopCfg, targets, rows, resu
       });
       if (!retryPlan.ok) return false;
       if (retryPlan.landed.length > 0) {
-        for (const id of retryPlan.landed) processed.add(id);
+        for (const id of retryPlan.landed) {
+          processed.add(id);
+          markTargetConfirmed(result, '商品自选', id);
+        }
         audit({
           kind: 'chengfang', event: 'retry-skipped', view: '商品自选',
           note: `重试前重新核验：${retryPlan.landed.length} 个目标已落地（回读确认关闭），不再重发`,
@@ -755,6 +830,9 @@ async function prepareRetry(o) {
     fail('zixuan', V_PARTIAL_FAILED, `重试前身份复核不通过（不再重发）：${(id && id.reason) || '未知'}`);
     return { ok: false };
   }
+  // 2026-09-21：新 UI 列表是 URL 快照——重试判定前必须刷新，否则用陈旧快照重发
+  // （旧 UI/无该方法时为空操作）。
+  if (controller.refreshView) await controller.refreshView({ page, tab: '商品自选' }).catch(() => {});
   const fresh = await readViewFor(controller, page, '商品自选');
   if (!fresh) {
     fail('zixuan', V_PARTIAL_FAILED, '重试前重新读取商品自选视图失败：结果未知，不重试');
@@ -794,10 +872,25 @@ async function restoreManagementPageForReadback({ controller, page, shopCfg, man
   const identity = await controller.verifyIdentity({ page, shopCfg }).catch(() => null);
   if (identity && identity.ok === true) return { ok: true, restored: false };
   if (!managementUrl || typeof page.goto !== 'function') return { ok: false, reason: '当前页面非乘方管理页，且没有可用的同会话管理页 URL' };
-  try {
-    await page.goto(managementUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(3000);
+  // 2026-09-21：goto 一次失败（如 net::ERR_ABORTED 瞬时导航中断）不再直接放弃本轮回读。
+  // 此前点击可能已派发，放弃回读会把"结果未知"留给 30 分钟后的下一轮（09-21 实录：
+  // 08:34 批量暂停已点击、恢复回读一次 ERR_ABORTED 即判 partial，商品自选拖到 09:07 才闭环）。
+  // 有界重试 3 次（间隔 2s，同会话内）；仍失败才如实返回失败。
+  let navError = null;
+  for (let navAttempt = 1; navAttempt <= 3; navAttempt += 1) {
+    try {
+      await page.goto(managementUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      navError = null;
+      break;
+    } catch (e) {
+      navError = e;
+      if (navAttempt < 3 && typeof page.waitForTimeout === 'function') await page.waitForTimeout(2000);
+    }
+  }
+  if (navError) return { ok: false, reason: navError.reason || navError.message };
+  if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(3000);
 
+  try {
     // 1) goto 后需先点"商品"营销目标标签，才会出现"商品自选/全店托管"子标签（实测）
     const deadlineTab = Date.now() + 25000;
     let identityOk = false;
@@ -871,6 +964,8 @@ async function verifyAllPaused({ controller, page, result }) {
   let scanError = null;
 
   for (const region of scope) {
+    // 2026-09-21：新 UI 列表为快照，全量回读前刷新一次取最新数据（旧 UI 空操作）
+    if (controller.refreshView) await controller.refreshView({ page, tab: region }).catch(() => {});
     await controller.switchView({ page, tab: region });
     const first = await readViewFor(controller, page, region);
     if (!first) {
@@ -948,7 +1043,8 @@ async function verifyAllPaused({ controller, page, result }) {
 
   if (scanError) {
     result.confirmReason = scanError;
-    result.finalVerify = { regionKeys: found.size, targets: targetKeys.size, confirmed: [], stillOpen: [], missing: [], unknown: [], scanError };
+    // 全量扫描失败不推翻此前**已按落地回读确认**的目标（渐进记录，见 markTargetConfirmed）
+    result.finalVerify = { regionKeys: found.size, targets: targetKeys.size, confirmed: (result.targetsConfirmedKeys || []).slice(), stillOpen: [], missing: [], unknown: [], scanError };
     return false;
   }
 
@@ -962,6 +1058,8 @@ async function verifyAllPaused({ controller, page, result }) {
   const missing = [];
   for (const key of targetKeys) if (!found.has(key)) missing.push(key);
 
+  // 全量回读成功：以完整扫描结果为准覆盖渐进记录（全量更权威）
+  result.targetsConfirmedKeys = confirmed.slice();
   result.finalVerify = { regionKeys: found.size, targets: targetKeys.size, confirmed, stillOpen, missing, unknown };
 
   // 新增/重新开启（全量清单中任何开启侧对象，含非目标）
@@ -1047,11 +1145,12 @@ async function executeChengfangEnable(p) {
     managementUrl: null,
   };
   const fail = (view, status, reason) => {
+    const text = compactUrls(reason);
     result.views[view] = result.views[view] || {};
     result.views[view].status = status;
-    result.views[view].reason = reason;
-    result.confirmReason = reason;
-    audit({ kind: 'chengfang-enable', event: 'abort', view, status, reason });
+    result.views[view].reason = text;
+    result.confirmReason = text;
+    audit({ kind: 'chengfang-enable', event: 'abort', view, status, reason: text });
   };
 
   // ── 0. 身份核验 ──────────────────────────────────────────────────
@@ -1063,7 +1162,7 @@ async function executeChengfangEnable(p) {
   result.identity = identity;
   if (typeof page.url === 'function') {
     const currentUrl = page.url();
-    if (typeof currentUrl === 'string' && currentUrl.includes('/uni-prom/overall')) result.managementUrl = currentUrl;
+    if (typeof currentUrl === 'string' && /\/(uni-prom\/overall|overall-prom)/.test(currentUrl)) result.managementUrl = currentUrl;
   }
   audit({ kind: 'chengfang-enable', event: 'identity', ok: true, accountId: identity.pageAccountId });
 
@@ -1453,7 +1552,10 @@ async function enablePageTargets({ controller, page, shopCfg, targets, rows, res
   const postRows = landing.rows;
   const failed = landing.failed;
   const notFound = landing.notFound;
-  for (const id of landing.confirmed) processed.add(id);
+  for (const id of landing.confirmed) {
+    processed.add(id);
+    markTargetConfirmed(result, '商品自选', id);
+  }
   for (const id of notFound) {
     if (!result.notFoundIds.includes(id)) result.notFoundIds.push(id);
   }
@@ -1491,7 +1593,10 @@ async function enablePageTargets({ controller, page, shopCfg, targets, rows, res
       });
       if (!retryPlan.ok) return false;
       if (retryPlan.landed.length > 0) {
-        for (const id of retryPlan.landed) processed.add(id);
+        for (const id of retryPlan.landed) {
+          processed.add(id);
+          markTargetConfirmed(result, '商品自选', id);
+        }
         audit({
           kind: 'chengfang-enable', event: 'retry-skipped', view: '商品自选',
           note: `重试前重新核验：${retryPlan.landed.length} 个目标已落地（回读确认开启），不再重发`,
@@ -1533,6 +1638,8 @@ async function verifyAllEnabled({ controller, page, result }) {
   let scanError = null;
 
   for (const region of scope) {
+    // 2026-09-21：新 UI 列表为快照，全量回读前刷新一次取最新数据（旧 UI 空操作）
+    if (controller.refreshView) await controller.refreshView({ page, tab: region }).catch(() => {});
     await controller.switchView({ page, tab: region });
     const first = await readViewFor(controller, page, region);
     if (!first) {
@@ -1606,7 +1713,8 @@ async function verifyAllEnabled({ controller, page, result }) {
 
   if (scanError) {
     result.confirmReason = scanError;
-    result.finalVerify = { regionKeys: found.size, targets: targetKeys.size, confirmed: [], stillClosed: [], missing: [], unknown: [], scanError };
+    // 全量扫描失败不推翻此前已按落地回读确认的目标（渐进记录，与暂停侧同构）
+    result.finalVerify = { regionKeys: found.size, targets: targetKeys.size, confirmed: (result.targetsConfirmedKeys || []).slice(), stillClosed: [], missing: [], unknown: [], scanError };
     return false;
   }
 
@@ -1620,6 +1728,8 @@ async function verifyAllEnabled({ controller, page, result }) {
   const missing = [];
   for (const key of targetKeys) if (!found.has(key)) missing.push(key);
 
+  // 全量回读成功：以完整扫描结果为准覆盖渐进记录（全量更权威）
+  result.targetsConfirmedKeys = confirmed.slice();
   result.finalVerify = { regionKeys: found.size, targets: targetKeys.size, confirmed, stillClosed, missing, unknown };
 
   if (stillClosed.length > 0) {

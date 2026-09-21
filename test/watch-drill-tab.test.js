@@ -233,7 +233,7 @@ test('独立每日开启任务行：running → 已登记待命+下次时间+停
     enableTask: { running: false, configEnabled: true, stoppedByUser: true, nextRunAt: null, lastMissedReason: null },
     gates: { realMode: true, pauseEnabled: true, enableEnabled: true, dryRun: false, pauseWillExecute: true, enableWillExecute: true, blockedBy: [], scope: ['全店托管', '商品自选'], deleteAdEnabled: false },
   });
-  assert.ok(r2.els.wdEnableTaskState.textContent.includes('已独立停用'), `实际：${r2.els.wdEnableTaskState.textContent}`);
+  assert.ok(r2.els.wdEnableTaskState.textContent.includes('已停用'), `实际：${r2.els.wdEnableTaskState.textContent}`);
   assert.strictEqual(r2.els.wdEnableTaskBtn.textContent, '恢复每日开启');
 });
 

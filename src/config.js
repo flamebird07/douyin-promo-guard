@@ -36,8 +36,9 @@ const DEFAULTS = {
     // - readbackIntervalMs = 两次回读之间的等待；读取串行，绝不与上一轮重叠；
     // - 执行器不再持有独立 fallback 数值（同源：src/lib/bounded-poll.js 的 POLLING_DEFAULTS
     //   与本处保持一致），避免"报告说 30 秒/3 秒、生产实际 15 秒/2 秒"的漂移。
-    // - 平台异步落地实测可延迟 27 秒以上 → 取 30 秒。
-    readbackTimeoutMs: 30000,
+    // - 平台异步落地实测可延迟 27 秒以上（2026-09-21 实录 >75 秒）→ 取 120 秒，
+    //   避免把成功误判为未生效而触发冗余重试点击。
+    readbackTimeoutMs: 120000,
     // readbackAttempts 为**次数语义**，仅关闭推广流程（close-flow.js）使用；
     // 乘方落地确认不使用本项（按截止时间有界，见 src/lib/bounded-poll.js）。
     readbackAttempts: 3,

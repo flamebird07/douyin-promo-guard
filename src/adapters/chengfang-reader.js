@@ -27,6 +27,9 @@ const { AuthError, DataGuardError } = require('../lib/errors');
 const { openQianchuanHome, closeBrowser } = require('./qianchuan-reader');
 
 const CHENGFANG_URL_MARKER = '/uni-prom/overall';
+// 2026-09-21：千川把乘方管理页路径由 /uni-prom/overall 改为 /overall-prom，
+// 此处同时兼容新旧两版（页面结构不变，仅路径前缀变化）。正则统一用本变量构造。
+const CHENGFANG_URL_RE = /\/(uni-prom\/overall|overall-prom)(?:[/?#]|$)/i;
 const SUB_TAB_OPTIONS = ['商品自选', '全店托管'];
 
 // ── 纯 DOM 逻辑（页面 evaluate 与本地 fixture 测试共用同一函数）─────
@@ -51,13 +54,78 @@ function resolveRowPlanIdFromText(rowText) {
 function collectChengfangRowsInPage() {
   // 状态词表内联（本函数会被 page.evaluate 序列化进浏览器执行，不能引用模块级常量）
   const STATUS_WORDS = ['投放中', '已暂停', '已终止', '已结束', '审核中', '已下线', '未投放', '投放完成', '预算不足', '已拒绝', '暂停中', '已删除'];
-  const out = { rows: [], total: null, totalText: null };
+  const out = { rows: [], total: null, totalText: null, ui: 'legacy' };
   const bodyText = document.body ? document.body.innerText : '';
   const tm = /共\s*([\d,]+)\s*条记录|共\s*([\d,]+)\s*条计划/.exec(bodyText);
   if (tm) {
     out.total = Number(String(tm[1] || tm[2]).replace(/,/g, ''));
     out.totalText = tm[0].replace(/\s+/g, ' ');
   }
+
+  // 2026-09-21：千川乘方管理页整体迁移到新前端（aurora-qc 组件：
+  // .aurora-qc-table / .aurora-qc-switch / .aurora-qc-pagination），旧 .ovui-* 结构消失
+  // （旧路径 /uni-prom/overall 与新路径 /overall-prom 都是新 UI，实测同日）。
+  // 新 UI 行：tr[data-row-key=<计划ID>]（汇总行 rowKey=__qc_table_summary_row__、
+  // 度量行 .aurora-qc-table-measure-row 必须排除）；开关状态取 .aurora-qc-switch 的 aria-checked。
+  if (document.querySelector('.aurora-qc-table')) {
+    out.ui = 'aurora';
+    const trs = [...document.querySelectorAll('.aurora-qc-table-tbody tr, .aurora-qc-table-row')];
+    const seen = new Set();
+    let rowIndex = 0;
+    for (const tr of trs) {
+      if (seen.has(tr)) continue;
+      seen.add(tr);
+      if (String(tr.className || '').includes('measure-row')) continue;
+      const key = String(tr.getAttribute('data-row-key') || '').trim();
+      if (!/^\d{12,20}$/.test(key)) continue; // 汇总/度量/分组行不当作计划行
+      const rowText = (tr.textContent || '').replace(/\s+/g, ' ').trim();
+      const sw = tr.querySelector('.aurora-qc-switch');
+      const swCount = tr.querySelectorAll('.aurora-qc-switch').length;
+      const aria = sw ? String(sw.getAttribute('aria-checked') || '') : '';
+      const checked = swCount === 1 ? (aria === 'true') : null;
+      const statusEl = tr.querySelector('[class*="ad-status"], [class*="status"]');
+      let status = '';
+      if (statusEl) {
+        const raw = (statusEl.textContent || '').replace(/\s+/g, ' ').trim();
+        for (const w of STATUS_WORDS) {
+          if (raw.includes(w)) { status = w; break; }
+        }
+      }
+      if (!status) {
+        for (const w of STATUS_WORDS) {
+          if (rowText.includes(w)) { status = w; break; }
+        }
+      }
+      const cb = tr.querySelector('input[type="checkbox"]');
+      const idText = new Set();
+      const re = /ID[:：]\s*(\d{12,20})(?!\d)/g;
+      let mm;
+      while ((mm = re.exec(rowText))) idText.add(mm[1]);
+      // 行键即平台计划ID（data-row-key）：行内文本ID仅作参考——新 UI 相邻单元格数字会与
+      // "ID：" 连写（如 ID：1875859981405339 29），文本解析不再作为一致性判据。
+      const ops = [...tr.querySelectorAll('.aurora-qc-promotion-operation-item, .oc-promotion-operation-action-item')]
+        .map((s) => (s.textContent || '').trim())
+        .filter((t) => /^(编辑|日志|删除|暂停|开启)$/.test(t));
+      const nameEl = tr.querySelector('[class*="name"], [class*="Name"]');
+      out.rows.push({
+        rowIndex,
+        id: key,
+        idError: null,
+        textIds: [...idText],
+        name: (nameEl ? (nameEl.textContent || '') : rowText).replace(/\s+/g, ' ').trim().slice(0, 60),
+        status,
+        switchChecked: checked,
+        switchCls: sw ? String(sw.className || '').slice(0, 60) : '',
+        switchAria: aria || null,
+        checkboxChecked: cb ? cb.checked : null,
+        ops: [...new Set(ops)],
+        rowText: rowText.slice(0, 300),
+      });
+      rowIndex += 1;
+    }
+    return out;
+  }
+
   const trs = document.querySelectorAll('tr.ovui-tr');
   let rowIndex = 0;
   for (const tr of trs) {
@@ -110,7 +178,42 @@ function collectChengfangRowsInPage() {
 
 /** 分页信息（自包含）。 */
 function collectChengfangPaginationInPage() {
-  const out = { total: null, totalText: null, pageSize: null, activePage: null, hasNext: null };
+  const out = { total: null, totalText: null, pageSize: null, activePage: null, hasNext: null, ui: 'legacy' };
+  // 新 UI（aurora-qc）：总数 .aurora-qc-pagination-total-text（"共 23 条记录"），
+  // 每页条数取选项控件当前值（"10 条/页"），当前页 .aurora-qc-pagination-item-active，
+  // 下一页 .aurora-qc-pagination-next（禁用时类名含 -disabled）。
+  if (document.querySelector('.aurora-qc-table')) {
+    out.ui = 'aurora';
+    const totalEl = document.querySelector('.aurora-qc-pagination-total-text');
+    if (totalEl) {
+      const t = (totalEl.textContent || '').replace(/\s+/g, ' ').trim();
+      out.totalText = t;
+      const m = /(\d[\d,]*)/.exec(t);
+      if (m) out.total = Number(m[1].replace(/,/g, ''));
+    } else {
+      const body = document.body ? document.body.innerText : '';
+      const m = /共\s*([\d,]+)\s*条(记录|计划)/.exec(body);
+      if (m) { out.total = Number(m[1].replace(/,/g, '')); out.totalText = m[0].replace(/\s+/g, ' '); }
+    }
+    const selVal = document.querySelector('.aurora-qc-pagination-options .aurora-qc-select-content-value');
+    if (selVal) {
+      const t = (selVal.getAttribute('title') || selVal.textContent || '').replace(/\s+/g, '').trim();
+      const m = /(\d+)/.exec(t);
+      if (m) out.pageSize = m[1];
+    }
+    const active = document.querySelector('.aurora-qc-pagination-item-active');
+    if (active) {
+      const t = (active.textContent || '').trim();
+      if (/^\d+$/.test(t)) out.activePage = t;
+    }
+    if (out.activePage == null) {
+      const items = [...document.querySelectorAll('.aurora-qc-pagination-item')];
+      if (items.length <= 1) out.activePage = '1';
+    }
+    const next = document.querySelector('.aurora-qc-pagination-next');
+    if (next) out.hasNext = !String(next.className || '').includes('disabled');
+    return out;
+  }
   const totalEl = document.querySelector('.ovui-page-total, [data-e2e*="pagination_group_total"]');
   if (totalEl) {
     const t = (totalEl.textContent || '').replace(/\s+/g, ' ').trim();
@@ -154,16 +257,24 @@ const clickChengfangSubTab = (label) => `(() => {
 
 /** 打开每页条数下拉（只读 UI）。 */
 function openChengfangPageSizeSelectInPage() {
+  // 新 UI：li.aurora-qc-pagination-options 内的 aurora-qc-select（ant 风格，需 mousedown 展开）
+  const auroraSel = document.querySelector('.aurora-qc-pagination-options .aurora-qc-select');
+  if (auroraSel) {
+    auroraSel.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    const content = auroraSel.querySelector('.aurora-qc-select-content') || auroraSel;
+    content.click();
+    return { opened: true, ui: 'aurora' };
+  }
   const sel = document.querySelector('.ovui-page-select .ovui-select__input, .ovui-page-select, [data-e2e*="pagination_group_select"]');
   if (!sel) return { opened: false, reason: '未找到每页条数下拉' };
   const clickable = sel.closest('.ovui-select, [class*="select"]') || sel;
   clickable.click();
-  return { opened: true };
+  return { opened: true, ui: 'legacy' };
 }
 
 /** 选择每页条数选项（如"100条/页"）。 */
 function pickChengfangPageSizeInPage(text) {
-  const opts = [...document.querySelectorAll('.ovui-option')];
+  const opts = [...document.querySelectorAll('.ovui-option, .aurora-qc-select-item-option, .aurora-qc-select-item')];
   const target = opts.find((o) => (o.textContent || '').replace(/\s+/g, '').includes(text));
   if (!target) {
     return { picked: false, available: opts.map((o) => (o.textContent || '').trim()).slice(0, 10) };
@@ -172,19 +283,40 @@ function pickChengfangPageSizeInPage(text) {
   return { picked: true };
 }
 
-/** 勾选表头全选框（th 内 label.ovui-checkbox[data-e2e="checkbox"]）。仅勾选，不触碰批量按钮。 */
+/** 勾选表头全选框（旧 UI：th 内 label.ovui-checkbox；新 UI：表头 input[type=checkbox]）。仅勾选，不触碰批量按钮。 */
 function clickChengfangHeaderSelectAllInPage() {
+  const aurora = document.querySelector('.aurora-qc-table-thead input[type="checkbox"]');
+  if (aurora) {
+    if (aurora.disabled) return { clicked: false, reason: '表头全选框不可用' };
+    aurora.click();
+    return { clicked: true, ui: 'aurora' };
+  }
   const label = document.querySelector('th .ovui-checkbox[data-e2e="checkbox"], th label.ovui-checkbox, th .ovui-checkbox');
   if (!label) return { clicked: false, reason: '未找到表头全选框' };
   const input = label.querySelector('input[type="checkbox"]');
   if (input && !input.disabled) input.click();
   else label.click();
-  return { clicked: true };
+  return { clicked: true, ui: 'legacy' };
 }
 
 /** 读取当前页选中行集合（行内 checkbox:checked → 行稳定ID）。自包含。 */
 function readSelectedChengfangRowIdsInPage() {
-  const out = { selectedIds: [], selectedCount: 0, checkedRows: [] };
+  const out = { selectedIds: [], selectedCount: 0, checkedRows: [], ui: 'legacy' };
+  if (document.querySelector('.aurora-qc-table')) {
+    out.ui = 'aurora';
+    const trs = [...document.querySelectorAll('.aurora-qc-table-tbody tr[data-row-key]')];
+    for (const tr of trs) {
+      if (String(tr.className || '').includes('measure-row')) continue;
+      const key = String(tr.getAttribute('data-row-key') || '').trim();
+      if (!/^\d{12,20}$/.test(key)) continue;
+      const cb = tr.querySelector('input[type="checkbox"]');
+      if (!cb || !cb.checked) continue;
+      out.selectedIds.push(key);
+      out.checkedRows.push({ id: key, text: (tr.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80) });
+    }
+    out.selectedCount = out.checkedRows.length;
+    return out;
+  }
   const trs = document.querySelectorAll('tr.ovui-tr');
   for (const tr of trs) {
     if (String(tr.className || '').includes('ovui-t-summary')) continue;
@@ -211,13 +343,20 @@ function readSelectedChengfangRowIdsInPage() {
  * 无标记的纯文本"暂停"不可信（禁止模糊文本兜底）。绝不返回"删除"/"开启"。
  */
 function findChengfangBatchPauseButtonInPage() {
-  const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar');
+  const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar, .aurora-qc-promotion-batch-operation-bar');
   let bar = null;
   for (const b of bars) {
     const r = b.getBoundingClientRect();
     if (r.width > 0 && r.height > 0) { bar = b; break; }
   }
   if (!bar) return { ok: false, reason: '未找到可见批量操作栏' };
+  // 新 UI：批量操作项为 span.aurora-qc-promotion-batch-operation-bar-item（无 data 标记），
+  // 以**精确文本**唯一匹配兜底；文本必须恰为"暂停"，且在可见批量栏内（删除/开启不会被选中）。
+  const auroraItems = [...bar.querySelectorAll('.aurora-qc-promotion-batch-operation-bar-item')]
+    .filter((b) => (b.textContent || '').trim() === '暂停');
+  if (auroraItems.length === 1 && bar.querySelectorAll('.oc-promotion-batch-operation-bar').length === 0) {
+    return { ok: true, e2e: '', autoId: '', tag: auroraItems[0].tagName, marker: 'aurora-exact-text' };
+  }
   const btns = [...bar.querySelectorAll('button')].filter((b) => (b.textContent || '').trim() === '暂停');
   if (btns.length === 0) return { ok: false, reason: '批量操作栏内未找到"暂停"按钮（删除/开启不得被选中）' };
   if (btns.length > 1) return { ok: false, reason: `批量操作栏内出现 ${btns.length} 个"暂停"候选，拒绝点击` };
@@ -237,13 +376,19 @@ function findChengfangBatchPauseButtonInPage() {
  * 无标记的纯文本"开启"不可信（禁止模糊文本兜底）。绝不返回"删除"/"暂停"。
  */
 function findChengfangBatchEnableButtonInPage() {
-  const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar');
+  const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar, .aurora-qc-promotion-batch-operation-bar');
   let bar = null;
   for (const b of bars) {
     const r = b.getBoundingClientRect();
     if (r.width > 0 && r.height > 0) { bar = b; break; }
   }
   if (!bar) return { ok: false, reason: '未找到可见批量操作栏' };
+  // 新 UI：同"暂停"——精确文本唯一匹配，且在可见批量栏内（删除/暂停不会被选中）。
+  const auroraItems = [...bar.querySelectorAll('.aurora-qc-promotion-batch-operation-bar-item')]
+    .filter((b) => (b.textContent || '').trim() === '开启');
+  if (auroraItems.length === 1 && bar.querySelectorAll('.oc-promotion-batch-operation-bar').length === 0) {
+    return { ok: true, e2e: '', autoId: '', tag: auroraItems[0].tagName, marker: 'aurora-exact-text' };
+  }
   const btns = [...bar.querySelectorAll('button')].filter((b) => (b.textContent || '').trim() === '开启');
   if (btns.length === 0) return { ok: false, reason: '批量操作栏内未找到"开启"按钮（删除/暂停不得被选中）' };
   if (btns.length > 1) return { ok: false, reason: `批量操作栏内出现 ${btns.length} 个"开启"候选，拒绝点击` };
@@ -262,8 +407,8 @@ function findChengfangBatchEnableButtonInPage() {
  * 点击前核验所选范围（与 readSelectedChengfangRowIdsInPage 交叉核对）。
  */
 function readChengfangBatchBarInPage() {
-  const out = { visible: false, selectedText: null, selectedCount: null, buttons: [] };
-  const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar');
+  const out = { visible: false, selectedText: null, selectedCount: null, buttons: [], ui: 'legacy' };
+  const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar, .aurora-qc-promotion-batch-operation-bar');
   let bar = null;
   for (const b of bars) {
     const r = b.getBoundingClientRect();
@@ -271,11 +416,13 @@ function readChengfangBatchBarInPage() {
   }
   if (!bar) return out;
   out.visible = true;
+  if (bar.querySelector('.aurora-qc-promotion-batch-operation-bar-item')) out.ui = 'aurora';
   const text = (bar.textContent || '').replace(/\s+/g, ' ').trim();
   out.selectedText = text.slice(0, 60);
   const m = /已选\s*(\d+)\s*个/.exec(text);
   if (m) out.selectedCount = Number(m[1]);
-  for (const b of bar.querySelectorAll('button')) {
+  const items = bar.querySelectorAll('button, .aurora-qc-promotion-batch-operation-bar-item');
+  for (const b of items) {
     const t = (b.textContent || '').trim();
     if (!t) continue;
     out.buttons.push({
@@ -289,10 +436,10 @@ function readChengfangBatchBarInPage() {
 
 /** 批量操作栏"删除"按钮识别（仅标记，绝不返回可点击句柄）。 */
 function findChengfangBatchDeleteButtonInPage() {
-  const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar');
+  const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar, .aurora-qc-promotion-batch-operation-bar');
   const out = [];
   for (const bar of bars) {
-    for (const b of bar.querySelectorAll('button')) {
+    for (const b of bar.querySelectorAll('button, .aurora-qc-promotion-batch-operation-bar-item')) {
       const t = (b.textContent || '').trim();
       if (t === '删除' || /_delete$/.test(b.getAttribute('data-e2e') || '')
         || b.getAttribute('data-auto-id') === 'bar-groups-group-item-btn-delete') {
@@ -565,6 +712,13 @@ function hasChengfangDeleteDialogInPage() {
 
 /** 翻页到下一页（事件绑在 li 上；点到内部 svg 不翻页——实测踩坑）。 */
 function clickChengfangNextPageInPage() {
+  const auroraNext = document.querySelector('.aurora-qc-pagination-next');
+  if (auroraNext) {
+    if (String(auroraNext.className || '').includes('disabled')) return { clicked: false, atEnd: true };
+    const btn = auroraNext.querySelector('.aurora-qc-pagination-item-link') || auroraNext;
+    btn.click();
+    return { clicked: true, ui: 'aurora' };
+  }
   const lis = document.querySelectorAll('li.ovui-page-turner__item');
   for (const li of lis) {
     if (!li.querySelector('.ovui-page-turner__next-icon')) continue;
@@ -577,6 +731,15 @@ function clickChengfangNextPageInPage() {
 
 /** 回到第一页（分页导航，只读 UI；供全量回读的扫描起点，避免从非首页开始漏扫）。 */
 function clickChengfangFirstPageInPage() {
+  const auroraActive = document.querySelector('.aurora-qc-pagination-item-active');
+  const auroraFirst = document.querySelector('.aurora-qc-pagination-item-1');
+  if (auroraFirst || auroraActive) {
+    if (auroraActive && (auroraActive.textContent || '').trim() === '1') return { clicked: false, alreadyFirst: true, ui: 'aurora' };
+    const btn = auroraFirst ? (auroraFirst.querySelector('.aurora-qc-pagination-item-link') || auroraFirst) : null;
+    if (!btn) return { clicked: false, reason: '未找到分页器（新 UI 首页按钮缺失）' };
+    btn.click();
+    return { clicked: true, ui: 'aurora' };
+  }
   const lis = document.querySelectorAll('li.ovui-page-turner__item');
   for (const li of lis) {
     const txt = (li.textContent || '').trim();
@@ -605,6 +768,16 @@ function clickChengfangFirstPageInPage() {
 function resolveChengfangRowSwitchHandle(planId) {
   const want = String(planId == null ? '' : planId).trim();
   if (!want) return { ok: false, reason: '计划ID为空，拒绝定位开关' };
+  // 新 UI（aurora-qc）：行以 data-row-key 精确承载计划ID，行内开关 button.aurora-qc-switch 恰好 1 个
+  if (document.querySelector('.aurora-qc-table')) {
+    const rows = [...document.querySelectorAll('.aurora-qc-table-row')]
+      .filter((tr) => String(tr.getAttribute('data-row-key') || '').trim() === want);
+    if (rows.length === 0) return { ok: false, reason: `未找到计划ID ${want} 所在行（data-row-key 全等核验）` };
+    if (rows.length > 1) return { ok: false, reason: `计划ID ${want} 匹配到 ${rows.length} 行，拒绝点击` };
+    const sws = [...rows[0].querySelectorAll('.aurora-qc-switch')];
+    if (sws.length !== 1) return { ok: false, reason: `计划ID ${want} 行内开关数量为 ${sws.length}（要求恰好 1 个），拒绝点击` };
+    return { ok: true, el: sws[0], wrapperCount: 1, innerCount: 1, ui: 'aurora' };
+  }
   const trs = [...document.querySelectorAll('tr.ovui-tr')];
   // 全等核验：优先取行内"ID：xxx"精确标注（避免 123 命中 12345）
   const marked = [];
@@ -651,6 +824,16 @@ function resolveChengfangRowSwitchHandle(planId) {
 function resolveChengfangRowSwitchHandleInPage(planId) {
   const want = String(planId == null ? '' : planId).trim();
   if (!want) return { ok: false, reason: '计划ID为空，拒绝定位开关' };
+  // 新 UI（aurora-qc）：行以 data-row-key 精确承载计划ID；行内 .aurora-qc-switch 恰好 1 个。
+  if (document.querySelector('.aurora-qc-table')) {
+    const rows = [...document.querySelectorAll('.aurora-qc-table-row')]
+      .filter((tr) => String(tr.getAttribute('data-row-key') || '').trim() === want);
+    if (rows.length === 0) return { ok: false, reason: `未找到计划ID ${want} 所在行（data-row-key 全等核验）` };
+    if (rows.length > 1) return { ok: false, reason: `计划ID ${want} 匹配到 ${rows.length} 行，拒绝点击` };
+    const sws = [...rows[0].querySelectorAll('.aurora-qc-switch')];
+    if (sws.length !== 1) return { ok: false, reason: `计划ID ${want} 行内开关数量为 ${sws.length}（要求恰好 1 个），拒绝点击` };
+    return { ok: true, el: sws[0], wrapperCount: 1, innerCount: 1, ui: 'aurora' };
+  }
   const trs = [...document.querySelectorAll('tr.ovui-tr')];
   const marked = [];
   for (const tr of trs) {
@@ -685,6 +868,18 @@ function resolveChengfangRowSwitchHandleInPage(planId) {
 function locateChengfangRowSwitchInPage(planId) {
   const want = String(planId == null ? '' : planId).trim();
   if (!want) return { ok: false, reason: '计划ID为空，拒绝定位开关' };
+  // 新 UI（aurora-qc）：开关为 button.aurora-qc-switch，状态以 aria-checked 承载（true=投放中）。
+  if (document.querySelector('.aurora-qc-table')) {
+    const rows = [...document.querySelectorAll('.aurora-qc-table-row')]
+      .filter((tr) => String(tr.getAttribute('data-row-key') || '').trim() === want);
+    if (rows.length === 0) return { ok: false, reason: `未找到计划ID ${want} 所在行（data-row-key 全等核验）` };
+    if (rows.length > 1) return { ok: false, reason: `计划ID ${want} 匹配到 ${rows.length} 行，拒绝点击` };
+    const sws = [...rows[0].querySelectorAll('.aurora-qc-switch')];
+    if (sws.length !== 1) return { ok: false, reason: `计划ID ${want} 行内开关数量为 ${sws.length}（要求恰好 1 个），拒绝点击` };
+    const el = sws[0];
+    const aria = el.getAttribute('aria-checked');
+    return { ok: true, wrapperCount: 1, innerCount: 1, beforeChecked: aria === 'true' ? true : (aria === 'false' ? false : null), checkedAttr: aria || null, ui: 'aurora' };
+  }
   const trs = [...document.querySelectorAll('tr.ovui-tr')];
   const marked = [];
   for (const tr of trs) {
@@ -721,6 +916,19 @@ function locateChengfangRowSwitchInPage(planId) {
 function clickChengfangRowSwitchByPlanId(planId) {
   const want = String(planId == null ? '' : planId).trim();
   if (!want) return { ok: false, reason: '计划ID为空，拒绝点击开关' };
+  // 新 UI（aurora-qc）：点击行内唯一 button.aurora-qc-switch（aria-checked 承载状态）。
+  if (document.querySelector('.aurora-qc-table')) {
+    const rows = [...document.querySelectorAll('.aurora-qc-table-row')]
+      .filter((tr) => String(tr.getAttribute('data-row-key') || '').trim() === want);
+    if (rows.length === 0) return { ok: false, reason: `未找到计划ID ${want} 所在行（data-row-key 全等核验）` };
+    if (rows.length > 1) return { ok: false, reason: `计划ID ${want} 匹配到 ${rows.length} 行，拒绝点击` };
+    const sws = [...rows[0].querySelectorAll('.aurora-qc-switch')];
+    if (sws.length !== 1) return { ok: false, reason: `计划ID ${want} 行内开关数量为 ${sws.length}（要求恰好 1 个），拒绝点击` };
+    const el = sws[0];
+    const beforeAria = el.getAttribute('aria-checked');
+    el.click();
+    return { ok: true, beforeChecked: beforeAria === 'true', beforeAria, target: 'aurora-row-switch' };
+  }
   const trs = [...document.querySelectorAll('tr.ovui-tr')];
   const marked = [];
   for (const tr of trs) {
@@ -758,6 +966,20 @@ function clickChengfangRowSwitchByPlanId(planId) {
  * 返回后由上层以 readSelection 回读核验实际选中集合（以回读为准）。
  */
 function setChengfangRowCheckboxByPlanId({ planId, checked }) {
+  // 新 UI（aurora-qc）：行以 data-row-key 精确定位；行内复选框恰好 1 个。
+  if (document.querySelector('.aurora-qc-table')) {
+    const rows = [...document.querySelectorAll('.aurora-qc-table-row')]
+      .filter((tr) => String(tr.getAttribute('data-row-key') || '').trim() === String(planId));
+    if (rows.length === 0) return { ok: false, reason: `未找到计划ID ${planId} 所在行（data-row-key 全等核验）` };
+    if (rows.length > 1) return { ok: false, reason: `计划ID ${planId} 匹配到 ${rows.length} 行，拒绝操作` };
+    const cbs = [...rows[0].querySelectorAll('input[type="checkbox"]')];
+    if (cbs.length === 0) return { ok: false, reason: `计划ID ${planId} 行内未找到复选框` };
+    if (cbs.length > 1) return { ok: false, reason: `计划ID ${planId} 行内出现 ${cbs.length} 个复选框，拒绝操作` };
+    const cb = cbs[0];
+    if (cb.disabled) return { ok: false, reason: `计划ID ${planId} 复选框不可用` };
+    if (cb.checked !== checked) cb.click();
+    return { ok: true, want: checked, ui: 'aurora' };
+  }
   const trs = [...document.querySelectorAll('tr.ovui-tr')];
   const target = trs.find((tr) => (tr.textContent || '').includes(`ID：${planId}`) || (tr.textContent || '').includes(`ID:${planId}`));
   if (!target) return { ok: false, reason: `未找到计划ID ${planId} 所在行` };
@@ -807,11 +1029,11 @@ async function openChengfangShop(p) {
         if (el) el.click();
       }).catch(() => {});
       await target.waitForTimeout(9000);
-      await target.waitForFunction(() => /uni-prom\/overall/.test(location.href), { timeout: 20000 }).catch(() => {});
+      await target.waitForFunction(() => /\/(uni-prom\/overall|overall-prom)(?:[/?#]|$)/i.test(location.href), { timeout: 20000 }).catch(() => {});
       st = await target.evaluate(readChengfangAccountInPage);
-      if (st && /uni-prom\/overall/.test(st.url)) break;
+      if (st && CHENGFANG_URL_RE.test(st.url)) break;
     }
-    if (!st || !/uni-prom\/overall/.test(st.url)) {
+    if (!st || !CHENGFANG_URL_RE.test(st.url)) {
       throw new DataGuardError(`导航"乘方"未到达管理页（当前 ${st ? st.url.slice(0, 80) : '未知'}）`);
     }
     // 乘方页先呈现营销目标标签（"直播/商品"），点击"商品"后才出现
@@ -948,7 +1170,7 @@ function createChengfangController(p) {
     async verifyIdentity({ page, shopCfg }) {
       const st = await page.evaluate(readChengfangAccountInPage).catch(() => null);
       if (!st) return { ok: false, reason: '乘方页身份读取失败' };
-      if (!/uni-prom\/overall/.test(st.url)) {
+      if (!CHENGFANG_URL_RE.test(st.url)) {
         return { ok: false, reason: `未在乘方管理页（当前 ${st.url.slice(0, 80)}）` };
       }
       if (!st.hasSubTabs) {
@@ -985,6 +1207,42 @@ function createChengfangController(p) {
       await sleep(tabWaitMs);
     },
 
+    /**
+     * 强制回读新鲜数据（2026-09-21，新 UI 缺陷：列表是"快照"）。
+     *
+     * 实测：新前端把列表数据快照绑在 URL 的 dataUpdateTime 参数上，**同一页面内重复读取
+     * 只会拿到同一快照**——批量暂停点击已生效，但同会话回读 39 次仍显示"投放中"
+     * （生产 21:30 实录：回读判未落地 → 重试再点一次 → 仍判未落地；事后新开页面加载
+     * 却显示 23 条全部"已暂停"）。旧 UI 列表会原地刷新，故旧路径保持原语义（不刷新）。
+     *
+     * 新 UI：reload（同标签、同一会话，不重开浏览器/不重读 Cookie）→ 重新切到目标视图
+     * → 重新置 100条/页（reload 会回到平台默认 10条/页，目标行会跨页导致误判缺失）。
+     * @param {object} o { page, tab }
+     * @returns {{refreshed:boolean, reason?:string, ui?:string, pageSize?:string|null}}
+     */
+    async refreshView({ page, tab }) {
+      const isAurora = await page.evaluate(() => !!document.querySelector('.aurora-qc-table')).catch(() => false);
+      if (!isAurora) return { refreshed: false, reason: 'legacy-ui', ui: 'legacy' };
+      if (typeof page.reload !== 'function') return { refreshed: false, reason: 'page.reload 不可用', ui: 'aurora' };
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch((e) => { throw new DataGuardError(`回读前刷新乘方管理页失败：${e.reason || e.message}`); });
+      await sleep(loadWaitMs);
+      await this.switchView({ page, tab });
+      // reload 后回到默认每页 10 条：目标清单会跨页，必须重新置 100条/页（与扫描口径一致）
+      let pageSize = null;
+      try {
+        const pag = await page.evaluate(collectChengfangPaginationInPage);
+        pageSize = pag && pag.pageSize ? String(pag.pageSize) : null;
+        if (pageSize && !pageSize.includes('100')) {
+          await this.switchPageSize({ page, size: '100条/页' });
+          const after = await page.evaluate(collectChengfangPaginationInPage);
+          pageSize = after && after.pageSize ? String(after.pageSize) : pageSize;
+        }
+      } catch (e) {
+        return { refreshed: true, ui: 'aurora', pageSize, warning: `刷新后重设每页条数未成功：${e.reason || e.message}` };
+      }
+      return { refreshed: true, ui: 'aurora', pageSize };
+    },
+
     async switchPageSize({ page, size }) {
       const opened = await page.evaluate(openChengfangPageSizeSelectInPage).catch((e) => ({ error: String(e) }));
       if (!opened || opened.opened !== true) {
@@ -992,7 +1250,7 @@ function createChengfangController(p) {
       }
       await sleep(1500);
       const picked = await page.evaluate((s) => {
-        const opts = [...document.querySelectorAll('.ovui-option')];
+        const opts = [...document.querySelectorAll('.ovui-option, .aurora-qc-select-item-option, .aurora-qc-select-item')];
         const target = opts.find((o) => (o.textContent || '').replace(/\s+/g, '').includes(s));
         if (!target) return { picked: false, available: opts.map((o) => (o.textContent || '').trim()).slice(0, 10) };
         target.click();
@@ -1052,13 +1310,20 @@ function createChengfangController(p) {
       await fireBeforeDispatch({ page });
       // 二次定位并点击（与 findChengfangBatchPauseButtonInPage 同一严格条件），结果回传核验
       const clicked = await page.evaluate(() => {
-        const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar');
+        const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar, .aurora-qc-promotion-batch-operation-bar');
         let bar = null;
         for (const b of bars) {
           const r = b.getBoundingClientRect();
           if (r.width > 0 && r.height > 0) { bar = b; break; }
         }
         if (!bar) return false;
+        // 新 UI：精确文本唯一匹配的批量项（删除/开启不会命中）
+        if (bar.querySelectorAll('.oc-promotion-batch-operation-bar').length === 0 && bar.querySelector('.aurora-qc-promotion-batch-operation-bar-item')) {
+          const items = [...bar.querySelectorAll('.aurora-qc-promotion-batch-operation-bar-item')].filter((b) => (b.textContent || '').trim() === '暂停');
+          if (items.length !== 1) return false;
+          items[0].click();
+          return true;
+        }
         const btns = [...bar.querySelectorAll('button')].filter((b) => (b.textContent || '').trim() === '暂停');
         if (btns.length !== 1) return false;
         const b = btns[0];
@@ -1102,13 +1367,20 @@ function createChengfangController(p) {
       await fireBeforeDispatch({ page });
       // 二次定位并点击（与 findChengfangBatchEnableButtonInPage 同一严格条件），结果回传核验
       const clicked = await page.evaluate(() => {
-        const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar');
+        const bars = document.querySelectorAll('.oc-promotion-batch-operation-bar, .batch-action-bar, .aurora-qc-promotion-batch-operation-bar');
         let bar = null;
         for (const b of bars) {
           const r = b.getBoundingClientRect();
           if (r.width > 0 && r.height > 0) { bar = b; break; }
         }
         if (!bar) return false;
+        // 新 UI：精确文本唯一匹配的批量项（删除/暂停不会命中）
+        if (bar.querySelectorAll('.oc-promotion-batch-operation-bar').length === 0 && bar.querySelector('.aurora-qc-promotion-batch-operation-bar-item')) {
+          const items = [...bar.querySelectorAll('.aurora-qc-promotion-batch-operation-bar-item')].filter((b) => (b.textContent || '').trim() === '开启');
+          if (items.length !== 1) return false;
+          items[0].click();
+          return true;
+        }
         const btns = [...bar.querySelectorAll('button')].filter((b) => (b.textContent || '').trim() === '开启');
         if (btns.length !== 1) return false;
         const b = btns[0];

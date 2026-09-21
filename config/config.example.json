@@ -39,7 +39,7 @@
     "maxRetries": 2,
     "retryBackoffMs": 3000,
     "closeTimeoutMs": 20000,
-    "readbackTimeoutMs": 30000,
+    "readbackTimeoutMs": 120000,
     "readbackAttempts": 3,
     "readbackIntervalMs": 3000,
     "zeroOrderRecheck": 1,

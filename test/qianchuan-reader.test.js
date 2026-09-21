@@ -201,6 +201,46 @@ test('资源清理：Cookie 缺失 → 浏览器尚未创建也不得误关其�
   await assert.rejects(() => openQianchuanHome(LOGIN_CFG, { cookieFile: '不存在的cookie' }, { browserFactory: async () => { throw new Error('不应创建'); } }), /未找到/);
 });
 
+// 2026-09-21 生产实录：抖店首页"巨量千川"入口点击偶发"点击成功但不弹新标签、URL 未变化"，
+// 导致整轮"操作前重新读取"作废（零请求）。该步只读 → 有界重试 + 账户ID已知时直连兜底。
+const QC_HOME = 'https://qianchuan.jinritemai.com/home?aavid=1710242295996424';
+const FXG_HOME = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
+
+test('入口点击首次不弹新标签：同会话回首页重试一次后到达千川（entry-click，attempts=2）', async () => {
+  const stub = makeStubPage({ urlQueue: [FXG_HOME, FXG_HOME, QC_HOME] });
+  const r = await openQianchuanHome(LOGIN_CFG, { cookieFile: '测试店铺', accountId: '1710242295996424' }, { browserFactory: async () => stub.browser });
+  assert.strictEqual(r.navMode, 'entry-click', '走入口点击路径');
+  assert.ok(String(r.target.url()).includes('qianchuan.jinritemai.com'), '确实落在千川首页');
+  assert.strictEqual(stub.calls.clicks, 2, '首次点击未到达 → 回首页再点一次（共 2 次），不无限点');
+  assert.strictEqual(stub.calls.gotos.filter((u) => u === FXG_HOME).length, 2, '重试前重新打开抖店首页（初始 + 重试）');
+  assert.strictEqual(stub.calls.closes, 0, '成功路径不关浏览器（由调用者释放）');
+});
+
+test('入口连续 3 次不弹标签：账户ID已知 → 直连千川首页兜底成功（direct-home-url）', async () => {
+  const stub = makeStubPage({ entryCount: 0, urlQueue: [FXG_HOME, FXG_HOME, FXG_HOME, QC_HOME] });
+  const r = await openQianchuanHome(LOGIN_CFG, { cookieFile: '测试店铺', accountId: '1710242295996424' }, { browserFactory: async () => stub.browser });
+  assert.strictEqual(r.navMode, 'direct-home-url', '入口不可用 → 用文档证据地址直连');
+  assert.ok(stub.calls.gotos.some((u) => u.includes('qianchuan.jinritemai.com/home?aavid=1710242295996424')), '直连 URL 必须带配置账户ID');
+  assert.strictEqual(stub.calls.clicks, 0, '入口不存在时零点击');
+});
+
+test('入口 3 次 + 直连兜底均未到达千川：如实失败并关闭浏览器（绝不把首页/登录页当千川）', async () => {
+  const stub = makeStubPage({ entryCount: 0, urlQueue: [FXG_HOME] });
+  await assert.rejects(
+    () => openQianchuanHome(LOGIN_CFG, { cookieFile: '测试店铺', accountId: '1710242295996424' }, { browserFactory: async () => stub.browser }),
+    /巨量千川/
+  );
+  assert.strictEqual(stub.calls.closes, 1, '失败必须关闭本次创建的浏览器');
+});
+
+test('入口点击后落到登录/授权中转页：不算到达千川，仍走重试与兜底', async () => {
+  const stub = makeStubPage({ urlQueue: [FXG_HOME, 'https://qianchuan.jinritemai.com/login?aavid=1710242295996424', QC_HOME] });
+  const r = await openQianchuanHome(LOGIN_CFG, { cookieFile: '测试店铺', accountId: '1710242295996424' }, { browserFactory: async () => stub.browser });
+  assert.strictEqual(r.navMode, 'entry-click');
+  assert.ok(!/\/login/.test(String(r.target.url())), '最终落点不得是登录页');
+  assert.strictEqual(stub.calls.clicks, 2, '登录中转页不算成功 → 重试一次');
+});
+
 test('费用读取：evaluate 序列驱动下输出账户/口径/分项（stub 页面）', async () => {
   const stub = makeStubPage({
     urlQueue: ['https://fxg.jinritemai.com/ffa/mshop/homepage/index', 'https://qianchuan.jinritemai.com/home?aavid=1710242295996424'],

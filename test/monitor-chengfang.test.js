@@ -672,27 +672,48 @@ test('自动开启调度：当天只执行一次（同一天重启监控不重�
   monitor.stop();
 });
 
-test('自动开启调度：跨日重置 → 次日 07:00 允许再次执行', async (t) => {
+test('自动开启调度：跨日重置（2026-09-21 新语义）→ 未暂停的次日跳过开启进程；中间暂停过则次日执行', async (t) => {
   const clock = makeClock(shanghaiMs('2026-09-12', '07:00'));
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
     costCents: 10000, // 恰好不超标：避免 08:00 暂停巡查再开页面，隔离开启相位计数
-    monitorChengfang: { pauseEnabled: true, enableEnabled: true },
+    monitorChengfang: { pauseEnabled: true, enableEnabled: true, enableSchedulerEnabled: true },
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
   });
   await startLoopAndSettle(monitor, clock);
   await waitFor(() => !!monitor.batches['shop-001'] && !!monitor.batches['shop-001']['2026-09-12'], 20000, '第一天开启批次落库（含真实开启+落地轮询耗时）');
   assert.strictEqual(track.sessions, 1);
+  assert.ok(monitor.adBelief['shop-001'] && monitor.adBelief['shop-001'].on === true, '开启确认后 belief=on');
   // 释放到 08:00 → 暂停巡查（不超标，零会话）→ 挂起 30 分钟间隔
   clock.releaseOne();
   await waitFor(() => clock.pending() >= 1, 5000, '08:00 后挂起');
   assert.strictEqual(track.sessions, 1, '08:00 暂停巡查不打开页面（费用恰好不超标）');
-  // 直接推进虚拟时钟到次日 07:00，释放当前 30 分钟门 → 次日 07:30（仍在开启窗口）
+  // 直接推进虚拟时钟到次日 07:00 后，释放当前 30 分钟门 → 次日 07:30（仍在开启窗口）
   clock.advance(23 * 3600 * 1000);
   clock.releaseOne();
-  await waitFor(() => !!monitor.batches['shop-001'] && !!monitor.batches['shop-001']['2026-09-13'], 20000, '次日开启批次落库（含真实开启+落地轮询耗时）');
-  assert.strictEqual(track.sessions, 2, '跨日重置后次日再次执行开启');
-  assert.strictEqual(lastRunOutcome(monitor, 'shop-001', '2026-09-13'), 'all_enabled_confirmed');
+  // 新语义：昨日开启确认后无暂停记录 → 次日跳过整个开启进程（零会话），相位=success 且注明跳过
+  await waitFor(() => (monitor.getEnablePhaseRecord('shop-001', '2026-09-13') || {}).status === 'success', 20000, '次日相位完成');
+  const rec13 = monitor.getEnablePhaseRecord('shop-001', '2026-09-13');
+  assert.match(rec13.reason || '', /跳过开启进程/, '次日必须跳过：' + (rec13.reason || ''));
+  assert.strictEqual(track.sessions, 1, '未暂停的次日不得再开浏览器会话');
+  assert.ok(!monitor.batches['shop-001']['2026-09-13'], '跳过日不产生开启批次');
+
+  // 模拟次日阈值暂停已确认（belief=off）→ 第 3 天必须真正执行开启进程。
+  // 停值守循环并启动独立每日开启调度器接管窗口（此前窗口由值守循环内分支驱动；
+  // 快进时两循环并发会撞 _cycleRunning 互斥把开启挤到下一天，那是时钟快进伪影）。
+  monitor.stop();
+  const sched = await monitor.startEnableScheduler({ reason: 'test' });
+  assert.strictEqual(sched.ok, true, sched.reason || '独立调度器启动失败');
+  monitor.adBelief['shop-001'] = { on: false, at: new Date(clock.nowFn()).toISOString(), evidence: '暂停批次回读确认全部已暂停' };
+  for (let round = 0; round < 10 && !monitor.batches['shop-001']['2026-09-14']; round += 1) {
+    // 相位可能正在真实执行（真计时器数秒）：等门超时不视为失败，回头再查批次
+    try { await waitFor(() => clock.pending() >= 1, 15000); } catch (_) { /* 执行中，继续查批次 */ }
+    if (clock.pending() > 0) clock.releaseAll();
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  await waitFor(() => !!monitor.batches['shop-001'] && !!monitor.batches['shop-001']['2026-09-14'], 30000, '暂停后的次日开启批次落库');
+  assert.strictEqual(track.sessions, 2, '暂停过的次日必须再次执行开启进程');
+  assert.strictEqual(lastRunOutcome(monitor, 'shop-001', '2026-09-14'), 'all_enabled_confirmed');
   monitor.stop();
 });
 
@@ -944,4 +965,140 @@ test('上线修复（2026-09-16）：暂停巡查延时同样以实际墙钟重�
   clearTimeout(jumpTimer);
   assert.ok(Date.now() - t0 < 3000, `时钟跳跃后 _chunkedDelay 应立即返回，实际 ${Date.now() - t0}ms`);
   monitor.running = false;
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 2026-09-21 阈值联动：pollNowAndReschedule = 立即巡查 + 以完成时刻为新基准重排
+// ═══════════════════════════════════════════════════════════════════
+test('阈值联动：pollNowAndReschedule 执行一次巡查并重排下次检查（完成+30min），epoch 递增使挂起旧等待作废', async (t) => {
+  const { makeClock, waitFor } = require('./helpers');
+  const clock = makeClock(shanghaiMs('2026-09-21', '09:00'));
+  const { monitor } = await setupChengfangMonitor(t, { costCents: 100, orders: 100, clock }); // 未超标，零操作
+  monitor.start();
+  // 09:00 已过 08:00 → 循环直接进入首轮 interval 巡查（零操作、瞬时），完成后挂起 30 分钟等待门
+  await waitFor(() => clock.pending() >= 1, 8000, '首轮巡查后挂起等待');
+  assert.strictEqual(monitor.cycleNo, 1, '首轮 interval 巡查已完成');
+  const firstNext = monitor.schedule.nextRunAt;
+  assert.ok(firstNext, '第一轮后必须排出 nextRunAt');
+
+  const before = clock.nowFn();
+  const r = await monitor.pollNowAndReschedule('threshold-change');
+  assert.strictEqual(r.ok, true, r.reason);
+  assert.strictEqual(r.rescheduled, true);
+  assert.strictEqual(monitor.cycleNo, 2, '联动巡查 = 一个新周期');
+  const expectedNext = before + 30 * 60 * 1000;
+  const got = Date.parse(monitor.schedule.nextRunAt);
+  const msg = 'nextRunAt 应≈完成时刻+30min（' + new Date(expectedNext).toISOString() + '），实际 ' + monitor.schedule.nextRunAt;
+  assert.ok(Math.abs(got - expectedNext) <= 60 * 1000, msg);
+  // 虚拟时钟静止时新旧基准相同 → nextRunAt 可能恰好相等；核心断言是上面的完成+30min 与下方 epoch 作废
+  assert.ok((monitor._scheduleEpoch || 0) >= 1, 'epoch 必须递增（旧挂起等待作废标记）');
+  // 旧 30 分钟等待门释放（releaseAll 同时把虚拟时钟快进到 09:30 = 已越过新 nextRunAt）
+  // → epoch 分支剩余 0 → 回循环头按到期执行新一轮 interval 巡查（等价于正常定时触发，
+  // 不是旧节奏的重复：epoch 作废分支走完，未出现"旧 delay 返回立即再巡查两次"的坏路径）。
+  clock.releaseAll();
+  await waitFor(() => clock.pending() >= 1, 8000, 'epoch 校验后重新挂起');
+  assert.strictEqual(monitor.cycleNo, 3, '时钟已越过新 nextRunAt → 按期执行下一轮（恰一次，无重复爆发）');
+});
+
+test('阈值联动：阈值未变化（unchanged）时 setRuleThreshold 返回 unchanged，不触发巡查', async (t) => {
+  const { makeClock } = require('./helpers');
+  const clock = makeClock(shanghaiMs('2026-09-21', '09:00'));
+  const { monitor } = await setupChengfangMonitor(t, { costCents: 100, orders: 100, clock });
+  const r = monitor.setRuleThreshold(100); // 与当前相同
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.unchanged, true, '相同值必须返回 unchanged（联动巡查据此跳过）');
+});
+
+test('阈值联动：已有周期进行中 → 等待其结束后仍执行联动巡查（不静默跳过）', async (t) => {
+  const { makeClock, waitFor } = require('./helpers');
+  const clock = makeClock(shanghaiMs('2026-09-21', '09:00'));
+  const { monitor } = await setupChengfangMonitor(t, { costCents: 100, orders: 100, clock });
+  monitor.start();
+  await waitFor(() => clock.pending() >= 1, 8000, '首轮巡查后挂起等待');
+  assert.strictEqual(monitor.cycleNo, 1);
+  // 手动占住互斥：直接注入 _cycleRunning=true 模拟"周期进行中"
+  monitor._cycleRunning = true;
+  const p = monitor.pollNowAndReschedule('threshold-change');
+  // 300ms 后释放互斥（模拟周期结束）
+  await new Promise((r2) => setTimeout(r2, 300));
+  monitor._cycleRunning = false;
+  const r = await p;
+  assert.strictEqual(r.ok, true, JSON.stringify(r));
+  assert.strictEqual(monitor.cycleNo, 2, '等待互斥释放后必须补执行联动巡查');
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 2026-09-21 每日开启前置门：已在投放中 → 跳过整个开启进程（零浏览器零请求）
+// ═══════════════════════════════════════════════════════════════════
+test('每日开启前置门：第 1 天真实开启成功 → 第 2 天 07:00 跳过开启进程（会话数不增，相位=success 且注明跳过）', async (t) => {
+  const { makeClock, waitFor } = require('./helpers');
+  const clock = makeClock(shanghaiMs('2026-09-21', '06:30'));
+  const { monitor, track } = await setupChengfangMonitor(t, {
+    clock,
+    execution: { realMode: true, dryRun: false },
+    monitorChengfang: { enableSchedulerEnabled: true, enableEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } }, // 全关 → 第 1 天需真实开启
+  });
+  await monitor.startEnableScheduler({ reason: 'test' });
+  clock.releaseAll(); // → 07:00，第 1 天开启执行
+  await waitFor(() => track.sessions >= 1, 20000, '第 1 天开启执行');
+  await waitFor(() => (monitor.adBelief && monitor.adBelief[SHOP.id] && monitor.adBelief[SHOP.id].on === true) === true, 20000, '开启确认后 adBelief.on=true');
+  const sessionsAfterDay1 = track.sessions;
+  assert.ok(sessionsAfterDay1 >= 1, '第 1 天必须打开过乘方会话');
+  const day1Rec = monitor.getEnablePhaseRecord(SHOP.id, '2026-09-21');
+  assert.strictEqual(day1Rec.status, 'success');
+
+  // 推进到第 2 天 07:00：相位完成后循环先等到 08:00（窗口结束）再等次日窗口，
+  // 逐个释放等待门（每轮 releaseAll 前先等挂起，避免空放），直到第 2 天相位出现。
+  for (let gate = 0; gate < 4 && !((monitor.getEnablePhaseRecord(SHOP.id, '2026-09-22') || {}).status); gate += 1) {
+    await waitFor(() => clock.pending() >= 1, 8000, `第 ${gate + 1} 个等待门挂起`);
+    clock.releaseAll();
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  await waitFor(() => {
+    const r = monitor.getEnablePhaseRecord(SHOP.id, '2026-09-22');
+    return r && r.status === 'success';
+  }, 20000, '第 2 天相位完成');
+  const day2Rec = monitor.getEnablePhaseRecord(SHOP.id, '2026-09-22');
+  assert.match(day2Rec.reason || '', /跳过开启进程/, '第 2 天必须注明跳过：' + (day2Rec.reason || ''));
+  assert.strictEqual(track.sessions, sessionsAfterDay1, '第 2 天不得再开浏览器会话（不重复开启进程）');
+});
+
+test('每日开启前置门：adBelief 未记录或为关 → 照常执行开启进程（fail-closed）', async (t) => {
+  const { makeClock, waitFor } = require('./helpers');
+  const clock = makeClock(shanghaiMs('2026-09-21', '06:30'));
+  const { monitor, track } = await setupChengfangMonitor(t, {
+    clock,
+    execution: { realMode: true, dryRun: false },
+    monitorChengfang: { enableSchedulerEnabled: true, enableEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
+  });
+  // 场景 A：无记录 → 执行
+  assert.strictEqual((monitor.adBelief || {})[SHOP.id], undefined);
+  // 场景 B：已确认暂停（昨日暂停批次）→ 执行
+  monitor.adBelief[SHOP.id] = { on: false, at: '2026-09-20T02:00:00.000Z', evidence: '暂停批次回读确认全部已暂停' };
+  await monitor.startEnableScheduler({ reason: 'test' });
+  clock.releaseAll(); // → 07:00
+  await waitFor(() => track.sessions >= 1, 20000, '已暂停 → 必须执行开启');
+  assert.ok(track.sessions >= 1, '已暂停时必须打开乘方会话执行开启');
+  await waitFor(() => monitor.adBelief[SHOP.id].on === true, 20000, '开启成功后 belief 翻转为 on');
+});
+
+test('每日开启前置门：adBelief 持久化（重启后保留，跨进程有效）', async (t) => {
+  const { makeClock, waitFor } = require('./helpers');
+  const clock = makeClock(shanghaiMs('2026-09-21', '06:30'));
+  const h = await setupChengfangMonitor(t, {
+    clock,
+    execution: { realMode: true, dryRun: false },
+    monitorChengfang: { enableSchedulerEnabled: true, enableEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
+  });
+  const { monitor, track, dataDir, cfgResult, controller, reader } = h;
+  await monitor.startEnableScheduler({ reason: 'test' });
+  clock.releaseAll();
+  await waitFor(() => monitor.adBelief[SHOP.id] && monitor.adBelief[SHOP.id].on === true, 20000, '第 1 天开启完成');
+  // 模拟重启：同一 dataDir 新建 Monitor（不 start，仅验证加载）
+  const monitor2 = new Monitor(cfgResult, { reader, controller }, { dataDir, nowFn: clock.nowFn, delayFn: clock.delayFn });
+  assert.ok(monitor2.adBelief[SHOP.id] && monitor2.adBelief[SHOP.id].on === true, '重启后 adBelief 必须保留');
+  try { monitor2.stopEnableScheduler({ byUser: false, reason: 'cleanup' }); } catch (_) {}
 });

@@ -25,6 +25,7 @@
 const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed } = require('./chengfang-gate');
 const { executeChengfangPause, executeChengfangEnable, V_READ_FAILED, V_PARTIAL_FAILED } = require('./chengfang-executor');
 const { isAfterDailyStart, shanghaiDate, shanghaiWall } = require('../lib/time');
+const { compactUrls } = require('../lib/log');
 const { perOrderDisplayText } = require('./rules');
 
 /** 生产默认会话开启器：真实乘方管理页（openChengfangShop + 真实控制器）。 */
@@ -364,7 +365,7 @@ class ChengfangRunner {
       batchResult = this._summarizeExecutorResult({ result, counts, pre, batchDate, base });
       return batchResult;
     } catch (e) {
-      const reason = `乘方暂停流程异常停止：${e.reason || e.message}。零新增请求`;
+      const reason = compactUrls(`乘方暂停流程异常停止：${e.reason || e.message}。零新增请求`);
       this.audit({ ...base, step: 'executor', ok: false, error: reason });
       return { outcome: 'partial', reason, counts, pre, batchDate, error: e };
     } finally {
@@ -434,7 +435,7 @@ class ChengfangRunner {
       batchResult = this._summarizeEnableResult({ result, counts, batchDate, base });
       return batchResult;
     } catch (e) {
-      const reason = `乘方开启流程异常停止：${e.reason || e.message}。零新增请求`;
+      const reason = compactUrls(`乘方开启流程异常停止：${e.reason || e.message}。零新增请求`);
       this.audit({ ...base, step: 'executor', ok: false, error: reason });
       return { outcome: 'partial', reason, counts, batchDate, error: e };
     } finally {
@@ -463,7 +464,13 @@ class ChengfangRunner {
         allPausedConfirmed: false, confirmReason: reason, batchDate, executor: result,
       };
     }
-    const confirmedKeys = new Set((result.finalVerify && result.finalVerify.confirmed) || []);
+    // 已确认键 = 全量回读结果 ∪ 流程中渐进记录（markTargetConfirmed）。
+    // 2026-09-21 修复：中途失败（如商品自选回读恢复失败）时 finalVerify 可能为 null，
+    // 旧实现把已确认的全店托管目标也计入 unknown（批次显示"已确认 0 / 未知 24"）。
+    const confirmedKeys = new Set([
+      ...((result.finalVerify && result.finalVerify.confirmed) || []),
+      ...(result.targetsConfirmedKeys || []),
+    ]);
     const stillOpenKeys = new Set((result.finalVerify && result.finalVerify.stillOpen) || []);
     const details = [];
     for (const t of result.targets || []) {
@@ -515,7 +522,10 @@ class ChengfangRunner {
         allEnabledConfirmed: false, confirmReason: reason, batchDate, executor: result,
       };
     }
-    const confirmedKeys = new Set((result.finalVerify && result.finalVerify.confirmed) || []);
+    const confirmedKeys = new Set([
+      ...((result.finalVerify && result.finalVerify.confirmed) || []),
+      ...(result.targetsConfirmedKeys || []),
+    ]);
     const stillClosedKeys = new Set((result.finalVerify && result.finalVerify.stillClosed) || []);
     const details = [];
     for (const t of result.targets || []) {

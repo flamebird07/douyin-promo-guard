@@ -30,7 +30,7 @@ const WATCH_DRILL_MODULE = [
   path.join(__dirname, 'watch-drill.js'),
 ].find((p) => fs.existsSync(p));
 if (!WATCH_DRILL_MODULE) throw new Error('未找到被测模块 watch-drill.js');
-const { createWatchDrill, scrub } = require(WATCH_DRILL_MODULE);
+const { createWatchDrill, scrub, deriveAdState } = require(WATCH_DRILL_MODULE);
 
 // 推广控制主项目根目录：优先环境变量，其次本机生产路径，最后公开仓库内相对位置
 // （integrations/bill-manager 向上两级 = 仓库根），保证公开仓库中的副本可自举运行。
@@ -165,12 +165,14 @@ function makeDrill(clock, timers, opts = {}) {
     delayFn: timers.delayFn,
     dataDir: opts.dataDir || path.join(require('os').tmpdir(), `wd-state-${process.pid}-${Date.now()}`),
     config: cfg,
-    configSourcePath: 'test',
+    configSourcePath: opts.configSourcePath || 'test',
     adapters: {
       reader,
       controller: opts.controller || null,
     },
     chengfangOpener: opts.chengfangOpener || null,
+    notify: opts.notify,
+    notifySpawn: opts.notifySpawn,
   });
   CREATED.push({ drill, timers });
   return { drill, readers };
@@ -486,6 +488,81 @@ test('周期号正确递增：roundNo 跟随 Monitor.cycleNo（每个完整巡�
   assert.ok(r2 > r1, `第二轮 roundNo 必须递增：${r1} → ${r2}`);
 });
 
+// ══════════════════════════════════════════════════════════════
+// 15) 飞书通知（Hermes send）：每轮判断数据推送一条；失败不影响值守
+// ══════════════════════════════════════════════════════════════
+test('飞书通知：每轮判断数据经 hermes send 推送一条摘要（目标/主题/数据一致），同一轮不重复推送', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const sent = [];
+  const { drill } = makeDrill(clock, timers, {
+    costCents: 10001, orderCount: 100, // 10001 分 > 100×100 分 → 超标
+    notify: { enabled: true, target: 'feishu:test-chat', timeoutMs: 1000 },
+    notifySpawn: (args, input) => { sent.push({ args, input }); return Promise.resolve({ code: 0 }); },
+  });
+  drill.start();
+  const m = drill._internal._monitor;
+  await until(() => m.lastCycleAt, 8000);
+  await callHttp(drill, 'GET', '/api/watch-drill/state'); // 触发同步 → 消费判断事件 → 推送
+  await until(() => sent.length >= 1, 8000);
+  const first = sent[0];
+  assert.ok(first.args[0] === 'send' && first.args.includes('--to') && first.args.includes('feishu:test-chat'),
+    `应调用 hermes send --to feishu:test-chat，实际参数：${JSON.stringify(first.args)}`);
+  const subjIdx = first.args.indexOf('--subject');
+  assert.ok(subjIdx >= 0 && /\[推广值守\] 第\d+轮 超标/.test(first.args[subjIdx + 1]),
+    `主题应含轮次与结论，实际：${JSON.stringify(first.args[subjIdx + 1])}`);
+  assert.ok(first.input.includes('100.01 元'), `正文应含费用 100.01 元，实际：\n${first.input}`);
+  assert.ok(first.input.includes('100 单'), `正文应含订单 100 单，实际：\n${first.input}`);
+  assert.ok(/判定：超标/.test(first.input), `正文应含超标判定，实际：\n${first.input}`);
+  assert.ok(/触发暂停乘方/.test(first.input), `超标时应说明触发暂停，实际：\n${first.input}`);
+  // 同一轮不重复推送
+  const count = sent.length;
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  assert.strictEqual(sent.length, count, '同一轮判断不得重复推送');
+  const st = drill.snapshot().notify;
+  assert.strictEqual(st.enabled, true, '快照应显示通知已启用');
+  assert.strictEqual(st.lastStatus, 'ok');
+  assert.ok(st.lastCycleNo >= 1, '应记录最近推送的轮次');
+  assert.ok(st.lastAt, '应记录最近推送时间');
+});
+
+test('飞书通知：发送失败 → 只记 warn 日志与失败状态，值守继续运行（绝不因通知中断）', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const { drill } = makeDrill(clock, timers, {
+    costCents: 5000, orderCount: 100, // 5000 ≤ 10000 → 未超标
+    notify: { enabled: true, target: 'feishu:test-chat', timeoutMs: 1000 },
+    notifySpawn: () => Promise.resolve({ code: 1, stderr: 'feishu upstream 502' }),
+  });
+  drill.start();
+  const m = drill._internal._monitor;
+  await until(() => m.lastCycleAt, 8000);
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  await until(() => drill.snapshot().notify.lastStatus === 'failed', 8000);
+  const logs = allLogs(drill);
+  assert.ok(/飞书通知发送失败/.test(logs), `失败必须记 warn 日志，实际：\n${logs}`);
+  assert.ok(logs.includes('feishu upstream 502'), `日志应含 hermes 的错误输出，实际：\n${logs}`);
+  const st = drill.snapshot().notify;
+  assert.strictEqual(st.lastStatus, 'failed');
+  assert.strictEqual(drill.snapshot().running, true, '通知失败不得停止值守');
+});
+
+test('飞书通知：未开启（默认）→ 绝不调用 hermes send', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const sent = [];
+  const { drill } = makeDrill(clock, timers, {
+    costCents: 5000, orderCount: 100,
+    notifySpawn: (args, input) => { sent.push({ args, input }); return Promise.resolve({ code: 0 }); },
+  });
+  assert.strictEqual(drill.snapshot().notify.enabled, false, '模块默认不得开启通知（生产由 server.js 显式开启）');
+  drill.start();
+  await until(() => drill._internal._monitor.lastCycleAt, 8000);
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  await sleep(50);
+  assert.strictEqual(sent.length, 0, '未开启时绝不调用 hermes send');
+});
+
 test('失败原因进入日志：读取异常时记录失败原因（不是静默忽略）', async () => {
   const clock = makeClock(BASE_SH);
   const timers = makeTimers();
@@ -684,10 +761,16 @@ test('演练开启（dry enable）必须写"将开启"，绝不误写为"暂停"
 // ══════════════════════════════════════════════════════════════
 // 6) HTTP 接口契约（保持与 index.html 兼容）
 // ══════════════════════════════════════════════════════════════
-function callHttp(drill, method, url) {
+function callHttp(drill, method, url, body) {
   return new Promise((resolve) => {
-    const req = { url, method };
-    const chunks = [];
+    const req = {
+      url, method,
+      on(evt, cb) {
+        if (evt === 'data' && body != null) setImmediate(() => cb(Buffer.from(JSON.stringify(body))));
+        if (evt === 'end') setImmediate(() => cb());
+        return req;
+      },
+    };
     const res = {
       writeHead(code, headers) { this._code = code; this._headers = headers; },
       end(body) { resolve({ code: this._code, headers: this._headers, body: JSON.parse(body) }); },
@@ -695,7 +778,6 @@ function callHttp(drill, method, url) {
     Promise.resolve(drill.serveHttp(req, res)).then(() => {
       if (res._code === undefined) resolve({ code: 0, body: null });
     });
-    return chunks;
   });
 }
 
@@ -1487,7 +1569,7 @@ function extractWatchScript(htmlSrc, name) {
 async function renderWatchUi(htmlSrc, name, state, opts = {}) {
   const elements = {};
   const mkEl = () => ({ textContent: '', className: '', innerHTML: '', style: {} });
-  for (const id of ['wdShopName', 'wdStatusBadge', 'wdToggleBtn', 'wdModeBadge', 'wdGates', 'wdGap', 'wdEnableTaskState', 'wdEnableTaskNext', 'wdEnableTaskMissed', 'wdEnableTaskBtn', 'wdToggleHint', 'wdLastCheck', 'wdNextRun', 'wdEnableToday', 'wdPhase', 'wdCost', 'wdOrders', 'wdPerOrder', 'wdConclusion', 'wdReason', 'wdError', 'wdLog']) {
+  for (const id of ['wdShopName', 'wdStatusBadge', 'wdToggleBtn', 'wdModeBadge', 'wdGates', 'wdGateDetails', 'wdAdState', 'wdThresholdInput', 'wdThresholdBtn', 'wdThresholdMsg', 'wdGap', 'wdEnableTaskState', 'wdEnableTaskNext', 'wdEnableTaskMissed', 'wdEnableTaskBtn', 'wdToggleHint', 'wdLastCheck', 'wdNextRun', 'wdEnableToday', 'wdPhase', 'wdCost', 'wdOrders', 'wdPerOrder', 'wdConclusion', 'wdReason', 'wdError', 'wdLog']) {
     elements[id] = mkEl();
   }
   // /logs 响应盒：测试可在多次刷新之间改写，模拟接口语义变化（缺口出现/消失）
@@ -1757,4 +1839,182 @@ test('过程日志：暂停 phase 的 plan 事件显示"暂停计划"，未知�
   const logs = resp.body.logs.map((l) => l.msg).join('\n');
   assert.ok(/过程：暂停计划/.test(logs), `暂停 plan 事件必须显示"暂停计划"，实际：\n${logs}`);
   assert.ok(!/过程：将开启目标/.test(logs), `暂停 plan 事件不得显示"将开启目标"，实际：\n${logs}`);
+});
+
+// ══════════════════════════════════════════════════════════════
+// 16) 日志可读性：超长 URL 压缩（2026-09-21）
+//    千川管理页地址带大量 utm/埋点参数，原样进日志单条可达数千字符。
+// ══════════════════════════════════════════════════════════════
+test('scrub：超长 URL 压缩（utm/埋点参数不再刷屏），短 URL 保留', () => {
+  const longUrl = 'https://qianchuan.jinritemai.com/uni-prom/overall?aavid=1710242295996424&utm_source=qianchuan-origin-entrance&utm_medium=doudian-pc&utm_campaign=top-navigation-qianchuan&dut=2026-09-21%2008%3A32&pad=' + 'x'.repeat(120);
+  const out = scrub(`批量暂停后无法恢复乘方管理页回读：page.goto: net::ERR_ABORTED at ${longUrl}`);
+  assert.ok(!out.includes('utm_'), `埋点参数必须省略，实际：${out}`);
+  assert.ok(out.includes('参数已省略'), `必须带省略说明，实际：${out}`);
+  assert.ok(out.length < 250, `压缩后应简短（实际 ${out.length} 字符）`);
+  assert.ok(out.includes('https://qianchuan.jinritemai.com/uni-prom/overall?…'), '保留可定位的 host/path');
+  // 短 URL 原样保留（如登录页跳转说明）
+  const short = '点击"巨量千川"后未到达千川（当前: https://fxg.jinritemai.com/ffa/mshop/homepage/index）';
+  assert.ok(scrub(short).includes('https://fxg.jinritemai.com/ffa/mshop/homepage/index'), '短 URL 不得误压缩');
+});
+
+// ══════════════════════════════════════════════════════════════
+// 17) 门槛明细折叠区：常态整体隐藏（2026-09-21 用户反馈"无信息量"）；
+//     演练/被阻断/模式未知等异常态必须显示（fail-closed 完整依据）
+// ══════════════════════════════════════════════════════════════
+test('门槛明细折叠区：全绿（真实+双执行）整体隐藏；dryRun 阻断时显示（运行页 + 公开片段一致）', async () => {
+  const runtimeIndexPath = path.join(__dirname, '..', 'index.html');
+  const sources = [['watch-drill-tab.html(公开片段)', fs.readFileSync(path.join(PROMO, 'integrations/bill-manager/watch-drill-tab.html'), 'utf-8')]];
+  if (fs.existsSync(runtimeIndexPath)) sources.unshift(['index.html(运行页)', fs.readFileSync(runtimeIndexPath, 'utf-8')]);
+  const GATES_ARMED = {
+    realMode: true, pauseEnabled: true, enableEnabled: true, dryRun: false,
+    pauseWillExecute: true, enableWillExecute: true,
+    pauseGateReason: null, enableGateReason: null, blockedBy: [],
+    scope: ['全店托管', '商品自选'], deleteAdEnabled: false,
+  };
+  for (const [name, src] of sources) {
+    const green = await renderWatchUi(src, name, {
+      shopName: SHOP_ID, realMode: true, realModeKnown: true, running: true, status: 'waiting',
+      gates: GATES_ARMED,
+    });
+    assert.strictEqual(green.els.wdGateDetails.style.display, 'none', `${name} 全绿时折叠区必须整体隐藏`);
+  }
+  for (const [name, src] of sources) {
+    const blocked = await renderWatchUi(src, name, {
+      shopName: SHOP_ID, realMode: true, running: false, status: 'idle', gates: GATES_ALL_ON_DRY,
+    });
+    assert.notStrictEqual(blocked.els.wdGateDetails.style.display, 'none', `${name} 阻断态必须显示门槛明细`);
+    assert.ok(blocked.gatesHtml.includes('dryRun=<b>true</b>'), `${name} 显示时内容必须完整`);
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// 18) 广告开/关状态推导 + 阈值调整（2026-09-21 页面主信息与控件）
+// ══════════════════════════════════════════════════════════════
+test('deriveAdState：暂停确认在开启之后 → 已暂停；仅开启成功 → 投放中；无记录 → 未知', () => {
+  const mk = (batchToday, enables) => ({
+    monitor: { enablePhaseToday: enables },
+    shops: [{ batchToday }],
+  });
+  const caseOf = (batchToday, enables) => {
+    const s = mk(batchToday, enables);
+    return deriveAdState(s, s.shops[0]);
+  };
+  const paused = caseOf({ allPausedConfirmed: true, lastBatchAt: '2026-09-21T01:07:00.000Z' },
+    [{ record: { status: 'success', at: '2026-09-20T23:00:00.000Z' } }]);
+  assert.deepStrictEqual({ on: paused.on, note: paused.note }, { on: false, note: '已暂停' });
+  const on = caseOf(null, [{ record: { status: 'success', at: '2026-09-20T23:00:00.000Z' } }]);
+  assert.deepStrictEqual({ on: on.on, note: on.note }, { on: true, note: '投放中' });
+  const unknown = caseOf(null, []);
+  assert.deepStrictEqual({ on: unknown.on, note: unknown.note }, { on: null, note: '未知' });
+  // 开启在暂停之后（理论跨日场景）→ 投放中
+  const reEnabled = caseOf({ allPausedConfirmed: true, lastBatchAt: '2026-09-21T01:07:00.000Z' },
+    [{ record: { status: 'success', at: '2026-09-21T23:05:00.000Z' } }]);
+  assert.strictEqual(reEnabled.on, true);
+});
+
+test('阈值调整端点：POST /threshold → Monitor 立即生效 + 落盘 + 状态回显；非法值拒绝', async () => {
+  const cfgFile = path.join(require('os').tmpdir(), `wd-cfg-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(cfgFile, JSON.stringify({ rules: [{ type: 'wholeShopCostPerOrder', thresholdCents: 100, enabled: true }] }));
+  try {
+    const clock = makeClock(BASE_SH);
+    const timers = makeTimers();
+    const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100, configSourcePath: cfgFile });
+    drill.boot(); // 装配 Monitor（阈值/广告状态来自 Monitor 状态）
+    const st0 = drill.sync();
+    assert.strictEqual(st0.threshold.cents, 100, '初始阈值 100 分');
+    assert.strictEqual(st0.threshold.yuan, 1);
+    assert.strictEqual(st0.adState.on, null, '无执行记录时广告状态未知');
+
+    const r1 = await callHttp(drill, 'POST', '/api/watch-drill/threshold', { thresholdCents: 150 });
+    assert.strictEqual(r1.body.ok, true, JSON.stringify(r1.body));
+    assert.strictEqual(r1.body.state.threshold.cents, 150, '状态必须回显新阈值');
+    assert.strictEqual(r1.body.state.threshold.yuan, 1.5);
+    assert.strictEqual(
+      JSON.parse(fs.readFileSync(cfgFile, 'utf-8')).rules[0].thresholdCents, 150,
+      '必须落盘到 config.json（重启后保持）'
+    );
+    assert.strictEqual(drill._internal._monitor.config.rules[0].thresholdCents, 150, 'Monitor 内存配置同步更新');
+
+    const r2 = await callHttp(drill, 'POST', '/api/watch-drill/threshold', { thresholdCents: -5 });
+    assert.strictEqual(r2.body.ok, false, '非法阈值必须拒绝');
+    assert.strictEqual(r2.body.state.threshold.cents, 150, '拒绝后阈值保持不变');
+
+    const r3 = await callHttp(drill, 'POST', '/api/watch-drill/threshold', { yuan: 2.5 });
+    assert.strictEqual(r3.body.ok, true);
+    assert.strictEqual(r3.body.state.threshold.cents, 250, '支持按元提交（2.5 元 → 250 分）');
+
+    const logs = allLogs(drill);
+    assert.ok(/阈值调整成功/.test(logs), '调整必须留痕日志');
+  } finally {
+    try { fs.rmSync(cfgFile, { force: true }); } catch (_) {}
+  }
+});
+
+test('页面渲染：主信息优先级 —— 广告状态格 + 阈值回显 + 次要信息行', async () => {
+  const fragHtml = fs.readFileSync(path.join(PROMO, 'integrations/bill-manager/watch-drill-tab.html'), 'utf-8');
+  const r = await renderWatchUi(fragHtml, 'frag', {
+    shopName: SHOP_ID, realMode: true, running: true, status: 'waiting',
+    adState: { on: false, note: '已暂停', at: '2026-09-21T01:07:00.000Z' },
+    threshold: { cents: 150, yuan: 1.5 },
+    lastCheckAt: '2026-09-21T01:07:40.000Z',
+    nextRunAt: '2026-09-21T01:37:40.000Z',
+    lastRound: { costCents: 10001, orders: 100, conclusion: 'over', conclusionText: '超标', reason: null },
+    gates: {
+      realMode: true, pauseEnabled: true, enableEnabled: true, dryRun: false,
+      pauseWillExecute: true, enableWillExecute: true, blockedBy: [],
+      scope: ['全店托管', '商品自选'], deleteAdEnabled: false,
+    },
+  });
+  assert.strictEqual(r.els.wdAdState.textContent, '已暂停', '广告状态格必须显示推导状态');
+  assert.strictEqual(r.els.wdAdState.style.color, '#b45309', '已暂停用橙色');
+  assert.strictEqual(r.els.wdThresholdInput.value, 1.5, '阈值输入框回显当前值');
+  assert.strictEqual(r.els.wdConclusion.textContent, '超标（应暂停乘方）');
+  assert.strictEqual(r.els.wdPerOrder.textContent, '约 1.00 元/单');
+});
+
+test('阈值确认联动：值变化 → 立即巡查一次并以完成时刻重排下次检查；值未变 → 不触发', async () => {
+  const cfgFile = path.join(require('os').tmpdir(), `wd-cfg2-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(cfgFile, JSON.stringify({ rules: [{ type: 'wholeShopCostPerOrder', thresholdCents: 100, enabled: true }] }));
+  try {
+    const clock = makeClock(BASE_SH);
+    const timers = makeTimers();
+    const { drill } = makeDrill(clock, timers, { costCents: 100, orderCount: 100, configSourcePath: cfgFile });
+    drill.boot();
+    assert.strictEqual(drill._internal._monitor.running, false, 'boot 后值守未启动');
+
+    // 值守未运行：联动巡查跳过（m2.running=false），但不报错
+    const r0 = await callHttp(drill, 'POST', '/api/watch-drill/threshold', { thresholdCents: 120 });
+    assert.strictEqual(r0.body.ok, true);
+    assert.strictEqual(r0.body.poll, null, '值守未运行时不触发联动巡查');
+
+    // 启动值守后改阈值 → 立即巡查（cycleNo 递增）+ 重排
+    drill.start();
+    const m = drill._internal._monitor;
+    await until(() => m.lastCycleAt, 8000);
+    const cycleBefore = m.cycleNo;
+    const r1 = await callHttp(drill, 'POST', '/api/watch-drill/threshold', { thresholdCents: 150 });
+    assert.strictEqual(r1.body.ok, true);
+    assert.ok(r1.body.poll, '阈值变化必须返回联动巡查结果');
+    assert.strictEqual(r1.body.poll.ok, true, JSON.stringify(r1.body.poll));
+    assert.strictEqual(m.cycleNo, cycleBefore + 1, '联动巡查恰好多一个周期');
+    assert.ok(r1.body.poll.nextRunAt, '必须返回重排后的下次检查时间');
+    // 新基准 = 联动巡查完成时刻 + 30 分钟（误差容忍 1 分钟）
+    const expected = Date.parse(m.lastCycleAt) + 30 * 60 * 1000;
+    const got = Date.parse(r1.body.poll.nextRunAt);
+    assert.ok(Math.abs(got - expected) <= 60 * 1000,
+      `nextRunAt 应=完成+30min（${new Date(expected).toISOString()}），实际 ${r1.body.poll.nextRunAt}`);
+    // schedule.nextRunAt 已同步改写
+    assert.strictEqual(m.schedule.nextRunAt, r1.body.poll.nextRunAt, '调度状态必须同步');
+
+    // 值未变：不触发
+    const r2 = await callHttp(drill, 'POST', '/api/watch-drill/threshold', { thresholdCents: 150 });
+    assert.strictEqual(r2.body.ok, true);
+    assert.strictEqual(r2.body.poll, null, '阈值未变化不触发巡查');
+    assert.strictEqual(m.cycleNo, cycleBefore + 1, '周期不再增加');
+
+    const logs = allLogs(drill);
+    assert.ok(/阈值变更联动巡查：已完成/.test(logs), '联动巡查必须留痕日志');
+  } finally {
+    try { fs.rmSync(cfgFile, { force: true }); } catch (_) {}
+  }
 });

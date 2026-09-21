@@ -38,6 +38,26 @@ function sanitize(data) {
   return sanitizeValue(data);
 }
 
+/**
+ * 压缩文本中的超长 URL（2026-09-21）：千川管理页等地址携带大量 utm/埋点查询参数，
+ * 原样进入日志后单条可达数千字符，严重干扰阅读。短 URL（≤100 字符）原样保留；
+ * 长 URL 压缩为「scheme://host/path?…（参数已省略，原 URL 共 N 字符）」，
+ * 保留可定位的路径信息。仅影响日志/展示文本，不改动任何业务请求。
+ */
+const LONG_URL_RE = /https?:\/\/[^\s"'<>\u0080-\uffff]+/g;
+
+function compactUrls(text) {
+  return String(text).replace(LONG_URL_RE, (raw) => {
+    if (raw.length <= 100) return raw;
+    // 尾部标点不属于 URL 本身，剥离后回接
+    const trail = /[.,。；;）)]+$/.exec(raw);
+    const u = trail ? raw.slice(0, raw.length - trail[0].length) : raw;
+    const cut = /^(https?:\/\/[^/?#]+\/[^?#]*)/.exec(u);
+    const base = cut ? cut[1] : u.slice(0, 48);
+    return `${base}?…（参数已省略，原 URL 共 ${u.length} 字符）${trail ? trail[0] : ''}`;
+  });
+}
+
 function fmtArg(arg) {
   if (typeof arg === 'string') return arg;
   try {
@@ -67,6 +87,7 @@ function write(level, args) {
 
 module.exports = {
   sanitize,
+  compactUrls,
   info: (...a) => write('INFO', a),
   warn: (...a) => write('WARN', a),
   error: (...a) => write('ERROR', a),

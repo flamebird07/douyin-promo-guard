@@ -39,7 +39,7 @@
  */
 
 /** 与 src/config.js DEFAULTS.execution 保持同一份数字（唯一来源）。 */
-const POLLING_DEFAULTS = { timeoutMs: 30000, intervalMs: 3000 };
+const POLLING_DEFAULTS = { timeoutMs: 120000, intervalMs: 3000 };
 
 /**
  * 解析生效的轮询配置。缺失/非法时回落到 POLLING_DEFAULTS，并如实标注来源，

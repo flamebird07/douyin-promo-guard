@@ -67,7 +67,7 @@ function makeController() {
 const PAUSE_NOW = shanghaiMs('2026-09-12', '08:00');
 const PAUSE_DATE = '2026-09-12';
 
-// 落地确认/回读轮询：测试注入短预算（生产为 execution.readbackTimeoutMs=30000 /
+// 落地确认/回读轮询：测试注入短预算（生产为 execution.readbackTimeoutMs=120000 /
 // readbackIntervalMs=3000，见 src/lib/bounded-poll.js 与 config/config.json）。
 // 测试只影响等待时长，不改变生产语义。
 const TEST_POLL = { readbackTimeoutMs: 2500, readbackIntervalMs: 250 };
@@ -863,13 +863,21 @@ test('千川首次开启未落地（first-noop）：同会话仅重试一次，�
 });
 
 test('开启连续两次未生效（noop）：同会话仅重试一次后停止，不报告全部开启且不再点击', async () => {
+  // 点击计数走控制器包装（真点击），不看 __CF.clickLog：回读恢复的 page.goto 会重建夹具页面
+  // 并清空 clickLog，npm test 17 个文件并行时偶发的一次瞬时身份读取失败即可把它误判成 1 次。
+  const realClicks = [];
   const { result, state } = await runEnable({
     fixture: {
       plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(5) },
       state: { enableEffect: 'noop' },
     },
+    controllerOverride: async (controller) => {
+      const orig = controller.clickBatchEnable.bind(controller);
+      controller.clickBatchEnable = async (p) => { realClicks.push(1); return orig(p); };
+      return controller;
+    },
   });
-  assert.strictEqual(enableClicks(state).length, 2, '首次 + 唯一一次同会话重试，绝无第三次');
+  assert.strictEqual(realClicks.length, 2, `首次 + 唯一一次同会话重试，绝无第三次（回读原因：${result.confirmReason}）`);
   assert.strictEqual(result.allEnabledConfirmed, false);
   assert.match(result.confirmReason, /未生效/);
   assert.ok(state.plansZixuan.some((p) => p.checked === false), '平台未生效，行仍关闭');
@@ -1438,4 +1446,121 @@ test('最后一次读取失败：不得据此前"仍关闭"的旧快照重发（
   assert.ok(!audits.some((a) => a.event === 'retry'), '不得进入重发分支');
   assert.strictEqual(deleteClicks(state).length, 0);
   assert.strictEqual(result.allPausedConfirmed, false);
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 2026-09-21 两项生产问题回归：
+// ① 批量暂停后回读恢复 goto 一次 ERR_ABORTED → 必须同轮重试恢复闭环（09-21 08:34 实录：
+//    一次失败即判 partial，商品自选暂停拖到 30 分钟后下一轮 09:07 才完成）
+// ② 已确认目标的统计不得因中途失败丢失（09-21 08:34 批次显示"已确认 0/未知 24"，
+//    实际全店托管 1 条已确认关闭）
+// ③ 成功之后不重复操作：全部已暂停 → 只读核验，零点击
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * 包装 page：goto 失败 failTimes 次（模拟 net::ERR_ABORTED 瞬时导航中断），之后放行。
+ * 注意：放行的 goto **不真正导航**（fixture 页面重载会重置状态机；真实千川的服务端
+ * 状态在导航后保持，此处以"原地恢复"等价模拟）。gotoCounter 记录真实调用次数。
+ */
+function flakyGotoPage(pageRef, failTimes, gotoCounter) {
+  return new Proxy(pageRef, {
+    get(target, prop) {
+      if (prop === 'goto') {
+        return async () => {
+          if (gotoCounter) gotoCounter.n += 1;
+          if (failTimes > 0) {
+            failTimes -= 1;
+            throw new Error('page.goto: net::ERR_ABORTED at https://qianchuan.jinritemai.com/uni-prom/overall?aavid=1710242295996424&awemeId=&utm_source=qianchuan-origin-entrance&utm_medium=doudian-pc&utm_campaign=top-navigation-qianchuan&dut=2026-09-21%2008%3A32&pad=' + 'x'.repeat(80));
+          }
+          return undefined; // 原地恢复成功（不重载 fixture）
+        };
+      }
+      const v = target[prop];
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+}
+
+test('2026-09-21 回归①：批量暂停后回读恢复 goto 一次 ERR_ABORTED → 同轮重试恢复并闭环（不拖到下一轮）', async () => {
+  const pageRef = await loadPage({ plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(23) } });
+  const controller = makeController();
+  const origIdentity = controller.verifyIdentity.bind(controller);
+  const origClick = controller.clickBatchPause.bind(controller);
+  let failNextIdentity = false;
+  // 批量暂停点击后第一次身份核验失败 = 模拟"提交后跳回首页"，触发回读恢复（goto）
+  controller.clickBatchPause = async (p, ...rest) => { const r = await origClick(p, ...rest); failNextIdentity = true; return r; };
+  controller.verifyIdentity = async (p) => {
+    if (failNextIdentity) { failNextIdentity = false; return { ok: false, reason: '模拟批量暂停后跳回首页（身份消失）' }; }
+    return origIdentity(p);
+  };
+  const gotoCounter = { n: 0 };
+  const result = await executeChengfangPause({
+    controller,
+    page: flakyGotoPage(pageRef, 1, gotoCounter),
+    shopCfg: SHOP_CFG,
+    config: { execution: { realMode: true, dryRun: false, ...TEST_POLL }, monitor: { chengfang: { pauseEnabled: true } } },
+    now: () => PAUSE_NOW, businessDate: PAUSE_DATE,
+    audit: () => {}, stopRequested: () => false,
+  });
+  const state = await pageRef.evaluate(() => ({
+    pauseClicks: window.__CF.clickLog.filter((c) => c.type === 'pause').length,
+    plansZixuan: (window.__CF.plans['商品自选'] || []).map((p) => p.checked),
+  }));
+  await pageRef.close().catch(() => {});
+  assert.strictEqual(result.allPausedConfirmed, true, result.confirmReason);
+  assert.strictEqual(gotoCounter.n, 2, '第一次 goto ERR_ABORTED 后必须在同轮重试恢复（不再一次失败即放弃）');
+  assert.strictEqual(state.pauseClicks, 1, '批量暂停只点击一次');
+  assert.ok(state.plansZixuan.every((c) => c === false), '商品自选全部暂停（当轮闭环）');
+});
+
+test('2026-09-21 回归②：商品自选回读恢复持续失败 → 已确认的全店托管目标不得计入未知', async () => {
+  const pageRef = await loadPage({ plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(23) } });
+  const controller = makeController();
+  const origIdentity = controller.verifyIdentity.bind(controller);
+  const origClick = controller.clickBatchPause.bind(controller);
+  let afterBatchPause = false;
+  controller.clickBatchPause = async (p, ...rest) => { const r = await origClick(p, ...rest); afterBatchPause = true; return r; };
+  controller.verifyIdentity = async (p) => {
+    if (afterBatchPause) return { ok: false, reason: '模拟持续不在乘方管理页（回读恢复失败）' };
+    return origIdentity(p);
+  };
+  // goto 持续 ERR_ABORTED（重试 3 次仍失败）→ 复刻 09-21 08:34 场景
+  const result = await executeChengfangPause({
+    controller,
+    page: flakyGotoPage(pageRef, 99, null),
+    shopCfg: SHOP_CFG,
+    config: { execution: { realMode: true, dryRun: false, ...TEST_POLL }, monitor: { chengfang: { pauseEnabled: true } } },
+    now: () => PAUSE_NOW, businessDate: PAUSE_DATE,
+    audit: () => {}, stopRequested: () => false,
+  });
+  await pageRef.close().catch(() => {});
+  assert.strictEqual(result.allPausedConfirmed, false);
+  assert.match(result.confirmReason, /无法恢复乘方管理页回读/, '失败原因如实保留');
+  // 2026-09-21：失败原因中的超长 URL 必须压缩（utm/埋点参数不再刷屏）
+  assert.ok(!result.confirmReason.includes('utm_'), `长 URL 参数必须省略，实际：${result.confirmReason}`);
+  assert.ok(result.confirmReason.includes('参数已省略'), `必须带省略说明，实际：${result.confirmReason}`);
+  assert.ok(result.confirmReason.length < 300, `压缩后应简短（实际 ${result.confirmReason.length} 字符）：${result.confirmReason}`);
+  assert.ok(
+    (result.targetsConfirmedKeys || []).includes(`全店托管:${TUOGUAN_PLAN.id}`),
+    `已确认的全店托管目标必须渐进记录，实际：${JSON.stringify(result.targetsConfirmedKeys)}`
+  );
+  // runner 汇总：已确认 ∪ 渐进记录 → 托管目标计 confirmed，商品自选计 unknown（而非全部 unknown）
+  const { ChengfangRunner } = require('../src/engine/chengfang-runner');
+  const runner = new ChengfangRunner({ coordinator: {}, config: {}, now: () => PAUSE_NOW });
+  const counts = { confirmed: 0, failed: 0, unknown: 0, skipped: 0, cancelled: 0 };
+  const batch = runner._summarizeExecutorResult({ result, counts, pre: {}, batchDate: PAUSE_DATE, base: {} });
+  assert.strictEqual(batch.counts.confirmed, 1, `全店托管 1 条应计已确认，实际 ${JSON.stringify(batch.counts)}`);
+  assert.strictEqual(batch.counts.unknown, 23, `商品自选 23 条结果未知，实际 ${JSON.stringify(batch.counts)}`);
+});
+
+test('2026-09-21 回归③：全部已暂停（两区域）→ 只读核验零点击，不重复暂停（成功之后不反复关闭）', async () => {
+  const { result, state } = await run({
+    fixture: { plans: { '全店托管': [{ ...TUOGUAN_PLAN, checked: false }], '商品自选': ZIXUAN_CLOSED(23) } },
+    dryRun: false,
+  });
+  assert.strictEqual(result.allPausedConfirmed, true, result.confirmReason);
+  assert.strictEqual(result.views.tuoguan.status, 'already_paused');
+  assert.strictEqual(switchClicks(state).length, 0, '行开关零点击');
+  assert.strictEqual(pauseClicks(state).length, 0, '批量暂停零点击');
+  assert.match(result.views.zixuan.note, /只读核验/, '商品自选全部已暂停时明确只读核验文案');
 });

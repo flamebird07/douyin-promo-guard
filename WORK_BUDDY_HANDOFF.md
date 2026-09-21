@@ -3,7 +3,7 @@
 ## 开工条件和交付性质
 本仓库 https://github.com/flamebird07/douyin-promo-guard 为公开仓库。第十二轮是待修复交接版本，不是已可上线版本。Codex 独立运行 npm test：237/237 通过，约 280 秒；隔离测试不证明真实操作闭环已接通。开工前核对远端 main 与本地提交；保留工作区已有修改。不得上传 Cookie、Token、config/config.json、evidence、日志、浏览器会话数据。不要提交诊断探针 test/probe-*.js。
 
-本地项目：C:\Users\Administrator\Documents\ChatGPT\推广广告控制。
+本地项目：C:\Users\Administrator\Documents\电商助手\douyin-promo-guard（2026-09-21 自 ChatGPT/推广广告控制 迁入）。
 现有电商助手：C:\Users\Administrator\Documents\电商助手\bill-manager。
 用户界面：https://localhost:3443/。
 从 Trae 转交 Work Buddy，由用户转发提示词，Codex 不可直连 Work Buddy。

@@ -36,7 +36,7 @@ const { createWatchDrill, scrub, deriveAdState } = require(WATCH_DRILL_MODULE);
 // （integrations/bill-manager 向上两级 = 仓库根），保证公开仓库中的副本可自举运行。
 const PROMO = [
   process.env.PROMO_GUARD_DIR,
-  'C:/Users/Administrator/Documents/ChatGPT/推广广告控制',
+  'C:/Users/Administrator/Documents/电商助手/douyin-promo-guard',
   path.join(__dirname, '..', '..'),
 ].filter(Boolean).find((p) => fs.existsSync(path.join(p, 'src/engine/monitor.js')));
 if (!PROMO) throw new Error('未找到推广控制主项目（src/engine/monitor.js）');

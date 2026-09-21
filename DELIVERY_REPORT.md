@@ -1,7 +1,7 @@
 # 交付报告 —— 乘方推广值守（交接修复 + 3443 接入真实操作模式）
 
 - 交接提交：`12d59855a9d82afae0f9364d9316552bb8b79dbc`
-- 本地路径：`C:\Users\Administrator\Documents\ChatGPT\推广广告控制`
+- 本地路径：`C:\Users\Administrator\Documents\电商助手\douyin-promo-guard`（2026-09-21 自 `ChatGPT/推广广告控制` 迁入）
 - 3443 后端：`C:\Users\Administrator\Documents\电商助手\bill-manager\watch-drill.js`
 - 日期：2026-09-15（第三轮定点修复，基于 Codex 复核 R2）
 - 基线：`a64675d`（第二轮已推送）

@@ -35,7 +35,7 @@ const path = require('path');
 function resolvePromoGuardDir() {
   const candidates = [
     process.env.PROMO_GUARD_DIR,
-    'C:/Users/Administrator/Documents/ChatGPT/推广广告控制',
+    'C:/Users/Administrator/Documents/电商助手/douyin-promo-guard',
     path.join(__dirname, '..', '..'),
   ].filter(Boolean);
   for (const c of candidates) {

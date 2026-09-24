@@ -83,10 +83,35 @@ async function setupChengfangMonitor(t, {
   reader.listAdPage = async (args) => { track.listAdPageCalls += 1; return origList(args); };
 
   let monitorRef = null;
+  // 决策层 currentAdState：来自本轮页面/清单回读（fixture 行级开关映射；adBelief 不得代替）
+  const mapRowsToAdState = (rows) => {
+    if (!Array.isArray(rows) || rows.length === 0) return 'off'; // 空清单+已确认无计划 → off
+    let sawOn = false; let sawOff = false;
+    for (const r of rows) {
+      if (r.switchChecked === true) { sawOn = true; continue; }
+      if (r.switchChecked === false) { sawOff = true; continue; }
+      return 'unknown';
+    }
+    if (sawOn && sawOff) return 'mixed';
+    if (sawOn) return 'on';
+    if (sawOff) return 'off';
+    return 'unknown';
+  };
+  const seedRows = [
+    ...(((fixture && fixture.plans && fixture.plans['全店托管']) || []).map((p) => ({ id: p.id, switchChecked: p.checked === true }))),
+    ...(((fixture && fixture.plans && fixture.plans['商品自选']) || []).map((p) => ({ id: p.id, switchChecked: p.checked === true }))),
+  ];
+  // liveRows 在每次会话 close 时从页面回读同步（模拟「本轮页面回读」）
+  let liveRows = seedRows.map((r) => ({ ...r }));
+  const live = {
+    get rows() { return liveRows; },
+    setRows(rows) { liveRows = rows.map((r) => ({ ...r })); },
+  };
   const monitor = new Monitor(cfgResult, { reader, controller }, {
     dataDir,
     nowFn: clock ? clock.nowFn : undefined,
     delayFn: clock ? clock.delayFn : undefined,
+    readAdState: async () => mapRowsToAdState(live.rows),
     chengfangOpener: async ({ loginCfg, shopCfg }) => {
       track.sessions += 1;
       const page = await browser.newPage();
@@ -100,13 +125,21 @@ async function setupChengfangMonitor(t, {
         controller: ctrl,
         close: async () => {
           track.clickLog = await page.evaluate(() => window.__CF.clickLog).catch(() => null);
+          // 会话结束后同步「页面回读」状态，供下一轮决策使用
+          try {
+            const next = await page.evaluate(() => [
+              ...(window.__CF.plans['全店托管'] || []),
+              ...(window.__CF.plans['商品自选'] || []),
+            ].map((p) => ({ id: p.id, switchChecked: p.checked === true })));
+            if (Array.isArray(next)) live.setRows(next);
+          } catch (_) { /* 页面已关则保留上次状态 */ }
           await page.close().catch(() => {});
         },
       };
     },
   });
   monitorRef = monitor;
-  return { monitor, controller, reader, track, dataDir, cookieDir, cfgResult };
+  return { monitor, controller, reader, track, dataDir, cookieDir, cfgResult, live };
 }
 
 const pauseClicks = (log) => (log || []).filter((c) => c.type === 'pause');
@@ -674,7 +707,7 @@ test('自动开启调度：当天只执行一次（同一天重启监控不重�
 
 test('自动开启调度：跨日重置（2026-09-21 新语义）→ 未暂停的次日跳过开启进程；中间暂停过则次日执行', async (t) => {
   const clock = makeClock(shanghaiMs('2026-09-12', '07:00'));
-  const { monitor, track } = await setupChengfangMonitor(t, {
+  const { monitor, track, live: hLive } = await setupChengfangMonitor(t, {
     clock,
     costCents: 10000, // 恰好不超标：避免 08:00 暂停巡查再开页面，隔离开启相位计数
     monitorChengfang: { pauseEnabled: true, enableEnabled: true, enableSchedulerEnabled: true },
@@ -694,17 +727,19 @@ test('自动开启调度：跨日重置（2026-09-21 新语义）→ 未暂停�
   // 新语义：昨日开启确认后无暂停记录 → 次日跳过整个开启进程（零会话），相位=success 且注明跳过
   await waitFor(() => (monitor.getEnablePhaseRecord('shop-001', '2026-09-13') || {}).status === 'success', 20000, '次日相位完成');
   const rec13 = monitor.getEnablePhaseRecord('shop-001', '2026-09-13');
-  assert.match(rec13.reason || '', /跳过开启进程/, '次日必须跳过：' + (rec13.reason || ''));
+  assert.match(rec13.reason || '', /跳过开启进程|already_on/, '次日必须跳过：' + (rec13.reason || ''));
   assert.strictEqual(track.sessions, 1, '未暂停的次日不得再开浏览器会话');
   assert.ok(!monitor.batches['shop-001']['2026-09-13'], '跳过日不产生开启批次');
 
-  // 模拟次日阈值暂停已确认（belief=off）→ 第 3 天必须真正执行开启进程。
+  // 模拟次日阈值暂停已确认（页面回读=off）→ 第 3 天必须真正执行开启进程。
+  // 决策只认本轮回读（adBelief 仅审计）：把 live 行翻到关闭侧。
   // 停值守循环并启动独立每日开启调度器接管窗口（此前窗口由值守循环内分支驱动；
   // 快进时两循环并发会撞 _cycleRunning 互斥把开启挤到下一天，那是时钟快进伪影）。
   monitor.stop();
   const sched = await monitor.startEnableScheduler({ reason: 'test' });
   assert.strictEqual(sched.ok, true, sched.reason || '独立调度器启动失败');
   monitor.adBelief['shop-001'] = { on: false, at: new Date(clock.nowFn()).toISOString(), evidence: '暂停批次回读确认全部已暂停' };
+  hLive.setRows(hLive.rows.map((r) => ({ ...r, switchChecked: false })));
   for (let round = 0; round < 10 && !monitor.batches['shop-001']['2026-09-14']; round += 1) {
     // 相位可能正在真实执行（真计时器数秒）：等门超时不视为失败，回头再查批次
     try { await waitFor(() => clock.pending() >= 1, 15000); } catch (_) { /* 执行中，继续查批次 */ }

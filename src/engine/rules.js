@@ -60,3 +60,4 @@ function perOrderDisplayText(costCents, orders) {
 }
 
 module.exports = { evaluateWholeShopCostPerOrder, perOrderDisplayText };
+// 开关目标状态决策见 ad-switch-decision.js（单独 require，避免与本模块循环依赖）。

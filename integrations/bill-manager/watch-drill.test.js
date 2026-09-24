@@ -171,6 +171,7 @@ function makeDrill(clock, timers, opts = {}) {
       controller: opts.controller || null,
     },
     chengfangOpener: opts.chengfangOpener || null,
+    readAdState: opts.readAdState || (async () => opts.adStateFixture || 'mixed'),
     notify: opts.notify,
     notifySpawn: opts.notifySpawn,
   });
@@ -431,8 +432,9 @@ test('判断数据日志：恰好等于 1 元/单（不超标）时给出费用/
   const logs = allLogs(drill);
   assert.ok(/第 \d+ 轮判断数据（周期 \d+/.test(logs), `应含周期号与判断标题，实际：\n${logs}`);
   assert.ok(/费用 .* 元（\d+ 分），订单 \d+ 单，每单/.test(logs), `应含费用/订单/每单，实际：\n${logs}`);
-  assert.ok(logs.includes('10000 分 ≤ 100×100 分') || logs.includes('10000 分 ≤ 100×100'), '应含整数分判定过程');
-  assert.ok(logs.includes('未超标，不暂停乘方'));
+  assert.ok(logs.includes('10000 分 = 100×100 分'), '应含等于阈值的整数分判定过程');
+  assert.ok(/保持|零动作/.test(logs), '等于阈值必须保持状态、零动作');
+  assert.ok(!logs.includes('未超标，不暂停乘方'), '不得将未超标统一写为不暂停');
 });
 
 test('判断数据日志：严格超过 1 元/单时判为超标并说明应暂停乘方', async () => {
@@ -445,8 +447,7 @@ test('判断数据日志：严格超过 1 元/单时判为超标并说明应暂�
   await callHttp(drill, 'GET', '/api/watch-drill/state');
   const logs = allLogs(drill);
   assert.ok(logs.includes('10001 分 > 100×100 分'), `应含严格大于的整数分判定，实际：\n${logs}`);
-  assert.ok(logs.includes('超标'), '应判为超标');
-  assert.ok(logs.includes('应暂停乘方'), '应说明应暂停乘方');
+  assert.ok(/将暂停|触发暂停/.test(logs), '高于阈值应转译为暂停动作');
 });
 
 test('判断数据日志：连续两轮数据完全相同 → 仍然各有两条判断日志（不以"数据变化"为条件）', async () => {
@@ -509,12 +510,12 @@ test('飞书通知：每轮判断数据经 hermes send 推送一条摘要（目�
   assert.ok(first.args[0] === 'send' && first.args.includes('--to') && first.args.includes('feishu:test-chat'),
     `应调用 hermes send --to feishu:test-chat，实际参数：${JSON.stringify(first.args)}`);
   const subjIdx = first.args.indexOf('--subject');
-  assert.ok(subjIdx >= 0 && /\[推广值守\] 第\d+轮 超标/.test(first.args[subjIdx + 1]),
+  assert.ok(subjIdx >= 0 && /\[推广值守\] 第\d+轮 将暂停/.test(first.args[subjIdx + 1]),
     `主题应含轮次与结论，实际：${JSON.stringify(first.args[subjIdx + 1])}`);
   assert.ok(first.input.includes('100.01 元'), `正文应含费用 100.01 元，实际：\n${first.input}`);
   assert.ok(first.input.includes('100 单'), `正文应含订单 100 单，实际：\n${first.input}`);
-  assert.ok(/判定：超标/.test(first.input), `正文应含超标判定，实际：\n${first.input}`);
-  assert.ok(/触发暂停乘方/.test(first.input), `超标时应说明触发暂停，实际：\n${first.input}`);
+  assert.ok(/判定：.*10001 分 > 100×100 分/.test(first.input), `正文应含严格大于的整数分判定，实际：\n${first.input}`);
+  assert.ok(/触发暂停|将暂停/.test(first.input), `高于阈值时应说明暂停动作，实际：\n${first.input}`);
   // 同一轮不重复推送
   const count = sent.length;
   await callHttp(drill, 'GET', '/api/watch-drill/state');
@@ -2016,5 +2017,44 @@ test('阈值确认联动：值变化 → 立即巡查一次并以完成时刻重
     assert.ok(/阈值变更联动巡查：已完成/.test(logs), '联动巡查必须留痕日志');
   } finally {
     try { fs.rmSync(cfgFile, { force: true }); } catch (_) {}
+  }
+});
+
+test('脱敏：假 cookie/token 不出现在日志、页面快照与通知正文', async () => {
+  const clock = makeClock(BASE_SH);
+  const timers = makeTimers();
+  const sent = [];
+  const FAKE = 'FAKE_COOKIE_VALUE_NOT_REAL';
+  const TOK = 'FAKE_TOKEN_XYZ';
+  const { drill } = makeDrill(clock, timers, {
+    costCents: 10001, orderCount: 100,
+    notify: { enabled: true, target: 'feishu:test-chat', timeoutMs: 1000 },
+    notifySpawn: (args, input) => { sent.push({ args, input }); return Promise.resolve({ code: 0 }); },
+  });
+  const t = drill.translateSwitchResult({ decision: 'data_blocked', reason: 'sessionid=' + FAKE + '; token=' + TOK, status: 'blocked' });
+  assert.ok(!t.line.includes(FAKE) && !t.line.includes(TOK), '转译输出须脱敏：' + t.line);
+  assert.ok(t.line.includes('***') || t.line.includes('已脱敏'), '转译须带脱敏标记：' + t.line);
+  drill.start();
+  await until(() => drill._internal._monitor, 4000, 'Monitor 装配');
+  const m = drill._internal._monitor;
+  assert.ok(m);
+  m._memPush(m.recentErrors, { scope: 'shop:test', error: 'lastError sessionid=' + FAKE + ' token=' + TOK }, undefined, 'error');
+  m._memPush(m.judgements, { kind: 'judgement', cycleNo: 990001, status: 'blocked', reason: 'sessionid=' + FAKE + '; token=' + TOK }, undefined, 'judgement');
+  await until(() => m.lastCycleAt, 8000);
+  // 本轮完成后设置展示用状态，避免轮询覆盖测试注入。
+  m._runtime(SHOP_ID).lastData = { blockedReason: 'sessionid=' + FAKE + '; token=' + TOK };
+  await callHttp(drill, 'GET', '/api/watch-drill/state');
+  await until(() => sent.length >= 1, 8000);
+  const logs = allLogs(drill);
+  const snap = JSON.stringify(drill.snapshot());
+  const notifyAll = sent.map((x) => (x.input || '') + (x.args || []).join(' ')).join(String.fromCharCode(10));
+  assert.ok(logs.includes('***') || logs.includes('已脱敏') || logs.includes('疑似凭证'), '日志须出现脱敏标记');
+  const st = drill.snapshot();
+  assert.ok(st.lastError, 'snapshot.lastError 须存在');
+  assert.ok(!String(st.lastError).includes(FAKE) && !String(st.lastError).includes(TOK));
+  assert.ok(/被拦下|未得出费用/.test(notifyAll), '通知须走 blocked 分支');
+  assert.ok(notifyAll.includes('***') || notifyAll.includes('已脱敏'), '通知须含脱敏标记');
+  for (const blob of [logs, snap, notifyAll]) {
+    assert.ok(!blob.includes(FAKE) && !blob.includes(TOK), '日志/快照/通知不得含假凭据原值');
   }
 });

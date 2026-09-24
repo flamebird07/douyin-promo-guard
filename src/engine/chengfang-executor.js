@@ -1120,6 +1120,7 @@ async function executeChengfangEnable(p) {
     stopRequested,
     businessDate: p.businessDate,
     action: 'enable',
+    enableSource: p.enableSource === undefined || p.enableSource === null ? 'daily_schedule' : p.enableSource,
   });
 
   const result = {

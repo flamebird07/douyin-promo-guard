@@ -33,6 +33,9 @@ const { ChengfangRunner, defaultChengfangOpener } = require('./chengfang-runner'
 const { resolvePollingConfig } = require('../lib/bounded-poll');
 const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed } = require('./chengfang-gate');
 const { perOrderDisplayText } = require('./rules');
+const { decideAdSwitchAction, DECISION } = require('./ad-switch-decision');
+const { AdSwitchOrchestrator, createSwitchSerialGate } = require('./ad-switch-orchestrator');
+const { mapAdStateFromAdList, mapAdStateFromSwitchRows, normalizeAdState } = require('./ad-switch-state');
 const guard = require('./guard');
 const { NotConnectedError } = require('../lib/errors');
 const { shanghaiDate, shanghaiClockText, shanghaiWall, shanghaiMs, isAfterDailyStart, msUntilDailyStart, msUntilHour, nextIntervalDelayMs } = require('../lib/time');
@@ -65,6 +68,10 @@ class Monitor {
     this._coordinators = new Map(); // shopId -> WholeShopCloseCoordinator（跨周期保留在途请求登记）
     this._chengfangRunners = new Map(); // shopId -> ChengfangRunner（乘方主链路）
     this._chengfangOpener = opts.chengfangOpener || null; // 测试注入：本地 DOM fixture 会话开启器
+    // 决策层 + 串行门外层（2026-09-22）：每日 07:00 开启 / 低于阈值开启 / 高于阈值暂停统一入口
+    this._readAdState = opts.readAdState || null; // 测试注入：本轮回读 currentAdState
+    this._switchOrchestrator = opts.switchOrchestrator || null; // 测试注入
+    this._switchGate = opts.switchGate || null;
 
     this.running = false;
     this._gen = 0;               // 代数：stop/start 快速切换时防止多循环（暂停巡查）
@@ -146,6 +153,11 @@ class Monitor {
       this._enableSchedule.stoppedByUser = loaded.enableScheduler.stoppedByUser === true;
       this._enableSchedule.stoppedAt = loaded.enableScheduler.stoppedAt || null;
     }
+    // 串行门持久化：未结束动作恢复为 unknown 阻塞（不把未知写成成功，禁止补点）
+    this._switchGate = this._switchGate
+      || createSwitchSerialGate({ state: loaded.switchSlots || { slots: [] } });
+    this._switchOrchestrator = this._switchOrchestrator
+      || new AdSwitchOrchestrator({ gate: this._switchGate, audit: (e) => this._audit(e) });
     // 重启回读：上次进程遗留的 in_progress 视为 unknown（进程已中断，结果未确认），
     // 交由 _runEnablePhase 先回读实际状态再决定，绝不盲目重发。
     this._reconcileEnablePhaseOnBoot();
@@ -233,11 +245,15 @@ class Monitor {
     }
   }
 
+  /**
+   * 持久化安全状态（批次/相位/串行门）。**真实返回成功/失败**，不静默吞掉。
+   * @returns {{ok:boolean, reason?:string}}
+   */
   _saveState() {
     try {
       this._ensureDataDir();
       const tmp = `${this.stateFile}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify({
+      const payload = JSON.stringify({
         version: STATE_VERSION,
         batches: this.batches,
         enablePhase: this.enablePhase || {},
@@ -246,12 +262,32 @@ class Monitor {
           stoppedByUser: this._enableSchedule.stoppedByUser === true,
           stoppedAt: this._enableSchedule.stoppedAt || null,
         },
+        switchSlots: (this._switchOrchestrator && this._switchOrchestrator.exportState)
+          ? this._switchOrchestrator.exportState()
+          : (this._switchGate && this._switchGate.exportState ? this._switchGate.exportState() : { slots: [] }),
         savedAt: new Date(this.nowFn()).toISOString(),
-      }, null, 2));
+      }, null, 2);
+      fs.writeFileSync(tmp, payload);
       fs.renameSync(tmp, this.stateFile);
+      return { ok: true };
     } catch (e) {
-      log.warn('状态持久化失败:', e.message);
+      const reason = `状态持久化失败: ${e.message}`;
+      log.warn(reason);
+      // 不删除/覆盖已有有效 state.json
+      return { ok: false, reason };
     }
+  }
+
+  /** 新动作发出前：必须成功写入 actionId/动作/未结束状态；失败则不发底层开关。 */
+  _persistBeforeDispatch(shopId, action, actionId) {
+    const r = this._saveState();
+    if (r.ok === true) {
+      return { ok: true };
+    }
+    const reason = `persistence_blocked: 动作前持久化失败（${r.reason || '未知'}），未发出开关`;
+    this._memPush(this.recentErrors, { scope: `shop:${shopId}`, error: reason, action, actionId: actionId || null }, undefined, 'error');
+    this._audit({ kind: 'persistence', shopId, action, actionId: actionId || null, ok: false, reason });
+    return { ok: false, reason, outcome: 'persistence_blocked' };
   }
 
   _pruneBatches() {
@@ -1028,7 +1064,7 @@ class Monitor {
    * 修复：每个完整周期都产生一条 judgement（带 cycleNo、业务日期、费用/订单/每单、
    * 整数分判定过程、结论），进入事件流供 3443 增量消费。**与数据是否变化无关。**
    */
-  _emitJudgement(shopCfg, { data, over, status, reason }) {
+  _emitJudgement(shopCfg, { data, over, status, reason, decision = null, currentAdState = null }) {
     const cycleNo = (this._currentCycle && this._currentCycle.cycleNo) || this.cycleNo;
     const costCents = data && data.cost ? data.cost.valueCents : null;
     const orders = data && data.orders ? data.orders.valueCount : null;
@@ -1047,6 +1083,11 @@ class Monitor {
       overKnown: over !== null && over !== undefined,
       status,
       reason: reason || null,
+      // 决策层标签（metric/decision 分离；currentAdState 只来自本轮回读）
+      currentAdState: currentAdState || null,
+      metric: (decision && decision.metric) || null,
+      decision: (decision && decision.decision) || null,
+      zeroClick: decision ? decision.zeroClick !== false : undefined,
       perOrderText: (data && data.cost && data.orders && typeof costCents === 'number' && orders > 0)
         ? perOrderDisplayText(costCents, orders) : null,
       at: new Date(this.nowFn()).toISOString(),
@@ -1057,6 +1098,410 @@ class Monitor {
       this.lastJudgementCycleNo = cycleNo;
     }
     return rec;
+  }
+
+  /** 启用的 wholeShopCostPerOrder 阈值（整数分）；缺失返回 null（决策层会 data_blocked）。 */
+  _thresholdCents() {
+    const rule = (this.config.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
+    return rule ? rule.thresholdCents : null;
+  }
+
+  /**
+   * 本轮回读 currentAdState（on/off/mixed/unknown）。
+   * - 测试可注入 opts.readAdState；
+   * - 清单身份/完整性失败 → 返回 error（调用方必须 blocked，不得包成 ok）；
+   * - 空清单仅在 listComplete+范围有效时为 off（无目标）；否则 unknown。
+   * @returns {Promise<{state:string, error?:{status:string,reason:string,blocked?:string}}>}
+   */
+  async _readCurrentAdState(shopCfg) {
+    if (this._readAdState) {
+      try {
+        return { state: normalizeAdState(await this._readAdState(shopCfg)) };
+      } catch (e) {
+        return {
+          state: 'unknown',
+          error: { status: 'blocked', reason: e.reason || e.message, blocked: 'ad_state_read' },
+        };
+      }
+    }
+    if (this._chengfangScopeConfigured()) {
+      return this._readChengfangAdState(shopCfg);
+    }
+    try {
+      const coord = this._getCoordinator(shopCfg);
+      const inventory = await coord.listAllAds(shopCfg);
+      const ads = inventory.ads || [];
+      const confirmedEmpty = inventory.listComplete === true
+        && ads.length === 0
+        && !(inventory.coverageGaps && inventory.coverageGaps.length > 0);
+      return {
+        state: mapAdStateFromAdList(ads, { confirmedEmpty }),
+        inventory,
+      };
+    } catch (e) {
+      // 身份/分页/完整性失败：blocked，不得映射成 ok/unknown 零点击
+      return {
+        state: 'unknown',
+        error: {
+          status: 'blocked',
+          reason: e.reason || e.message,
+          blocked: /身份/.test(String(e.reason || e.message)) ? 'identity' : 'inventory',
+        },
+      };
+    }
+  }
+
+  /**
+   * 生产默认：乘方双 UI（scope）只读回读 → on/off/mixed/unknown。
+   * 复用会话开启器 + controller.readView/refreshView/分页；**不点击任何开关**。
+   * 身份/清单/分页失败 → error(blocked)，不得包成 ok。
+   */
+  async _readChengfangAdState(shopCfg) {
+    const opener = this._chengfangOpener || defaultChengfangOpener;
+    const loginCfg = this.config.login;
+    const tabs = ((this.config.monitor && this.config.monitor.chengfang && this.config.monitor.chengfang.scope)
+      || ['全店托管', '商品自选']).filter((t) => t === '全店托管' || t === '商品自选');
+    let session = null;
+    try {
+      session = await opener({ loginCfg, shopCfg });
+      if (!session || !session.page || !session.controller) {
+        return { state: 'unknown', error: { status: 'blocked', reason: '乘方会话不完整（缺 page/controller）', blocked: 'ad_state_read' } };
+      }
+      const { page, controller } = session;
+      const identity = await controller.verifyIdentity({ page, shopCfg });
+      guard.checkControllerIdentity(identity, shopCfg);
+      const rows = [];
+      let sawTab = false;
+      let emptyEvidence = true;
+      for (const tab of tabs) {
+        if (controller.refreshView) {
+          let rf;
+          try {
+            rf = await controller.refreshView({ page, tab });
+          } catch (e) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」刷新失败：${e.reason || e.message}`, blocked: 'inventory' } };
+          }
+          // 旧 UI 明确 legacy-ui → 保留既有语义，继续读取
+          const legacyUi = !!(rf && (rf.reason === 'legacy-ui' || rf.ui === 'legacy'));
+          if (!rf || typeof rf !== 'object') {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」刷新结果不可识别（null/非对象）`, blocked: 'inventory' } };
+          }
+          if (legacyUi) {
+            // 旧 UI：不猜测缺失数据，继续按 readView 契约读取
+          } else if (rf.refreshed === false) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」刷新未成功：${rf.reason || '未刷新'}`, blocked: 'inventory' } };
+          } else if (rf.refreshed !== true) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」刷新结果不可识别（refreshed=${JSON.stringify(rf.refreshed)}）`, blocked: 'inventory' } };
+          } else if (rf.warning) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」刷新警告：${rf.warning}`, blocked: 'inventory' } };
+          }
+        }
+        await controller.switchView({ page, tab });
+        let pageNo = 0;
+        const seenIds = new Set();
+        const seenPages = new Set();
+        let rowsInTab = 0;
+        let totalHint = null;
+        while (true) {
+          pageNo += 1;
+          const v = await controller.readView({ page, tab });
+          if (!v || (v.rows && v.rows.error) || v.error) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」第 ${pageNo} 页读取失败`, blocked: 'inventory' } };
+          }
+          sawTab = true;
+          const list = (v.rows && v.rows.rows) || v.rows || [];
+          if (!Array.isArray(list)) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」行数据非法`, blocked: 'inventory' } };
+          }
+          const pag = v.pagination || {};
+          if (list.length === 0) {
+            if (pag.total !== 0) {
+              return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」无行但缺少空态证据（分页 total=${pag.total == null ? '缺失' : pag.total}）`, blocked: 'inventory' } };
+            }
+            emptyEvidence = emptyEvidence && true;
+          } else {
+            emptyEvidence = false;
+            for (const r of list) {
+              if (!r || r.id === undefined || r.id === null || r.id === '') {
+                return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」第 ${pageNo} 页存在无稳定 ID 行，清单不可信`, blocked: 'inventory' } };
+              }
+              const idKey = String(r.id);
+              if (seenIds.has(idKey)) {
+                return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」计划 ID 跨页重复：${idKey}`, blocked: 'inventory' } };
+              }
+              seenIds.add(idKey);
+              rowsInTab += 1;
+              rows.push({ id: r.id, switchChecked: r.switchChecked });
+            }
+          }
+          // 页码以读取器实际 activePage 为准（pageNo 缺失不得退回本地计数掩盖重复页）
+          // 多页（已有前页或 hasNext=true）必须以 activePage 核对顺序；单页末页可缺省
+          const multi = seenPages.size > 0 || pag.hasNext === true;
+          const apRaw = pag.activePage;
+          if (multi && (apRaw === undefined || apRaw === null)) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」第 ${pageNo} 页缺失 activePage：多页页码顺序不可核对`, blocked: 'inventory' } };
+          }
+          // 页面读取器从 DOM 文本解析 activePage，实际返回 "1" 这类十进制字符串。
+          const apText = typeof apRaw === 'string' ? apRaw : null;
+          const ap = (apRaw === undefined || apRaw === null) ? 1
+            : (Number.isSafeInteger(apRaw) ? apRaw
+              : (apText && /^[1-9]\d*$/.test(apText) ? Number(apText) : NaN));
+          if (!Number.isSafeInteger(ap) || ap < 1) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」activePage 非法：${JSON.stringify(apRaw)}`, blocked: 'inventory' } };
+          }
+          if (seenPages.has(ap)) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」重复页：activePage=${ap}`, blocked: 'inventory' } };
+          }
+          const lastAp = seenPages.size ? Math.max(...seenPages) : 0;
+          if (ap !== lastAp + 1) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」页码不递增：activePage=${ap}（期望 ${lastAp + 1}）`, blocked: 'inventory' } };
+          }
+          seenPages.add(ap);
+          if (pag.total !== undefined && pag.total !== null) {
+            if (!Number.isInteger(pag.total) || pag.total < 0) {
+              return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」total 非法：${JSON.stringify(pag.total)}`, blocked: 'inventory' } };
+            }
+            if (totalHint === null) totalHint = pag.total;
+            else if (pag.total !== totalHint) {
+              return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」分页 total 不一致：${totalHint} → ${pag.total}`, blocked: 'inventory' } };
+            }
+          }
+          if (pag.hasNext === false) {
+            if (typeof totalHint === 'number' && rowsInTab !== totalHint) {
+              return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」末页已读行数 ${rowsInTab} 与 total ${totalHint} 不一致：清单不完整`, blocked: 'inventory' } };
+            }
+            break;
+          }
+          if (pag.hasNext !== true) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」第 ${pageNo} 页 hasNext=${JSON.stringify(pag.hasNext)}：分页结束标记不明确，清单不完整`, blocked: 'inventory' } };
+          }
+          if (pageNo >= 20) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」分页超过上限，清单不完整`, blocked: 'inventory' } };
+          }
+          const next = await controller.clickNextPage({ page });
+          if (!next || next.clicked !== true) {
+            return { state: 'unknown', error: { status: 'blocked', reason: `乘方「${tab}」翻页失败，清单不完整`, blocked: 'inventory' } };
+          }
+        }
+      }
+      if (!sawTab) {
+        return { state: 'unknown', error: { status: 'blocked', reason: '乘方控制范围为空，无法回读状态', blocked: 'inventory' } };
+      }
+      const state = mapAdStateFromSwitchRows(rows, { confirmedEmpty: emptyEvidence && rows.length === 0 });
+      return { state, rows };
+    } catch (e) {
+      return {
+        state: 'unknown',
+        error: {
+          status: 'blocked',
+          reason: e.reason || e.message,
+          blocked: /身份/.test(String(e.reason || e.message)) ? 'identity' : 'inventory',
+        },
+      };
+    } finally {
+      try {
+        if (session && typeof session.close === 'function') await session.close();
+        else if (session && session.browser) await session.browser.close();
+      } catch (_) { /* 关闭失败不冒泡 */ }
+    }
+  }
+
+  /** 开启/暂停已执行批次唯一落库入口：盘点/未发出/门槛结果不进 actions；partial/unknown 如实记录。 */
+  _commitExecutedBatch(shopId, batch) {
+    if (!batch || !batch.outcome) return;
+    const o = batch.outcome;
+    // 盘点无动作 / 门槛 / 取消 / 演练：保留批次与审计，但不记「已执行广告动作」
+    if (o === 'blocked' || o === 'blocked_window' || o === 'blocked_stopped' || o === 'blocked_coverage'
+      || o === 'cancelled' || o === 'dry' || o === 'dry_failed'
+      || o === 'nothing_to_close' || o === 'nothing_to_pause' || o === 'nothing_to_enable') {
+      return;
+    }
+    if (!batch.counts) return;
+    batch.actionType = batch.actionType || 'enable';
+    this._recordBatch(shopId, batch);
+    this._memPush(this.actions, { shopId, ...this._summarizeBatch(batch) }, undefined, 'batch');
+    this._audit({ kind: 'action', shopId, ...this._summarizeBatch(batch) });
+  }
+
+  /**
+   * 决策 + 串行门外层统一入口：should_pause / should_enable。
+   * 动作执行复用现有 runner/executor（不复制 Playwright）。
+   */
+  async _runShopSwitchAction(shopCfg, action, data, cycleToken, trigger, opts = {}) {
+    const thresholdCents = this._thresholdCents();
+    const decide = (currentAdState) => this._switchOrchestrator.evaluatePeriodic({
+      costCents: data.cost.valueCents,
+      orders: data.orders.valueCount,
+      thresholdCents,
+      currentAdState,
+      identityOk: true,
+    });
+    const targetState = action === 'enable' ? 'on' : 'off';
+    const settled = await this._switchOrchestrator.runSwitchAction({
+      shopId: shopCfg.id,
+      action,
+      targetState,
+      allowAlreadyOffPause: opts.allowAlreadyOffPause === true,
+      persistBeforeRelease: () => this._saveState(),
+      readState: async () => {
+        const r = await this._readCurrentAdState(shopCfg);
+        return r.state;
+      },
+      decide,
+      execute: async () => {
+        // 动作发出前必须成功持久化 actionId/未结束状态（tryBegin 已占槽）
+        const pre = this._persistBeforeDispatch(shopCfg.id, action, null);
+        if (!pre.ok) {
+          return { outcome: 'persistence_blocked', neverSent: true, reason: pre.reason, counts: { confirmed: 0, failed: 0, unknown: 0, skipped: 0, cancelled: 0 } };
+        }
+        if (action === 'pause') {
+          if (this._chengfangScopeConfigured()) {
+            const r = await this._pollChengfangOver(shopCfg, data, cycleToken, trigger);
+            return this._normalizeExecuteResult(r, 'pause');
+          }
+          if (this._legacyWholeShopAllowed()) {
+            const r = await this._pollLegacyWholeShopOver(shopCfg, data, cycleToken);
+            return this._normalizeExecuteResult(r, 'pause');
+          }
+          return {
+            neverSent: true,
+            outcome: 'blocked',
+            reason: '未配置乘方控制范围（monitor.chengfang.scope）且未显式开启历史全店路径：监控不执行任何关闭',
+          };
+        }
+        // 低于阈值开启：threshold_recovery（值守窗口；不受每日相位去重）
+        return this._executeEnableBatchFor(shopCfg, cycleToken, {
+          reason: data.evaluation && data.evaluation.reason,
+          triggerLabel: 'below_threshold_enable',
+          enableSource: 'threshold_recovery',
+        });
+      },
+    });
+
+    if (action === 'enable' && settled.serial && settled.serial !== 'not_sent') {
+      const b0 = settled.batch || {};
+      const br0 = b0.batch || b0;
+      this._commitExecutedBatch(shopCfg.id, br0 && br0.outcome ? br0 : b0);
+    }
+    return this._mapSwitchReturn({ action, settled });
+  }
+
+  /**
+   * 统一动作返回契约（单一映射）。优先级：blocked/status > dryRun/batch/outcome > zeroClick/decision。
+   * 不覆盖门禁字段；不适用字段不伪造。
+   */
+  _mapSwitchReturn({ action, settled, extra = null }) {
+    const s = settled || {};
+    const inner = (s.batch && typeof s.batch === 'object') ? s.batch : {};
+    const nested = (inner.batch && typeof inner.batch === 'object') ? inner.batch : inner;
+    // 优先 settle 已带的 outcome（含 persistence_blocked），再 batch
+    let outcome = s.outcome || nested.outcome || null;
+    if (!outcome && s.persistence && s.persistence.ok === false && s.serial === 'not_sent') {
+      outcome = 'persistence_blocked';
+    }
+    let status = 'ok';
+    if (s.blocked === 'serial_gate') status = 'blocked';
+    else if (nested.status === 'window_blocked' || outcome === 'blocked_window' || s.status === 'window_blocked') status = 'window_blocked';
+    else if (nested.status === 'stopped' || outcome === 'blocked_stopped') status = 'stopped';
+    else if (nested.status === 'blocked' || outcome === 'blocked' || outcome === 'blocked_coverage') status = 'blocked';
+    else if (outcome === 'persistence_blocked') status = 'blocked';
+    const dryRun = inner.dryRun === true || nested.dryRun === true || outcome === 'dry' || outcome === 'dry_failed';
+    const zeroClick = s.zeroClick === true || s.serial === 'not_sent';
+    const out = {
+      status,
+      over: status === 'ok' && !zeroClick && action === 'pause',
+      zeroClick,
+      action: action || null,
+      actionId: s.actionId || null,
+      serial: s.serial,
+      decision: s.decision || null,
+      currentAdState: s.currentAdState || null,
+      reason: s.reason || null,
+      outcome,
+      dispatched: s.dispatched,
+      batch: nested.outcome ? this._summarizeBatch(nested) : (inner.batch || null),
+    };
+    if (dryRun) out.dryRun = true;
+    if (inner.chengfang) out.chengfang = inner.chengfang;
+    if (inner.targetCount != null) out.targetCount = inner.targetCount;
+    if (s.blocked) out.blocked = s.blocked;
+    if (s.inflight) out.inflight = s.inflight;
+    if (s.persistence) out.persistence = s.persistence;
+    if (action === 'enable') out.enable = { outcome, serial: s.serial };
+    if (extra) for (const [k, v] of Object.entries(extra)) { if (v !== undefined) out[k] = v; }
+    return out;
+  }
+
+  /**
+   * 把 monitor 路径返回值归一为编排器可收口的批次形状。
+   * **缺失的 confirmed 布尔不得写成 false**（不得作为否定证据）；仅显式 true 时写入。
+   */
+  _normalizeExecuteResult(r, action) {
+    const inner = (r && (r.batch || r.chengfang)) || {};
+    const outcome = inner.outcome
+      || (r && r.outcome)
+      || (r && r.dryRun ? (inner.outcome || 'dry') : null)
+      || (r && r.status) || 'unknown';
+    const neverSent =
+      (r && r.dryRun === true) ||
+      (r && (r.status === 'blocked' || r.status === 'window_blocked' || r.status === 'stopped')) ||
+      outcome === 'blocked' || outcome === 'blocked_window' || outcome === 'blocked_stopped' ||
+      outcome === 'blocked_coverage' ||
+      outcome === 'cancelled' || outcome === 'dry' || outcome === 'dry_failed';
+    const out = {
+      ...r,
+      actionType: action,
+      outcome,
+      neverSent,
+      dryRun: !!(r && r.dryRun),
+      reason: (r && r.reason) || inner.reason || inner.confirmReason || null,
+      confirmReason: inner.confirmReason || (r && r.batch && r.batch.confirmReason) || null,
+      batch: r && r.batch ? r.batch : inner,
+    };
+    // 仅显式 true 写入；缺失/undefined 不得变成 false
+    if (inner.allPausedConfirmed === true || (r && r.batch && r.batch.allPausedConfirmed === true) || (r && r.allPausedConfirmed === true)) {
+      out.allPausedConfirmed = true;
+    }
+    if (inner.allEnabledConfirmed === true || (r && r.batch && r.batch.allEnabledConfirmed === true) || (r && r.allEnabledConfirmed === true)) {
+      out.allEnabledConfirmed = true;
+    }
+    if (inner.allClosedConfirmed === true || (r && r.batch && r.batch.allClosedConfirmed === true) || (r && r.allClosedConfirmed === true)) {
+      out.allClosedConfirmed = true;
+    }
+    return out;
+  }
+
+  /**
+   * 低于阈值 / 每日开启共用的执行入口（复用 ChengfangRunner，不复制 Playwright）。
+   * 返回形状与 runner 批次兼容，供编排器收口。
+   */
+  async _executeEnableBatchFor(shopCfg, cycleToken, { reason, triggerLabel, enableSource = 'daily_schedule' } = {}) {
+    const runner = this._getChengfangRunner(shopCfg);
+    const opener = this._chengfangOpener || defaultChengfangOpener;
+    const loginCfg = this.config.login;
+    try {
+      if (!this.realMode) {
+        const res = await runner.runDryEnableCycle({ shopCfg, pageOpener: opener, loginCfg, enableSource });
+        return { ...res, neverSent: true, dryRun: true, triggerLabel, enableSource, reason: reason || res.reason };
+      }
+      this.schedule.lastWindowBlockReason = null;
+      const batch = await runner.executeChengfangEnableBatch({
+        shopCfg,
+        cycleToken,
+        trigger: { reason: reason || triggerLabel || 'enable' },
+        pageOpener: opener,
+        loginCfg,
+        enableSource,
+      });
+      // 落库唯一入口在调用方 _commitExecutedBatch（此处不写 actions/batch，避免双写）
+      return { ...batch, triggerLabel, enableSource };
+    } catch (e) {
+      const reason = `乘方开启批次异常：${e.reason || e.message}`;
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
+      this._audit({ kind: 'action', shopId: shopCfg.id, status: 'unknown', reason });
+      // 异常可能已发出 → 交给编排器 markUnknown（不在此处 markNotSent）
+      return { outcome: 'partial', reason, error: e, actionType: 'enable', counts: { confirmed: 0, failed: 0, unknown: 1, skipped: 0, cancelled: 0 } };
+    }
   }
 
   // ── 单店铺轮询 ───────────────────────────────────────────────────
@@ -1085,33 +1530,104 @@ class Monitor {
       rt.lastError = null;
       rt.lastData = this._summarizeData(data);
 
-      // 3) 评估结果分流
       if (data.ok === false) {
-        // 零订单/无效订单已重读核实仍异常 → 阻止本轮关闭
         rt.lastData.blockedReason = data.reason;
         this._emitJudgement(shopCfg, { data, over: null, status: 'blocked', reason: data.reason });
         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: data.reason, blocked: data.blocked });
         return { status: 'blocked', reason: data.reason, blocked: data.blocked };
       }
-      // 2026-09-15 修复第 3 项：**每个完整周期记录一条判断**，不以"数据是否变化"为条件。
-      this._emitJudgement(shopCfg, { data, over: data.evaluation.over === true, status: 'ok', reason: data.evaluation.reason });
-      if (!data.evaluation.over) {
-        this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'ok', over: false, reason: data.evaluation.reason });
-        return { status: 'ok', over: false, reason: data.evaluation.reason };
+
+      // 3) 门禁优先：有效控制路径/范围（already_* 不得把门禁失败包成 ok）
+      if (!this._chengfangScopeConfigured() && !this._legacyWholeShopAllowed()) {
+        const scopeBlockedReason = '未配置乘方控制范围（monitor.chengfang.scope）且未显式开启历史全店路径：监控不执行任何关闭';
+        rt.lastData.blockedReason = scopeBlockedReason;
+        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: scopeBlockedReason }, undefined, 'error');
+        this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: scopeBlockedReason });
+        return { status: 'blocked', reason: scopeBlockedReason };
       }
 
-      // 4) 超标 → 分流：乘方主链路（生产唯一路径）；历史全店路径仅测试显式开启
-      if (this._chengfangScopeConfigured()) {
-        return this._pollChengfangOver(shopCfg, data, cycleToken, trigger);
+      // 4) 执行时间窗口（超标=暂停意图）：窗口外不打开执行会话，直接 window_blocked
+      if (data.evaluation.over === true && !isAfterDailyStart(this.nowFn(), this.config.schedule.dailyStartHour)) {
+        const hh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
+        const reason = `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：已读取并记录，未执行真实关闭（手动检查不绕过时间限制）`;
+        this.schedule.lastWindowBlockReason = reason;
+        this._memPush(this.triggers, {
+          shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason,
+          targetCount: 0,
+        }, undefined, 'trigger');
+        this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason });
+        this._emitJudgement(shopCfg, { data, over: true, status: 'window_blocked', reason });
+        return { status: 'window_blocked', reason };
       }
-      if (this._legacyWholeShopAllowed()) {
-        return this._pollLegacyWholeShopOver(shopCfg, data, cycleToken);
+
+      // 5) 本轮回读 currentAdState（清单身份/完整性失败 → blocked，不得包成 ok）
+      const stateRead = await this._readCurrentAdState(shopCfg);
+      if (stateRead.error) {
+        const err = stateRead.error;
+        rt.lastData.blockedReason = err.reason;
+        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: err.reason }, undefined, 'error');
+        this._emitJudgement(shopCfg, { data, over: data.evaluation.over === true, status: 'blocked', reason: err.reason, currentAdState: stateRead.state });
+        this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: err.reason, blocked: err.blocked, zeroClick: true });
+        // 状态回读失败发生在任何开关之前：blocked + 原因 + zeroClick；不伪造成 already_* / 成功
+        return {
+          status: 'blocked',
+          reason: err.reason,
+          blocked: err.blocked || 'ad_state_read',
+          zeroClick: true,
+          decision: DECISION.UNKNOWN_BLOCKED,
+          currentAdState: stateRead.state || 'unknown',
+        };
       }
-      const scopeBlockedReason = '未配置乘方控制范围（monitor.chengfang.scope）且未显式开启历史全店路径：监控不执行任何关闭';
-      rt.lastData.blockedReason = scopeBlockedReason;
-      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: scopeBlockedReason }, undefined, 'error');
-      this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: scopeBlockedReason });
-      return { status: 'blocked', reason: scopeBlockedReason };
+      const currentAdState = stateRead.state;
+      const identityOk = true;
+      const thresholdCents = this._thresholdCents();
+      const decision = this._switchOrchestrator.evaluatePeriodic({
+        costCents: data.cost.valueCents,
+        orders: data.orders.valueCount,
+        thresholdCents,
+        currentAdState,
+        identityOk,
+      });
+
+      // 每周期一条判断
+      this._emitJudgement(shopCfg, {
+        data,
+        over: data.evaluation.over === true,
+        status: 'ok',
+        reason: decision.reason || data.evaluation.reason,
+        decision,
+        currentAdState,
+      });
+
+      // 6) 决策分流：should_* 进入动作；超标 + already_off 走暂停只读盘点（nothing_to_close）
+      if (decision.decision === DECISION.SHOULD_PAUSE) {
+        return this._runShopSwitchAction(shopCfg, 'pause', data, cycleToken, trigger);
+      }
+      if (decision.decision === DECISION.ALREADY_OFF && data.evaluation.over === true) {
+        return this._runShopSwitchAction(shopCfg, 'pause', data, cycleToken, trigger, { allowAlreadyOffPause: true });
+      }
+      if (decision.decision === DECISION.SHOULD_ENABLE) {
+        return this._runShopSwitchAction(shopCfg, 'enable', data, cycleToken, trigger);
+      }
+      this._audit({
+        kind: 'poll',
+        shopId: shopCfg.id,
+        status: 'ok',
+        over: false,
+        decision: decision.decision,
+        currentAdState,
+        zeroClick: true,
+        reason: decision.reason,
+      });
+      return {
+        status: 'ok',
+        over: false,
+        zeroClick: true,
+        decision: decision.decision,
+        metric: decision.metric,
+        currentAdState,
+        reason: decision.reason,
+      };
     } catch (e) {
       const reason = e.reason || e.message;
       rt.lastError = reason;
@@ -1269,17 +1785,36 @@ class Monitor {
     const enableHour = this._enableHour();
     const today = businessDate || shanghaiDate(this.nowFn());
 
-    // 2026-09-21 用户要求：每日 07:00 自动开启只在"未开启"时执行。已确认处于投放侧
-    //（上次回读确认开启后无暂停记录，adBelief.on=true）→ 跳过整个开启进程：
-    // 不开浏览器、不进乘方页、零请求；登记当日相位为 success（目标状态已达成，
-    // 页面/日志可见"跳过"原因）。无记录/已暂停/未知 → 照常执行（fail-closed）。
+    // 决策层：当前状态只来自本轮回读（adBelief 仅审计，不得代替回读、不得直接触发点击）
+    const stateRead0 = await this._readCurrentAdState(shopCfg);
+    const currentAdState = stateRead0.state;
+    const dailyDecision = this._switchOrchestrator.evaluateDailyEnable({
+      currentAdState,
+      identityOk: true,
+    });
     const belief = (this.adBelief || {})[shopCfg.id];
-    if (this.realMode && belief && belief.on === true) {
-      const reason = `已在投放中（${belief.evidence}，${belief.at || '—'}），无需开启：跳过开启进程（不打开浏览器、零请求）`;
-      this._setEnablePhase(shopCfg.id, today, 'success', { phase: 'precheck', reason });
-      this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-already-on', note: reason, beliefAt: belief.at });
+    this._audit({
+      kind: 'enable-phase',
+      shopId: shopCfg.id,
+      event: 'daily-decide',
+      currentAdState,
+      decision: dailyDecision.decision,
+      beliefOn: belief ? belief.on === true : null,
+    });
+
+    if (dailyDecision.zeroClick) {
+      const reason = dailyDecision.reason;
+      // already_on（本轮回读已开启）→ 登记 success；unknown/身份失败 → 不占用成功
+      const phaseStatus = dailyDecision.decision === DECISION.ALREADY_ON ? 'success' : 'failed';
+      this._setEnablePhase(shopCfg.id, today, phaseStatus, {
+        phase: 'precheck',
+        reason,
+        currentAdState,
+        decision: dailyDecision.decision,
+      });
+      this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-zero-click', note: reason, currentAdState, decision: dailyDecision.decision, beliefAt: belief && belief.at });
       try { log.info(`每日开启跳过（${shopCfg.id}）：${reason}`); } catch (_) { /* 日志失败不影响 */ }
-      return { status: 'ok', skipped: true, reason };
+      return { status: 'ok', skipped: true, zeroClick: true, decision: dailyDecision.decision, currentAdState, reason };
     }
 
     // 第 3 项：执行前记录 in_progress（区分"执行中"），成功/失败/未知分别落状态。
@@ -1296,110 +1831,103 @@ class Monitor {
       this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'reconcile', note: prevNote });
     }
 
-    if (!this.realMode) {
-      let res;
-      try {
-        res = await runner.runDryEnableCycle({ shopCfg, pageOpener: opener, loginCfg });
-      } catch (e) {
-        const reason = `乘方开启演练周期失败：${e.reason || e.message}`;
-        rt.lastError = reason;
+    // 决策 + 串行门 + 复用 runner/executor
+    const settled = await this._switchOrchestrator.runSwitchAction({
+      shopId: shopCfg.id,
+      action: 'enable',
+      targetState: 'on',
+      persistBeforeRelease: () => this._saveState(),
+      readState: async () => {
+        const r = await this._readCurrentAdState(shopCfg);
+        return r.state;
+      },
+      decide: (st) => this._switchOrchestrator.evaluateDailyEnable({ currentAdState: st, identityOk: true }),
+      execute: async () => {
+        const pre = this._persistBeforeDispatch(shopCfg.id, 'enable', null);
+        if (!pre.ok) {
+          return { outcome: 'persistence_blocked', neverSent: true, reason: pre.reason, counts: { confirmed: 0, failed: 0, unknown: 0, skipped: 0, cancelled: 0 } };
+        }
+        return this._executeEnableBatchFor(shopCfg, cycleToken, {
+          reason: `每日 ${enableHour}:00 自动开启`,
+          triggerLabel: 'daily_enable',
+          businessDate: today,
+          enableSource: 'daily_schedule',
+        });
+      },
+    });
+
+    // 串行门拒绝先于普通 zeroClick（避免误报 already_on/成功）
+    if (settled.blocked === 'serial_gate') {
+      this._setEnablePhase(shopCfg.id, today, 'unknown', {
+        phase: 'execute', reason: settled.reason, blocked: 'serial_gate', actionId: null,
+      });
+      return this._mapSwitchReturn({ action: 'enable', settled, extra: { status: 'blocked' } });
+    }
+    // 纯决策跳过（未登记 actionId、无执行结果）
+    if (settled.zeroClick && !settled.actionId && !settled.batch) {
+      const phaseStatus = settled.decision === DECISION.ALREADY_ON ? 'success' : 'failed';
+      this._setEnablePhase(shopCfg.id, today, phaseStatus, {
+        phase: 'precheck', reason: settled.reason, decision: settled.decision,
+      });
+      return this._mapSwitchReturn({ action: 'enable', settled, extra: { skipped: true } });
+    }
+
+    const batch = settled.batch || {};
+    if (batch.dryRun === true || settled.outcome === 'dry' || settled.outcome === 'dry_failed') {
+      const failed = settled.outcome === 'dry_failed';
+      const reason = batch.error || batch.reason || settled.reason || null;
+      if (failed) {
         this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'dry', reason });
-        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
-        this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'stopped', reason });
-        return { status: 'stopped', reason };
-      }
-      if (res.outcome === 'dry_failed') {
-        const reason = res.error || res.reason || '乘方开启演练未完成（身份/读取/分页/选择范围失败）';
-        rt.lastError = reason;
-        this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'dry', reason });
-        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: `乘方开启演练失败：${reason}` }, undefined, 'error');
         this._memPush(this.triggers, {
           shopId: shopCfg.id, mode: 'dry', targetAction: 'enable', failed: true, reason,
-          businessDate: today, targetCount: 0, targets: [],
-          dryOutcome: 'dry_failed',
+          businessDate: today, targetCount: 0, targets: [], dryOutcome: 'dry_failed',
           note: `每日开启相位演练未完成（失败），不计为"正常枚举"：${reason}`,
         }, undefined, 'trigger');
         this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'dry', failed: true, reason });
-        return { status: 'ok', dryRun: true, targetCount: 0, enable: { outcome: 'dry_failed', error: reason } };
+        return this._mapSwitchReturn({
+          action: 'enable', settled,
+          extra: { dryRun: true, targetCount: 0, enable: { outcome: 'dry_failed', error: reason } },
+        });
       }
-      const triggerRec = {
+      const targetCount = (batch.targets || []).length;
+      this._memPush(this.triggers, {
         shopId: shopCfg.id, mode: 'dry', targetAction: 'enable',
         scope: '乘方(全店托管+商品自选)',
-        reason: `每日 ${enableHour}:00 自动开启相位`,
-        businessDate: today,
-        targetCount: (res.targets || []).length,
-        targets: res.targets,
-        dryOutcome: res.outcome,
-        note: res.error
-          ? `演练模式：每日开启相位演练未完成（${res.error}）`
-          : `演练模式：每日开启相位将开启以下乘方目标（未点击任何开关/开启/删除）`,
-      };
-      this._memPush(this.triggers, triggerRec, undefined, 'trigger');
-      this._audit({ kind: 'trigger', ...triggerRec, targets: (res.targets || []).map((t) => t.planId || t.adId) });
-      // 演练不计入"已开启成功"——保留为 dry_done（不阻塞当日真实窗口，但也不谎报成功）
-      this._setEnablePhase(shopCfg.id, today, res.error ? 'unknown' : 'dry_done', {
-        phase: 'dry', reason: res.error || null, targetCount: (res.targets || []).length,
+        reason: `每日 ${enableHour}:00 自动开启相位`, businessDate: today,
+        targetCount, targets: batch.targets, dryOutcome: settled.outcome || 'dry',
+        note: '演练模式：每日开启相位将开启以下乘方目标（未点击任何开关/开启/删除）',
+      }, undefined, 'trigger');
+      this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'dry', targetAction: 'enable', targetCount });
+      this._setEnablePhase(shopCfg.id, today, 'dry_done', { phase: 'dry', reason: null, targetCount });
+      return this._mapSwitchReturn({
+        action: 'enable', settled,
+        extra: { dryRun: true, targetCount, enable: { outcome: settled.outcome || 'dry' } },
       });
-      return { status: 'ok', dryRun: true, targetCount: (res.targets || []).length, enable: { outcome: res.outcome, error: res.error } };
     }
 
-    this.schedule.lastWindowBlockReason = null;
-    let batch;
-    try {
-      batch = await runner.executeChengfangEnableBatch({
-        shopCfg,
-        cycleToken,
-        trigger: { reason: `每日 ${enableHour}:00 自动开启` },
-        pageOpener: opener,
-        loginCfg,
+    this._commitExecutedBatch(shopCfg.id, batch);
+
+    if (settled.serial === 'not_sent' && (settled.outcome === 'blocked' || settled.outcome === 'blocked_window' || settled.outcome === 'blocked_stopped')) {
+      this._setEnablePhase(shopCfg.id, today, 'failed', {
+        phase: 'execute', reason: settled.reason, blocked: settled.outcome,
       });
-    } catch (e) {
-      const reason = `乘方开启批次异常：${e.reason || e.message}`;
-      // 异常可能已发出部分请求 → unknown（不盲重发，等待回读）
-      this._setEnablePhase(shopCfg.id, today, 'unknown', { phase: 'execute', reason });
-      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
-      this._audit({ kind: 'action', shopId: shopCfg.id, status: 'unknown', reason });
-      return { status: 'unknown', reason };
+      if (settled.reason) {
+        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: settled.reason }, undefined, 'error');
+      }
+      if (settled.outcome === 'blocked_window') {
+        this.schedule.lastWindowBlockReason = settled.reason;
+        this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', targetAction: 'enable', blocked: 'window', reason: settled.reason, targetCount: 0 }, undefined, 'trigger');
+      }
+      return this._mapSwitchReturn({ action: 'enable', settled });
     }
-    if (batch.outcome === 'blocked_window') {
-      this.schedule.lastWindowBlockReason = batch.reason;
-      this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'execute', reason: batch.reason, blocked: 'window' });
-      // 真实 trigger 也必须带显式动作标签（值守侧 describeTrigger 只认 targetAction，不猜）
-      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', targetAction: 'enable', blocked: 'window', reason: batch.reason, targetCount: 0 }, undefined, 'trigger');
-      this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', targetAction: 'enable', blocked: 'window', reason: batch.reason });
-      return { status: 'window_blocked', reason: batch.reason };
-    }
-    if (batch.outcome === 'blocked_stopped') {
-      const reason = batch.reason || '监控已停止，未发出乘方开启请求';
-      // 未发出任何请求 → 不占用当日（标记为 failed，允许窗口内重试）
-      this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'execute', reason, stopped: true });
-      this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'stopped', reason });
-      return { status: 'stopped', reason };
-    }
-    if (batch.outcome === 'blocked') {
-      const reason = batch.reason || '乘方开启被门槛阻止，未发出任何请求';
-      rt.lastData = rt.lastData || {};
-      rt.lastData.blockedReason = reason;
-      this._setEnablePhase(shopCfg.id, today, 'failed', { phase: 'execute', reason });
-      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
-      this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason });
-      return { status: 'blocked', reason, batch: this._summarizeBatch(batch) };
-    }
-    // nothing_to_enable / all_enabled_confirmed / partial → 记录批次
-    // 第 4 项：显式声明动作类型，下游禁止从 outcome 推断
-    batch.actionType = batch.actionType || 'enable';
-    this._recordBatch(shopCfg.id, batch);
-    this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) }, undefined, 'batch');
-    this._audit({ kind: 'action', shopId: shopCfg.id, ...this._summarizeBatch(batch) });
-    // 全部确认开启 → success；部分确认 → unknown（不谎报成功，不阻塞已确认部分）
-    const okStatus = batch.allEnabledConfirmed === true ? 'success' : 'unknown';
+
+    const okStatus = settled.serial === 'confirmed' ? 'success' : 'unknown';
     this._setEnablePhase(shopCfg.id, today, okStatus, {
-      phase: 'execute',
-      outcome: batch.outcome,
-      allEnabledConfirmed: batch.allEnabledConfirmed === true,
-      reason: batch.reason || null,
+      phase: 'execute', outcome: settled.outcome, serial: settled.serial,
+      allEnabledConfirmed: settled.serial === 'confirmed', actionId: settled.actionId,
+      reason: settled.reason || null,
     });
-    return { status: 'ok', enable: { outcome: batch.outcome }, batch: this._summarizeBatch(batch) };
+    return this._mapSwitchReturn({ action: 'enable', settled });
   }
 
   /**

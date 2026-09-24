@@ -79,21 +79,38 @@ function resolveChengfangEnableAllowed(config) {
  *                                      enable 走 enableHour 起窗口与 enableEnabled（默认 'pause'）
  * @returns {()=>{ok:boolean,reason?:string}}
  */
-function buildChengfangRequestGate({ config, nowFn, stopRequested, businessDate, action = 'pause' }) {
+/**
+ * @param {'pause'|'enable'} [p.action]
+ * @param {'daily_schedule'|'threshold_recovery'} [p.enableSource]
+ *   daily_schedule：[enableHour, dailyStartHour)；
+ *   threshold_recovery：值守窗口 dailyStartHour 起（周期低阈值恢复）。
+ *   缺省/未识别按 daily_schedule（旧定时开启语义）；显式非法值拒绝。
+ */
+function buildChengfangRequestGate({ config, nowFn, stopRequested, businessDate, action = 'pause', enableSource = 'daily_schedule' }) {
   const sch = (config && config.schedule) || { dailyStartHour: 8 };
   const cf = (config && config.monitor && config.monitor.chengfang) || {};
   const enableHour = cf.enableHour !== undefined && cf.enableHour !== null ? cf.enableHour : 7;
   const label = action === 'enable' ? '开启' : '暂停';
+  const src = enableSource === undefined || enableSource === null ? 'daily_schedule' : enableSource;
   return function check() {
     if (stopRequested && stopRequested()) {
       return { ok: false, reason: `停止信号：不再发出新的${label}请求` };
     }
     if (action === 'enable') {
+      if (src !== 'daily_schedule' && src !== 'threshold_recovery') {
+        return { ok: false, reason: `未知开启来源 ${JSON.stringify(src)}：拒绝放行` };
+      }
       const w = shanghaiWall(nowFn());
-      if (w.hour < enableHour || w.hour >= sch.dailyStartHour) {
-        const hh = String(enableHour).padStart(2, '0');
-        const dh = String(sch.dailyStartHour).padStart(2, '0');
-        return { ok: false, reason: `未到允许开启时段（每日 ${hh}:00–${dh}:00，Asia/Shanghai）：不再发出新的开启请求` };
+      if (src === 'daily_schedule') {
+        if (w.hour < enableHour || w.hour >= sch.dailyStartHour) {
+          const hh = String(enableHour).padStart(2, '0');
+          const dh = String(sch.dailyStartHour).padStart(2, '0');
+          return { ok: false, reason: `未到允许开启时段（每日 ${hh}:00–${dh}:00，Asia/Shanghai）：不再发出新的开启请求` };
+        }
+      } else if (!isAfterDailyStart(nowFn(), sch.dailyStartHour)) {
+        // threshold_recovery：仅值守窗口（dailyStartHour 起）
+        const hh = String(sch.dailyStartHour).padStart(2, '0');
+        return { ok: false, reason: `未到值守窗口（每日 ${hh}:00 后，Asia/Shanghai）：周期恢复开启被拒绝` };
       }
     } else if (!isAfterDailyStart(nowFn(), sch.dailyStartHour)) {
       const hh = String(sch.dailyStartHour).padStart(2, '0');

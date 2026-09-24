@@ -68,7 +68,7 @@ const STATUS_TEXT = {
 function scrub(msg) {
   let s = typeof msg === 'string' ? msg : String(msg);
   s = s
-    .replace(/((?:cookie|token|secret|password|passwd|pwd|app_secret|api_key|apikey)[=:\s"']+)(?![\u4e00-\u9fff])([^\s"',}{]{6,})/gi, '$1***')
+    .replace(/((?:cookie|token|secret|password|passwd|pwd|app_secret|api_key|apikey|sessionid|session_id)[=:\s"']+)(?![\u4e00-\u9fff])([^\s"',}{]{6,})/gi, '$1***')
     .replace(/(Bearer\s+)(?![\u4e00-\u9fff])[^\s]{20,}/gi, '$1***');
   s = compactUrls(s);
   return s.replace(/[\r]/g, '').replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, '').slice(0, 2000);
@@ -229,13 +229,93 @@ function createWatchDrill(opts = {}) {
   }
   const spawnNotify = opts.notifySpawn || defaultSpawnNotify;
 
+  /**
+   * 开关结果转译：只认显式字段（decision/metric/zeroClick/blocked/serial/outcome/persistence/targetAction），
+   * 不按文案猜动作。返回 { head, line }。
+   */
+  function translateSwitchResult(j) {
+    const dec = j.decision || null;
+    const st = j.currentAdState || null;
+    const zc = j.zeroClick === true;
+    const serial = j.serial || null;
+    const outcome = j.outcome || null;
+    const blocked = j.blocked || null;
+    const persist = j.persistence && j.persistence.ok === false ? 'persistence_blocked' : (outcome === 'persistence_blocked' ? 'persistence_blocked' : null);
+    const dry = j.dryRun === true || outcome === 'dry' || outcome === 'dry_failed';
+    const mixed = st === 'mixed';
+    let actionWord = null;
+    if (j.targetAction === 'enable' || dec === 'should_enable') actionWord = '开启';
+    else if (j.targetAction === 'pause' || dec === 'should_pause') actionWord = '暂停';
+    const safeReason = j.reason ? scrub(String(j.reason)) : '';
+
+    let head;
+    let line;
+    // 优先级：持久化/串行门/身份数据/回读未确认 > 已达状态 > 计划动作
+    if (persist) {
+      head = '持久化阻止';
+      line = `持久化失败（persistence_blocked），未发出或不释放${actionWord ? `；目标动作=${actionWord}` : ''}${safeReason ? `；${safeReason}` : ''}`;
+    } else if (blocked === 'serial_gate' || (blocked && /serial/.test(String(blocked)))) {
+      head = '串行门阻止';
+      line = `同店动作串行门拒绝（不补点）${actionWord ? `，目标动作=${actionWord}` : ''}${safeReason ? `；${safeReason}` : ''}`;
+    } else if (dec === 'data_blocked') {
+      head = '数据/身份阻止';
+      line = `数据或身份校验未通过 → 零动作${safeReason ? `；${safeReason}` : ''}`;
+    } else if (dec === 'unknown_blocked' || st === 'unknown') {
+      head = '状态未知';
+      line = `当前广告状态 unknown → 零动作（fail-closed）${safeReason ? `；${safeReason}` : ''}`;
+    } else if (serial === 'unknown' || outcome === 'partial') {
+      head = '回读未确认';
+      line = `动作可能已发出但回读未确认 → 保持阻塞，禁止补点${actionWord ? `；目标动作=${actionWord}` : ''}${safeReason ? `；${safeReason}` : ''}`;
+    } else if (dec === 'equal_no_action') {
+      head = '保持';
+      const cmp = (Number.isSafeInteger(j.costCents) && Number.isSafeInteger(j.orders) && Number.isSafeInteger(j.thresholdCents))
+        ? `${j.costCents} 分 = ${j.orders}×${j.thresholdCents} 分`
+        : null;
+      line = `${cmp ? `整数分判定 ${cmp}` : '等于阈值'} → 保持当前状态，零动作${mixed ? '（mixed 只保持，不单侧操作）' : ''}${safeReason ? `；${safeReason}` : ''}`;
+    } else if (dec === 'already_on') {
+      head = '已开启';
+      line = `当前已开启 → 零点击（already_on）${safeReason ? `；${safeReason}` : ''}`;
+    } else if (dec === 'already_off') {
+      head = '已暂停';
+      line = `当前已暂停 → 零点击（already_off）${safeReason ? `；${safeReason}` : ''}`;
+    } else if (dec === 'should_enable') {
+      head = dry ? '将开启（演练）' : '将开启';
+      const cmp = (Number.isSafeInteger(j.costCents) && Number.isSafeInteger(j.orders) && Number.isSafeInteger(j.thresholdCents))
+        ? `${j.costCents} 分 < ${j.orders}×${j.thresholdCents} 分`
+        : null;
+      line = `${cmp ? `整数分判定 ${cmp}；` : ''}${mixed ? 'mixed：只开启暂停项（对侧）' : '低于阈值'} → ${dry ? '演练枚举将开启' : '触发开启'}${safeReason ? `；${safeReason}` : ''}`;
+    } else if (dec === 'should_pause') {
+      head = dry ? '将暂停（演练）' : '将暂停';
+      const cmp = (Number.isSafeInteger(j.costCents) && Number.isSafeInteger(j.orders) && Number.isSafeInteger(j.thresholdCents))
+        ? `${j.costCents} 分 > ${j.orders}×${j.thresholdCents} 分`
+        : null;
+      line = `${cmp ? `整数分判定 ${cmp}；` : ''}${mixed ? 'mixed：只暂停开启项（对侧）' : '高于阈值'} → ${dry ? '演练枚举将暂停' : '触发暂停'}${safeReason ? `；${safeReason}` : ''}`;
+    } else if (j.status === 'blocked') {
+      head = '本轮被拦下';
+      line = `本轮被拦下；原因：${safeReason || '未知'}`;
+    } else if (j.over === true && Number.isSafeInteger(j.costCents) && Number.isSafeInteger(j.orders) && Number.isSafeInteger(j.thresholdCents)) {
+      head = dry ? '将暂停（演练）' : '将暂停';
+      line = `整数分判定 ${j.costCents} 分 > ${j.orders}×${j.thresholdCents} 分${actionWord ? `，目标动作=${actionWord}` : ''}${safeReason ? `；${safeReason}` : ''}`;
+    } else if (j.over !== true && Number.isSafeInteger(j.costCents) && Number.isSafeInteger(j.orders) && Number.isSafeInteger(j.thresholdCents)) {
+      const exp = j.orders * j.thresholdCents;
+      const op = j.costCents < exp ? '<' : (j.costCents === exp ? '=' : '>');
+      head = op === '=' ? '保持' : (op === '<' ? '未超标' : '超标');
+      line = `整数分判定 ${j.costCents} 分 ${op} ${j.orders}×${j.thresholdCents} 分${actionWord ? `，目标动作=${actionWord}` : '，零动作'}${zc ? '；zeroClick' : ''}${safeReason ? `；${safeReason}` : ''}`;
+    } else {
+      head = j.over === true ? '超标' : '未超标';
+      line = `${actionWord ? `目标动作=${actionWord}` : '零动作'}${zc ? '；zeroClick' : ''}${safeReason ? `；${safeReason}` : ''}`;
+    }
+    return { head, line };
+  }
+
   /** 组装一轮判断数据的推送文案（纯文本；只含业务数字，无敏感信息）。 */
   function judgementNotify(j) {
     const at = j.at ? shanghaiClockText(new Date(j.at).getTime()) : '—';
     const lines = [];
+    const t = translateSwitchResult(j);
     if (j.status === 'blocked') {
       lines.push(`第 ${j.cycleNo} 轮巡查被拦下，未得出费用/订单结论`);
-      lines.push(`原因：${j.reason || '未知'}`);
+      lines.push(`原因：${scrub(String(j.reason || '未知'))}`);
     } else {
       const cost = j.costCents == null ? '—' : `${centsToYuan(j.costCents)} 元`;
       const orders = j.orders == null ? '—' : `${j.orders} 单`;
@@ -243,14 +323,10 @@ function createWatchDrill(opts = {}) {
       lines.push(`第 ${j.cycleNo} 轮巡查数据（业务日期 ${j.businessDate || '—'}）`);
       lines.push(`店铺：${drill.shopName}`);
       lines.push(`当天费用：${cost} ｜ 全店订单：${orders} ｜ 每单成本：${perOrder}`);
-      if (j.over === true) {
-        lines.push(`判定：超标（${j.costCents} 分 > ${j.orders}×${j.thresholdCents} 分）→ 触发暂停乘方`);
-      } else {
-        lines.push(`判定：未超标（${j.costCents} 分 ≤ ${j.orders}×${j.thresholdCents} 分），不暂停乘方`);
-      }
+      lines.push(`判定：${t.line}`);
     }
     lines.push(`巡查时间：${at}`);
-    const head = j.status === 'blocked' ? '本轮被拦下' : (j.over === true ? '超标⚠' : '未超标');
+    const head = j.status === 'blocked' ? '本轮被拦下' : t.head;
     return {
       subject: `[推广值守] 第${j.cycleNo}轮 ${head}`,
       body: lines.join('\n'),
@@ -448,6 +524,7 @@ function createWatchDrill(opts = {}) {
       nowFn: opts.nowFn || undefined,
       delayFn: opts.delayFn || undefined,
       chengfangOpener: opts.chengfangOpener || undefined,
+      readAdState: opts.readAdState || undefined,
     });
     drill._monitor = monitor;
     drill.shopName = (cfgResult.config.shops || []).map((s) => s.name || s.id).join('、') || '—';
@@ -528,11 +605,9 @@ function createWatchDrill(opts = {}) {
     }
     const perOrder = j.perOrderText ? `，每单 ${j.perOrderText}` : '';
     const body = `费用 ${centsToYuan(cost)} 元（${cost} 分），订单 ${orders} 单${perOrder}`;
-    if (j.over === true) {
-      return head + `${body}；整数分判定 ${cost} 分 > ${orders}×${thr} 分（阈值 ${centsToYuan(j.expectedCents)} 元）→ 超标，应暂停乘方。`
-        + (j.reason ? `；${j.reason}` : '');
-    }
-    return head + `${body}；整数分判定 ${cost} 分 ≤ ${orders}×${thr} 分（阈值 ${centsToYuan(j.expectedCents)} 元）→ 未超标，不暂停乘方。`;
+    const t = translateSwitchResult(j);
+    const extra = j.reason && !t.line.includes(scrub(String(j.reason))) ? `；${scrub(String(j.reason))}` : '';
+    return head + `${body}；${t.line}` + extra;
   }
 
   /**
@@ -698,6 +773,7 @@ function createWatchDrill(opts = {}) {
       const shop = (status.shops || [])[0];
       if (shop && shop.today) {
         const d = shop.today;
+        const sw = translateSwitchResult(d);
         st.lastRound = {
           roundNo: st.roundNo,
           businessDate: d.businessDate,
@@ -708,14 +784,17 @@ function createWatchDrill(opts = {}) {
           perOrderText: d.perOrderText,
           over: d.over === true,
           conclusion: d.over === true ? 'over' : 'under',
-          conclusionText: d.over === true ? '超标' : '未超标',
-          reason: d.blockedReason || null,
+          conclusionText: sw.head,
+          switchText: sw.line,
+          decision: d.decision || null,
+          zeroClick: d.zeroClick === true,
+          reason: scrub(String(d.blockedReason || d.reason || '')) || null,
           fetchedAt: d.fetchedAt,
           pageUpdatedAt: d.pageUpdatedAt,
         };
-        st.lastError = d.blockedReason || null;
+        st.lastError = scrub(String(d.blockedReason || '')) || null;
       } else {
-        st.lastError = st.lastRound && st.lastRound.reason ? st.lastRound.reason : null;
+        st.lastError = st.lastRound && st.lastRound.reason ? scrub(String(st.lastRound.reason)) : null;
       }
 
       // 3) 事件流增量消费（唯一入口；游标 = evtSeq）
@@ -917,13 +996,13 @@ function createWatchDrill(opts = {}) {
     try {
       monitor = ensureMonitor();
     } catch (e) {
-      st.lastError = (e && e.message) || String(e);
+      st.lastError = scrub(String((e && e.message) || e));
       pushLog('error', `值守启动失败：${st.lastError}（不启动调度）`);
       return snapshot();
     }
     const r = monitor.start();
     if (r && r.ok === false) {
-      st.lastError = r.reason;
+      st.lastError = scrub(String(r.reason));
       pushLog('error', `值守启动被拒：${r.reason}`);
       return snapshot();
     }
@@ -1173,6 +1252,7 @@ function createWatchDrill(opts = {}) {
     get logs() { return drill._logs.slice(); },
     confirmDialogs: CONFIRM_DIALOG_MEASURED,
     _internal: drill,
+    translateSwitchResult,
   };
 }
 

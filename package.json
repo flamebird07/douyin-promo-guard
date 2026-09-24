@@ -11,7 +11,7 @@
     "start": "node src/index.js serve",
     "check": "node src/index.js check",
     "login": "node src/index.js login",
-    "test": "node --test test/money-time.test.js test/bounded-poll.test.js test/cookie-writeback.test.js test/rules-guard.test.js test/close-flow.test.js test/coordinator.test.js test/monitor.test.js test/compass-order.test.js test/compass-dom.test.js test/qianchuan-reader.test.js test/qianchuan-dom.test.js test/chengfang-dom.test.js test/chengfang-executor.test.js test/chengfang-aurora-ui.test.js test/monitor-chengfang.test.js test/chengfang-confirm-switch.test.js test/watch-drill-tab.test.js test/log-compact-urls.test.js"
+    "test": "node --test test/money-time.test.js test/bounded-poll.test.js test/cookie-writeback.test.js test/rules-guard.test.js test/close-flow.test.js test/coordinator.test.js test/monitor.test.js test/compass-order.test.js test/compass-dom.test.js test/qianchuan-reader.test.js test/qianchuan-dom.test.js test/chengfang-dom.test.js test/chengfang-executor.test.js test/chengfang-aurora-ui.test.js test/monitor-chengfang.test.js test/chengfang-confirm-switch.test.js test/watch-drill-tab.test.js test/log-compact-urls.test.js test/ad-switch-decision.test.js test/ad-switch-integration.test.js test/ad-switch-default-chain.test.js test/ad-switch-persist-guard.test.js test/ad-switch-persist-restart.test.js"
   },
   "dependencies": {
     "playwright": "^1.62.1"

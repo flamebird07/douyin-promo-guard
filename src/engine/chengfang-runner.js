@@ -389,26 +389,43 @@ class ChengfangRunner {
    * 门槛 = realMode + enableEnabled + 上海 enableHour 起窗口 + 未停止 + 未跨日。
    * 返回与 Monitor._recordBatch/_summarizeBatch 兼容的批次结果。
    */
-  async executeChengfangEnableBatch({ shopCfg, cycleToken, trigger, pageOpener, loginCfg }) {
+  /**
+   * @param {'daily_schedule'|'threshold_recovery'} [p.enableSource]
+   *   缺省 daily_schedule（旧定时开启）；threshold_recovery 走值守窗口 dailyStartHour 起。
+   */
+  async executeChengfangEnableBatch({ shopCfg, cycleToken, trigger, pageOpener, loginCfg, enableSource = 'daily_schedule' }) {
     const batchDate = shanghaiDate(this.now());
     const counts = { confirmed: 0, failed: 0, unknown: 0, skipped: 0, cancelled: 0 };
     const base = { kind: 'chengfang-enable-batch', shopId: shopCfg.id, batchDate };
     const cf = (this.config.monitor && this.config.monitor.chengfang) || {};
     const enableHour = cf.enableHour !== undefined && cf.enableHour !== null ? cf.enableHour : 7;
     const dailyStartHour = this.config.schedule.dailyStartHour;
+    const src = enableSource === undefined || enableSource === null ? 'daily_schedule' : enableSource;
 
     // ── 0) 前置门槛（fail-closed）：集中配置门槛 → 开启时段 → 停止 ─────
     const realAllowed = resolveChengfangEnableAllowed(this.config);
     if (!realAllowed.ok) {
       return { outcome: 'blocked', reason: realAllowed.reason, counts, batchDate, error: null };
     }
+    if (src !== 'daily_schedule' && src !== 'threshold_recovery') {
+      return { outcome: 'blocked', reason: `未知开启来源 ${JSON.stringify(src)}：拒绝放行`, counts, batchDate, error: null };
+    }
     const w = shanghaiWall(this.now());
-    if (!(w.hour >= enableHour && w.hour < dailyStartHour)) {
-      const hh = String(enableHour).padStart(2, '0');
-      const dh = String(dailyStartHour).padStart(2, '0');
+    if (src === 'daily_schedule') {
+      if (!(w.hour >= enableHour && w.hour < dailyStartHour)) {
+        const hh = String(enableHour).padStart(2, '0');
+        const dh = String(dailyStartHour).padStart(2, '0');
+        return {
+          outcome: 'blocked_window',
+          reason: `未到允许开启时段（每日 ${hh}:00–${dh}:00，Asia/Shanghai），本轮不执行真实开启`,
+          counts, batchDate,
+        };
+      }
+    } else if (!isAfterDailyStart(this.now(), dailyStartHour)) {
+      const hh = String(dailyStartHour).padStart(2, '0');
       return {
         outcome: 'blocked_window',
-        reason: `未到允许开启时段（每日 ${hh}:00–${dh}:00，Asia/Shanghai），本轮不执行真实开启`,
+        reason: `未到值守窗口（每日 ${hh}:00 后，Asia/Shanghai），周期恢复开启被拒绝`,
         counts, batchDate,
       };
     }
@@ -428,6 +445,7 @@ class ChengfangRunner {
         shopCfg,
         config: this.config,
         businessDate: batchDate,
+        enableSource: src,
         now: this.now,
         audit: this.audit,
         stopRequested: () => !!(cycleToken && cycleToken.aborted),

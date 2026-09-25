@@ -122,13 +122,14 @@ class AdSwitchOrchestrator {
   }
 
   /** 周期评估：费用/订单/阈值 + 本轮 currentAdState + identityOk → decision。 */
-  evaluatePeriodic({ costCents, orders, thresholdCents, currentAdState, identityOk, dataError = null, adStateSource = null }) {
+  evaluatePeriodic({ costCents, orders, thresholdCents, currentAdState, identityOk, identityReason = null, dataError = null, adStateSource = null }) {
     return decideAdSwitchAction({
       costCents,
       orders,
       thresholdCents,
       currentAdState: normalizeAdState(currentAdState),
       identityOk,
+      identityReason,
       dataError,
       adStateSource,
     });
@@ -137,9 +138,10 @@ class AdSwitchOrchestrator {
   /**
    * 每日 07:00 开启意图（不读费用/订单，不用阈值）。
    * currentAdState 必须来自本轮回读；identityOk 严格 true。
+   * @param {string|null} [identityReason] 身份未通过的具体原因（如"待身份核验：…"）
    * @returns {{decision:string, action:'enable'|null, zeroClick:boolean, reason:string}}
    */
-  evaluateDailyEnable({ currentAdState, identityOk }) {
+  evaluateDailyEnable({ currentAdState, identityOk, identityReason = null }) {
     const st = normalizeAdState(currentAdState);
     if (identityOk !== true) {
       return {
@@ -147,7 +149,9 @@ class AdSwitchOrchestrator {
         action: null,
         zeroClick: true,
         blocked: 'identity_mismatch',
-        reason: 'identityOk 不是严格 true：每日开启 fail-closed，零动作',
+        reason: identityReason
+          ? `${identityReason}：每日开启 fail-closed，零动作`
+          : 'identityOk 不是严格 true：每日开启 fail-closed，零动作',
       };
     }
     if (st === 'on') {

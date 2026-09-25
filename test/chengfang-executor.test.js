@@ -1063,6 +1063,29 @@ test('开启：最终身份复核期间页面账户变化 → 身份复检拦截
   assert.strictEqual(enableClicks(state).length, 0);
 });
 
+// 2026-09-24：开启路径第 0 步身份核验（账户不匹配）镜像用例——与暂停路径
+// 「身份核验失败（账户不匹配）：停止，零点击」对齐：配置账户与页面账户不一致时，
+// 开启（含每日 07:00 开启批次）必须 fail-closed，零点击、不覆盖配置。
+test('开启：身份核验失败（账户不匹配）：停止，零点击，不覆盖配置账户', async () => {
+  const { result, state } = await runEnable({
+    fixture: {
+      plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) },
+      // 页面导航栏账户 ID 与 SHOP_CFG.accountId（1710242295996424）不一致
+      navText: '首页 乘方 全域投放 品牌投放 数据 工具 财务 营销学堂 成长伙伴 99+ 伊人美 ID：1710242295000000',
+    },
+    dryRun: false,
+  });
+  assert.strictEqual(result.allEnabledConfirmed, false, '不得宣称已开启');
+  assert.strictEqual(result.views.identity.status, 'read_failed', '身份视图判读取失败');
+  assert.match(result.confirmReason, /身份核验失败/, `原因须明确身份核验失败：${result.confirmReason}`);
+  assert.match(result.confirmReason, /账户不匹配/, '须写明账户不匹配（配置 vs 页面）');
+  assert.strictEqual(state.clickLog.length, 0, '零业务点击');
+  assert.strictEqual(switchClicks(state).length, 0, '行开关零点击');
+  assert.strictEqual(enableClicks(state).length, 0, '批量开启零点击');
+  // fail-closed：绝不为"继续执行"而把页面账户写回配置（SHOP_CFG 保持原值）
+  assert.strictEqual(SHOP_CFG.accountId, ACCOUNT_ID, '配置账户未被覆盖');
+});
+
 test('开启：最终身份复核期间关闭 enableEnabled → 复核返回后 requestGate 实时拦截，零业务点击', async () => {
   let identityCalls = 0;
   const config = {

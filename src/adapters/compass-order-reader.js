@@ -344,6 +344,14 @@ function createCompassOrderReader(p) {
         rawText: probed.valueText,
         cardText: probed.cardText || null,
         identityEvidence: { via: '罗盘右上角 userName 元素精确比对', pageShopName: ident.pageShopName },
+        // 结构化来源标记（2026-09-25 阶段 6 来源门禁）：证明店铺名证据出自本罗盘
+        // 适配器的实测链（userName 精确比对）；下游建立账户映射前必须核对该标记，
+        // 不得仅凭 identityEvidence.pageShopName 字段存在放行。
+        identitySource: {
+          adapter: 'compass-order-reader',
+          evidence: 'userName-exact-match',
+          pageShopName: ident.pageShopName,
+        },
         pageUrl: landedUrl,
         valueCount: parsed.count,
       };

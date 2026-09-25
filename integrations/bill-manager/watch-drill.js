@@ -36,6 +36,7 @@ function resolvePromoGuardDir() {
   const candidates = [
     process.env.PROMO_GUARD_DIR,
     'C:/Users/Administrator/Documents/电商助手/douyin-promo-guard',
+    // 本副本位于 <仓库根>/integrations/bill-manager/，向上两级即仓库根
     path.join(__dirname, '..', '..'),
   ].filter(Boolean);
   for (const c of candidates) {
@@ -75,30 +76,110 @@ function scrub(msg) {
 }
 
 /**
+ * 递归脱敏：对象/数组/错误/嵌套结构中的所有字符串均经 scrub。
+ * 保留 `***` 标记；原始 Cookie/token/secret 值不得出现在任何展示或持久化出口。
+ */
+function scrubDeep(value, seen) {
+  if (value == null) return value;
+  if (typeof value === 'string') return scrub(value);
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'bigint') return String(value);
+  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Error) {
+    return { name: scrub(value.name), message: scrub(value.message), stack: scrub(value.stack || '') };
+  }
+  const guard = seen || new WeakSet();
+  if (typeof value === 'object') {
+    if (guard.has(value)) return '[circular]';
+    guard.add(value);
+    try {
+      // 路径式循环检测（2026-09-24）：处理完即移出 guard——共享引用（如快照中
+      // st.adState 与 st.shopRows[0].adState 为同一对象）各自得到一份脱敏副本，
+      // 不再被误判成 [circular]；只有真正的环（祖先路径上再次遇到）才标记。
+      if (Array.isArray(value)) {
+        return value.map((v) => scrubDeep(v, guard));
+      }
+      const out = {};
+      for (const k of Object.keys(value)) {
+        out[k] = scrubDeep(value[k], guard);
+      }
+      return out;
+    } finally {
+      guard.delete(value);
+    }
+  }
+  return scrub(String(value));
+}
+
+/**
  * 从今日暂停批次与每日开启记录推导广告当前开/关（2026-09-21 页面主信息）。
+ * 多店铺：按 shopId 过滤开启相位记录，保持平台/店铺对应关系。
  * 依据是**本系统的执行记录**：最近一次回读确认的全量暂停 → 已暂停；其后若每日开启
  * 成功（跨日 07:00）→ 投放中；均无记录 → 未知。人工在千川端的开关不在此感知范围内
  * （下一轮巡查/批次回读会重新核对）。导出供测试直接覆盖各分支。
+ * 注意：推广广告控制仅针对抖店（douyin）；拼多多店铺可出现在商品分析列表，但不参与广告控制。
  */
 function deriveAdState(status, shop) {
   const b = shop && shop.batchToday;
   const pausedAt = b && b.allPausedConfirmed === true ? (b.lastBatchAt || null) : null;
   let enabledAt = null;
   let enabledTs = -Infinity;
+  const shopId = shop && (shop.id || shop.shopId);
   for (const it of (status && status.monitor && status.monitor.enablePhaseToday) || []) {
+    if (shopId && it.shopId && it.shopId !== shopId) continue;
     const r = it.record || {};
     if (r.status === 'success' && r.at) {
       const t = Date.parse(r.at);
       if (!Number.isNaN(t) && t > enabledTs) { enabledTs = t; enabledAt = r.at; }
     }
   }
+  if (shop && shop.lastAdState) {
+    const map = { on: { on: true, note: '开启' }, off: { on: false, note: '暂停' }, mixed: { on: null, note: '混合' }, unknown: { on: null, note: '未知' } };
+    const m = map[shop.lastAdState] || map.unknown;
+    return { on: m.on, at: shop.lastDataAt || null, note: m.note, state: shop.lastAdState };
+  }
   const pt = pausedAt ? Date.parse(pausedAt) : NaN;
   const et = enabledAt ? Date.parse(enabledAt) : NaN;
   if (pausedAt && !Number.isNaN(pt) && (Number.isNaN(et) || pt >= et)) {
-    return { on: false, at: pausedAt, note: '已暂停' };
+    return { on: false, at: pausedAt, note: '已暂停', state: 'off' };
   }
-  if (enabledAt && !Number.isNaN(et)) return { on: true, at: enabledAt, note: '投放中' };
-  return { on: null, at: null, note: '未知' };
+  if (enabledAt && !Number.isNaN(et)) return { on: true, at: enabledAt, note: '投放中', state: 'on' };
+  return { on: null, at: null, note: '未知', state: 'unknown' };
+}
+
+/**
+ * 多店铺快照行：每店独立 { id, displayName, platform, adState, ... }。
+ * 推广广告控制仅抖店；拼多多行 adControl=false，界面不得假装支持广告开关。
+ */
+function buildShopRows(status) {
+  const shops = (status && status.shops) || [];
+  return shops
+    .filter((s) => s && s.deleted !== true)
+    .map((s) => {
+      const ad = deriveAdState(status, s);
+      const platform = s.platform || 'douyin';
+      return {
+        id: s.id,
+        name: s.name || s.id,
+        displayName: s.displayName || s.name || s.id,
+        platform,
+        platformLabel: platform === 'pinduoduo' ? '拼多多' : '抖店',
+        // 推广广告控制仅抖店
+        adControl: platform !== 'pinduoduo',
+        adState: ad,
+        lastDataAt: s.lastDataAt || (s.today && s.today.fetchedAt) || null,
+        costCents: s.today && s.today.costCents != null ? s.today.costCents : null,
+        orders: s.today && s.today.orders != null ? s.today.orders : null,
+        thresholdCents: s.thresholdCents != null ? s.thresholdCents : null,
+        // 账户身份状态（2026-09-25 阶段 6）：界面据此显示"待身份核验/已阻止"
+        identityPending: s.identityPending === true,
+        identityNote: s.identityNote ? scrub(String(s.identityNote)) : null,
+        // 展示结构一律递归脱敏（today.blockedReason / today.reason / lastError / batchToday…）
+        lastError: s.lastError ? scrub(String(s.lastError)) : null,
+        today: s.today ? scrubDeep(s.today) : null,
+        batchToday: s.batchToday ? scrubDeep(s.batchToday) : null,
+      };
+    });
 }
 
 function createWatchDrill(opts = {}) {
@@ -106,6 +187,7 @@ function createWatchDrill(opts = {}) {
 
   const drill = {
     shopName: opts.shopName || '—',
+    shops: [],
     // 兼容字段：不再有"强制只读演练"语义（2026-09-15 起接入真实操作模式）
     realMode: false,
     state: {
@@ -117,7 +199,9 @@ function createWatchDrill(opts = {}) {
       lastCheckAt: null,
       nextRunAt: null,
       lastError: null,
-      lastRound: null,       // 转译后的最近一轮（供界面展示）
+      lastRound: null,       // 转译后的最近一轮（兼容；多店用 lastRounds）
+      shopRows: [],          // 多店铺紧凑行
+      lastRounds: {},        // shopId -> 最近一轮
       gates: null,           // 真实执行门槛快照（界面必须让用户看到是否真的会操作广告）
       enableTask: null,      // 独立每日开启任务状态（与 running 完全分离的生命周期）
       polling: null,         // 落地确认/回读的实际生效轮询配置（与执行器同源）
@@ -142,6 +226,8 @@ function createWatchDrill(opts = {}) {
     _lastCycleNo: 0,
     _lastJudgementCycleNo: 0,
     _lastEnableSeen: {},
+    // 只读运行时版本指纹（require.resolve 路径 + 文件 sha256；无密钥）
+    _runtimeFingerprint: null,
   };
 
   // ── 日志（内存有界 + JSONL 持久化）────────────────────────────────────────
@@ -308,7 +394,7 @@ function createWatchDrill(opts = {}) {
     return { head, line };
   }
 
-  /** 组装一轮判断数据的推送文案（纯文本；只含业务数字，无敏感信息）。 */
+  /** 组装一轮判断数据的推送文案（纯文本；主题/正文均经 scrub，无敏感信息）。 */
   function judgementNotify(j) {
     const at = j.at ? shanghaiClockText(new Date(j.at).getTime()) : '—';
     const lines = [];
@@ -321,15 +407,15 @@ function createWatchDrill(opts = {}) {
       const orders = j.orders == null ? '—' : `${j.orders} 单`;
       const perOrder = j.perOrderText || '—';
       lines.push(`第 ${j.cycleNo} 轮巡查数据（业务日期 ${j.businessDate || '—'}）`);
-      lines.push(`店铺：${drill.shopName}`);
+      lines.push(`店铺：${(drill.shops || []).map((s) => (s.platform === 'pinduoduo' ? '拼多多/' : '抖店/') + s.name).join('，') || drill.shopName}`);
       lines.push(`当天费用：${cost} ｜ 全店订单：${orders} ｜ 每单成本：${perOrder}`);
       lines.push(`判定：${t.line}`);
     }
     lines.push(`巡查时间：${at}`);
     const head = j.status === 'blocked' ? '本轮被拦下' : t.head;
     return {
-      subject: `[推广值守] 第${j.cycleNo}轮 ${head}`,
-      body: lines.join('\n'),
+      subject: scrub(`[推广值守] 第${j.cycleNo}轮 ${head}`),
+      body: scrub(lines.join('\n')),
     };
   }
 
@@ -524,14 +610,23 @@ function createWatchDrill(opts = {}) {
       nowFn: opts.nowFn || undefined,
       delayFn: opts.delayFn || undefined,
       chengfangOpener: opts.chengfangOpener || undefined,
+      // 测试可注入广告状态 fixture；生产缺省走 Monitor 默认读取
       readAdState: opts.readAdState || undefined,
     });
     drill._monitor = monitor;
-    drill.shopName = (cfgResult.config.shops || []).map((s) => s.name || s.id).join('、') || '—';
+    // 多店铺：结构化列表 + 兼容拼接名（仅用于标题；数据行绝不拼串）
+    const activeShops = (cfgResult.config.shops || []).filter((s) => s && s.deleted !== true);
+    drill.shops = activeShops.map((s) => ({
+      id: s.id,
+      name: s.displayName || s.name || s.id,
+      platform: s.platform || 'douyin',
+    }));
+    drill.shopName = drill.shops.map((s) => s.name).join('、') || '—';
     drill.realMode = monitor.realMode === true;
 
     // 门槛快照（fail-closed 依据；界面必须可见；此后每轮 refreshGates 重读）
     const g = refreshGates();
+    collectRuntimeFingerprint();
     pushLog('info',
       `值守装配完成 · 店铺 ${drill.shopName} · 模式：${monitor.realMode ? '真实执行' : '演练模式（不操作广告）'}`);
     pushLog('info',
@@ -586,11 +681,11 @@ function createWatchDrill(opts = {}) {
     // 动作标签：显式字段优先；未知则如实标注（绝不按 outcome 文本猜测）
     const label = ACTION_LABEL[kind] || '未知动作';
     const verb = kind === 'unknown' ? '将操作' : `将${label}`;
-    return `${label}批次结果：${a.outcome || 'unknown'}（${bits.join('，') || '无明细'}）`
+    return `${label}批次结果：${scrub(String(a.outcome || 'unknown'))}（${bits.join('，') || '无明细'}）`
       + `；目标 ${targetIds.length} 条${ids.length ? `（ID ${ids.slice(0, 5).join(',')}${ids.length > 5 ? '…' : ''}）` : ''}`
       + (isPause || isEnable ? `；本次动作=${label}` : `；本次动作=未知（actionType 未提供，未按结果文本猜测）`)
-      + (a.confirmReason ? `；回读核验：${a.confirmReason}` : '')
-      + (a.error ? `；失败原因：${a.error}` : '')
+      + (a.confirmReason ? `；回读核验：${scrub(String(a.confirmReason))}` : '')
+      + (a.error ? `；失败原因：${scrub(String(a.error))}` : '')
       + (kind === 'unknown' ? '' : `；${verb}，系统绝不删除广告。`);
   }
 
@@ -601,7 +696,7 @@ function createWatchDrill(opts = {}) {
     const thr = j.thresholdCents;
     const head = `第 ${j.cycleNo} 轮判断数据（周期 ${j.cycleNo}${j.trigger ? ` / ${j.trigger}` : ''}）：`;
     if (j.status === 'blocked') {
-      return head + `本轮判断被拦下，未得出费用/订单结论；原因：${j.reason || '未知'}`;
+      return head + `本轮判断被拦下，未得出费用/订单结论；原因：${scrub(String(j.reason || '未知'))}`;
     }
     const perOrder = j.perOrderText ? `，每单 ${j.perOrderText}` : '';
     const body = `费用 ${centsToYuan(cost)} 元（${cost} 分），订单 ${orders} 单${perOrder}`;
@@ -622,7 +717,7 @@ function createWatchDrill(opts = {}) {
    */
   function describeTrigger(t) {
     if (t.failed) {
-      return `命中处理失败：${t.reason || '未知原因'}${t.dryOutcome ? `（${t.dryOutcome}）` : ''}`;
+      return `命中处理失败：${scrub(String(t.reason || '未知原因'))}${t.dryOutcome ? `（${t.dryOutcome}）` : ''}`;
     }
     const act = (t.targetAction === 'pause' || t.targetAction === 'enable') ? t.targetAction : null;
     const dataBits = [];
@@ -644,7 +739,7 @@ function createWatchDrill(opts = {}) {
 
   /** 错误事件（失败原因，界面必须可见）。 */
   function describeError(e) {
-    return `失败原因：${e.error}${e.code ? ` [${e.code}]` : ''}${e.scope ? `（${e.scope}）` : ''}`;
+    return `失败原因：${scrub(String(e.error))}${e.code ? ` [${scrub(String(e.code))}]` : ''}${e.scope ? `（${scrub(String(e.scope))}）` : ''}`;
   }
 
   /**
@@ -747,18 +842,20 @@ function createWatchDrill(opts = {}) {
         : null;
       st.phase = status.monitor.phase;
       st.nextRunAt = status.monitor.nextRunAt;
-      st.windowBlockReason = status.monitor.windowBlockReason;
+      st.windowBlockReason = status.monitor.windowBlockReason ? scrub(String(status.monitor.windowBlockReason)) : null;
       st.lastCheckAt = status.monitor.lastCycleAt;
-      st.enablePhaseToday = status.monitor.enablePhaseToday || [];
-      // 最近一次会话 Cookie 回写结果（仅元信息，绝不含 Cookie 值）
-      st.cookieWriteback = status.monitor.cookieWriteback || null;
+      st.enablePhaseToday = scrubDeep(status.monitor.enablePhaseToday || []);
+      // 最近一次会话 Cookie 回写结果（仅元信息，绝不含 Cookie 值；仍递归脱敏）
+      st.cookieWriteback = status.monitor.cookieWriteback ? scrubDeep(status.monitor.cookieWriteback) : null;
       st.polling = status.monitor.polling || (drill.state.gates && drill.state.gates.polling) || null;
       st.running = m.running === true;
-      // 广告开/关状态（2026-09-21 页面主信息）：从今日暂停批次与每日开启记录推导
-      st.adState = deriveAdState(status, (status.shops || [])[0]);
-      // 当前生效阈值（wholeShopCostPerOrder，整数分；页面阈值控件回显）
+      // 多店铺：每店独立广告状态与数据行（保持平台-店铺对应）
+      st.shopRows = buildShopRows(status);
+      st.adState = st.shopRows.length ? st.shopRows[0].adState : deriveAdState(status, (status.shops || [])[0]);
       const thrRule = (status.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
-      st.thresholdCents = thrRule ? thrRule.thresholdCents : null;
+      st.thresholdCents = st.shopRows.length && st.shopRows[0].thresholdCents != null
+        ? st.shopRows[0].thresholdCents
+        : (thrRule ? thrRule.thresholdCents : null);
       // roundNo 取 Monitor 的真实周期号（每个完整 pollOnce 递增一次）
       const mCycleNo = (status.monitor && status.monitor.cycleNo) || m.cycleNo || 0;
       if (typeof mCycleNo === 'number' && mCycleNo >= 0) st.roundNo = mCycleNo;
@@ -769,32 +866,43 @@ function createWatchDrill(opts = {}) {
         st.status = 'idle';
       }
 
-      // 2) 最近一轮展示数据（判断日志统一由事件流产出，这里不再按"数据变化"记日志）
-      const shop = (status.shops || [])[0];
-      if (shop && shop.today) {
-        const d = shop.today;
-        const sw = translateSwitchResult(d);
-        st.lastRound = {
-          roundNo: st.roundNo,
-          businessDate: d.businessDate,
-          costCents: d.costCents,
-          costRaw: d.rawCostText,
-          costText: d.costText,
-          orders: d.orders,
-          perOrderText: d.perOrderText,
-          over: d.over === true,
-          conclusion: d.over === true ? 'over' : 'under',
-          conclusionText: sw.head,
-          switchText: sw.line,
-          decision: d.decision || null,
-          zeroClick: d.zeroClick === true,
-          reason: scrub(String(d.blockedReason || d.reason || '')) || null,
-          fetchedAt: d.fetchedAt,
-          pageUpdatedAt: d.pageUpdatedAt,
-        };
-        st.lastError = scrub(String(d.blockedReason || '')) || null;
+      // 2) 最近一轮展示数据（多店铺：每店独立 lastRounds；兼容 lastRound=第一店）
+      st.lastRounds = st.lastRounds || {};
+      const activeShopList = (status.shops || []).filter((x) => x && x.deleted !== true);
+      for (const shop of activeShopList) {
+        if (shop && shop.today) {
+          const d = shop.today;
+          const sw = translateSwitchResult(d);
+          st.lastRounds[shop.id] = {
+            shopId: shop.id,
+            shopName: shop.displayName || shop.name || shop.id,
+            roundNo: st.roundNo,
+            businessDate: d.businessDate,
+            costCents: d.costCents,
+            costRaw: d.rawCostText ? scrub(String(d.rawCostText)) : null,
+            costText: d.costText ? scrub(String(d.costText)) : null,
+            orders: d.orders,
+            perOrderText: d.perOrderText ? scrub(String(d.perOrderText)) : null,
+            over: d.over === true,
+            conclusion: d.over === true ? 'over' : 'under',
+            conclusionText: scrub(sw.head),
+            switchText: scrub(sw.line),
+            decision: d.decision || null,
+            zeroClick: d.zeroClick === true,
+            reason: scrub(String(d.blockedReason || d.reason || '')) || null,
+            fetchedAt: d.fetchedAt,
+            pageUpdatedAt: d.pageUpdatedAt,
+          };
+        } else {
+          st.lastRounds[shop.id] = st.lastRounds[shop.id] || { shopId: shop.id, shopName: shop.displayName || shop.name || shop.id, reason: null };
+        }
+      }
+      const firstActive = activeShopList[0];
+      if (firstActive && firstActive.today) {
+        st.lastRound = st.lastRounds[firstActive.id];
+        st.lastError = scrub(String(firstActive.today.blockedReason || firstActive.lastError || '')) || null;
       } else {
-        st.lastError = st.lastRound && st.lastRound.reason ? scrub(String(st.lastRound.reason)) : null;
+        st.lastError = st.lastRound && st.lastRound.reason ? scrub(String(st.lastRound.reason)) : (st.lastError ? scrub(String(st.lastError)) : null);
       }
 
       // 3) 事件流增量消费（唯一入口；游标 = evtSeq）
@@ -919,6 +1027,38 @@ function createWatchDrill(opts = {}) {
     pushLog('warn', '当前 Monitor 未提供事件流（evtSeq）；已退化为按有界数组消费，可能漏事件。');
   }
 
+  /**
+   * 只读运行时版本指纹：require.resolve 实际解析路径 + 该路径字节 sha256。
+   * 只写启动日志/只读状态；不写 Cookie、店铺 ID、令牌、密钥。
+   * 不把工作区文件存在当作运行时已加载证据。
+   */
+  function collectRuntimeFingerprint() {
+    if (drill._runtimeFingerprint) return drill._runtimeFingerprint;
+    try {
+      const fpMod = promo('src/lib/runtime-fingerprint.js');
+      const fp = fpMod.computeRuntimeFingerprint([
+        { id: 'watch-drill', path: __filename },
+      ]);
+      drill._runtimeFingerprint = fp;
+      const line = fpMod.formatFingerprintLine(fp);
+      pushLog('info', line);
+      try { console.log(line); } catch (_) { /* 启动日志尽力而为 */ }
+      return fp;
+    } catch (err) {
+      const fp = {
+        buildMarker: null,
+        at: new Date().toISOString(),
+        pid: process.pid,
+        ok: false,
+        error: String((err && err.message) || err).slice(0, 160),
+        files: [],
+      };
+      drill._runtimeFingerprint = fp;
+      pushLog('warn', `运行时版本指纹不可用：${fp.error}`);
+      return fp;
+    }
+  }
+
   // ── 对外操作 ─────────────────────────────────────────────────────────────
   /**
    * 服务启动装配（2026-09-15 上线）：3443 进程启动即调用，不依赖任何页面访问。
@@ -927,6 +1067,7 @@ function createWatchDrill(opts = {}) {
    * - 启动后台周期同步：无人打开页面也持续转译事件流并落盘值守日志。
    */
   function boot() {
+    try { collectRuntimeFingerprint(); } catch (_) { /* 指纹失败不阻塞装配 */ }
     try {
       ensureMonitor();
     } catch (e) {
@@ -1014,7 +1155,7 @@ function createWatchDrill(opts = {}) {
       st.lastError = null;
       const g = st.gates || {};
       pushLog('info',
-        `值守启动 · 店铺 ${drill.shopName} · 模式：${monitor.modeLabel}；`
+        `值守启动 · 店铺 ${(drill.shops || []).map((s) => (s.platform === 'pinduoduo' ? '拼多多/' : '抖店/') + s.name).join('，') || drill.shopName} · 模式：${monitor.modeLabel}；`
         + `每日 ${String(g.enableHour).padStart(2, '0')}:00 开启乘方，${String(g.dailyStartHour).padStart(2, '0')}:00 后每 ${g.intervalMinutes} 分钟检查；`
         + `规则：当天费用÷当天全店订单 严格超过 1 元/单（整数分 >）即暂停乘方；绝不删除广告。`);
     }
@@ -1056,8 +1197,13 @@ function createWatchDrill(opts = {}) {
         st.gates = gates;
         drill.realMode = gates.realMode === true;
         drill.shopName = (drill._config && Array.isArray(drill._config.shops))
-          ? (drill._config.shops.map((s) => s.name || s.id).join('、') || '—')
+          ? (drill._config.shops.filter((s) => s && s.deleted !== true).map((s) => s.displayName || s.name || s.id).join('、') || '—')
           : drill.shopName;
+        drill.shops = (drill._config && Array.isArray(drill._config.shops))
+          ? drill._config.shops.filter((s) => s && s.deleted !== true).map((s) => ({
+              id: s.id, name: s.displayName || s.name || s.id, platform: s.platform || 'douyin',
+            }))
+          : drill.shops;
         // 未装配 Monitor（boot 前）：如实展示"调度器未运行"；配置开关与停用标记未知不臆断
         if (!st.enableTask) {
           const cf = (drill._config && drill._config.monitor && drill._config.monitor.chengfang) || {};
@@ -1070,8 +1216,12 @@ function createWatchDrill(opts = {}) {
         }
       } catch (_) { /* 读配置失败：保留 null/未知，不臆断 */ }
     }
-    return {
+    // 终态统一递归脱敏：snapshot 整包（含 shopRows.today/lastRounds/lastError/嵌套对象）不得含原始凭据
+    return scrubDeep({
       shopName: drill.shopName,
+      shops: drill.shops || [],
+      shopRows: st.shopRows || [],
+      lastRounds: st.lastRounds || {},
       realMode: m ? m.realMode === true : (gates ? gates.realMode === true : drill.realMode),
       // 首次启动前也如实告知：模式是否已知、配置声明的模式是什么
       realModeKnown: gates ? gates.modeKnown !== false : false,
@@ -1113,7 +1263,9 @@ function createWatchDrill(opts = {}) {
       threshold: st.thresholdCents != null
         ? { cents: st.thresholdCents, yuan: st.thresholdCents / 100 }
         : null,
-    };
+      // 只读运行时版本指纹（非敏感；require.resolve 路径 + 文件 sha256）
+      runtimeFingerprint: drill._runtimeFingerprint || collectRuntimeFingerprint(),
+    });
   }
 
   /**
@@ -1207,6 +1359,42 @@ function createWatchDrill(opts = {}) {
           ? { ok: true, result: r, poll: poll ? { ok: !!poll.ok, cycleNo: poll.cycleNo, nextRunAt: poll.nextRunAt, reason: poll.reason } : null, state: snapshot() }
           : { ok: false, error: r.reason, state: snapshot() });
       }
+      // 逐店只读更新 / 修改 / 删除（2026-09-24 多店铺生产接入）
+      // 推广广告控制仅抖店；删除后调度器与手动接口都会再次检查活动列表。
+      if (p === '/api/watch-drill/shop/refresh' && req.method === 'POST') {
+        const body = await readBody(req);
+        const shopId = body && body.shopId;
+        if (!shopId) return send(400, { ok: false, error: '缺少 shopId' });
+        const m2 = ensureMonitor();
+        const r = await m2.refreshShopData(String(shopId));
+        syncFromMonitor();
+        pushLog(r.ok ? 'info' : 'warn', `单店立即更新（只读）${r.ok ? '完成' : '失败'}：${shopId}${r.reason ? ' · ' + r.reason : ''}`);
+        return send(r.ok ? 200 : 400, { ...r, state: snapshot() });
+      }
+      if (p === '/api/watch-drill/shop/update' && req.method === 'POST') {
+        const body = await readBody(req);
+        const shopId = body && body.shopId;
+        if (!shopId) return send(400, { ok: false, error: '缺少 shopId' });
+        const m2 = ensureMonitor();
+        const r = m2.updateShop(String(shopId), {
+          displayName: body.displayName,
+          name: body.name,
+          thresholdCents: body.thresholdCents,
+        });
+        syncFromMonitor();
+        pushLog(r.ok ? 'info' : 'warn', `单店修改${r.ok ? '已落盘' : '失败'}：${shopId}${r.reason ? ' · ' + r.reason : ''}${r.rolledBack ? '（内存已回滚）' : ''}`);
+        return send(r.ok ? 200 : 400, { ...r, error: r.ok ? undefined : r.reason, state: snapshot() });
+      }
+      if (p === '/api/watch-drill/shop/delete' && req.method === 'POST') {
+        const body = await readBody(req);
+        const shopId = body && body.shopId;
+        if (!shopId) return send(400, { ok: false, error: '缺少 shopId' });
+        const m2 = ensureMonitor();
+        const r = m2.deleteShop(String(shopId));
+        syncFromMonitor();
+        pushLog(r.ok ? 'warn' : 'error', `单店删除${r.ok ? '已落盘（历史与 Cookie 保留；不影响其他店在途任务）' : '失败'}：${shopId}${r.reason ? ' · ' + r.reason : ''}`);
+        return send(r.ok ? 200 : 400, { ...r, error: r.ok ? undefined : r.reason, state: snapshot() });
+      }
       if (p === '/api/watch-drill/state' && req.method === 'GET') { syncFromMonitor(); return send(200, { ok: true, state: snapshot() }); }
       if (p === '/api/watch-drill/logs' && req.method === 'GET') {
         syncFromMonitor();
@@ -1253,7 +1441,9 @@ function createWatchDrill(opts = {}) {
     confirmDialogs: CONFIRM_DIALOG_MEASURED,
     _internal: drill,
     translateSwitchResult,
+    /** 多店铺行构建（测试/界面复用）。 */
+    buildShopRows,
   };
 }
 
-module.exports = { createWatchDrill, STATUS_TEXT, scrub, deriveAdState };
+module.exports = { createWatchDrill, STATUS_TEXT, scrub, scrubDeep, deriveAdState, buildShopRows };

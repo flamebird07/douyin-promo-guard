@@ -36,6 +36,7 @@ const { perOrderDisplayText } = require('./rules');
 const { decideAdSwitchAction, DECISION } = require('./ad-switch-decision');
 const { AdSwitchOrchestrator, createSwitchSerialGate } = require('./ad-switch-orchestrator');
 const { mapAdStateFromAdList, mapAdStateFromSwitchRows, normalizeAdState } = require('./ad-switch-state');
+const { discoverShopsFromCookies, cookieKey } = require('./shop-discovery');
 const guard = require('./guard');
 const { NotConnectedError } = require('../lib/errors');
 const { shanghaiDate, shanghaiClockText, shanghaiWall, shanghaiMs, isAfterDailyStart, msUntilDailyStart, msUntilHour, nextIntervalDelayMs } = require('../lib/time');
@@ -158,6 +159,11 @@ class Monitor {
       || createSwitchSerialGate({ state: loaded.switchSlots || { slots: [] } });
     this._switchOrchestrator = this._switchOrchestrator
       || new AdSwitchOrchestrator({ gate: this._switchGate, audit: (e) => this._audit(e) });
+    // Cookie 自动发现店铺（2026-09-25 阶段 5，用户已确认）：目录为入口，新增 Cookie
+    // 自动建店；已软删除店绝不复活。发现失败只记日志，绝不阻塞装配。
+    try { this._discoverShopsFromCookies(); } catch (e) {
+      try { log.warn(`Cookie 店铺发现异常（不阻塞装配）: ${e.message}`); } catch (_) {}
+    }
     // 重启回读：上次进程遗留的 in_progress 视为 unknown（进程已中断，结果未确认），
     // 交由 _runEnablePhase 先回读实际状态再决定，绝不盲目重发。
     this._reconcileEnablePhaseOnBoot();
@@ -586,15 +592,16 @@ class Monitor {
     if (this.pending.length > 0) {
       return { ok: false, reason: `存在待配置/非法配置项，不允许启动监控: ${this.pending.join('；')}` };
     }
-    if (this.running) return { ok: true, alreadyRunning: true };
+    const activeShopCount = this._activeShops().length;
+    if (this.running) return { ok: true, alreadyRunning: true, activeShopCount };
     this._gen += 1;
     this.running = true;
     this.startedAt = new Date(this.nowFn()).toISOString();
     const gen = this._gen;
-    this._audit({ kind: 'monitor', event: 'start', mode: this.modeLabel });
+    this._audit({ kind: 'monitor', event: 'start', mode: this.modeLabel, activeShopCount });
     this._loopPromise = this._intervalLoop(gen);
-    log.info(`监控已启动（${this.modeLabel}，每日 ${this.config.schedule.dailyStartHour}:00 后，每 ${this.config.schedule.intervalMinutes} 分钟）`);
-    return { ok: true };
+    log.info(`监控已启动（${this.modeLabel}，活动店铺 ${activeShopCount} 家，每日 ${this.config.schedule.dailyStartHour}:00 后，每 ${this.config.schedule.intervalMinutes} 分钟）`);
+    return { ok: true, activeShopCount };
   }
 
   stop() {
@@ -702,7 +709,7 @@ class Monitor {
    */
   _noteMissedEnableWindowIfNeeded(date) {
     if (this._enableSchedule.lastMissedDate === date) return;
-    const anyRecord = (this.config.shops || []).some((s) => this.getEnablePhaseRecord(s.id, date));
+    const anyRecord = this._activeShops().some((s) => this.getEnablePhaseRecord(s.id, date));
     if (anyRecord) return; // 今日已执行过（success/failed/unknown 均有记录），非"错过"
     this._enableSchedule.lastMissedDate = date;
     const dh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
@@ -749,8 +756,8 @@ class Monitor {
       const w = shanghaiWall(now);
       if (w.hour >= this._enableHour() && w.hour < sch.dailyStartHour) {
         const today = w.date;
-        const shopsToRun = (this.config.shops || []).filter(
-          (s) => s.enabled !== false && !this._enablePhaseDone(s.id, today),
+        const shopsToRun = this._activeShops().filter(
+          (s) => !this._enablePhaseDone(s.id, today),
         );
         if (shopsToRun.length > 0) {
           this._enableSchedule.phase = 'enable_window';
@@ -831,9 +838,9 @@ class Monitor {
       // 值守循环在本窗口内只等待到 dailyStartHour（避免双循环重复开启）。
       if (enableWindow && w.hour >= enableHour && w.hour < sch.dailyStartHour && !this.enableRunning) {
         const today = w.date;
-        // 仅当所有启用店铺当日均为 success 时才算"已完成"
-        const shopsToRun = (this.config.shops || []).filter(
-          (s) => s.enabled !== false && !this._enablePhaseDone(s.id, today)
+        // 仅当所有活动店铺当日均为 success 时才算"已完成"（已删除店铺不参与）
+        const shopsToRun = this._activeShops().filter(
+          (s) => !this._enablePhaseDone(s.id, today)
         );
         if (shopsToRun.length > 0) {
           this.schedule.phase = 'enable_window';
@@ -932,9 +939,14 @@ class Monitor {
     this._currentCycle = { cycleNo, trigger, startedAt: this.nowFn() };
     try {
       const results = [];
-      for (const shopCfg of this.config.shops) {
+      // 批量轮询：遍历**全部**活动店铺；单店失败不影响其他店（结果逐店如实记录）
+      for (const shopCfg of this._activeShops()) {
         if (token.aborted) break;
-        if (shopCfg.enabled === false) continue;
+        // 调度中途可能被删除：再次检查活动列表
+        if (!this._isShopActive(shopCfg.id)) {
+          results.push({ shopId: shopCfg.id, status: 'skipped', reason: '店铺已删除，跳过值守/轮询' });
+          continue;
+        }
         results.push({ shopId: shopCfg.id, ...(await this._pollShop(shopCfg, token, trigger)) });
       }
       this.lastCycleAt = new Date(this.nowFn()).toISOString();
@@ -1069,7 +1081,7 @@ class Monitor {
     const costCents = data && data.cost ? data.cost.valueCents : null;
     const orders = data && data.orders ? data.orders.valueCount : null;
     const rule = (this.config.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
-    const thresholdCents = rule ? rule.thresholdCents : null;
+    const thresholdCents = this._thresholdCents(shopCfg);
     const rec = {
       cycleNo,
       trigger: this._currentCycle ? this._currentCycle.trigger : null,
@@ -1100,10 +1112,426 @@ class Monitor {
     return rec;
   }
 
-  /** 启用的 wholeShopCostPerOrder 阈值（整数分）；缺失返回 null（决策层会 data_blocked）。 */
-  _thresholdCents() {
+  /**
+   * 启用的 wholeShopCostPerOrder 阈值（整数分）；缺失返回 null（决策层会 data_blocked）。
+   * 多店铺：优先取店铺级 thresholdCents 覆盖，否则回落全局规则。
+   */
+  _thresholdCents(shopCfg = null) {
+    if (shopCfg && Number.isSafeInteger(shopCfg.thresholdCents) && shopCfg.thresholdCents > 0) {
+      return shopCfg.thresholdCents;
+    }
     const rule = (this.config.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
     return rule ? rule.thresholdCents : null;
+  }
+
+  // ── 多店铺管理（2026-09-22）──────────────────────────────────────
+  /** 未删除且未禁用的店铺清单（调度/手动操作的唯一活动范围）。 */
+  _activeShops() {
+    return (this.config.shops || []).filter((s) => s && s.deleted !== true && s.enabled !== false);
+  }
+
+  /** 店铺是否仍在活动列表（删除后调度器与手动接口都必须再次检查）。 */
+  _isShopActive(shopId) {
+    return this._activeShops().some((s) => s.id === shopId);
+  }
+
+  /** 按 id 找配置店铺（含已删除，供历史/编辑查找）。 */
+  _findShop(shopId) {
+    return (this.config.shops || []).find((s) => s && s.id === shopId) || null;
+  }
+
+  /**
+   * Cookie 自动发现店铺（2026-09-25 阶段 5，用户已确认方案）：
+   * login.cookieSourceDir（+项目 cookies/ 目录）里的 Cookie 文件即店铺入口——
+   * 新 Cookie 自动建店（autoDiscovered=true，追加在末尾）；既有条目（含
+   * deleted=true 软删除店）原样保留，**绝不因重复扫描复活**；阈值/删除状态
+   * 按店铺保存在 config.json（既有 updateShop/deleteShop 原子写语义不变）。
+   * 发现到新店时尝试原子持久化：持久化失败仅记录（内存已生效），
+   * 下次构造重试；发现流程任何异常不得阻塞装配。
+   */
+  _discoverShopsFromCookies() {
+    const loginCfg = (this.config && this.config.login) || {};
+    const r = discoverShopsFromCookies({
+      loginCfg,
+      shops: this.config.shops || [],
+    });
+    if (r.skipped.length > 0) {
+      this._audit({ kind: 'shop-discovery', skipped: r.skipped });
+    }
+    if (r.added.length === 0) return r;
+    this.config.shops = r.shops;
+    const persist = this._persistShopsToConfig();
+    this._audit({
+      kind: 'shop-discovery',
+      added: r.added,
+      scannedDirs: r.scannedDirs,
+      persisted: persist.ok === true,
+      reason: persist.ok === true ? null : persist.reason,
+    });
+    if (persist.ok === true) {
+      try { log.info(`Cookie 自动发现 ${r.added.length} 家新店铺并已写入配置: ${r.added.join('、')}`); } catch (_) {}
+    } else {
+      this._memPush(this.recentErrors, {
+        scope: 'shop-config',
+        error: `Cookie 自动发现 ${r.added.length} 家新店铺（${r.added.join('、')}），但配置落盘失败（内存已生效，下次启动重试）: ${persist.reason}`,
+      }, undefined, 'error');
+    }
+    return r;
+  }
+
+  /**
+   * 把 shops **原子写**回 config.json（tmp+rename；保留 _说明 等其他键；绝不写 Cookie/令牌/密钥）。
+   * 写入失败返回 ok:false（调用方必须回滚内存并报告失败，不得先报成功）。
+   * @returns {{ok:boolean, persisted:boolean, reason?:string}}
+   */
+  _persistShopsToConfig() {
+    const cfgPath = (this.cfgResult && this.cfgResult.sourcePath) || null;
+    if (!cfgPath || typeof cfgPath !== 'string' || !cfgPath.endsWith('.json')) {
+      return { ok: false, persisted: false, reason: '无配置文件路径，无法持久化店铺变更' };
+    }
+    const tmp = `${cfgPath}.tmp-${process.pid}`;
+    try {
+      const raw = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+      // 只投影安全展示字段，避免把运行时/敏感字段写回配置
+      raw.shops = (this.config.shops || []).map((s) => {
+        const out = {};
+        for (const k of Object.keys(s)) {
+          if (k === 'cookie' || k === 'token' || k === 'secret' || k === 'password' || k === 'apiKey') continue;
+          out[k] = s[k];
+        }
+        return out;
+      });
+      fs.writeFileSync(tmp, JSON.stringify(raw, null, 2) + '\n');
+      fs.renameSync(tmp, cfgPath);
+      return { ok: true, persisted: true };
+    } catch (e) {
+      try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) { /* 清理失败忽略 */ }
+      const reason = `店铺配置落盘失败: ${e.message}`;
+      this._memPush(this.recentErrors, { scope: 'shop-config', error: reason }, undefined, 'error');
+      return { ok: false, persisted: false, reason };
+    }
+  }
+
+  /**
+   * 店铺账户身份状态（2026-09-25 阶段 6，用户已确认方案）。
+   * - 已配置 accountId（非空/非 TODO）→ 非 pending：账户映射由 guard 既有链路核验；
+   * - 自动发现店（autoDiscovered）且无 accountId → **pending**：尚未从只读回读链路
+   *   建立页面/费用账户映射，禁止一切真实广告动作（fail-closed，绝不把缺 accountId
+   *   当成身份校验通过）；
+   * - 既有手工配置店缺 accountId → 保持现行语义（不回退既有行为）。
+   * pending 是**派生态**（由配置字段推导，不落独立状态），重启/重新构造后自然保持，
+   * 不会误变成可执行。
+   */
+  _shopIdentityState(shopCfg) {
+    if (!shopCfg) return { pending: true, reason: '缺少店铺配置：禁止真实广告动作' };
+    const raw = shopCfg.accountId;
+    const acc = raw === undefined || raw === null ? '' : String(raw).trim();
+    if (acc !== '' && !acc.toUpperCase().startsWith('TODO')) {
+      return { pending: false, reason: null, configured: true };
+    }
+    if (shopCfg.autoDiscovered === true) {
+      return {
+        pending: true,
+        reason: '待身份核验：自动发现店尚未建立账户映射（页面/费用源账户一致后自动解除），期间禁止真实开启/暂停/关闭/补点',
+      };
+    }
+    return { pending: false, reason: null, legacy: true };
+  }
+
+  /**
+   * 尝试用**三重证据**自动建立账户映射（2026-09-25 阶段 6 修正+来源门禁补修）：
+   *  1. 本轮费用源页面实测账户号（data.cost.accountId，千川页 shop-name 元素）；
+   *  2. 本轮乘方页面实测账户号（verifyIdentity.pageAccountId，导航 ID 元素）；
+   *  3. 本轮罗盘页面实测店铺名——**必须经来源门禁证明出自真实罗盘订单链**：
+   *     配置 `monitor.orderDataSource === 'compass'` + 订单摘要 `source === 'promo-page'`
+   *     + 摘要携带罗盘适配器的结构化标记 `identitySource.adapter === 'compass-order-reader'`。
+   * 店铺名还须与该店稳定的 **Cookie 文件基名**（cookieKey(shopCfg.cookieFile)）精确一致。
+   * 三者齐备且一致 → 保存 accountId 并原子落盘（先落盘成功才算建立，失败回滚内存）。
+   * 来源门禁不通过（非罗盘配置/mock 来源/标记缺失或不符）即使携带同名 pageShopName
+   * 且双账户一致 → 保持 pending、不写元数据、零动作、留明确原因。
+   * 不使用 displayName、乘方回填 pageShopName/pageShopId、配置回填 orders.shopId
+   * 作为店铺身份替代；已手工配置账户的店绝不进入本流程（不覆盖旧元数据）。
+   * 注意：两个账户号一致只证明同一 Cookie 会话解析到同一千川账户，本身不构成
+   * 店铺身份证据——店铺级锚点唯有经来源门禁核验的罗盘页面实测店铺名。
+   */
+  _maybeEstablishIdentity(shopCfg, { costAccountId = null, pageAccountId = null, pageAccountSource = null, ordersSummary = null } = {}) {
+    const st = this._shopIdentityState(shopCfg);
+    if (!st.pending || st.configured) return { established: false, blocked: null, pending: st.pending };
+    const cost = costAccountId == null ? '' : String(costAccountId).trim();
+    const page = pageAccountId == null ? '' : String(pageAccountId).trim();
+    // 订单证据来源门禁（阶段 6 补修）：三查——配置来源 / 摘要来源 / 适配器结构化标记
+    const orderSrc = (this.config.monitor && this.config.monitor.orderDataSource) || null;
+    const os = ordersSummary && typeof ordersSummary === 'object' ? ordersSummary : null;
+    let markerState = '缺失';
+    if (os && os.identitySource) markerState = os.identitySource.adapter === 'compass-order-reader' ? '符合' : '适配器不符';
+    const marker = markerState === '符合' ? os.identitySource : null;
+    const sourceOk = orderSrc === 'compass' && !!os && os.source === 'promo-page' && markerState === '符合';
+    if (!sourceOk) {
+      const fails = [];
+      if (orderSrc !== 'compass') fails.push(`订单源配置=${orderSrc || '未配置'}`);
+      if (!os) fails.push('订单摘要=缺失');
+      else if (os.source !== 'promo-page') fails.push(`摘要来源=${os.source}`);
+      if (markerState !== '符合') fails.push(`罗盘来源标记=${markerState}`);
+      const reason = `订单证据来源门禁不通过（${fails.join('，')}）：店铺名证据不可信，保持待身份核验，零动作`;
+      this._audit({ kind: 'identity-establish', shopId: shopCfg.id, ok: false, blocked: true, reason });
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
+      return { established: false, blocked: reason, pending: true };
+    }
+    const cookieBase = cookieKey(shopCfg.cookieFile);
+    const pageShop = String((marker && marker.pageShopName) || '').trim();
+    // 店铺级锚点（罗盘页面实测店铺名）再核对：缺失或不一致一律保持待核验
+    if (!cookieBase) {
+      const reason = '店铺缺少 Cookie 文件基名，无法核对罗盘页面实测店铺名：保持待身份核验，零动作';
+      this._audit({ kind: 'identity-establish', shopId: shopCfg.id, ok: false, blocked: true, reason });
+      return { established: false, blocked: reason, pending: true };
+    }
+    if (!pageShop) {
+      const reason = '罗盘来源标记未携带页面实测店铺名：保持待身份核验，零动作，不建立账户映射';
+      this._audit({ kind: 'identity-establish', shopId: shopCfg.id, ok: false, blocked: true, reason });
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
+      return { established: false, blocked: reason, pending: true };
+    }
+    if (pageShop !== cookieBase) {
+      const reason = `罗盘页面实测店铺名「${pageShop}」与 Cookie 文件基名「${cookieBase}」不一致：零动作，保持待身份核验（不代选、不覆盖）`;
+      this._audit({ kind: 'identity-establish', shopId: shopCfg.id, ok: false, blocked: true, reason });
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
+      return { established: false, blocked: reason, pending: true };
+    }
+    if (cost && page) {
+      if (cost === page) {
+        const prev = shopCfg.accountId;
+        shopCfg.accountId = cost;
+        const persist = this._persistShopsToConfig();
+        if (!persist.ok) {
+          shopCfg.accountId = prev; // 落盘失败回滚内存，保持待核验（先落盘成功才算建立）
+          const reason = `账户映射自动建立失败（配置落盘失败，保持待核验）: ${persist.reason}`;
+          this._audit({ kind: 'identity-establish', shopId: shopCfg.id, ok: false, reason, persisted: false });
+          this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
+          return { established: false, blocked: reason, pending: true };
+        }
+        this._audit({
+          kind: 'identity-establish',
+          shopId: shopCfg.id,
+          ok: true,
+          persisted: true,
+          pageAccountSource: pageAccountSource || null,
+          shopNameEvidence: pageShop,
+          note: '罗盘实测店铺名（经来源门禁）与 Cookie 文件基名一致，且页面实测账户与费用源实测账户一致：自动建立账户映射并解除待核验',
+        });
+        try { log.info(`店铺 ${shopCfg.id} 账户映射自动建立（罗盘店铺名经来源门禁核验且与 Cookie 基名一致、页面/费用源账户一致）并已落盘`); } catch (_) {}
+        return { established: true, blocked: null, pending: false };
+      }
+      const reason = `账户来源不一致：费用源实测 ${cost}，乘方页面实测 ${page}。零动作，保持待身份核验（不代选、不覆盖既有元数据）`;
+      this._audit({ kind: 'identity-establish', shopId: shopCfg.id, ok: false, blocked: true, reason });
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason }, undefined, 'error');
+      return { established: false, blocked: reason, pending: true };
+    }
+    return { established: false, blocked: null, pending: true };
+  }
+
+  /**
+   * 立即更新单店数据（**只读**：只读取费用/订单/广告状态，绝不触发开关）。
+   * 删除后店铺拒绝；未知/身份失败/分页不完整返回 blocked，零动作。
+   */
+  async refreshShopData(shopId) {
+    const shopCfg = this._findShop(shopId);
+    if (!shopCfg) return { ok: false, reason: '店铺不存在' };
+    if (!this._isShopActive(shopId)) {
+      return { ok: false, reason: '店铺已删除或停用，不再值守/更新', deleted: shopCfg.deleted === true };
+    }
+    if (this.pending.length > 0) {
+      return { ok: false, reason: `存在待配置/非法配置项，不允许更新: ${this.pending.join('；')}` };
+    }
+    const rt = this._runtime(shopId);
+    try {
+      const coord = this._getCoordinator(shopCfg);
+      let data;
+      try {
+        data = await coord.readAndEvaluate(shopCfg);
+      } catch (e) {
+        if (e instanceof NotConnectedError) {
+          rt.lastError = '推广数据读取尚未接入';
+          return { ok: false, reason: rt.lastError, zeroClick: true };
+        }
+        throw e;
+      }
+      rt.lastError = null;
+      rt.lastData = this._summarizeData(data);
+      rt.lastDataAt = new Date(this.nowFn()).toISOString();
+      // 只读回读广告状态（on/off/mixed/unknown）；失败 → unknown + blocked 说明
+      const stateRead = await this._readCurrentAdState(shopCfg);
+      rt.lastAdState = stateRead.state || 'unknown';
+      if (stateRead.error) {
+        rt.lastData.blockedReason = stateRead.error.reason;
+        return {
+          ok: true,
+          readOnly: true,
+          shopId,
+          data: rt.lastData,
+          adState: rt.lastAdState,
+          blocked: stateRead.error.blocked || 'ad_state_read',
+          reason: stateRead.error.reason,
+          zeroClick: true,
+        };
+      }
+      if (data.ok === false) {
+        rt.lastData.blockedReason = data.reason;
+        return {
+          ok: true,
+          readOnly: true,
+          shopId,
+          data: rt.lastData,
+          adState: rt.lastAdState,
+          blocked: data.blocked || 'data',
+          reason: data.reason,
+          zeroClick: true,
+        };
+      }
+      this._audit({ kind: 'shop-refresh', shopId, readOnly: true, zeroClick: true, adState: rt.lastAdState });
+      // 账户身份自动建立（2026-09-25 阶段 6 修正+来源门禁）：只读回读链路三重证据
+      // 齐备且订单证据经来源门禁核验才建立
+      const idState0 = this._shopIdentityState(shopCfg);
+      if (idState0.pending) {
+        this._maybeEstablishIdentity(shopCfg, {
+          costAccountId: (data.cost && data.cost.accountId) || null,
+          pageAccountId: (stateRead.identity && stateRead.identity.pageAccountId) || null,
+          pageAccountSource: stateRead.identity ? 'chengfang-nav' : null,
+          ordersSummary: data.orders || null,
+        });
+      }
+      return {
+        ok: true,
+        readOnly: true,
+        shopId,
+        data: rt.lastData,
+        adState: rt.lastAdState,
+        zeroClick: true,
+      };
+    } catch (e) {
+      const reason = e.reason || e.message;
+      rt.lastError = reason;
+      this._memPush(this.recentErrors, { scope: `shop:${shopId}`, error: reason }, undefined, 'error');
+      this._audit({ kind: 'shop-refresh', shopId, ok: false, reason, zeroClick: true });
+      return { ok: false, reason, zeroClick: true };
+    }
+  }
+
+  /**
+   * 修改店铺**展示名称**与阈值。
+   * - 展示名写入 `displayName`，**绝不修改**身份字段 `name`/`id`/`compassShopName`/`accountId`/`cookieFile`；
+   * - 先持久化（原子写），成功后才报告 ok:true；写入失败回滚内存并返回失败。
+   * 不暴露/不修改 Cookie、令牌、密钥。
+   */
+  updateShop(shopId, { displayName, name, thresholdCents } = {}) {
+    const shop = this._findShop(shopId);
+    if (!shop) return { ok: false, reason: '店铺不存在' };
+    if (shop.deleted === true) return { ok: false, reason: '店铺已删除，无法修改' };
+    const patch = {};
+    const rawDisplay = displayName !== undefined && displayName !== null ? displayName : name;
+    if (rawDisplay !== undefined && rawDisplay !== null) {
+      const n = String(rawDisplay).trim();
+      if (!n || n.length > 100) {
+        return { ok: false, reason: '展示名称无效：1–100 个字符' };
+      }
+      if (/cookie|token|secret|password|passwd|pwd|api[_-]?key|sessionid/i.test(n)) {
+        return { ok: false, reason: '展示名称不得包含敏感字样' };
+      }
+      patch.displayName = n;
+    }
+    if (thresholdCents !== undefined && thresholdCents !== null) {
+      const t = Math.floor(Number(thresholdCents));
+      if (!Number.isFinite(t) || t < 1 || t > 1000000) {
+        return { ok: false, reason: '阈值无效：需为 0.01–10000 元/单（整数分 1–1000000）' };
+      }
+      patch.thresholdCents = t;
+    }
+    if (Object.keys(patch).length === 0) {
+      return { ok: false, reason: '未提供可修改字段（展示名称/阈值）' };
+    }
+    // 整店浅快照：写入失败精确回滚（含字段是否存在）
+    const snapshotBefore = { ...shop };
+    const from = {
+      displayName: shop.displayName !== undefined ? shop.displayName : (shop.name || shop.id),
+      thresholdCents: shop.thresholdCents ?? this._thresholdCents(shop),
+    };
+    // 只写允许修改的字段；身份字段由 Object.keys(shop) 原样保留
+    Object.assign(shop, patch);
+    const persist = this._persistShopsToConfig();
+    if (!persist.ok) {
+      // 精确回滚
+      for (const k of Object.keys(shop)) {
+        if (!(k in snapshotBefore)) delete shop[k];
+      }
+      Object.assign(shop, snapshotBefore);
+      this._audit({ kind: 'shop-update', shopId, ok: false, reason: persist.reason, persisted: false, rolledBack: true });
+      return { ok: false, reason: persist.reason, rolledBack: true, persisted: false };
+    }
+    this._audit({
+      kind: 'shop-update',
+      shopId,
+      change: patch,
+      from,
+      to: { displayName: shop.displayName || shop.name, thresholdCents: shop.thresholdCents ?? this._thresholdCents(shop) },
+      identityUnchanged: true,
+      persisted: true,
+    });
+    this._saveState();
+    return {
+      ok: true,
+      shopId,
+      displayName: shop.displayName || shop.name,
+      thresholdCents: shop.thresholdCents ?? this._thresholdCents(shop),
+      from,
+      identityUnchanged: true,
+      persisted: true,
+    };
+  }
+
+  /**
+   * 删除店铺：软删除（deleted=true），停止值守/轮询/自动开启/自动暂停/手动操作。
+   * - 先持久化，成功后才报告 ok:true；失败回滚内存并返回失败。
+   * - **不中止其他店铺的在途任务**；被删除店在每次可能发出新广告动作前复核活动状态；
+   *   已发出的动作仍完成有界回读。
+   * **保留**历史状态（batches/enablePhase/adBelief）与 Cookie 文件，不删本地凭据。
+   */
+  deleteShop(shopId) {
+    const shop = this._findShop(shopId);
+    if (!shop) return { ok: false, reason: '店铺不存在' };
+    if (shop.deleted === true) return { ok: true, alreadyDeleted: true, shopId, keepHistory: true, keepCookies: true };
+    const snapshotBefore = {
+      deleted: shop.deleted,
+      enabled: shop.enabled,
+      deletedAt: shop.deletedAt,
+    };
+    shop.deleted = true;
+    shop.enabled = false;
+    shop.deletedAt = new Date(this.nowFn()).toISOString();
+    const persist = this._persistShopsToConfig();
+    if (!persist.ok) {
+      Object.assign(shop, snapshotBefore);
+      this._audit({ kind: 'shop-delete', shopId, ok: false, reason: persist.reason, persisted: false, rolledBack: true });
+      return { ok: false, reason: persist.reason, rolledBack: true, persisted: false };
+    }
+    // 绝不 abort 其他店的在途令牌；只在后续动作入口复核 _isShopActive
+    this._audit({
+      kind: 'shop-delete',
+      shopId,
+      note: '软删除：停止值守/轮询/自动启停/手动操作；保留历史状态与 Cookie 文件；不中止其他店在途任务',
+      persisted: true,
+    });
+    this._memPush(this.recentErrors, {
+      scope: `shop:${shopId}`,
+      error: '店铺已删除：停止值守/轮询/自动开启/自动暂停/手动操作（历史与 Cookie 已保留）',
+    }, undefined, 'error');
+    this._saveState();
+    return {
+      ok: true,
+      shopId,
+      deleted: true,
+      persisted: true,
+      keepHistory: true,
+      keepCookies: true,
+    };
   }
 
   /**
@@ -1116,7 +1544,13 @@ class Monitor {
   async _readCurrentAdState(shopCfg) {
     if (this._readAdState) {
       try {
-        return { state: normalizeAdState(await this._readAdState(shopCfg)) };
+        const r = await this._readAdState(shopCfg);
+        // 注入契约扩展（2026-09-25 阶段 6）：可返回 {state, identity}（携带页面身份锚点）；
+        // 字符串返回值保持既有语义（无 identity）。
+        if (r && typeof r === 'object' && !Array.isArray(r)) {
+          return { state: normalizeAdState(r.state), identity: r.identity || null };
+        }
+        return { state: normalizeAdState(r) };
       } catch (e) {
         return {
           state: 'unknown',
@@ -1288,7 +1722,8 @@ class Monitor {
         return { state: 'unknown', error: { status: 'blocked', reason: '乘方控制范围为空，无法回读状态', blocked: 'inventory' } };
       }
       const state = mapAdStateFromSwitchRows(rows, { confirmedEmpty: emptyEvidence && rows.length === 0 });
-      return { state, rows };
+      // 透出本轮回读的页面身份（供账户映射自动建立使用；不改变既有状态语义）
+      return { state, rows, identity };
     } catch (e) {
       return {
         state: 'unknown',
@@ -1328,7 +1763,17 @@ class Monitor {
    * 动作执行复用现有 runner/executor（不复制 Playwright）。
    */
   async _runShopSwitchAction(shopCfg, action, data, cycleToken, trigger, opts = {}) {
-    const thresholdCents = this._thresholdCents();
+    if (!this._isShopActive(shopCfg.id)) {
+      return { status: 'blocked', reason: '店铺已删除或停用，拒绝执行广告操作', zeroClick: true, outcome: 'blocked_stopped' };
+    }
+    // 账户身份门禁（2026-09-25 阶段 6）：待身份核验店零动作（纵深防御——决策层已拦，
+    // 此处覆盖一切其他调用方）。
+    const idGate = this._shopIdentityState(shopCfg);
+    if (idGate.pending) {
+      this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: idGate.reason, blocked: 'identity_pending', zeroClick: true });
+      return { status: 'blocked', reason: idGate.reason, zeroClick: true, outcome: 'blocked', blocked: 'identity_pending' };
+    }
+    const thresholdCents = this._thresholdCents(shopCfg);
     const decide = (currentAdState) => this._switchOrchestrator.evaluatePeriodic({
       costCents: data.cost.valueCents,
       orders: data.orders.valueCount,
@@ -1579,14 +2024,36 @@ class Monitor {
         };
       }
       const currentAdState = stateRead.state;
-      const identityOk = true;
-      const thresholdCents = this._thresholdCents();
+      rt.lastAdState = currentAdState;
+      rt.lastDataAt = new Date(this.nowFn()).toISOString();
+      // 账户身份门禁（2026-09-25 阶段 6）：自动发现店在页面/费用双锚点一致前
+      // identityOk=false（决策层零动作）；本轮回读锚点齐全且一致时自动建立映射，
+      // 建立成功（先落盘）当轮即解除；不一致/落盘失败保持待核验并留阻止原因。
+      const idState = this._shopIdentityState(shopCfg);
+      let identityOk = !idState.pending;
+      let identityNote = idState.reason;
+      if (idState.pending) {
+        const est = this._maybeEstablishIdentity(shopCfg, {
+          costAccountId: (data.cost && data.cost.accountId) || null,
+          pageAccountId: (stateRead.identity && stateRead.identity.pageAccountId) || null,
+          pageAccountSource: stateRead.identity ? 'chengfang-nav' : null,
+          ordersSummary: data.orders || null,
+        });
+        if (est.established) {
+          identityOk = true;
+          identityNote = null;
+        } else if (est.blocked) {
+          identityNote = est.blocked;
+        }
+      }
+      const thresholdCents = this._thresholdCents(shopCfg);
       const decision = this._switchOrchestrator.evaluatePeriodic({
         costCents: data.cost.valueCents,
         orders: data.orders.valueCount,
         thresholdCents,
         currentAdState,
         identityOk,
+        identityReason: identityNote,
       });
 
       // 每周期一条判断
@@ -1752,14 +2219,15 @@ class Monitor {
     this._cycleRunning = true;
     const today = businessDate || shanghaiDate(this.nowFn());
     try {
-      for (const shopCfg of this.config.shops) {
+      for (const shopCfg of this._activeShops()) {
         if (schedScope) {
           if (gen !== this._enableGen || !this.enableRunning) break;
         } else if (gen !== this._gen || !this.running) {
           break;
         }
         if (token.aborted) break;
-        if (shopCfg.enabled === false) continue;
+        // 删除后调度器再次检查活动列表
+        if (!this._isShopActive(shopCfg.id)) continue;
         if (this._enablePhaseDone(shopCfg.id, today)) continue;
         await this._runShopEnablePhase(shopCfg, token, today);
       }
@@ -1788,9 +2256,14 @@ class Monitor {
     // 决策层：当前状态只来自本轮回读（adBelief 仅审计，不得代替回读、不得直接触发点击）
     const stateRead0 = await this._readCurrentAdState(shopCfg);
     const currentAdState = stateRead0.state;
+    // 账户身份门禁（2026-09-25 阶段 6）：待身份核验店每日开启 fail-closed，零动作
+    const dailyIdState = this._shopIdentityState(shopCfg);
+    const dailyIdentityOk = !dailyIdState.pending;
+    const dailyIdentityNote = dailyIdState.reason;
     const dailyDecision = this._switchOrchestrator.evaluateDailyEnable({
       currentAdState,
-      identityOk: true,
+      identityOk: dailyIdentityOk,
+      identityReason: dailyIdentityNote,
     });
     const belief = (this.adBelief || {})[shopCfg.id];
     this._audit({
@@ -1841,7 +2314,11 @@ class Monitor {
         const r = await this._readCurrentAdState(shopCfg);
         return r.state;
       },
-      decide: (st) => this._switchOrchestrator.evaluateDailyEnable({ currentAdState: st, identityOk: true }),
+      decide: (st) => this._switchOrchestrator.evaluateDailyEnable({
+        currentAdState: st,
+        identityOk: dailyIdentityOk,
+        identityReason: dailyIdentityNote,
+      }),
       execute: async () => {
         const pre = this._persistBeforeDispatch(shopCfg.id, 'enable', null);
         if (!pre.ok) {
@@ -2150,14 +2627,25 @@ class Monitor {
       }
       const dateRec = (this.batches[s.id] && this.batches[s.id][today]) || null;
       const enableRec = this.getEnablePhaseRecord(s.id, today);
+      const thresholdCents = this._thresholdCents(s);
       return {
         id: s.id,
         name: s.name || null,
+        displayName: s.displayName || s.name || s.id,
         cookieFile: s.cookieFile,
         enabled: s.enabled !== false,
+        deleted: s.deleted === true,
+        deletedAt: s.deletedAt || null,
+        thresholdCents,
+        platform: s.platform || 'douyin',
         cookieInfo,
         lastError: rt.lastError || null,
         today: rt.lastData || null,
+        lastDataAt: rt.lastDataAt || (rt.lastData && rt.lastData.fetchedAt) || null,
+        lastAdState: rt.lastAdState || null,
+        // 账户身份状态（2026-09-25 阶段 6）：自动发现店未建立映射前展示"待身份核验"
+        identityPending: this._shopIdentityState(s).pending,
+        identityNote: this._shopIdentityState(s).reason,
         enablePhase: enableRec || null,
         batchToday: dateRec ? { runs: dateRec.runs.length, totals: { confirmed: dateRec.totals.confirmed.length, failed: dateRec.totals.failed.length, unknown: dateRec.totals.unknown.length, skipped: dateRec.totals.skipped.length }, allClosedConfirmed: dateRec.allClosedConfirmed, allPausedConfirmed: dateRec.allPausedConfirmed === true, allEnabledConfirmed: dateRec.allEnabledConfirmed === true, lastBatchAt: dateRec.lastBatchAt, lastRuns: dateRec.runs.slice(-3) } : null,
       };
@@ -2199,15 +2687,38 @@ class Monitor {
             lastMissedReason: this._enableSchedule.lastMissedReason || null,
           },
         // 第 3 项：按店铺+上海日期的持久化开启相位状态（界面展示"今日是否已开启"及失败/未知原因）
-        enablePhaseToday: shops.map((s) => ({ shopId: s.id, record: s.enablePhase })).filter((x) => x.record),
-        // 兼容字段：任一启用店铺今日 success 即视为该日期已完成（不再是纯内存值）
-        lastEnableDate: shops.some((s) => s.enablePhase && s.enablePhase.status === 'success') ? today : null,
+        enablePhaseToday: shops.filter((s) => s.deleted !== true).map((s) => ({ shopId: s.id, record: s.enablePhase })).filter((x) => x.record),
+        // 兼容字段：任一活动店铺今日 success 即视为该日期已完成（不再是纯内存值）
+        lastEnableDate: shops.some((s) => s.deleted !== true && s.enablePhase && s.enablePhase.status === 'success') ? today : null,
         snapshotMaxAgeMinutes: this.config.monitor.snapshotMaxAgeMinutes,
         mockDataSource: this.config.monitor.mockDataSource === true,
         chengfang: (this.config.monitor && this.config.monitor.chengfang) || null,
         legacyWholeShopCloseEnabled: this._legacyWholeShopAllowed(),
       },
       shops,
+      // 紧凑多店铺行（主控制页直接消费；不含 Cookie/令牌/密钥）
+      shopRows: (this.config.shops || []).filter((s) => s && s.deleted !== true).map((s) => {
+        const rt = (this._runtimeMap && this._runtimeMap.get(s.id)) || {};
+        const t = rt.lastData || null;
+        return {
+          id: s.id,
+          name: s.name || s.id,
+          displayName: s.displayName || s.name || s.id,
+          adState: rt.lastAdState || 'unknown',
+          lastDataAt: rt.lastDataAt || (t && t.fetchedAt) || null,
+          costCents: t && t.costCents != null ? t.costCents : null,
+          costText: t ? t.costText : null,
+          orders: t && t.orders != null ? t.orders : null,
+          thresholdCents: this._thresholdCents(s),
+          over: t ? t.over === true : null,
+          lastError: rt.lastError || (t && t.blockedReason) || null,
+          // 账户身份状态（2026-09-25 阶段 6）：界面据此展示"待身份核验"
+          identityPending: this._shopIdentityState(s).pending,
+          identityNote: this._shopIdentityState(s).reason,
+          enabled: s.enabled !== false,
+          platform: s.platform || 'douyin',
+        };
+      }),
       rules: this.config.rules || [],
       // 事件流（2026-09-15 修复第 1 项）：附带单调序号，供消费方可靠增量。
       evtSeq: this._evtSeq || 0,

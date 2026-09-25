@@ -90,13 +90,17 @@ class WholeShopCloseCoordinator {
     }
 
     const rule = (this.config.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
-    if (!rule) {
-      throw new DataGuardError('未找到启用的 wholeShopCostPerOrder 规则，无法判定');
+    // 多店铺：店铺级 thresholdCents 覆盖全局规则；判定语义（严格大于）不变
+    const shopThr = shopCfg && Number.isSafeInteger(shopCfg.thresholdCents) && shopCfg.thresholdCents > 0
+      ? shopCfg.thresholdCents : null;
+    const thresholdCents = shopThr != null ? shopThr : (rule ? rule.thresholdCents : null);
+    if (!Number.isSafeInteger(thresholdCents) || thresholdCents <= 0) {
+      throw new DataGuardError('未找到启用的 wholeShopCostPerOrder 规则或店铺阈值，无法判定');
     }
     const evaluation = evaluateWholeShopCostPerOrder({
       costCents: cost.valueCents,
       orders: orders.valueCount,
-      thresholdCents: rule.thresholdCents,
+      thresholdCents,
     });
     return { ok: true, cost, orders, evaluation, rechecked };
   }

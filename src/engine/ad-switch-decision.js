@@ -70,6 +70,7 @@ const DECISIONS = Object.freeze({
  * @param {number} p.thresholdCents
  * @param {'on'|'off'|'mixed'|'unknown'} p.currentAdState
  * @param {boolean} p.identityOk   必须严格 === true（缺失/null/假值/字符串皆阻止）
+ * @param {string|null} [p.identityReason] 身份未通过时的具体原因（如"待身份核验：…"）；缺省用通用文案
  * @param {string|null} [p.dataError]
  * @param {string} [p.adStateSource]
  */
@@ -79,6 +80,7 @@ function decideAdSwitchAction({
   thresholdCents,
   currentAdState,
   identityOk,
+  identityReason = null,
   dataError = null,
   adStateSource = null,
 }) {
@@ -103,7 +105,9 @@ function decideAdSwitchAction({
       ...base,
       decision: DECISION.DATA_BLOCKED,
       blocked: 'identity_mismatch',
-      reason: 'identityOk 不是严格 true（缺失/非法）：fail-closed，零动作',
+      reason: identityReason
+        ? `${identityReason}（identityOk 非 true：fail-closed，零动作）`
+        : 'identityOk 不是严格 true（缺失/非法）：fail-closed，零动作',
     };
   }
 

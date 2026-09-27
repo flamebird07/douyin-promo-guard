@@ -25,7 +25,13 @@ const {
   clickChengfangRowSwitchByPlanId,
   setChengfangRowCheckboxByPlanId,
   clickChengfangNextPageInPage,
+  clickChengfangSubTab,
   readChengfangBatchBarInPage,
+  advanceChengfangPlanViewInPage,
+  readChengfangAccountInPage,
+  parseBalanceTextToCents,
+  readQianchuanBalanceInPage,
+  balanceCentsFromPageResult,
 } = require('../src/adapters/chengfang-reader');
 
 const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
@@ -40,6 +46,330 @@ before(async () => {
 
 after(async () => {
   await browser.close().catch(() => {});
+});
+
+test('新账户乘方页：关闭介绍浮层 → 商品 → 计划视图后才出现控制子标签', async () => {
+  await page.setContent(`
+    <div data-e2e="oc_emptyKey_overall-prom" class="ocean-vmok-plugin-oc-modal-wrap" id="intro">
+      <div class="tools-vmok-plugin-modal__close-icon" id="close-intro">关闭</div>
+    </div>
+    <div role="tab" aria-selected="false" id="product">商品</div>
+    <div role="tab" aria-selected="false" id="plan" hidden>计划视图</div>
+    <div id="subtabs"></div>
+    <script>
+      document.getElementById('close-intro').onclick = () => document.getElementById('intro').remove();
+      document.getElementById('product').onclick = () => {
+        document.getElementById('product').setAttribute('aria-selected', 'true');
+        document.getElementById('plan').hidden = false;
+      };
+      document.getElementById('plan').onclick = () => {
+        document.getElementById('plan').setAttribute('aria-selected', 'true');
+        document.getElementById('subtabs').innerHTML = '<div role="tab">商品自选</div><div role="tab">全店托管</div>';
+      };
+    </script>`);
+  assert.strictEqual((await page.evaluate(advanceChengfangPlanViewInPage)).action, 'dismiss-intro');
+  assert.strictEqual((await page.evaluate(advanceChengfangPlanViewInPage)).action, 'open-product');
+  assert.strictEqual((await page.evaluate(advanceChengfangPlanViewInPage)).action, 'open-plan-view');
+  assert.strictEqual((await page.evaluate(readChengfangAccountInPage)).hasSubTabs, true);
+  assert.strictEqual((await page.evaluate(advanceChengfangPlanViewInPage)).action, 'none');
+});
+
+test('商品行文字不能冒充计划标签；引导只点唯一跳过按钮', async () => {
+  await page.setContent('<div>商品自选</div><div>全店托管</div><div role="dialog" id="guide"><p>产品引导</p><button onclick="this.parentElement.remove()"><span>跳过</span></button></div><button id="other">跳过</button>');
+  assert.equal((await page.evaluate(readChengfangAccountInPage)).hasSubTabs, false);
+  assert.equal((await page.evaluate(advanceChengfangPlanViewInPage)).action, 'skip-guide');
+  assert.equal(await page.locator('#guide').count(), 0);
+  assert.equal(await page.locator('#other').count(), 1);
+});
+
+// ── 新 UI 子视图单选组（2026-09-27 实页证据：计划视图下两子视图是 aurora 单选组）──
+
+/**
+ * 实页结构复刻（cf-deep-1790476750352.json）：
+ * div.tabs-* > .aurora-qc-radio-group > .aurora-qc-radio-button-wrapper（选中者带
+ * -checked 后缀，内含 input[type=radio]）+ span.aurora-qc-radio-button-label。
+ * -checked 类由"React"在点击后 100ms 异步更新（模拟实页异步重渲染，考验轮询核对）。
+ */
+function radioGroupFixtureHtml(opts = {}) {
+  const zxChecked = opts.checked === '商品自选';
+  const tgChecked = opts.checked !== '商品自选'; // 实页默认选中"全店托管"
+  const wrap = (id, label, checked, extra = '') =>
+    `<div class="aurora-qc-radio-button-wrapper${checked ? ' aurora-qc-radio-button-wrapper-checked' : ''}" id="${id}-wrap">`
+    + (opts.noInput ? '' : `<input type="radio" name="_r_ci_" value="${id}" id="${id}-input"${checked ? ' checked' : ''}${extra}>`)
+    + `<span class="aurora-qc-radio-button-label">${label}</span></div>`;
+  return `<!DOCTYPE html><html><body>
+    <div role="tab" aria-selected="true">商品</div>
+    <div role="tab" aria-selected="true">计划视图</div>
+    <div class="tabs-BBBF4_"><div class="aurora-qc-radio-group aurora-qc-radio-group-outline" id="group">
+      ${wrap('zx', '商品自选', zxChecked, opts.zxDisabled ? ' disabled' : '')}
+      ${wrap('tg', '全店托管', tgChecked)}
+    </div></div>
+    <div class="aurora-qc-table"><table><tbody class="aurora-qc-table-tbody">
+      <tr data-row-key="187585998140533930"><td><span class="aurora-qc-tag-text">商品自选</span> 千川乘方_计划0</td></tr>
+    </tbody></table></div>
+    <script>
+      window.__clicks = [];
+      document.addEventListener('click', (e) => { window.__clicks.push(e.target.id || (e.target.tagName + ':' + e.target.className)); }, true);
+      ${opts.noInput ? `
+      document.getElementById('zx-wrap').addEventListener('click', () => {
+        setTimeout(() => {
+          document.getElementById('zx-wrap').classList.add('aurora-qc-radio-button-wrapper-checked');
+          document.getElementById('tg-wrap').classList.remove('aurora-qc-radio-button-wrapper-checked');
+        }, 100);
+      });` : `
+      for (const id of ['zx', 'tg']) {
+        document.getElementById(id + '-input').addEventListener('click', () => {
+          setTimeout(() => {
+            document.getElementById('zx-wrap').classList.toggle('aurora-qc-radio-button-wrapper-checked', document.getElementById('zx-input').checked);
+            document.getElementById('tg-wrap').classList.toggle('aurora-qc-radio-button-wrapper-checked', document.getElementById('tg-input').checked);
+          }, 100);
+        });
+      }`}
+    </script>
+  </body></html>`;
+}
+
+test('新 UI 计划视图：子视图为 aurora 单选组 → hasSubTabs=true（表格/卡片同名字样不干扰）', async () => {
+  await page.setContent(radioGroupFixtureHtml({ checked: '全店托管' }));
+  const st = await page.evaluate(readChengfangAccountInPage);
+  assert.strictEqual(st.hasSubTabs, true, '单选组两项须被识别为子视图导航');
+});
+
+test('新 UI 商品视图负例：仅商品卡片 .aurora-qc-tag-text 同名字样 → hasSubTabs=false', async () => {
+  await page.setContent(`<!DOCTYPE html><html><body>
+    <div role="tab" aria-selected="true">商品</div>
+    <div role="tab" aria-selected="false">计划视图</div>
+    <div class="aurora-qc-table"><table><tbody class="aurora-qc-table-tbody">
+      <tr data-row-key="187585998140533900"><td><span class="aurora-qc-tag-text">商品自选</span> 卡片A</td></tr>
+      <tr data-row-key="187585998140533901"><td><span class="aurora-qc-tag-text">全店托管</span> 卡片B</td></tr>
+    </tbody></table></div>
+  </body></html>`, { waitUntil: 'load' });
+  const st = await page.evaluate(readChengfangAccountInPage);
+  assert.strictEqual(st.hasSubTabs, false, '卡片文本（及其 tab 类表格容器）不得被误认成子视图导航');
+});
+
+test('新 UI 子视图切换：点击落在目标单选项 input，外层组容器零点击，选中态核对通过（两个方向 + 幂等）', async () => {
+  await page.setContent(radioGroupFixtureHtml({ checked: '全店托管' }));
+  // 方向 1：全店托管（默认）→ 商品自选
+  const r1 = await page.evaluate(clickChengfangSubTab('商品自选'));
+  assert.strictEqual(r1.clicked, true);
+  assert.strictEqual(r1.target, 'aurora-radio');
+  assert.strictEqual(r1.verified, true, '点击后须核对选中态（input.checked + 异步 -checked 类）');
+  const clicks1 = await page.evaluate(() => window.__clicks);
+  assert.ok(clicks1.includes('zx-input'), '点击必须落在目标单选项 input 上');
+  assert.ok(!clicks1.some((c) => c.includes('group') || c.includes('tabs-BBBF4_') || c.includes('wrap')), '组容器/外层 tabs-* 容器/wrapper 均零点击');
+  assert.strictEqual(await page.evaluate(() => document.getElementById('zx-input').checked), true, '目标 input 选中态已翻转');
+  assert.strictEqual(await page.evaluate(() => document.getElementById('tg-input').checked), false);
+  // 夹具模拟"React"在点击 100ms 后才更新 -checked 类（实页同为异步重渲染）
+  await page.waitForTimeout(300);
+  assert.strictEqual(await page.evaluate(() => document.getElementById('zx-wrap').className.includes('checked')), true, '异步 -checked 类已翻转');
+  // 方向 2：商品自选 → 全店托管
+  const r2 = await page.evaluate(clickChengfangSubTab('全店托管'));
+  assert.strictEqual(r2.clicked, true);
+  assert.strictEqual(r2.verified, true);
+  const s2 = await page.evaluate(() => ({ zx: document.getElementById('zx-input').checked, tg: document.getElementById('tg-input').checked }));
+  assert.deepStrictEqual(s2, { zx: false, tg: true });
+  // 幂等：目标已选中 → alreadySelected，零新增点击
+  const before = await page.evaluate(() => window.__clicks.length);
+  const r3 = await page.evaluate(clickChengfangSubTab('全店托管'));
+  assert.strictEqual(r3.clicked, true);
+  assert.strictEqual(r3.alreadySelected, true);
+  assert.strictEqual(await page.evaluate(() => window.__clicks.length), before, '已选中时不得再点击');
+});
+
+test('新 UI 子视图切换：点击后选中态未变化 → clicked=false（不得虚报成功）', async () => {
+  // disabled input：点击派发但原生不激活、选中态不变 → 必须失败并如实报告
+  await page.setContent(radioGroupFixtureHtml({ checked: '全店托管', zxDisabled: true }));
+  const r = await page.evaluate(clickChengfangSubTab('商品自选'));
+  assert.strictEqual(r.clicked, false);
+  assert.match(r.reason, /未确认/);
+  assert.strictEqual(await page.evaluate(() => document.getElementById('zx-input').checked), false, '选中态确实未变化');
+});
+
+test('新 UI 子视图切换（无 input 防御）：点击 wrapper 后 -checked 类异步更新 → 轮询核对通过', async () => {
+  await page.setContent(radioGroupFixtureHtml({ checked: '全店托管', noInput: true }));
+  const r = await page.evaluate(clickChengfangSubTab('商品自选'));
+  assert.strictEqual(r.clicked, true);
+  assert.strictEqual(r.target, 'aurora-radio');
+  assert.strictEqual(r.verified, true, '100ms 后 -checked 类才更新，轮询须核对到');
+  const clicks = await page.evaluate(() => window.__clicks);
+  assert.ok(clicks.includes('zx-wrap'), '无 input 时点击落在目标 wrapper');
+  assert.ok(!clicks.some((c) => c.includes('group') || c.includes('tabs-BBBF4_')), '组容器零点击');
+});
+
+test('旧 UI 兼容：ovui tab 结构仍被 hasSubTabs 识别并切换子标签', async () => {
+  await page.setContent(`<!DOCTYPE html><html><body>
+    <div class="ovui-tabs">
+      <div class="ovui-tabs__tab" id="t-tg"><span class="ovui-tabs__tab-btn">全店托管</span></div>
+      <div class="ovui-tabs__tab" id="t-zx"><span class="ovui-tabs__tab-btn">商品自选</span></div>
+    </div>
+    <div id="view">tg</div>
+    <script>
+      document.querySelectorAll('.ovui-tabs__tab').forEach((t) => {
+        t.onclick = () => { document.getElementById('view').textContent = t.id.slice(2); };
+      });
+    </script>
+  </body></html>`, { waitUntil: 'load' });
+  assert.strictEqual((await page.evaluate(readChengfangAccountInPage)).hasSubTabs, true);
+  const r = await page.evaluate(clickChengfangSubTab('商品自选'));
+  assert.strictEqual(r.clicked, true);
+  assert.strictEqual(await page.evaluate(() => document.getElementById('view').textContent), 'zx', '旧 UI tab 点击仍切换视图');
+});
+
+// ── 新 UI 双 tab 变体（2026-09-27 实页证据 clf-inspect.json：潮流服饰）─────────
+
+/**
+ * 实页结构复刻：点"商品"后直接是两个 role=tab——
+ * "商品自选"（文本全等）与"全店托管加速新品爆发"（tab 内层 span.tabLabel 自身
+ * 文本"全店托管" + "加速新品爆发"，整段 textContent 需前缀匹配）。无计划视图、
+ * 无单选组。aria-selected 由"React"在点击后 100ms 异步更新（模拟实页异步重渲染）。
+ */
+function dualTabFixtureHtml(opts = {}) {
+  const zxSel = opts.checked === '商品自选';
+  const tgSel = opts.checked !== '商品自选'; // 实页默认"全店托管加速新品爆发"选中
+  const zxTab = `<div class="aurora-qc-tabs-tab${zxSel ? ' aurora-qc-tabs-tab-active' : ''}" id="zx-tab"><div class="aurora-qc-tabs-tab-btn" role="tab" aria-selected="${zxSel}" id="zx-btn">商品自选</div></div>`;
+  const tgTab = `<div class="aurora-qc-tabs-tab${tgSel ? ' aurora-qc-tabs-tab-active' : ''}" id="tg-tab"><div class="aurora-qc-tabs-tab-btn" role="tab" aria-selected="${tgSel}" id="tg-btn"><span class="tabLabel-Fake123"><span>全店托管</span></span><span class="tabExt-Fake123">加速新品爆发</span></div></div>`;
+  const multi = opts.multiPrefix ? `<div class="aurora-qc-tabs-tab" id="tg2-tab"><div class="aurora-qc-tabs-tab-btn" role="tab" aria-selected="false" id="tg2-btn"><span class="tabLabel-Fake123"><span>全店托管</span></span><span class="tabExt-Fake123">另一种</span></div></div>` : '';
+  return `<!DOCTYPE html><html><body>
+    <div role="tab" aria-selected="true">商品</div>
+    <div class="aurora-qc-tabs"><div class="aurora-qc-tabs-nav"><div class="aurora-qc-tabs-nav-list">
+      ${zxTab}${tgTab}${multi}
+    </div></div></div>
+    <div class="aurora-qc-table"><table><tbody class="aurora-qc-table-tbody">
+      <tr data-row-key="187585998140533900"><td><span class="aurora-qc-tag-text">全店托管</span> 千川乘方_计划0</td></tr>
+    </tbody></table></div>
+    <script>
+      window.__clicks = [];
+      document.addEventListener('click', (e) => { window.__clicks.push(e.target.id || (e.target.tagName + ':' + e.target.className)); }, true);
+      ${opts.frozen ? '' : `
+      for (const id of ['zx', 'tg']) {
+        document.getElementById(id + '-tab').addEventListener('click', () => {
+          setTimeout(() => {
+            document.getElementById('zx-btn').setAttribute('aria-selected', String(id === 'zx'));
+            document.getElementById('tg-btn').setAttribute('aria-selected', String(id === 'tg'));
+            document.getElementById('zx-tab').classList.toggle('aurora-qc-tabs-tab-active', id === 'zx');
+            document.getElementById('tg-tab').classList.toggle('aurora-qc-tabs-tab-active', id === 'tg');
+          }, 100);
+        });
+      }`}
+    </script>
+  </body></html>`;
+}
+
+test('新 UI 双 tab 变体（潮流服饰）：前缀 role=tab 命中 → hasSubTabs=true（卡片同名字样仍不误报）', async () => {
+  await page.setContent(dualTabFixtureHtml({ checked: '全店托管加速新品爆发' }));
+  const st = await page.evaluate(readChengfangAccountInPage);
+  assert.strictEqual(st.hasSubTabs, true, '双 role=tab 变体须被识别（含前缀"全店托管加速新品爆发"）');
+});
+
+test('新 UI 双 tab 变体切换：两方向点击真实 tab 控件并核对 aria-selected 翻转；已选中幂等零点击', async () => {
+  await page.setContent(dualTabFixtureHtml({})); // 实页默认"全店托管加速新品爆发"选中
+  // 方向 1：全店托管加速新品爆发（默认）→ 商品自选
+  const r1 = await page.evaluate(clickChengfangSubTab('商品自选'));
+  assert.strictEqual(r1.clicked, true);
+  assert.strictEqual(r1.target, 'aurora-tab');
+  assert.strictEqual(r1.verified, true, '点击后须核对 aria-selected（异步 100ms，轮询覆盖）');
+  const clicks1 = await page.evaluate(() => window.__clicks);
+  assert.ok(clicks1.includes('zx-btn'), '点击必须落在目标 tab 控件上');
+  await page.waitForTimeout(300);
+  assert.strictEqual(await page.evaluate(() => document.getElementById('zx-btn').getAttribute('aria-selected')), 'true');
+  assert.strictEqual(await page.evaluate(() => document.getElementById('tg-btn').getAttribute('aria-selected')), 'false');
+  // 方向 2：商品自选 → 全店托管（前缀命中"全店托管加速新品爆发"）
+  const r2 = await page.evaluate(clickChengfangSubTab('全店托管'));
+  assert.strictEqual(r2.clicked, true);
+  assert.strictEqual(r2.verified, true);
+  await page.waitForTimeout(300);
+  assert.strictEqual(await page.evaluate(() => document.getElementById('tg-btn').getAttribute('aria-selected')), 'true');
+  assert.strictEqual(await page.evaluate(() => document.getElementById('zx-btn').getAttribute('aria-selected')), 'false');
+  // 幂等：目标已选中 → alreadySelected，零新增点击
+  const before = await page.evaluate(() => window.__clicks.length);
+  const r3 = await page.evaluate(clickChengfangSubTab('全店托管'));
+  assert.strictEqual(r3.clicked, true);
+  assert.strictEqual(r3.alreadySelected, true);
+  assert.strictEqual(await page.evaluate(() => window.__clicks.length), before, '已选中时不得再点击');
+});
+
+test('新 UI 双 tab 变体：点击后 aria-selected 未翻转 → clicked=false（不虚报成功）', async () => {
+  await page.setContent(dualTabFixtureHtml({ frozen: true })); // 无"React"模拟：点击后选中态不变
+  const r = await page.evaluate(clickChengfangSubTab('商品自选'));
+  assert.strictEqual(r.clicked, false);
+  assert.match(r.reason, /未确认/);
+  assert.strictEqual(await page.evaluate(() => document.getElementById('zx-btn').getAttribute('aria-selected')), 'false', '选中态确实未变化');
+});
+
+test('新 UI 双 tab 变体：前缀命中多个候选 → 拒绝猜测（clicked=false）', async () => {
+  await page.setContent(dualTabFixtureHtml({ multiPrefix: true }));
+  const r = await page.evaluate(clickChengfangSubTab('全店托管'));
+  assert.strictEqual(r.clicked, false);
+  assert.match(r.reason, /候选 2 个/);
+});
+
+// ── 千川可用余额（2026-09-27，账户级只读展示字段）─────────────────────────
+
+/** 实页同构 DOM（bal-inspect.json）：infoItem 内 infoLabel + infoValue + 余额徽标 + 资金按钮。 */
+const BAL_ITEM_HTML = (valueHtml) => `<div class="infoList-kJFfx6">
+  <div class="infoItem-fWuH4T" id="bal-item">
+    <div class="infoLabelReference-wfyTn5"></div>
+    <div class="infoLabel-tcmJ_o" id="bal-label">千川可用余额(元)</div>
+    <div class="infoContent-EIwyVr">${valueHtml}<div class="balanceSlot-Jygctx"><span class="aurora-qc-tag"><span class="aurora-qc-tag-text">余额不足</span></span></div></div>
+    <button class="financeButton-Y06som" id="finance-btn"></button>
+  </div>
+  <div class="infoItem-fWuH4T"><div class="infoLabel-tcmJ_o">千川日预算(元)</div><div class="infoContent-EIwyVr"><div class="infoValue-TfdFGw" id="budget-val">不限</div></div></div>
+</div>`;
+
+const balPage = (valueHtml) => `<!DOCTYPE html><html><body>${BAL_ITEM_HTML(valueHtml)}
+  <script>window.__clicks = []; document.addEventListener('click', (e) => window.__clicks.push(e.target.id || e.target.className), true);</script>
+</body></html>`;
+
+test('余额解析：0/1-2 位小数/千分位 → 安全整数分；其余一律 null（不编造 0）', () => {
+  const f = parseBalanceTextToCents;
+  assert.strictEqual(f('0'), 0, '真实零余额 = 0 分（与"未知"有明确区别）');
+  assert.strictEqual(f('273.9'), 27390, '1 位小数补零到分');
+  assert.strictEqual(f('298.05'), 29805);
+  assert.strictEqual(f('1,234.56'), 123456, '千分位逗号容忍');
+  assert.strictEqual(f('12345.6'), 1234560);
+  assert.strictEqual(f(''), null);
+  assert.strictEqual(f('abc'), null);
+  assert.strictEqual(f('12.345'), null, '3 位小数不接受');
+  assert.strictEqual(f('-5'), null);
+  assert.strictEqual(f(null), null);
+  assert.strictEqual(f('不限'), null, '日预算占位不得当余额');
+});
+
+test('余额读取（实页同构 DOM）：infoLabel/infoValue 配对取值；日预算/徽标/资金按钮零接触、零点击', async () => {
+  await page.setContent(balPage('<div class="infoValue-TfdFGw" id="val">273.9</div>'));
+  const r = await page.evaluate(readQianchuanBalanceInPage);
+  assert.deepStrictEqual(r, { balanceText: '273.9', reason: null });
+  assert.deepStrictEqual(balanceCentsFromPageResult(r), { balanceCents: 27390, balanceText: '273.9', reason: null });
+  assert.strictEqual(await page.evaluate(() => window.__clicks.length), 0, '余额读取零点击');
+});
+
+test('余额读取：真实零余额 → 0 分（与"未知"有明确区别）', async () => {
+  await page.setContent(balPage('<div class="infoValue-TfdFGw">0</div>'));
+  const r = await page.evaluate(readQianchuanBalanceInPage);
+  assert.strictEqual(r.balanceText, '0');
+  assert.strictEqual(balanceCentsFromPageResult(r).balanceCents, 0);
+});
+
+test('余额读取 fail-closed：缺标签/双 item/重复数值/非法原文 → null 不编造', async () => {
+  await page.setContent('<div class="infoItem-fWuH4T"><div class="infoContent-EIwyVr"><div class="infoValue-TfdFGw">273.9</div></div></div>');
+  let r = await page.evaluate(readQianchuanBalanceInPage);
+  assert.strictEqual(r.balanceText, null);
+  assert.match(r.reason, /未找到/);
+  await page.setContent(balPage('<div class="infoValue-TfdFGw">273.9</div>') + BAL_ITEM_HTML('<div class="infoValue-TfdFGw">100.00</div>'));
+  r = await page.evaluate(readQianchuanBalanceInPage);
+  assert.strictEqual(r.balanceText, null);
+  assert.match(r.reason, /infoItem 有 2 个/);
+  await page.setContent(balPage('<div class="infoValue-TfdFGw">273.9</div><div class="infoValue-TfdFGw">100.2</div>'));
+  r = await page.evaluate(readQianchuanBalanceInPage);
+  assert.strictEqual(r.balanceText, null);
+  assert.match(r.reason, /数值叶子 2 个/);
+  await page.setContent(balPage('<div class="infoValue-TfdFGw">abc</div>'));
+  r = await page.evaluate(readQianchuanBalanceInPage);
+  assert.strictEqual(r.balanceText, 'abc');
+  const c = balanceCentsFromPageResult(r);
+  assert.strictEqual(c.balanceCents, null);
+  assert.match(c.reason, /无法解析/);
 });
 
 const TUOGUAN_PLAN = { id: '184388555253250562', name: '全店托管 2025-09-21_商品全店托管', checked: true };

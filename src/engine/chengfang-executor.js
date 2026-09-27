@@ -32,6 +32,7 @@ const { shanghaiDate } = require('../lib/time');
 const { boundedLandingPoll, resolvePollingConfig } = require('../lib/bounded-poll');
 const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed, buildChengfangRequestGate } = require('./chengfang-gate');
 const { compactUrls } = require('../lib/log');
+const { advanceChengfangPlanViewInPage } = require('../adapters/chengfang-reader');
 
 const MAX_PAGE_VISITS = 20; // 商品自选分页处理/全量回读的翻页硬上限（防失控循环）
 
@@ -897,15 +898,8 @@ async function restoreManagementPageForReadback({ controller, page, shopCfg, man
     while (Date.now() < deadlineTab) {
       const cur = await controller.verifyIdentity({ page, shopCfg }).catch(() => null);
       if (cur && cur.ok === true) { identityOk = true; break; }
-      // 尝试点击"商品"标签（自包含点击；找不到则等待）
-      await page.evaluate(() => {
-        const els = [...document.querySelectorAll('body *')].filter((el) => {
-          const own = Array.from(el.childNodes).filter((n) => n.nodeType === Node.TEXT_NODE).map((n) => n.textContent.trim()).join('');
-          return own === '商品' && el.querySelectorAll('*').length <= 4;
-        });
-        const el = els.find((e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
-        if (el) el.click();
-      }).catch(() => {});
+      // 新账户可能先展示介绍浮层和「商品视图」；逐步进入「商品 / 计划视图」。
+      await page.evaluate(advanceChengfangPlanViewInPage).catch(() => {});
       if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(2000);
     }
     if (!identityOk) {

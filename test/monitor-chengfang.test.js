@@ -1137,3 +1137,70 @@ test('每日开启前置门：adBelief 持久化（重启后保留，跨进程�
   assert.ok(monitor2.adBelief[SHOP.id] && monitor2.adBelief[SHOP.id].on === true, '重启后 adBelief 必须保留');
   try { monitor2.stopEnableScheduler({ byUser: false, reason: 'cleanup' }); } catch (_) {}
 });
+
+// ── 千川可用余额（2026-09-27，账户级只读展示字段）─────────────────────────
+
+test('余额展示字段：refreshShopData 后进入 shopRows/today；本轮失败→未知；费用/广告状态/零动作不受影响', async (t) => {
+  const { monitor } = await setupChengfangMonitor(t, {
+    costCents: 100, orders: 100,
+    fixture: { plans: { '全店托管': [Object.assign({}, TUOGUAN_PLAN)], '商品自选': [] } },
+  });
+  // 生产契约：_readCurrentAdState 返回 {state, balance}（balance 由乘方页同会话读取）
+  monitor._readAdState = async () => ({ state: 'on', balance: { balanceCents: 27390, balanceAt: '2026-09-27T05:00:00.000Z' } });
+  const r1 = await monitor.refreshShopData(SHOP.id);
+  assert.strictEqual(r1.ok, true);
+  assert.strictEqual(r1.zeroClick, true, '余额经只读路径取得，零广告动作');
+  const row1 = monitor.getStatus().shopRows.find((s) => s.id === SHOP.id);
+  assert.strictEqual(row1.balanceCents, 27390, '余额进入 shopRows');
+  assert.strictEqual(row1.balanceAt, '2026-09-27T05:00:00.000Z', '记录本机读取时间');
+  assert.strictEqual(row1.costCents, 100, '费用不受余额影响');
+  assert.strictEqual(row1.adState, 'on', '广告状态不受余额影响（getStatus().shopRows 口径为字符串）');
+  // 下一轮余额读取失败 → 未知（null），不得沿用旧值伪装成本轮新读数
+  monitor._readAdState = async () => ({ state: 'on' });
+  const r2 = await monitor.refreshShopData(SHOP.id);
+  assert.strictEqual(r2.ok, true);
+  assert.strictEqual(r2.zeroClick, true);
+  const row2 = monitor.getStatus().shopRows.find((s) => s.id === SHOP.id);
+  assert.strictEqual(row2.balanceCents, null, '本轮失败显示"未知"');
+  assert.strictEqual(row2.balanceAt, null);
+  assert.strictEqual(row2.costCents, 100, '费用照常');
+  assert.strictEqual(row2.adState, 'on', '广告状态照常（getStatus().shopRows 口径为字符串）');
+  // 真实零余额 = 0（与"未知"有明确区别），且绝不触发任何广告动作
+  monitor._readAdState = async () => ({ state: 'on', balance: { balanceCents: 0, balanceAt: '2026-09-27T05:01:00.000Z' } });
+  const r3 = await monitor.refreshShopData(SHOP.id);
+  assert.strictEqual(r3.ok, true);
+  assert.strictEqual(r3.zeroClick, true);
+  assert.strictEqual(monitor.getStatus().shopRows.find((s) => s.id === SHOP.id).balanceCents, 0, '真实零余额 = 0 分');
+});
+
+test('余额进入值守轮：pollOnce 后 today 与 shopRows 均有余额；下一轮缺失归未知；无额外广告动作', async (t) => {
+  const { monitor, track } = await setupChengfangMonitor(t, { costCents: 100, orders: 100 });
+  // 余额经注入的 readAdState 随值守轮进入状态链（生产契约：_readCurrentAdState 返回 {state, balance}）
+  let balancePayload = { balanceCents: 27390, balanceAt: '2026-09-27T05:00:00.000Z' };
+  monitor._readAdState = async () => ({ state: 'on', balance: balancePayload });
+  const r1 = await monitor.pollOnce('test');
+  assert.strictEqual(r1.results[0].status, 'ok');
+  assert.strictEqual(r1.results[0].over, false, '0.26 元/单未超阈值，无开关动作');
+  assert.strictEqual(monitor.triggers.length, 0, '无触发记录');
+  assert.strictEqual(track.sessions, 0, '余额经注入 readAdState 取得，值守轮零页面会话');
+  // today（status.shops[].today）与 shopRows 双口径均有余额与本机读取时间
+  const st1 = monitor.getStatus();
+  const s1 = st1.shops.find((x) => x.id === SHOP.id);
+  assert.strictEqual(s1.today.balanceCents, 27390, '值守轮余额进入 today');
+  assert.strictEqual(s1.today.balanceAt, '2026-09-27T05:00:00.000Z', 'today 记录本机读取时间');
+  const row1 = st1.shopRows.find((x) => x.id === SHOP.id);
+  assert.strictEqual(row1.balanceCents, 27390, '值守轮余额进入 shopRows');
+  assert.strictEqual(row1.balanceAt, '2026-09-27T05:00:00.000Z');
+  // 下一轮余额缺失 → 归未知，不沿用旧值（today 与 shopRows 双口径）
+  balancePayload = null;
+  const r2 = await monitor.pollOnce('test');
+  assert.strictEqual(r2.results[0].status, 'ok');
+  const st2 = monitor.getStatus();
+  assert.strictEqual(st2.shops.find((x) => x.id === SHOP.id).today.balanceCents, null, '值守轮失败归未知（today）');
+  assert.strictEqual(st2.shops.find((x) => x.id === SHOP.id).today.balanceAt, null, '不沿用旧值（today.balanceAt）');
+  assert.strictEqual(st2.shopRows.find((x) => x.id === SHOP.id).balanceCents, null, '值守轮失败归未知（shopRows）');
+  // 两轮均无额外广告动作：费用照常、无触发、零页面会话
+  assert.strictEqual(st2.shopRows.find((x) => x.id === SHOP.id).costCents, 100, '费用照常');
+  assert.strictEqual(monitor.triggers.length, 0, '两轮均无开关触发');
+  assert.strictEqual(track.sessions, 0, '两轮零页面会话');
+});

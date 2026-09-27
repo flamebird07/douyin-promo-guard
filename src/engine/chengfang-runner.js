@@ -30,9 +30,11 @@ const { perOrderDisplayText } = require('./rules');
 
 /** 生产默认会话开启器：真实乘方管理页（openChengfangShop + 真实控制器）。 */
 async function defaultChengfangOpener({ loginCfg, shopCfg }) {
-  const { openChengfangShop, createChengfangController } = require('../adapters/chengfang-reader');
+  const { openChengfangShop, createChengfangController, watchChengfangControlsForManualReview } = require('../adapters/chengfang-reader');
   const { browser, target, account, context, cookieSession } = await openChengfangShop({ loginCfg, shopCfg });
-  const controller = createChengfangController({});
+  const controller = watchChengfangControlsForManualReview(createChengfangController({}), {
+    context, target, shopCfg, loginCfg,
+  });
   // context / cookieSession 一并透出：批次结束（浏览器关闭前）用于**本次实际加载的**
   // 店铺 Cookie 文件回写（见 _closeSession → writebackSessionCookies）。
   return { browser, page: target, controller, account, context, cookieSession };

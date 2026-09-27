@@ -1,10 +1,8 @@
 'use strict';
 
 /**
- * 账户身份待核验隔离测试（2026-09-25 阶段 6）。
- * 用户已确认方案：自动发现店在页面/费用源双锚点一致前保持待身份核验，
- * 禁止真实开启/暂停/关闭/补点；一致时自动建立映射并解除；不一致时零动作、
- * 不覆盖、不代选。既有手工配置店行为不回归。
+ * Cookie-first 店铺行为隔离测试。
+ * 自动发现店使用各自 Cookie，无需预填广告账户号；显式配置账户号时保留原有校验。
  * 全部临时目录 + mock 读取器/控制器；不读取真实 Cookie 内容，不访问真实页面。
  */
 
@@ -111,283 +109,70 @@ function setup(t, { shops, costAccountId = null, pageAccountId = null, controlle
 
 const shop = (over = {}) => ({ id: 'shop-a', name: '甲店', cookieFile: '甲店', enabled: true, autoDiscovered: true, ...over });
 
-// ── 1. 新发现店：可展示、待核验、真实动作 0 ─────────────────────────
+// Cookie-first 行为：新店无需预填账户号，已有账户号仍照原有校验。
 
-test('新 Cookie 自动发现后可展示，但未拿到账户身份时不进入真实动作（零关闭）', async (t) => {
-  const { m, controllers } = setup(t, { shops: [shop()], costAccountId: 'ACC-COST', pageAccountId: null });
-  const s = m.getStatus();
-  assert.strictEqual(s.shops.length, 1, '待核验店在列表中可展示');
-  assert.strictEqual(s.shops[0].identityPending, true, 'identityPending=true');
-  assert.ok(/待身份核验/.test(s.shops[0].identityNote || ''), '状态说明含待身份核验');
-  assert.strictEqual(s.shopRows[0].identityPending, true, 'shopRows 同步标记');
+test('自动发现店有 Cookie 即可值守，不因缺少账户号显示待核验', async (t) => {
+  const { m, controllers, disk } = setup(t, { shops: [shop()], costAccountId: 'ACC-COST', pageAccountId: null });
+  assert.strictEqual(m.getStatus().shopRows[0].identityPending, false);
   const p = await m.pollOnce('test');
-  const r = (p.results || [])[0] || {};
-  assert.strictEqual(r.zeroClick, true, '零点击');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '真实关闭调用为 0');
-  // 判定层 blocked + 原因可见（judgement.decision 为决策字符串；阻止码在 reason/结果里）
-  const j = m.judgements[m.judgements.length - 1];
-  assert.ok(j, '有周期判定');
-  assert.strictEqual(j.decision, 'data_blocked', '决策层 data_blocked 零动作');
-  assert.ok(/待身份核验/.test(j.reason || ''), `判定原因含待身份核验：${j.reason}`);
-  assert.strictEqual(m.getStatus().shops[0].identityPending, true, '仍未解除');
+  assert.notStrictEqual(p.results[0].blocked, 'identity_pending');
+  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 1, '超标时使用该店 Cookie 会话执行');
+  assert.strictEqual(disk().shops[0].accountId, undefined, '不自动写入页面账户号');
 });
 
-// ── 2. 双锚一致：自动建立并解除 ────────────────────────────────────
-
-test('页面账户和费用账户一致：自动保存账户元数据（落盘）并允许后续值守动作', async (t) => {
-  const { m, cfgPath, controllers } = setup(t, { shops: [shop()], costAccountId: 'ACC-1', pageAccountId: 'ACC-1', controllerAccountId: 'ACC-1' });
-  assert.strictEqual(m.getStatus().shops[0].identityPending, true, '建立前 pending');
-  const p = await m.pollOnce('test');
-  const r = (p.results || [])[0] || {};
-  assert.strictEqual(r.zeroClick, false, '解除后本轮按超标执行暂停（mock）');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 1, '建立后允许值守动作');
-  assert.strictEqual(m._findShop('shop-a').accountId, 'ACC-1', '内存元数据已保存');
-  const disk = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
-  assert.strictEqual(disk.shops[0].accountId, 'ACC-1', '账户元数据原子落盘');
-  assert.strictEqual(m.getStatus().shops[0].identityPending, false, '待核验解除');
-  // 审计留痕
-  const auditText = fs.readFileSync(path.join(m.dataDir, 'audit.jsonl'), 'utf-8');
-  assert.ok(auditText.includes('"kind":"identity-establish"') && auditText.includes('"ok":true'), 'identity-establish 审计留痕');
-  // 第二轮：广告已暂停（首批已关闭）→ nothing_to_close 不重复关闭；关键是不再有身份阻断
-  const p2 = await m.pollOnce('test');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 1, '已关闭广告不重复关闭');
-  assert.notStrictEqual(p2.results[0].blocked, 'identity_pending', '后续值守不再被身份阻断');
-  assert.notStrictEqual(p2.results[0].status, 'stopped', '后续轮询正常（非 AUTH/异常停止）');
-});
-
-// ── 3. 双锚不一致：零动作、配置不变、原因保留 ──────────────────────
-
-test('页面账户和费用账户不一致：零动作、配置不变、保留阻止原因、不代选不覆盖', async (t) => {
-  const { m, cfgPath, controllers, disk } = setup(t, { shops: [shop()], costAccountId: 'ACC-COST', pageAccountId: 'ACC-PAGE' });
-  const before = JSON.stringify(disk());
-  const p = await m.pollOnce('test');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '零真实动作');
-  assert.strictEqual(JSON.stringify(disk()), before, 'config.json 一个字节都不变');
-  const after = m.getStatus();
-  assert.strictEqual(after.shops[0].identityPending, true, '保持待核验');
-  assert.strictEqual(m._findShop('shop-a').accountId, undefined, '绝不自动选择任一账户写入');
-  const errs = m.recentErrors.map((e) => e.error).join('\n');
-  assert.ok(/账户来源不一致/.test(errs), `阻止原因保留：${errs.slice(0, 200)}`);
-  const j = m.judgements[m.judgements.length - 1];
-  assert.ok(/账户来源不一致/.test(j.reason || ''), '判定层同样可见阻止原因');
-  // 重复轮询仍零动作、仍不写配置
-  await m.pollOnce('test');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '重复扫描仍零动作');
-  assert.strictEqual(JSON.stringify(disk()), before, '重复扫描配置仍不变');
-});
-
-// ── 3b. 罗盘店铺名锚点（2026-09-25 阶段 6 修正）────────────────────
-
-test('两个账户号一致但罗盘店铺名与 Cookie 基名不符：零动作、配置逐字节不变', async (t) => {
-  const { m, cfgPath, controllers, disk } = setup(t, {
-    shops: [shop()], costAccountId: 'ACC-1', pageAccountId: 'ACC-1', compassPageName: '别的店名',
-  });
-  const before = JSON.stringify(disk());
-  await m.pollOnce('test');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '零真实动作');
-  assert.strictEqual(JSON.stringify(disk()), before, 'config.json 逐字节不变');
-  assert.strictEqual(m._findShop('shop-a').accountId, undefined, '不写入任一账户');
-  assert.strictEqual(m.getStatus().shops[0].identityPending, true, '保持待核验');
-  const errs = m.recentErrors.map((e) => e.error).join('\n');
-  assert.ok(/罗盘页面实测店铺名「别的店名」与 Cookie 文件基名「甲店」不一致/.test(errs), `阻止原因保留：${errs.slice(0, 200)}`);
-  const j = m.judgements[m.judgements.length - 1];
-  assert.ok(/罗盘页面实测店铺名/.test(j.reason || ''), '判定层可见阻止原因');
-});
-
-test('罗盘店铺名证据缺失（摘要无来源标记）：两账户一致也不建立、零动作', async (t) => {
-  const { m, cfgPath, controllers, disk } = setup(t, {
-    shops: [shop()], costAccountId: 'ACC-1', pageAccountId: 'ACC-1', compassPageName: null,
-  });
-  const before = JSON.stringify(disk());
-  await m.pollOnce('test');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '零真实动作');
-  assert.strictEqual(JSON.stringify(disk()), before, 'config.json 逐字节不变');
-  assert.strictEqual(m._findShop('shop-a').accountId, undefined, '不建立账户映射');
-  assert.strictEqual(m.getStatus().shops[0].identityPending, true, '保持待核验');
-  const errs = m.recentErrors.map((e) => e.error).join('\n');
-  assert.ok(/订单证据来源门禁不通过/.test(errs) && /罗盘来源标记=缺失/.test(errs), `阻止原因保留：${errs.slice(0, 240)}`);
-  // 立即更新（只读链路）同样不建立
-  await m.refreshShopData('shop-a');
-  assert.strictEqual(m._findShop('shop-a').accountId, undefined, '只读链路同样不建立');
-});
-
-// ── 3c. 订单证据来源门禁（2026-09-25 来源门禁补修）─────────────────
-
-test('非罗盘订单源伪装同名字段（含伪造罗盘标记）：配置不符即门禁拦截，零动作、配置逐字节不变', async (t) => {
-  const { m, cfgPath, controllers, disk } = setup(t, {
-    shops: [shop()], costAccountId: 'ACC-1', pageAccountId: 'ACC-1',
-    orderDataSource: 'not-compass', // 配置层即为非罗盘；摘要层伪装同名同标记也不放行
-  });
-  const before = JSON.stringify(disk());
-  await m.pollOnce('test');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '零真实动作');
-  assert.strictEqual(JSON.stringify(disk()), before, 'config.json 逐字节不变');
-  assert.strictEqual(m._findShop('shop-a').accountId, undefined, '不建立账户映射');
-  assert.strictEqual(m.getStatus().shops[0].identityPending, true, '保持待核验');
-  const errs = m.recentErrors.map((e) => e.error).join('\n');
-  assert.ok(/订单证据来源门禁不通过/.test(errs) && /订单源配置=not-compass/.test(errs), `阻止原因保留：${errs.slice(0, 240)}`);
-});
-
-test('订单摘要来源为 mock：门禁拦截（摘要来源不符），零动作、不建立', async (t) => {
-  const { m, controllers } = setup(t, {
-    shops: [shop()], costAccountId: 'ACC-1', pageAccountId: 'ACC-1',
-    realMode: false, ordersSource: 'mock', // dry 模式让 mock 来源穿过既有 guard，专测来源门禁
-  });
-  await m.pollOnce('test');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '零真实动作');
-  assert.strictEqual(m._findShop('shop-a').accountId, undefined, '不建立账户映射');
-  assert.strictEqual(m.getStatus().shops[0].identityPending, true, '保持待核验');
-  const errs = m.recentErrors.map((e) => e.error).join('\n');
-  assert.ok(/订单证据来源门禁不通过/.test(errs) && /摘要来源=mock/.test(errs), `阻止原因保留：${errs.slice(0, 240)}`);
-});
-
-test('罗盘来源标记被剥离（identitySource 缺失）：同名 pageShopName 也不放行', async (t) => {
+test('自动发现店不要求费用页和乘方页账户号预先一致', async (t) => {
   const { m, controllers, disk } = setup(t, {
-    shops: [shop()], costAccountId: 'ACC-1', pageAccountId: 'ACC-1',
-    orderSummaryPatch: (o) => { delete o.identitySource; }, // 只留 identityEvidence.pageShopName
+    shops: [shop()], costAccountId: 'ACC-COST', pageAccountId: 'ACC-PAGE',
   });
-  const before = JSON.stringify(disk());
-  const s = m.getStatus();
-  // 摘要里 identityEvidence.pageShopName 仍存在（同名同 Cookie 基名），但无来源标记
-  await m.pollOnce('test');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '零真实动作');
-  assert.strictEqual(JSON.stringify(disk()), before, 'config.json 逐字节不变');
-  assert.strictEqual(m._findShop('shop-a').accountId, undefined, '不建立账户映射');
-  assert.strictEqual(s.shops[0].identityPending, true, '保持待核验');
-  const errs = m.recentErrors.map((e) => e.error).join('\n');
-  assert.ok(/订单证据来源门禁不通过/.test(errs) && /罗盘来源标记=缺失/.test(errs), `阻止原因保留：${errs.slice(0, 240)}`);
+  const p = await m.pollOnce('test');
+  assert.notStrictEqual(p.results[0].blocked, 'identity_pending');
+  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 1);
+  assert.strictEqual(disk().shops[0].accountId, undefined);
 });
 
-// ── 4. 每日 07:00 开启路径的身份门禁（2026-09-25 阶段 7）───────────
-// 直接驱动 _runEnablePhase（等价于调度器运行态：enableRunning=true、gen 一致）；
-// 开启批次 spy 采用安全桩（只计数、不透传）——即使出现缺陷路径也绝不触达真实页面。
-
-test('每日开启：待身份核验店即使 off 且窗口内也不开启、不补点、不写成开启成功', async (t) => {
-  const { m, controllers } = setup(t, {
-    shops: [shop()], costAccountId: 'ACC-COST', pageAccountId: null, // 锚点不全 → 持续 pending
-    realMode: true,
-  });
-  m.enableRunning = true; // 模拟每日开启调度器运行态
-  let enableBatchCalls = 0;
-  m._executeEnableBatchFor = async () => { enableBatchCalls += 1; return { outcome: 'dry', dryRun: true, neverSent: true }; };
-  m._readAdState = async () => ({ state: 'off', identity: null }); // 广告当前为 off；锚点缺失
-  const today = '2026-09-12';
-  const r1 = await m._runEnablePhase(0, today);
-  assert.strictEqual(r1.skipped, false, '进入开启相位处理（未被互斥跳过）');
-  const rec = m.getEnablePhaseRecord('shop-a', today);
-  assert.ok(rec, '有开启相位记录');
-  assert.strictEqual(rec.status, 'failed', '身份未核验不得写成开启成功');
-  assert.strictEqual(rec.phase, 'precheck', '停在决策前（未进入 execute/dry 批次）');
-  assert.ok(/待身份核验/.test(rec.reason || ''), `原因含待身份核验：${rec.reason}`);
-  assert.strictEqual(enableBatchCalls, 0, '底层开启批次调用为 0');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '零广告动作');
-  // 补点场景：窗口内重复触发仍零开启，相位不得转为 success/in_progress
-  await m._runEnablePhase(0, today);
-  assert.strictEqual(enableBatchCalls, 0, '重复触发不补点');
-  const rec2 = m.getEnablePhaseRecord('shop-a', today);
-  assert.strictEqual(rec2.status, 'failed', '重复触发仍不写成成功');
-  assert.notStrictEqual(rec2.status, 'in_progress');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '重复触发仍零动作');
-  m.enableRunning = false;
-});
-
-test('每日开启：已删除店零动作（活动列表两层过滤，不进相位、不调用开启批次）', async (t) => {
-  const { m, controllers } = setup(t, {
-    shops: [shop({ deleted: true, enabled: false })],
-    costAccountId: 'ACC-1', pageAccountId: 'ACC-1', controllerAccountId: 'ACC-1',
-  });
-  m.enableRunning = true;
-  let enableBatchCalls = 0;
-  m._executeEnableBatchFor = async () => { enableBatchCalls += 1; return { outcome: 'dry', dryRun: true, neverSent: true }; };
-  m._readAdState = async () => ({ state: 'off', identity: null });
-  const r = await m._runEnablePhase(0, '2026-09-12');
-  assert.strictEqual(r.skipped, false);
-  assert.strictEqual(enableBatchCalls, 0, '已删除店零开启批次');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '零广告动作');
-  assert.strictEqual(m.getEnablePhaseRecord('shop-a', '2026-09-12'), null, '不产生开启相位记录');
-  assert.strictEqual(m._activeShops().length, 0, '不在活动列表');
-  m.enableRunning = false;
-});
-
-// ── 4. 重启/重新构造后不误变成可执行 ───────────────────────────────
-
-test('重启/重新构造后：未建立映射的待核验店仍不可执行', async (t) => {
-  const first = setup(t, { shops: [shop()], costAccountId: 'ACC-COST', pageAccountId: null });
-  const { m, cfgPath, controllers } = first;
-  await m.pollOnce('test');
+test('自动发现店只读更新不写入账户元数据', async (t) => {
+  const { m, controllers, disk } = setup(t, { shops: [shop()], costAccountId: 'ACC-COST' });
+  const r = await m.refreshShopData('shop-a');
+  assert.strictEqual(r.ok, true, JSON.stringify(r).slice(0, 200));
+  assert.strictEqual(r.readOnly, true);
   assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0);
-  const disk = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
-  assert.strictEqual(disk.shops[0].accountId, undefined, '磁盘无账户元数据');
-  // 模拟重启：磁盘配置重读 + 新 Monitor（同锚点缺失）
-  const second = setup(t, { shops: disk.shops, costAccountId: 'ACC-COST', pageAccountId: null });
-  const m2 = second.m;
-  assert.strictEqual(m2.getStatus().shops[0].identityPending, true, '重新构造后仍待核验');
-  const p2 = await m2.pollOnce('test');
-  assert.strictEqual(second.controllers.get('shop-a').state.closeCalls.length, 0, '重启后仍零动作');
-  assert.strictEqual(p2.results[0].zeroClick, true);
+  assert.strictEqual(disk().shops[0].accountId, undefined);
 });
 
-// ── 5. 既有手工配置店行为不回归 ────────────────────────────────────
-
-test('已有配置账户的店铺：不回归（无待核验标记、正常决策、元数据不被覆盖）', async (t) => {
-  const { m, controllers, cfgPath } = setup(t, {
-    shops: [{ id: 'shop-m', name: '甲店', cookieFile: '甲店', enabled: true, accountId: 'ACC-M' }],
-    costAccountId: 'ACC-M', pageAccountId: 'ACC-M', controllerAccountId: 'ACC-M',
-  });
-  const s = m.getStatus();
-  assert.strictEqual(s.shops[0].identityPending, false, '手工配置店无待核验标记');
-  const p = await m.pollOnce('test');
-  assert.strictEqual(p.results[0].zeroClick, false);
-  assert.strictEqual(controllers.get('shop-m').state.closeCalls.length, 1, '正常值守动作');
-  assert.strictEqual(JSON.parse(fs.readFileSync(cfgPath, 'utf-8')).shops[0].accountId, 'ACC-M', '元数据原样');
-  const auditText = fs.readFileSync(path.join(m.dataDir, 'audit.jsonl'), 'utf-8');
-  assert.ok(!auditText.includes('"kind":"identity-establish"'), '不产生身份建立审计（本来就已配置）');
+test('每日开启对自动发现店正常进入开启批次', async (t) => {
+  const { m } = setup(t, { shops: [shop()] });
+  m.enableRunning = true;
+  let calls = 0;
+  m._executeEnableBatchFor = async () => { calls += 1; return { outcome: 'dry', dryRun: true, neverSent: true }; };
+  m._readAdState = async () => ({ state: 'off', identity: null });
+  await m._runEnablePhase(0, '2026-09-12');
+  assert.strictEqual(calls, 1, '无账户号时仍进入该店开启批次');
+  assert.strictEqual(m.getStatus().shopRows[0].identityPending, false);
+  m.enableRunning = false;
 });
 
-test('手工配置但未填 accountId 的店：保持现行语义（不阻断），不误伤既有行为', async (t) => {
-  const { m, controllers } = setup(t, {
-    shops: [{ id: 'shop-l', name: '甲店', cookieFile: '甲店', enabled: true, accountId: null }],
-    costAccountId: 'ACC-X', pageAccountId: 'ACC-Y', controllerAccountId: 'ACC-X',
-  });
-  const s = m.getStatus();
-  assert.strictEqual(s.shops[0].identityPending, false, '非自动发现店不启用待核验（现行语义）');
-  const p = await m.pollOnce('test');
-  assert.strictEqual(controllers.get('shop-l').state.closeCalls.length, 1, '现行行为：正常值守动作');
-});
-
-test('手工配置店费用源账户不一致：既有 fail-closed 保持（AUTH 阻断、元数据不被覆盖）', async (t) => {
-  const { m, controllers, cfgPath } = setup(t, {
+test('显式配置的账户号不匹配时仍按原有 AUTH 校验阻止', async (t) => {
+  const { m, controllers, disk } = setup(t, {
     shops: [{ id: 'shop-m', name: '甲店', cookieFile: '甲店', enabled: true, accountId: 'ACC-M' }],
     costAccountId: 'ACC-WRONG', pageAccountId: 'ACC-M', controllerAccountId: 'ACC-M',
   });
   const p = await m.pollOnce('test');
-  const r = (p.results || [])[0] || {};
-  assert.strictEqual(r.status, 'stopped', '既有 guard AUTH 阻断');
-  assert.strictEqual(r.code, 'AUTH');
-  assert.strictEqual(controllers.get('shop-m').state.closeCalls.length, 0, '零动作');
-  assert.strictEqual(JSON.parse(fs.readFileSync(cfgPath, 'utf-8')).shops[0].accountId, 'ACC-M', '不覆盖既有元数据');
+  assert.strictEqual(p.results[0].status, 'stopped');
+  assert.strictEqual(p.results[0].code, 'AUTH');
+  assert.strictEqual(controllers.get('shop-m').state.closeCalls.length, 0);
+  assert.strictEqual(disk().shops[0].accountId, 'ACC-M');
 });
 
-// ── 6. 删除店铺后仍不进值守、不建立身份 ────────────────────────────
-
-test('删除店铺后仍不进入值守：轮询跳过、零动作、不做身份建立', async (t) => {
-  const { m, controllers } = setup(t, { shops: [shop({ deleted: true, enabled: false })], costAccountId: 'ACC-1', pageAccountId: 'ACC-1' });
-  assert.strictEqual(m._activeShops().length, 0, '不在活动范围');
-  const p = await m.pollOnce('test');
-  const r = (p.results || [])[0];
-  assert.ok(!r || r.status === 'skipped', '轮询跳过');
-  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '零动作');
-  assert.strictEqual(m._findShop('shop-a').accountId, undefined, '不做身份建立');
-});
-
-// ── 7. 立即更新（只读）也能自动建立 ────────────────────────────────
-
-test('立即更新（只读链路）：双锚一致时同样自动建立并解除待核验', async (t) => {
-  const { m, cfgPath } = setup(t, { shops: [shop()], costAccountId: 'ACC-1', pageAccountId: 'ACC-1', controllerAccountId: 'ACC-1' });
-  const r = await m.refreshShopData('shop-a');
-  assert.strictEqual(r.ok, true, JSON.stringify(r).slice(0, 200));
-  assert.strictEqual(r.readOnly, true, '立即更新保持只读');
-  assert.strictEqual(m._findShop('shop-a').accountId, 'ACC-1', '元数据已建立');
-  assert.strictEqual(m.getStatus().shops[0].identityPending, false, '待核验解除');
-  assert.strictEqual(JSON.parse(fs.readFileSync(cfgPath, 'utf-8')).shops[0].accountId, 'ACC-1', '落盘');
+test('已删除店不进入巡查和每日开启', async (t) => {
+  const { m, controllers } = setup(t, { shops: [shop({ deleted: true, enabled: false })] });
+  assert.strictEqual(m._activeShops().length, 0);
+  await m.pollOnce('test');
+  assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0);
+  m.enableRunning = true;
+  let calls = 0;
+  m._executeEnableBatchFor = async () => { calls += 1; return { outcome: 'dry', dryRun: true, neverSent: true }; };
+  m._readAdState = async () => ({ state: 'off', identity: null });
+  await m._runEnablePhase(0, '2026-09-12');
+  assert.strictEqual(calls, 0);
+  m.enableRunning = false;
 });

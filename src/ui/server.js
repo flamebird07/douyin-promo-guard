@@ -75,11 +75,13 @@ const HTML = `<!DOCTYPE html>
       <th>上次数据更新</th>
       <th>广告费</th>
       <th>订单数</th>
+      <th title="广告费 ÷ 订单数">费比</th>
+      <th title="账户级数据，仅展示、不参与自动开关判定">千川可用余额</th>
       <th>当前阈值</th>
       <th style="width:220px;">操作</th>
     </tr>
   </thead>
-  <tbody id="shopBody"><tr><td colspan="7" class="muted">加载中…</td></tr></tbody>
+  <tbody id="shopBody"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody>
 </table>
 
 <details>
@@ -104,6 +106,10 @@ function adBadge(st) {
 function yuan(cents) {
   if (cents == null) return '—';
   return (cents / 100).toFixed(2) + ' 元';
+}
+function feeRatio(costCents, orders) {
+  if (!Number.isSafeInteger(costCents) || costCents < 0 || !Number.isSafeInteger(orders) || orders <= 0) return '—';
+  return (costCents / orders / 100).toFixed(2) + ' 元/单';
 }
 async function api(p, method, body) {
   var o = { method: method || 'GET', headers: { 'Content-Type': 'application/json' } };
@@ -146,12 +152,9 @@ function closeEdit(id) {
 async function saveEdit(id) {
   var box = document.getElementById('edit-' + id);
   if (!box) return;
-  var nameEl = box.querySelector('.ename');
   var thrEl = box.querySelector('.ethr');
-  var displayName = nameEl ? nameEl.value : '';
   var thrYuan = thrEl ? parseFloat(thrEl.value) : NaN;
   var body = { shopId: id };
-  if (displayName) body.displayName = displayName;
   if (!isNaN(thrYuan) && thrYuan > 0) body.thresholdCents = Math.round(thrYuan * 100);
   var r = await api('/api/shop/update', 'POST', body);
   if (r.ok) {
@@ -195,16 +198,14 @@ function renderShops(rows) {
   document.querySelectorAll('.edit-box.open').forEach(function(box) {
     var id = box.getAttribute('data-shop-id');
     if (!id) return;
-    var nameEl = box.querySelector('.ename');
     var thrEl = box.querySelector('.ethr');
     editState[id] = {
       open: true,
-      displayName: nameEl ? nameEl.value : '',
       thresholdYuan: thrEl ? thrEl.value : '',
     };
   });
   if (!rows || rows.length === 0) {
-    body.innerHTML = '<tr><td colspan="7" class="muted">暂无活动店铺</td></tr>';
+    body.innerHTML = '<tr><td colspan="9" class="muted">暂无活动店铺</td></tr>';
     return;
   }
   // 用 DOM 构建 + data-id / data-name，不用字符串拼 onclick（防引号注入）
@@ -228,8 +229,25 @@ function renderShops(rows) {
     var td5 = document.createElement('td');
     td5.textContent = s.orders == null ? '—' : (s.orders + ' 单');
     var td6 = document.createElement('td');
-    td6.textContent = thr;
+    td6.textContent = feeRatio(s.costCents, s.orders);
+    var tdBal = document.createElement('td');
+    tdBal.textContent = s.balanceCents != null ? (s.balanceCents / 100).toFixed(2) + ' 元' : '未知';
+    // balanceAt 为 UTC ISO；上海 = UTC+8（无夏令时），行内可见小字显示本机读取时间
+    if (s.balanceCents != null && s.balanceAt) {
+      var balD = new Date(String(s.balanceAt));
+      if (!isNaN(balD.getTime())) {
+        var balSh = new Date(balD.getTime() + 8 * 3600 * 1000);
+        var balP = function (x) { return ('0' + x).slice(-2); };
+        var balSmall = document.createElement('div');
+        balSmall.style.fontSize = '11px';
+        balSmall.style.color = '#888';
+        balSmall.textContent = balP(balSh.getUTCMonth() + 1) + '-' + balP(balSh.getUTCDate()) + ' ' + balP(balSh.getUTCHours()) + ':' + balP(balSh.getUTCMinutes()) + ' 读取';
+        tdBal.appendChild(balSmall);
+      }
+    }
     var td7 = document.createElement('td');
+    td7.textContent = thr;
+    var td8 = document.createElement('td');
 
     var btnRefresh = document.createElement('button');
     btnRefresh.className = 'ghost';
@@ -265,16 +283,6 @@ function renderShops(rows) {
     editBox.className = 'edit-box';
     editBox.id = 'edit-' + s.id;
     editBox.setAttribute('data-shop-id', s.id);
-    var l1 = document.createElement('label');
-    l1.textContent = '展示名称';
-    var in1 = document.createElement('input');
-    in1.className = 'ename';
-    in1.maxLength = 100;
-    in1.value = (editState[s.id] && editState[s.id].displayName) != null
-      ? editState[s.id].displayName
-      : (s.displayName || s.name || '');
-    var d1 = document.createElement('div');
-    d1.appendChild(l1); d1.appendChild(in1);
     var l2 = document.createElement('label');
     l2.textContent = '阈值(元/单)';
     var in2 = document.createElement('input');
@@ -298,14 +306,13 @@ function renderShops(rows) {
     var d2 = document.createElement('div');
     d2.style.marginTop = '6px';
     d2.appendChild(l2); d2.appendChild(in2); d2.appendChild(btnSave); d2.appendChild(btnCancel);
-    editBox.appendChild(d1);
     editBox.appendChild(d2);
     if (editState[s.id] && editState[s.id].open) editBox.classList.add('open');
 
-    td7.appendChild(btnRefresh);
-    td7.appendChild(opsWrap);
-    td7.appendChild(editBox);
-    [td1, td2, td3, td4, td5, td6, td7].forEach(function(td) { tr.appendChild(td); });
+    td8.appendChild(btnRefresh);
+    td8.appendChild(opsWrap);
+    td8.appendChild(editBox);
+    [td1, td2, td3, td4, td5, td6, tdBal, td7, td8].forEach(function(td) { tr.appendChild(td); });
     body.appendChild(tr);
   });
 }

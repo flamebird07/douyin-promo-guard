@@ -26,6 +26,112 @@ const path = require('path');
 const { AuthError, DataGuardError } = require('../lib/errors');
 const { openQianchuanHome, closeBrowser } = require('./qianchuan-reader');
 
+// 自动会话始终保持后台运行；仅控件定位失败时，另开一份同店铺可见会话供人工检查。
+// 每店最多保留一个窗口，用户关闭窗口后下一轮才允许再次尝试。
+const manualReviewSessions = new Map();
+
+function isMissingChengfangControl(error) {
+  const reason = String((error && (error.reason || error.message)) || error || '');
+  return /(?:未找到|无法唯一定位|定位失败|二次定位不一致|控件缺失)/.test(reason)
+    && /(?:子标签|按钮|开关|每页条数|全选框|批量操作栏|分页器|控件|确认弹窗)/.test(reason);
+}
+
+function manualReviewShopKey(shopCfg) {
+  return String((shopCfg && (shopCfg.id || shopCfg.name || shopCfg.cookieFile)) || '');
+}
+
+function hasChengfangManualReview(shopCfg) {
+  const key = manualReviewShopKey(shopCfg);
+  const held = manualReviewSessions.get(key);
+  if (!held) return false;
+  if (held.page && typeof held.page.isClosed === 'function' && held.page.isClosed()) {
+    manualReviewSessions.delete(key);
+    return false;
+  }
+  return true;
+}
+
+async function retainChengfangPageForManualReview({ context, target, shopCfg, loginCfg, browserFactory }) {
+  const key = manualReviewShopKey(shopCfg);
+  if (!key || !context || !target || typeof context.storageState !== 'function') return { held: false, reason: '页面会话不可用' };
+  if (hasChengfangManualReview(shopCfg)) return { held: true, reused: true };
+  const url = typeof target.url === 'function' ? target.url() : '';
+  if (!/^https:\/\/qianchuan\.jinritemai\.com\//i.test(url)) return { held: false, reason: '当前不是千川页面' };
+  let browser = null;
+  try {
+    const storageState = await context.storageState(); // 仅在内存传递，绝不写入日志或文件
+    if (browserFactory) browser = await browserFactory();
+    else {
+      const { chromium } = require('playwright');
+      browser = await chromium.launch({
+        headless: false,
+        executablePath: loginCfg.edgePath,
+        args: ['--window-size=1920,1080'],
+      });
+    }
+    const reviewContext = await browser.newContext({
+      storageState,
+      viewport: { width: 1920, height: 1080 },
+      timezoneId: 'Asia/Shanghai',
+    });
+    const page = await reviewContext.newPage();
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    if (typeof page.bringToFront === 'function') await page.bringToFront();
+    const held = { browser, page };
+    manualReviewSessions.set(key, held);
+    if (typeof page.on === 'function') page.on('close', () => {
+      if (manualReviewSessions.get(key) === held) manualReviewSessions.delete(key);
+      closeBrowser(browser);
+    });
+    if (typeof browser.on === 'function') browser.on('disconnected', () => {
+      if (manualReviewSessions.get(key) === held) manualReviewSessions.delete(key);
+    });
+    return { held: true, reused: false };
+  } catch (e) {
+    if (browser) await closeBrowser(browser);
+    return { held: false, reason: `可见窗口打开失败：${e.message}` };
+  }
+}
+
+async function holdOnMissingChengfangControl(error, session) {
+  if (!error || typeof error !== 'object' || error.manualReviewHandled) return false;
+  if (!isMissingChengfangControl(error)) return false;
+  error.manualReviewHandled = true;
+  // 注入的 browserFactory 属隔离测试，不得意外启动真实可见浏览器。
+  if (session.browserFactory && !session.reviewBrowserFactory) return false;
+  const held = await retainChengfangPageForManualReview({
+    context: session.context,
+    target: session.target,
+    shopCfg: session.shopCfg,
+    loginCfg: session.loginCfg,
+    browserFactory: session.reviewBrowserFactory,
+  });
+  const suffix = held.held
+    ? '；已保留可见千川页面供人工检查，关闭检查窗口后才恢复该店自动尝试'
+    : `；未能打开人工检查窗口（${held.reason}），该轮仍停止自动操作`;
+  error.reason = `${error.reason || error.message}${suffix}`;
+  error.message = error.reason;
+  return held.held;
+}
+
+function watchChengfangControlsForManualReview(controller, session) {
+  const methods = ['switchView', 'refreshView', 'switchPageSize', 'selectAllInPage',
+    'clickBatchPause', 'clickBatchEnable', 'clickRowSwitch', 'setRowCheckbox',
+    'clickNextPage', 'ensureFirstPage'];
+  for (const name of methods) {
+    if (typeof controller[name] !== 'function') continue;
+    const original = controller[name];
+    controller[name] = async function (...args) {
+      try { return await original.apply(this, args); }
+      catch (e) {
+        await holdOnMissingChengfangControl(e, session);
+        throw e;
+      }
+    };
+  }
+  return controller;
+}
+
 const CHENGFANG_URL_MARKER = '/uni-prom/overall';
 // 2026-09-21：千川把乘方管理页路径由 /uni-prom/overall 改为 /overall-prom，
 // 此处同时兼容新旧两版（页面结构不变，仅路径前缀变化）。正则统一用本变量构造。
@@ -234,13 +340,64 @@ function collectChengfangPaginationInPage() {
   return out;
 }
 
-/** 切换子标签（商品自选/全店托管）：定位含该文本的 tab 祖先并点击。 */
-const clickChengfangSubTab = (label) => `(() => {
+/**
+ * 切换子标签（商品自选/全店托管）。
+ * 2026-09-27 实页证据（高定私服）：aurora 新 UI 计划视图下两子视图是
+ * .aurora-qc-radio-group 单选组——必须精确点击目标单选项（input[type=radio]
+ * 优先，其次 wrapper），绝不点击外层组容器（div.tabs-*，点中也切不动视图）；
+ * 点击后核对选中态（input.checked 或 wrapper 含 -checked 类），未确认则如实
+ * 失败，绝不虚报成功。
+ * 2026-09-27 实页证据二（潮流服饰，clf-inspect.json）：另一 aurora 变体是两个
+ * role=tab（"商品自选" 文本全等；"全店托管加速新品爆发" 前缀起始）——优先找
+ * 唯一目标 role=tab（文本全等或前缀起始，多候选拒绝猜测），点击真实 tab 控件；
+ * 页面提供 aria-selected 时点击后核对已选中，未确认则如实失败；已选中保持幂等。
+ * 旧 UI 保持"含该文本的 tab 祖先并点击"原口径；单选组内元素不走 tab 祖先后备，
+ * 防止后备命中组容器。
+ */
+const clickChengfangSubTab = (label) => `(async () => {
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const labels = [...document.querySelectorAll('.aurora-qc-radio-group .aurora-qc-radio-button-label')]
+    .filter((el) => (el.textContent || '').trim() === '${label}' && visible(el));
+  if (labels.length > 1) return { clicked: false, reason: '单选标签候选 ' + labels.length + ' 个，拒绝猜测' };
+  if (labels.length === 1) {
+    const wrap = labels[0].closest('.aurora-qc-radio-button-wrapper');
+    if (!wrap) return { clicked: false, reason: '未找到目标单选项容器' };
+    const input = wrap.querySelector('input[type="radio"]');
+    const selected = () => !!(input && input.checked) || String(wrap.className || '').includes('checked');
+    if (selected()) return { clicked: true, target: 'aurora-radio', alreadySelected: true };
+    (input || wrap).click();
+    for (let i = 0; i < 10; i++) {
+      if (selected()) return { clicked: true, target: 'aurora-radio', verified: true };
+      await new Promise((res) => setTimeout(res, 150));
+    }
+    return { clicked: false, target: 'aurora-radio', reason: '已点击目标单选项但选中态未确认，拒绝虚报成功' };
+  }
+  let tabCands = [...document.querySelectorAll('[role="tab"]')]
+    .filter((el) => visible(el) && !(el.closest && el.closest('.aurora-qc-radio-group')))
+    .filter((el) => { const t = (el.textContent || '').trim(); return t === '${label}' || t.startsWith('${label}'); });
+  tabCands = tabCands.filter((el) => !tabCands.some((p) => p !== el && p.contains(el)));
+  if (tabCands.length > 1) return { clicked: false, reason: '目标 tab 候选 ' + tabCands.length + ' 个，拒绝猜测' };
+  if (tabCands.length === 1) {
+    const tab = tabCands[0];
+    const hasAria = tab.getAttribute('aria-selected') != null;
+    const isSel = () => tab.getAttribute('aria-selected') === 'true';
+    if (hasAria && isSel()) return { clicked: true, target: 'aurora-tab', alreadySelected: true };
+    tab.click();
+    if (hasAria) {
+      for (let i = 0; i < 10; i++) {
+        if (isSel()) return { clicked: true, target: 'aurora-tab', verified: true };
+        await new Promise((res) => setTimeout(res, 150));
+      }
+      return { clicked: false, target: 'aurora-tab', reason: '已点击目标 tab 但选中态未确认，拒绝虚报成功' };
+    }
+    return { clicked: true, target: 'aurora-tab' };
+  }
   const els = [...document.querySelectorAll('body *')].filter((el) => {
     const own = Array.from(el.childNodes).filter((n) => n.nodeType === Node.TEXT_NODE).map((n) => n.textContent.trim()).join('');
     return own === '${label}' && el.getBoundingClientRect().width > 0;
   });
   for (const el of els) {
+    if (el.closest && el.closest('.aurora-qc-radio-group')) continue;
     let cur = el;
     for (let i = 0; i < 6 && cur; i++) {
       const cls = String(cur.className || '');
@@ -993,6 +1150,56 @@ function setChengfangRowCheckboxByPlanId({ planId, checked }) {
 }
 
 /** 账户与页面身份（自包含）。 */
+/**
+ * 余额原文 → 整数分（严格十进制字符串，禁止浮点乘法）。
+ * 接受 0-9 位整数与可选 1-2 位小数，容忍千分位逗号；其余一律 null（显示"未知"，绝不编造 0）。
+ */
+function parseBalanceTextToCents(raw) {
+  const t = String(raw == null ? '' : raw).trim().replace(/,/g, '');
+  if (!/^\d{1,9}(?:\.\d{1,2})?$/.test(t)) return null;
+  const dot = t.indexOf('.');
+  const intPart = dot === -1 ? t : t.slice(0, dot);
+  const frac = dot === -1 ? '00' : (t.slice(dot + 1) + '00').slice(0, 2);
+  const cents = Number(intPart) * 100 + Number(frac);
+  return Number.isSafeInteger(cents) && cents >= 0 ? cents : null;
+}
+
+/**
+ * 乘方页"千川可用余额(元)"只读取证（自包含，page.evaluate 用；不点击任何控件）。
+ * 2026-09-27 实页证据（bal-inspect.json，两店同构）：同一 div.infoItem 内
+ * div.infoLabel 自身文本恰为"千川可用余额(元)"，数值在其 div.infoValue 叶子；
+ * "千川日预算(元)"与"余额不足"徽标为相邻结构，绝不取值。CSS 哈希后缀仅辅助。
+ * 返回 { balanceText, reason }；金额→分由节点侧 parseBalanceTextToCents 完成。
+ */
+function readQianchuanBalanceInPage() {
+  const out = { balanceText: null, reason: null };
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const ownText = (el) => Array.from(el.childNodes).filter((n) => n.nodeType === Node.TEXT_NODE).map((n) => n.textContent.trim()).join('');
+  const labels = [...document.querySelectorAll('div[class*="infoLabel"]')]
+    .filter((el) => visible(el) && ownText(el) === '千川可用余额(元)');
+  if (labels.length === 0) { out.reason = '未找到"千川可用余额(元)"标签'; return out; }
+  const items = [...new Set(labels.map((el) => el.closest('[class*="infoItem"]')).filter(Boolean))];
+  if (items.length !== 1) { out.reason = `余额标签所在 infoItem 有 ${items.length} 个，拒绝猜测`; return out; }
+  const values = [...items[0].querySelectorAll('div[class*="infoValue"]')].filter(visible);
+  const texts = [...new Set(values.map((el) => (el.textContent || '').trim()).filter((t) => t.length > 0))];
+  if (texts.length !== 1) { out.reason = `余额数值叶子 ${texts.length} 个，拒绝猜测`; return out; }
+  out.balanceText = texts[0];
+  return out;
+}
+
+/** 页面余额取证结果 → { balanceCents, balanceText, reason }（原文非法 → null 分，不编造 0）。 */
+function balanceCentsFromPageResult(pageResult) {
+  if (!pageResult || pageResult.balanceText == null) {
+    return { balanceCents: null, balanceText: null, reason: (pageResult && pageResult.reason) || '页面未返回余额' };
+  }
+  const cents = parseBalanceTextToCents(pageResult.balanceText);
+  if (cents == null) {
+    return { balanceCents: null, balanceText: pageResult.balanceText, reason: `余额原文无法解析为整数分: ${pageResult.balanceText}` };
+  }
+  return { balanceCents: cents, balanceText: pageResult.balanceText, reason: null };
+}
+
+/** 账户与页面身份（自包含）。 */
 function readChengfangAccountInPage() {
   const out = {
     url: location.href.slice(0, 160),
@@ -1010,14 +1217,78 @@ function readChengfangAccountInPage() {
   const nameM = /([\u4e00-\u9fa5A-Za-z0-9_-]{1,20})\s*ID[:：]\s*\d{8,20}/.exec(navText.replace(/\s+/g, ' '));
   if (nameM) out.accountName = nameM[1];
   out.hasChengfangNav = navText.includes('乘方');
-  const bodyText = document.body ? document.body.innerText : '';
-  out.hasSubTabs = bodyText.includes('商品自选') && bodyText.includes('全店托管');
+  // 商品视图的商品行也包含这两个词，必须核对真实可见的标签控件。
+  // 2026-09-27 实页证据一（高定私服，cf-deep-*.json）：aurora 计划视图下两个子视图是
+  // .aurora-qc-radio-group 单选组（wrapper 内含 input[type=radio]），不是 tab；
+  // 商品卡片上的同名字样是 .aurora-qc-tag-text 文本，不在单选组内，不得误认。
+  // 2026-09-27 实页证据二（潮流服饰，clf-inspect.json）：另一 aurora 变体点击"商品"后
+  // 直接是两个 role=tab——"商品自选"（文本全等）与"全店托管加速新品爆发"（以前缀
+  // "全店托管"起始）。前缀放宽仅限真实 role=tab 控件：表格（无 role=tab）、商品卡片、
+  // 整页文字均不命中，不会回到旧的卡片文字误报。
+  const tabs = [...document.querySelectorAll('[role="tab"], [class*="tab"], [class*="Tab"]')];
+  const tabMatch = (el, label) => {
+    const r = el.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0)) return false;
+    const text = (el.textContent || '').trim();
+    if (text === label) return true;
+    return !!el.getAttribute && el.getAttribute('role') === 'tab' && text.startsWith(label);
+  };
+  const radioLabels = [...document.querySelectorAll('.aurora-qc-radio-group .aurora-qc-radio-button-label')];
+  out.hasSubTabs = ['商品自选', '全店托管'].every(label => tabs.some(el => tabMatch(el, label)) || radioLabels.some(el => {
+    const r = el.getBoundingClientRect();
+    if (!(r.width > 0 && r.height > 0) || (el.textContent || '').trim() !== label) return false;
+    const wrap = el.closest('.aurora-qc-radio-button-wrapper');
+    return !!(wrap && wrap.querySelector('input[type="radio"]'));
+  }));
   return out;
+}
+
+/** 进入商品的计划视图；只关闭乘方介绍浮层和切换视图，不触碰投放开关。 */
+function advanceChengfangPlanViewInPage() {
+  const visible = (el) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const guides = [...document.querySelectorAll('[role="dialog"], [class*="guide"], [class*="Guide"], [class*="tour"], [class*="Tour"], .ocean-vmok-plugin-oc-modal-wrap')];
+  const skipButtons = [...new Set(guides.flatMap(root => [...root.querySelectorAll('button, a, [role="button"], span')]))]
+    .filter(el => visible(el) && /^(跳过|跳过引导)$/.test((el.textContent || '').trim()));
+  // 同一个按钮内部的 span 不作为第二个候选；有多个独立候选时不猜测。
+  const skips = skipButtons.filter(el => !skipButtons.some(parent => parent !== el && parent.contains(el)));
+  if (skips.length === 1) {
+    skips[0].click();
+    return { action: 'skip-guide' };
+  }
+  const introClose = document.querySelector(
+    '[data-e2e="oc_emptyKey_overall-prom"] .tools-vmok-plugin-modal__close-icon, '
+      + '.ocean-vmok-plugin-oc-modal-wrap .tools-vmok-plugin-modal__close-icon'
+  );
+  if (visible(introClose)) {
+    introClose.click();
+    return { action: 'dismiss-intro' };
+  }
+  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  const findTab = (name) => tabs.find((el) => visible(el) && (el.textContent || '').trim() === name);
+  const product = findTab('商品');
+  if (product && product.getAttribute('aria-selected') !== 'true') {
+    product.click();
+    return { action: 'open-product' };
+  }
+  const plan = findTab('计划视图');
+  if (product && product.getAttribute('aria-selected') === 'true'
+      && plan && plan.getAttribute('aria-selected') !== 'true') {
+    plan.click();
+    return { action: 'open-plan-view' };
+  }
+  return { action: 'none' };
 }
 
 // ── 页面驱动（真实页面；browserFactory 可注入供测试）────────────────
 
 async function openChengfangShop(p) {
+  if (hasChengfangManualReview(p.shopCfg)) {
+    throw new DataGuardError('该店千川页面正在等待人工检查；请先查看并关闭保留的可见窗口，本轮不再自动操作');
+  }
   const { browser, context, target, cookieSession } = await openQianchuanHome(p.loginCfg, p.shopCfg, p);
   try {
     await target.waitForTimeout(2000);
@@ -1036,37 +1307,35 @@ async function openChengfangShop(p) {
     if (!st || !CHENGFANG_URL_RE.test(st.url)) {
       throw new DataGuardError(`导航"乘方"未到达管理页（当前 ${st ? st.url.slice(0, 80) : '未知'}）`);
     }
-    // 乘方页先呈现营销目标标签（"直播/商品"），点击"商品"后才出现
-    // "商品自选/全店托管"子标签（2026-09-13 实测）。若子标签已存在则跳过。
+    // 部分店铺需关闭介绍浮层，再依次进入「商品」和「计划视图」；
+    // 只有「商品自选/全店托管」子标签真实出现才继续。
     const deadlineTab = Date.now() + 15000;
     let hasTabs = false;
     while (Date.now() < deadlineTab) {
+      await target.evaluate(advanceChengfangPlanViewInPage).catch(() => {});
+      await target.waitForTimeout(2000);
       const check = await target.evaluate(readChengfangAccountInPage);
       if (check && check.hasSubTabs) { st = check; hasTabs = true; break; }
-      await target.evaluate(() => {
-        const els = [...document.querySelectorAll('body *')].filter((el) => {
-          const own = Array.from(el.childNodes).filter((n) => n.nodeType === Node.TEXT_NODE).map((n) => n.textContent.trim()).join('');
-          return own === '商品' && el.querySelectorAll('*').length <= 4;
-        });
-        const el = els.find((e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
-        if (el) el.click();
-      }).catch(() => {});
-      await target.waitForTimeout(2000);
     }
     if (!hasTabs) {
       // 子标签（商品自选/全店托管）异步渲染，轮询等待（最长 40s）
       const deadline = Date.now() + 40000;
       while (Date.now() < deadline) {
+        await target.evaluate(advanceChengfangPlanViewInPage).catch(() => {});
+        await target.waitForTimeout(2000);
         const check = await target.evaluate(readChengfangAccountInPage);
         if (check && check.hasSubTabs) { st = check; hasTabs = true; break; }
-        await target.waitForTimeout(2000);
       }
     }
     if (!hasTabs) {
-      throw new DataGuardError('乘方页未找到"商品自选/全店托管"子标签（点击"商品"后仍未出现），拒绝继续');
+      throw new DataGuardError('乘方页未找到"商品自选/全店托管"子标签（尝试进入"商品→计划视图"后仍未出现），拒绝继续');
     }
     return { browser, target, account: st, context, cookieSession };
   } catch (e) {
+    await holdOnMissingChengfangControl(e, {
+      context, target, shopCfg: p.shopCfg, loginCfg: p.loginCfg,
+      browserFactory: p.browserFactory, reviewBrowserFactory: p.reviewBrowserFactory,
+    });
     await closeBrowser(browser);
     throw e;
   }
@@ -1226,6 +1495,16 @@ function createChengfangController(p) {
       if (typeof page.reload !== 'function') return { refreshed: false, reason: 'page.reload 不可用', ui: 'aurora' };
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch((e) => { throw new DataGuardError(`回读前刷新乘方管理页失败：${e.reason || e.message}`); });
       await sleep(loadWaitMs);
+      // 部分店铺刷新后回到「商品视图」甚至展示介绍浮层；先恢复计划视图。
+      let hasSubTabs = false;
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const advanced = await page.evaluate(advanceChengfangPlanViewInPage).catch(() => null);
+        if (advanced && advanced.action !== 'none') await sleep(1000);
+        const st = await page.evaluate(readChengfangAccountInPage).catch(() => null);
+        if (st && st.hasSubTabs) { hasSubTabs = true; break; }
+        await sleep(1000);
+      }
+      if (!hasSubTabs) throw new DataGuardError('刷新后未能恢复商品计划视图，拒绝用商品视图数据冒充计划清单');
       await this.switchView({ page, tab });
       // reload 后回到默认每页 10 条：目标清单会跨页，必须重新置 100条/页（与扫描口径一致）
       let pageSize = null;
@@ -1506,6 +1785,9 @@ function createChengfangController(p) {
 }
 
 module.exports = {
+  parseBalanceTextToCents,
+  readQianchuanBalanceInPage,
+  balanceCentsFromPageResult,
   resolveRowPlanIdFromText,
   collectChengfangRowsInPage,
   collectChengfangPaginationInPage,
@@ -1530,6 +1812,11 @@ module.exports = {
   clickChengfangNextPageInPage,
   clickChengfangFirstPageInPage,
   readChengfangAccountInPage,
+  advanceChengfangPlanViewInPage,
+  isMissingChengfangControl,
+  hasChengfangManualReview,
+  retainChengfangPageForManualReview,
+  watchChengfangControlsForManualReview,
   openChengfangShop,
   createChengfangController,
   closeBrowser,

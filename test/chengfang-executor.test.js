@@ -379,18 +379,33 @@ test('dryRun：只枚举目标，零点击（全选框/暂停/开关均不点）
   assert.ok(result.dryRunTargets.every((t) => t.action.startsWith('pause')), '只含暂停动作');
 });
 
-test('身份核验失败（账户不匹配）：停止，零点击', async () => {
+test('身份核验：页面账户 ID 与配置不同 → 不因 ID 阻断（可选观察，Cookie 归属）', async () => {
+  // 原断言：账户不匹配 → 身份 read_failed、零点击。
+  // 新规则：账户 ID 缺失/不一致不得因 ID 本身失败；仍要求正确乘方 URL 与必需子视图。
   const { result, state } = await run({
     fixture: {
       plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(3) },
       navText: '首页 乘方 全域投放 品牌投放 数据 工具 财务 营销学堂 成长伙伴 99+ 伊人美 ID：1710242295000000',
     },
-    dryRun: false,
+    dryRun: true,
   });
-  assert.strictEqual(result.allPausedConfirmed, false);
-  assert.strictEqual(result.views.identity.status, 'read_failed');
-  assert.match(result.confirmReason, /身份核验失败/);
-  assert.strictEqual(state.clickLog.length, 0);
+  assert.notStrictEqual(result.views.identity && result.views.identity.status, 'read_failed',
+    `不得因账户 ID 不一致判身份失败：${result.confirmReason || ''}`);
+  assert.ok(!/账户不匹配/.test(String(result.confirmReason || '')), '原因不得写账户不匹配');
+  assert.strictEqual(state.clickLog.length, 0, 'dryRun 仍零业务点击');
+});
+
+test('身份核验：页面账户 ID 缺失 → 不因 ID 阻断', async () => {
+  const { result, state } = await run({
+    fixture: {
+      plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(3) },
+      navText: '首页 乘方 全域投放 品牌投放 数据 工具 财务 营销学堂 成长伙伴 99+ 伊人美',
+    },
+    dryRun: true,
+  });
+  assert.notStrictEqual(result.views.identity && result.views.identity.status, 'read_failed',
+    `不得因账户 ID 缺失判身份失败：${result.confirmReason || ''}`);
+  assert.strictEqual(state.clickLog.length, 0, 'dryRun 仍零业务点击');
 });
 
 // ── 全量回读：完整当前范围（缺空态证据 / 重新开启）────────────────────
@@ -1063,26 +1078,20 @@ test('开启：最终身份复核期间页面账户变化 → 身份复检拦截
   assert.strictEqual(enableClicks(state).length, 0);
 });
 
-// 2026-09-24：开启路径第 0 步身份核验（账户不匹配）镜像用例——与暂停路径
-// 「身份核验失败（账户不匹配）：停止，零点击」对齐：配置账户与页面账户不一致时，
-// 开启（含每日 07:00 开启批次）必须 fail-closed，零点击、不覆盖配置。
-test('开启：身份核验失败（账户不匹配）：停止，零点击，不覆盖配置账户', async () => {
+// 2026-09-28 规则更新：页面账户 ID 与配置不一致不得因 ID 阻断开启身份核验；
+// 归属=Cookie+shopCfg。仍拒绝缺配置 id、错误 URL、缺子视图、ok=false。
+test('开启：页面账户 ID 与配置不同 → 不因 ID 阻断，不覆盖配置账户', async () => {
   const { result, state } = await runEnable({
     fixture: {
       plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) },
-      // 页面导航栏账户 ID 与 SHOP_CFG.accountId（1710242295996424）不一致
       navText: '首页 乘方 全域投放 品牌投放 数据 工具 财务 营销学堂 成长伙伴 99+ 伊人美 ID：1710242295000000',
     },
-    dryRun: false,
+    dryRun: true,
   });
-  assert.strictEqual(result.allEnabledConfirmed, false, '不得宣称已开启');
-  assert.strictEqual(result.views.identity.status, 'read_failed', '身份视图判读取失败');
-  assert.match(result.confirmReason, /身份核验失败/, `原因须明确身份核验失败：${result.confirmReason}`);
-  assert.match(result.confirmReason, /账户不匹配/, '须写明账户不匹配（配置 vs 页面）');
-  assert.strictEqual(state.clickLog.length, 0, '零业务点击');
-  assert.strictEqual(switchClicks(state).length, 0, '行开关零点击');
-  assert.strictEqual(enableClicks(state).length, 0, '批量开启零点击');
-  // fail-closed：绝不为"继续执行"而把页面账户写回配置（SHOP_CFG 保持原值）
+  assert.notStrictEqual(result.views.identity && result.views.identity.status, 'read_failed',
+    `不得因账户 ID 不一致判身份失败：${result.confirmReason || ''}`);
+  assert.ok(!/账户不匹配/.test(String(result.confirmReason || '')), '原因不得写账户不匹配');
+  assert.strictEqual(state.clickLog.length, 0, 'dryRun 零业务点击');
   assert.strictEqual(SHOP_CFG.accountId, ACCOUNT_ID, '配置账户未被覆盖');
 });
 

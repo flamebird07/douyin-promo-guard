@@ -363,11 +363,9 @@ function createQianchuanCostReader(p) {
     async readCostSummary({ shopCfg }) {
       const { browser, target } = await openQianchuanHome(loginCfg, shopCfg, p);
       try {
+        // Cookie 文件绑定决定店铺归属；页面账户 ID 仅为可选观测，缺失/不同均不得拒绝费用数据。
         const acct = await readQianchuanAccountId(target);
-        if (!acct || !acct.accountId) {
-          throw new AuthError('千川页面未读到账户ID（页面结构可能变化或未完成授权），拒绝采用');
-        }
-        const accountId = acct.accountId;
+        const accountId = acct && acct.accountId ? acct.accountId : null;
 
         const period = await target.evaluate(() => {
           const wrap = document.querySelector('[class*="report-shortcuts-datepicker"]');
@@ -419,8 +417,10 @@ function createQianchuanCostReader(p) {
           shopId: shopCfg.id,
           shopIdAttribution: '配置归因：千川页不展示店铺ID/店铺名；shopId 取自配置，身份经"抖店首页入口授权进入该千川账户"链路核验',
           accountId,
-          accountName: acct.accountName,
-          accountIdAttribution: '页面实测：千川头部 ID 元素（class shop-name，ID 在第二个该类元素）',
+          accountName: (acct && acct.accountName) || null,
+          accountIdAttribution: accountId
+            ? '页面可选观测：千川头部 ID 元素（class shop-name）/正文 ID 兜底；不参与费用采集聚属'
+            : '页面未读到账户ID（可选观测缺失，不阻断费用采集；归属以 shopCfg.cookieFile 为准）',
           businessDate: scope.businessDate,
           dateScopeEvidence: `统计周期 datepicker 实测 ${JSON.stringify(period)}（当天单日）`,
           fetchedAt: new Date(nowFn()).toISOString(),

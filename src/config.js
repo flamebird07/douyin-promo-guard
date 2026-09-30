@@ -209,10 +209,6 @@ function collectPending(cfg) {
     const unknown = cf.scope.filter((s) => !known.includes(s));
     if (unknown.length > 0) push(`monitor.chengfang.scope: 含未知视图 ${unknown.join(',')}（仅支持 ${known.join('/')}）`);
   }
-  if ((cfg.monitor.costDataSource === 'qianchuan' || cfg.monitor.adListDataSource === 'qianchuan')
-    && (!Array.isArray(cfg.shops) || !cfg.shops[0] || isPlaceholder(String(cfg.shops[0].accountId || '')))) {
-    push('shops[0].accountId: 启用千川数据源时必须配置页面实测的千川账户ID（用于账户映射核验）');
-  }
   if (cfg.monitor.mockDataSource === true && cfg.execution.realMode === true) {
     push('真实模式下禁止使用 mockDataSource，请先接入真实页面');
   }

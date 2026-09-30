@@ -48,10 +48,9 @@ function validateSummaryShape(summary, kindLabel) {
 
 /**
  * 单源身份核验：页面 shopId 必须与配置精确相等。
- * 广告账户映射按数据源分别校验（不能一律要求）：
- * - 千川费用源（kind='cost'）：配置了 accountId 时必须提供并精确匹配；
- * - 罗盘订单源（kind='orders'）：页面通常无千川账户概念，不强制要求 accountId，
- *   但若 summary 提供了非空 accountId，则必须与配置精确一致。
+ * 店铺归属以配置绑定的 Cookie 文件 + shopCfg.id 为准；千川页面账户 ID
+ * 仅为可选观测字段，**不得**因缺失或不一致拒绝费用/订单数据（2026-09-28）。
+ * 广告控制页身份（checkControllerIdentity）仍单独核验，不在本函数放宽。
  * @param summary 带 shopId/accountId/kind 的数据源快照
  * @param shopCfg {id, accountId?}
  * @param kindLabel 用于报错说明
@@ -68,25 +67,7 @@ function checkSourceIdentity(summary, shopCfg, kindLabel) {
       { cfgId, srcId }
     );
   }
-  const cfgAccConfigured = shopCfg.accountId !== undefined && shopCfg.accountId !== null && String(shopCfg.accountId).trim() !== '' && !String(shopCfg.accountId).startsWith('TODO');
-  if (!cfgAccConfigured) return;
-  const cfgAcc = String(shopCfg.accountId).trim();
-  const srcAccRaw = summary.accountId === undefined || summary.accountId === null ? '' : String(summary.accountId).trim();
-  const provided = srcAccRaw !== '';
-  if (summary.kind === 'orders') {
-    // 罗盘订单源：无千川账户概念，仅在页面提供 accountId 时核对
-    if (provided && srcAccRaw !== cfgAcc) {
-      throw new AuthError(`${kindLabel}广告账户映射不匹配：配置 ${cfgAcc}，页面 ${srcAccRaw}。零关闭`, { cfgAcc, srcAcc: srcAccRaw });
-    }
-    return;
-  }
-  // 千川费用/广告源：必须提供账户 ID 并精确匹配
-  if (!provided) {
-    throw new AuthError(`${kindLabel}未提供广告账户ID，无法核验与配置账户 ${cfgAcc} 的映射关系，拒绝采用`);
-  }
-  if (srcAccRaw !== cfgAcc) {
-    throw new AuthError(`${kindLabel}广告账户映射不匹配：配置 ${cfgAcc}，页面实际 ${srcAccRaw}。零关闭`, { cfgAcc, srcAcc: srcAccRaw });
-  }
+  // 账户 ID：可选观测，不阻断费用/订单采集聚属（归属=Cookie+shopCfg.id）
 }
 
 /** 业务日期必须等于当前上海统计日期（页面口径与本地时钟一致）。 */
@@ -129,6 +110,8 @@ function checkSameShopAndDate(costSummary, orderSummary) {
 
 /**
  * 广告控制页身份核验（控制器 verifyIdentity 的结果与配置比对）。
+ * 店铺归属=Cookie+shopCfg；千川/乘方账户 ID 为可选观察，不因缺失/不一致拒绝
+ *（2026-09-28）。仍拒绝：非 ok、缺 shopCfg.id、店铺标识不符、名称明确不一致。
  * @param pageIdentity {ok, pageShopId?, pageShopName?, pageAccountId?}
  */
 function checkControllerIdentity(pageIdentity, shopCfg) {
@@ -148,13 +131,7 @@ function checkControllerIdentity(pageIdentity, shopCfg) {
       { cfgId, pageId, pageShopName: pageIdentity.pageShopName }
     );
   }
-  if (shopCfg.accountId !== undefined && shopCfg.accountId !== null) {
-    const cfgAcc = String(shopCfg.accountId).trim();
-    const pageAcc = pageIdentity.pageAccountId === undefined || pageIdentity.pageAccountId === null ? '' : String(pageIdentity.pageAccountId).trim();
-    if (pageAcc !== cfgAcc) {
-      throw new AuthError(`广告控制页账户映射不匹配：配置 ${cfgAcc}，页面实际 ${pageAcc || '(空)'}`);
-    }
-  }
+  // 账户 ID：可选观察，不阻断广告状态读取/开关
   if (shopCfg.name && pageIdentity.pageShopName && String(shopCfg.name).trim() !== String(pageIdentity.pageShopName).trim()) {
     throw new AuthError(`店铺名称不匹配：配置「${shopCfg.name}」，页面实际「${pageIdentity.pageShopName}」`);
   }

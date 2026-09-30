@@ -29,14 +29,15 @@
 const fs = require('fs');
 const path = require('path');
 
-// 推广控制主项目根目录解析：优先环境变量；其次本机生产路径；最后按公开仓库内
-// 相对位置（integrations/bill-manager 向上两级 = 仓库根）探测，使公开仓库中的
-// 副本在无生产路径的机器上也能装配同一份生产模块。
+// 推广控制主项目根目录解析：优先环境变量；再按部署位置探测（本文件位于
+// bill-manager/ 且与 douyin-promo-guard 为兄弟目录）；最后按公开仓库内相对位置
+// （integrations/bill-manager 向上两级 = 仓库根）探测，使公开仓库中的副本在
+// 任意机器上都能装配同一份生产模块（不依赖本机绝对路径）。
 function resolvePromoGuardDir() {
   const candidates = [
     process.env.PROMO_GUARD_DIR,
-    'C:/Users/Administrator/Documents/电商助手/douyin-promo-guard',
-    // 本副本位于 <仓库根>/integrations/bill-manager/，向上两级即仓库根
+    path.join(__dirname, '..', 'douyin-promo-guard'),
+    // 本副本位于 <仓库根>/integrations/bill-manager/ 时，向上两级即仓库根
     path.join(__dirname, '..', '..'),
   ].filter(Boolean);
   for (const c of candidates) {
@@ -136,7 +137,20 @@ function deriveAdState(status, shop) {
   if (shop && shop.lastAdState) {
     const map = { on: { on: true, note: '开启' }, off: { on: false, note: '暂停' }, mixed: { on: null, note: '混合' }, unknown: { on: null, note: '未知' } };
     const m = map[shop.lastAdState] || map.unknown;
-    return { on: m.on, at: shop.lastDataAt || null, note: m.note, state: shop.lastAdState };
+    // 展示时间必须与当前状态同源且仅有状态证据：只读观测优先，其次动作确认。
+    // 无 adStateObservedAt / adStateConfirmedAt 时 at=null；不得用费用/订单采集时间（lastDataAt）冒充。
+    const at = shop.adStateObservedAt || shop.adStateConfirmedAt || null;
+    const evidenceKind = shop.adStateObservedAt ? 'read_only'
+      : (shop.adStateConfirmedAt ? 'action_confirm' : null);
+    return {
+      on: m.on,
+      at,
+      note: m.note,
+      state: shop.lastAdState,
+      confirmedAt: shop.adStateConfirmedAt || null,
+      observedAt: shop.adStateObservedAt || null,
+      evidenceKind,
+    };
   }
   const pt = pausedAt ? Date.parse(pausedAt) : NaN;
   const et = enabledAt ? Date.parse(enabledAt) : NaN;
@@ -170,6 +184,9 @@ function buildShopRows(status) {
         lastDataAt: s.lastDataAt || (s.today && s.today.fetchedAt) || null,
         costCents: s.today && s.today.costCents != null ? s.today.costCents : null,
         orders: s.today && s.today.orders != null ? s.today.orders : null,
+        // 千川可用余额（2026-09-27，账户级只读展示字段；null=本轮未读到，界面显示"未知"）
+        balanceCents: s.today && s.today.balanceCents != null ? s.today.balanceCents : null,
+        balanceAt: s.today && s.today.balanceAt ? s.today.balanceAt : null,
         thresholdCents: s.thresholdCents != null ? s.thresholdCents : null,
         // 账户身份状态（2026-09-25 阶段 6）：界面据此显示"待身份核验/已阻止"
         identityPending: s.identityPending === true,
@@ -209,6 +226,7 @@ function createWatchDrill(opts = {}) {
       phase: null,           // Monitor 调度相位
       windowBlockReason: null,
       enablePhaseToday: [],
+      shopDiscovery: null,   // 运行期店铺发现结果（含落盘成功/待重试；第 13 阶段补验证）
     },
     _logs: [],
     _seq: 0,
@@ -270,18 +288,19 @@ function createWatchDrill(opts = {}) {
   // 绝不含 Cookie/密钥；发送失败只记 warn 日志并在 state.notify 如实展示，
   // 绝不影响值守调度本身。
   // 默认关闭：由生产装配方（server.js）显式开启，测试/公开仓库副本不触发真实发送。
-  // 目标与 hermes 路径可用环境变量覆盖（WATCH_NOTIFY_TARGET / HERMES_BIN）。
+  // 目标与 hermes 路径用环境变量指定（WATCH_NOTIFY_TARGET / HERMES_BIN）；公开副本
+  // 不内置生产通知目标（target 未配置时保持 null，通知发送会被如实标记为失败）。
   const notifyOverride = opts.notify || {};
   const notifyCfg = Object.assign({
     enabled: false,
-    target: process.env.WATCH_NOTIFY_TARGET || 'feishu:oc_3f06614a465eef6c86262bc33677d9c9',
+    target: process.env.WATCH_NOTIFY_TARGET || null,
     timeoutMs: 20000,
   });
   for (const k of Object.keys(notifyOverride)) {
     if (notifyOverride[k] !== undefined) notifyCfg[k] = notifyOverride[k];
   }
   function resolveHermesBin() {
-    const candidates = [process.env.HERMES_BIN, 'C:/Users/Administrator/.local/bin/hermes.exe'].filter(Boolean);
+    const candidates = [process.env.HERMES_BIN].filter(Boolean);
     for (const c of candidates) {
       try { if (fs.existsSync(c)) return c; } catch (_) { /* 换下一个 */ }
     }
@@ -830,6 +849,27 @@ function createWatchDrill(opts = {}) {
     const st = drill.state;
 
     try {
+      // -1) 运行期店铺发现（2026-09-29 第 13 阶段）：每次状态拉取触发带节流的 Cookie 目录
+      // 扫描——新增抖店 Cookie 在一个拉取周期内进入配置与下方 shops/shopRows 展示；来源文件
+      // 删除不删除店铺（合并规则见 shop-discovery）。仅读目录+合并配置，无页面/广告动作。
+      // 第 13 阶段补验证：发现结果（含落盘是否成功/是否待重试）如实进入 /state.shopDiscovery，
+      // 集成层不得在落盘失败时声称"持久化成功"；节流命中不覆盖上次结果。
+      if (typeof m.requestShopDiscovery === 'function') {
+        try {
+          const disc = m.requestShopDiscovery();
+          if (disc && disc.throttled !== true) {
+            st.shopDiscovery = {
+              at: new Date(drill._now()).toISOString(),
+              added: Array.isArray(disc.added) ? disc.added.map((x) => scrub(String(x))) : [],
+              ok: disc.ok === true,
+              persisted: disc.persisted === true,
+              pending: disc.pending === true,
+              reason: disc.reason ? scrub(String(disc.reason)) : null,
+            };
+          }
+        } catch (_) { /* 发现失败不阻塞状态拉取 */ }
+      }
+
       // 0) 门槛每次轮询重读（运行中配置变更 → 界面立即反映；fail-closed）
       refreshGates();
 
@@ -851,6 +891,16 @@ function createWatchDrill(opts = {}) {
       st.running = m.running === true;
       // 多店铺：每店独立广告状态与数据行（保持平台-店铺对应）
       st.shopRows = buildShopRows(status);
+      // 第 13 阶段补验证：shops/shopName 与 shopRows 同源刷新（同一 status.shops、同一 deleted
+      // 过滤），使运行期新增/来源删除后 /state 的 shops、shopRows、shopName 三处一致；旧行为仅在
+      // 装配时赋值，运行期发现新店后 shops/shopName 会滞后于 shopRows。
+      const activeStatusShops = (status.shops || []).filter((s) => s && s.deleted !== true);
+      drill.shops = activeStatusShops.map((s) => ({
+        id: s.id,
+        name: s.displayName || s.name || s.id,
+        platform: s.platform || 'douyin',
+      }));
+      drill.shopName = drill.shops.map((s) => s.name).join('、') || '—';
       st.adState = st.shopRows.length ? st.shopRows[0].adState : deriveAdState(status, (status.shops || [])[0]);
       const thrRule = (status.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
       st.thresholdCents = st.shopRows.length && st.shopRows[0].thresholdCents != null
@@ -1221,7 +1271,13 @@ function createWatchDrill(opts = {}) {
       shopName: drill.shopName,
       shops: drill.shops || [],
       shopRows: st.shopRows || [],
+      // 运行期店铺发现结果（第 13 阶段补验证）：如实透出落盘成功/待重试，集成层不假称成功
+      shopDiscovery: st.shopDiscovery || null,
       lastRounds: st.lastRounds || {},
+      // 手动验证每日开启（2026-09-29 第 10 阶段）：异步状态可回读（running/done/failed）
+      manualVerify: (m && typeof m.getManualEnableVerifyStatus === 'function')
+        ? m.getManualEnableVerifyStatus()
+        : (st.manualVerify || null),
       realMode: m ? m.realMode === true : (gates ? gates.realMode === true : drill.realMode),
       // 首次启动前也如实告知：模式是否已知、配置声明的模式是什么
       realModeKnown: gates ? gates.modeKnown !== false : false,
@@ -1328,6 +1384,17 @@ function createWatchDrill(opts = {}) {
       // 独立每日开启任务控制（与"启动值守"完全分离；页面提供独立按钮）
       if (p === '/api/watch-drill/daily-enable/start' && req.method === 'POST') return send(200, { ok: true, state: startEnableScheduler() });
       if (p === '/api/watch-drill/daily-enable/stop' && req.method === 'POST') return send(200, { ok: true, state: stopEnableScheduler() });
+      // 手动验证每日开启（2026-09-29 第 10 阶段）：body={shopId}；单店任意时刻触发同一开启预检链。
+      // 异步执行（HTTP 不悬挂），进度经 GET /state 的 manualVerify 字段回读；不改变自动排程。
+      if (p === '/api/watch-drill/daily-enable/verify' && req.method === 'POST') {
+        const body = await readBody(req);
+        const shopId = body && body.shopId;
+        if (!shopId) return send(400, { ok: false, error: '缺少 shopId' });
+        const m2 = ensureMonitor();
+        const r = m2.runManualEnableVerify(String(shopId));
+        pushLog(r.ok ? 'info' : 'warn', `手动验证每日开启${r.ok ? '已启动' : '被拒绝'}：${shopId}${r.error ? ' · ' + r.error : ''}`);
+        return send(r.ok ? 200 : 409, { ...r, state: snapshot() });
+      }
       // 阈值调整（2026-09-21）：body 为 { thresholdCents } 或 { yuan }；点「确定」后才生效并落盘
       if (p === '/api/watch-drill/threshold' && req.method === 'POST') {
         const body = await readBody(req);

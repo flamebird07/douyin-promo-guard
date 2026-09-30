@@ -275,10 +275,11 @@ test('独立失败用例：身份不匹配 → 不声称成功，零动作', asy
 });
 
 // 2026-09-24 生产实录回归：费用源 accountId 与配置不一致 →
-// 「全店推广费用广告账户映射不匹配：配置 X，页面实际 Y。零关闭」（code=AUTH）。
-// fail-closed 契约：轮询阻断、零广告动作、明确返回阻止原因、
-// 绝不把页面账户写回配置（等主脑人工核对后另行修改）。
-test('账户映射不匹配（费用源 accountId）：轮询 fail-closed 阻断，零动作，配置不被覆盖', async (t) => {
+// 「费用源账户映射不匹配」新契约（Cookie 归属）：店铺归属=Cookie 文件+店铺 ID，
+// 费用源 accountId 与配置不一致不再触发 AUTH；动作仍由费用/订单/阈值/广告状态门禁决定。
+// 本夹具费用 500 分 ≤ 订单 10×阈值 100 分（未超标）且回读当前已开启 → 按指标保持、
+// 零点击；写保护保留：绝不把页面账户写回配置。
+test('费用源账户映射不匹配：不因 ID 阻断，低于阈值且已开启→保持零点击，配置逐字节不变', async (t) => {
   const { monitor, cfgPath, controllers, readers } = setupShops(t, {
     shops: [
       { id: 'shop-a', name: '甲店', compassShopName: '甲店罗盘', cookieFile: '甲店', accountId: '1710242295996424', enabled: true, platform: 'douyin' },
@@ -293,12 +294,10 @@ test('账户映射不匹配（费用源 accountId）：轮询 fail-closed 阻断
   const p = await monitor.pollOnce('test');
   const r = (p.results || []).find((x) => x.shopId === 'shop-a');
   assert.ok(r, '店铺必须有轮询结果（不静默漏掉）');
-  assert.strictEqual(r.status, 'stopped', `轮询必须 fail-closed 阻断，实际：${JSON.stringify(r).slice(0, 200)}`);
-  assert.strictEqual(r.code, 'AUTH', '身份类错误 code=AUTH');
-  assert.match(r.reason, /广告账户映射不匹配/, '须写明账户映射不匹配');
-  assert.match(r.reason, /配置 1710242295996424/, '须写明配置账户');
-  assert.match(r.reason, /页面实际 100761046755/, '须写明页面实际账户');
-  assert.match(r.reason, /零关闭/, '须声明零关闭');
+  assert.strictEqual(r.status, 'ok', `轮询应正常完成（不因账户 ID 阻断），实际：${JSON.stringify(r).slice(0, 200)}`);
+  assert.strictEqual(r.over, false, '费用 500 分 ≤ 订单 10×阈值 100 分：未超标');
+  assert.strictEqual(r.zeroClick, true, '低于阈值且当前已开启：零点击');
+  assert.strictEqual(r.decision, 'already_on', '按指标与当前广告状态保持');
   assert.strictEqual(controllers.get('shop-a').state.closeCalls.length, 0, '零广告动作');
   // 绝不把页面账户覆盖进配置
   const after = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));

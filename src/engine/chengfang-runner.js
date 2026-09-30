@@ -392,8 +392,11 @@ class ChengfangRunner {
    * 返回与 Monitor._recordBatch/_summarizeBatch 兼容的批次结果。
    */
   /**
-   * @param {'daily_schedule'|'threshold_recovery'} [p.enableSource]
-   *   缺省 daily_schedule（旧定时开启）；threshold_recovery 走值守窗口 dailyStartHour 起。
+   * @param {'daily_schedule'|'threshold_recovery'|'manual_verify'} [p.enableSource]
+   *   缺省 daily_schedule（旧定时开启，enableHour 起至当日结束——2026-09-29 第 10 阶段去除
+   *   dailyStartHour 上界，支持 enableHour 晚于 dailyStartHour 的配置）；
+   *   threshold_recovery 走值守窗口 dailyStartHour 起；
+   *   manual_verify 人工按需验证（无时段门槛，其余门槛照常，fail-closed 不变）。
    */
   async executeChengfangEnableBatch({ shopCfg, cycleToken, trigger, pageOpener, loginCfg, enableSource = 'daily_schedule' }) {
     const batchDate = shanghaiDate(this.now());
@@ -409,21 +412,20 @@ class ChengfangRunner {
     if (!realAllowed.ok) {
       return { outcome: 'blocked', reason: realAllowed.reason, counts, batchDate, error: null };
     }
-    if (src !== 'daily_schedule' && src !== 'threshold_recovery') {
+    if (src !== 'daily_schedule' && src !== 'threshold_recovery' && src !== 'manual_verify') {
       return { outcome: 'blocked', reason: `未知开启来源 ${JSON.stringify(src)}：拒绝放行`, counts, batchDate, error: null };
     }
     const w = shanghaiWall(this.now());
     if (src === 'daily_schedule') {
-      if (!(w.hour >= enableHour && w.hour < dailyStartHour)) {
+      if (!(w.hour >= enableHour)) {
         const hh = String(enableHour).padStart(2, '0');
-        const dh = String(dailyStartHour).padStart(2, '0');
         return {
           outcome: 'blocked_window',
-          reason: `未到允许开启时段（每日 ${hh}:00–${dh}:00，Asia/Shanghai），本轮不执行真实开启`,
+          reason: `未到允许开启时段（每日 ${hh}:00 起至当日结束，Asia/Shanghai），本轮不执行真实开启`,
           counts, batchDate,
         };
       }
-    } else if (!isAfterDailyStart(this.now(), dailyStartHour)) {
+    } else if (src === 'threshold_recovery' && !isAfterDailyStart(this.now(), dailyStartHour)) {
       const hh = String(dailyStartHour).padStart(2, '0');
       return {
         outcome: 'blocked_window',

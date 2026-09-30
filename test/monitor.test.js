@@ -46,10 +46,10 @@ function setup(t, {
 }
 
 // ── 基础停机条件 ─────────────────────────────────────────────────
-test('停止后立即启动：等待旧读取结束，再遍历全部店铺，不把互斥跳过算成一轮', async (t) => {
+test('停止后立即启动：等待旧读取结束，再遍历全部店铺；同轮最多 2 家并行', async (t) => {
   const clock = makeClock(shanghaiMs('2026-09-27', '10:00'));
   const { monitor } = setup(t, { clock });
-  monitor.config.shops = [{ id: 'a', enabled: true }, { id: 'b', enabled: true }];
+  monitor.config.shops = [{ id: 'a', enabled: true }, { id: 'b', enabled: true }, { id: 'c', enabled: true }];
   let release;
   const held = new Promise(resolve => { release = resolve; });
   const calls = [];
@@ -58,20 +58,25 @@ test('停止后立即启动：等待旧读取结束，再遍历全部店铺，�
   monitor._pollShop = async (shop) => {
     calls.push(shop.id);
     peak = Math.max(peak, ++inFlight);
+    // 第一轮仅第一家挂起，观察并行度；后续不挂
     if (calls.length === 1) await held;
     inFlight--;
     return { status: 'ok' };
   };
   t.after(() => { release(); monitor.stop(); });
   monitor.start();
-  await waitFor(() => calls.length === 1);
+  await waitFor(() => calls.length >= 1);
+  // 有界并行：第二家应与第一家重叠开始，但峰值不超过 2
+  await waitFor(() => peak >= 2 || calls.length >= 2, 2000);
+  assert.ok(peak <= 2, `并行上限为 2，实际 peak=${peak}`);
   monitor.stop();
   monitor.start();
   assert.equal(monitor.schedule.nextRunAt, null);
   release();
-  await waitFor(() => calls.length === 3, 3000);
-  assert.deepEqual(calls, ['a', 'a', 'b']);
-  assert.equal(peak, 1);
+  await waitFor(() => calls.length >= 4, 3000);
+  assert.ok(peak <= 2, `并行上限为 2，实际 peak=${peak}`);
+  // 结果按配置顺序归集（不串店）
+  assert.ok(calls.includes('a') && calls.includes('b') && calls.includes('c'));
 });
 
 test('默认未接入：轮询明确停在"尚未接入"，不伪造数据', async (t) => {

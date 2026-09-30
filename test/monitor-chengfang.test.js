@@ -473,7 +473,10 @@ async function makeDryFixture(fixture) {
   return { opener, readClickLog: () => clickLog };
 }
 
-const BAD_NAV = '首页 乘方 全域投放 品牌投放 伊人美 ID：1999888877776666';
+// 结构性身份失败负例：URL 与"商品自选/全店托管"子视图保持正常，但导航缺少"乘方"
+// → readChengfangAccountInPage 判 hasChengfangNav=false → verifyIdentity 拒绝
+// （页面账户 ID 缺失/变化已不构成身份失败，错误管理页/缺导航/缺子视图仍拒绝）。
+const NO_CF_NAV = '首页 全域投放 品牌投放 数据 工具 财务 营销学堂';
 
 test('演练入口强制只读：realMode+pauseEnabled 全开也走 dryRun，托管/暂停/开启/删除均零点击', async () => {
   const cfg = makeCfgResult({
@@ -500,7 +503,7 @@ test('演练失败透出（Runner级）：身份核验失败 → dry_failed，�
     monitor: { chengfang: { scope: ['全店托管', '商品自选'], pauseEnabled: true } },
   });
   const runner = new ChengfangRunner({ coordinator: {}, config: cfg.config });
-  const { opener, readClickLog } = await makeDryFixture({ plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(3) }, navText: BAD_NAV });
+  const { opener, readClickLog } = await makeDryFixture({ plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(3) }, navText: NO_CF_NAV });
   const res = await runner.runDryCycle({ shopCfg: SHOP, pageOpener: opener, loginCfg: {} });
   assert.strictEqual(res.outcome, 'dry_failed');
   assert.match(res.error, /身份核验失败/);
@@ -511,7 +514,7 @@ test('演练失败透出（Runner级）：身份核验失败 → dry_failed，�
 test('主链路集成：演练身份核验失败 → trigger 透出 failed，不计为正常枚举', async (t) => {
   const { monitor, track } = await setupChengfangMonitor(t, {
     execution: { realMode: false, dryRun: true },
-    fixture: { plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(3) }, navText: BAD_NAV },
+    fixture: { plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(3) }, navText: NO_CF_NAV },
   });
   const r = await monitor.pollOnce('test');
   assert.strictEqual(r.results[0].chengfang.outcome, 'dry_failed');
@@ -593,7 +596,7 @@ test('贴近点击 + gate 实时：批次中关闭暂停许可 → 已发出托�
   assert.strictEqual(deleteClicks(track.clickLog).length, 0);
 });
 
-test('贴近点击：页面账户变化 → beforeDispatch 身份复检拦截，零点击停止', async (t) => {
+test('贴近点击：页面结构变化（乘方导航消失）→ beforeDispatch 身份复检拦截，零点击停止', async (t) => {
   const clock = makeClock(shanghaiMs('2026-09-12', '08:00'));
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
@@ -604,7 +607,7 @@ test('贴近点击：页面账户变化 → beforeDispatch 身份复检拦截，
         await page.evaluate((txt) => {
           const n = document.querySelector('.qc-page-navigator-container');
           if (n) n.textContent = txt;
-        }, BAD_NAV); // 账户身份变化 只在 select 完成后、点击派发前生效 → beforeDispatch verifyIdentity 拦截
+        }, NO_CF_NAV); // 点击派发前导航"乘方"消失（结构变化）→ beforeDispatch verifyIdentity 复检拦截
         return orig(p);
       };
       return ctrl;
@@ -775,13 +778,13 @@ test('自动开启调度：监控未启动 → 手动 pollOnce（07:00）也不�
 });
 
 test('第三轮：真实开启路径被窗口拦下 → trigger 带 targetAction=enable（动作标签不得缺失）', async (t) => {
-  const clock = makeClock(shanghaiMs('2026-09-12', '08:30'));
+  const clock = makeClock(shanghaiMs('2026-09-12', '06:59'));
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
     monitorChengfang: { pauseEnabled: true, enableEnabled: true },
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
   });
-  // 直接驱动 Monitor 的单店铺开启相位（08:30 已过开启窗口 [07:00,08:00)）→
+  // 直接驱动 Monitor 的单店铺开启相位（06:59 未到 enableHour=7——第 10 阶段窗口改为 [07:00,24)）→
   // runner 集中门槛拦截 → blocked_window trigger（真实代码路径，非手工塞事件）
   await monitor._runShopEnablePhase(monitor.config.shops[0], { aborted: false });
   const tr = monitor.triggers.find((x) => x.mode === 'real' && x.blocked === 'window');
@@ -903,8 +906,8 @@ test('上线：独立停用每日开启 → 07:00 零请求；持久化停用标
   monitor2.stopEnableScheduler({ byUser: false, reason: 'test-cleanup' });
 });
 
-test('上线：08:00 后启动调度器 → 记录"错过窗口"原因，不擅自补开，下次=明日 07:00', async (t) => {
-  const clock = makeClock(shanghaiMs('2026-09-12', '08:05'));
+test('上线：凌晨启动调度器（前日无记录）→ 记录"错过窗口"原因，不擅自补开，下次=当日 07:00（第 10 阶段：窗口 [enableHour,24)，missed 在次日凌晨判定）', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-13', '00:30'));
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
     execution: { realMode: false, dryRun: true },
@@ -916,6 +919,7 @@ test('上线：08:00 后启动调度器 → 记录"错过窗口"原因，不擅�
   await waitFor(() => clock.pending() >= 1, 8000, '调度器登记明日窗口');
   const es = monitor.getStatus().monitor.enableScheduler;
   assert.match(es.lastMissedReason || '', /错过|不擅自补开/, '必须记录错过窗口原因');
+  assert.match(es.lastMissedReason || '', /2026-09-12/, '错过日期应为前一日（2026-09-12）');
   assert.strictEqual(track.sessions, 0, '08:00 后零页面会话（不补开）');
   assert.strictEqual(monitor.triggers.length, 0);
   const next = new Date(es.nextRunAt);
@@ -923,9 +927,11 @@ test('上线：08:00 后启动调度器 → 记录"错过窗口"原因，不擅�
   assert.strictEqual(wall.hour, 7, '下次开启必须是明日 07:00（上海）');
   assert.strictEqual(wall.date, '2026-09-13');
 });
+// 补充（第 10 阶段）：过点启动（如 15:00）不再当日记 missed——窗口持续到午夜，
+// 「错过」只能在跨入次日的凌晨段判定；过点启动当天零执行、零 missed 记录。
 
 test('上线：当日已 success 后窗口内重启 → 不重复开启（真实模式，零新会话）', async (t) => {
-  const clock = makeClock(shanghaiMs('2026-09-12', '07:00'));
+  const clock = makeClock(shanghaiMs('2026-09-12', '06:59'));
   const { monitor, track, dataDir, cfgResult, controller, reader } = await setupChengfangMonitor(t, {
     clock,
     monitorChengfang: { enableSchedulerEnabled: true, enableEnabled: true },
@@ -933,7 +939,10 @@ test('上线：当日已 success 后窗口内重启 → 不重复开启（真实
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
   });
   await monitor.startEnableScheduler({ reason: 'test' });
-  await waitFor(() => clock.pending() >= 1, 20000, '挂起等待（07:00 已在窗口内，应立即处理；含真实开启+落地轮询耗时）');
+  // 第 10 阶段：07:00 整启动会被"过点闸门"判为明日（不倒补），故从 06:59 注册当日 07:00 后推进
+  await waitFor(() => clock.pending() >= 1, 8000, '调度器登记（等待当日 07:00）');
+  clock.releaseOne(); // 推进到 07:00，循环进入窗口执行
+  await waitFor(() => clock.pending() >= 1, 20000, '挂起等待（07:00 在窗口内，应处理；含真实开启+落地轮询耗时）');
   // 07:00 在窗口内：循环先处理今日开启再挂起等待 08:00
   await waitFor(() => monitor.actions.length >= 1 && monitor.actions[0].allEnabledConfirmed === true, 20000, "真实开启批次执行");
   await waitFor(() => (monitor.getStatus().shops[0].enablePhase || {}).status === 'success', 15000, '开启成功持久化');

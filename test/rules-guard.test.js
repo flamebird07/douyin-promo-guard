@@ -86,11 +86,19 @@ test('逐源身份核验：WRONG_SHOP 快照必须被拒绝（Codex 复核问题
   assert.doesNotThrow(() => guard.checkSourceIdentity(costSummary(), SHOP, '全店推广费用'));
 });
 
-test('逐源身份核验：配置了广告账户 ID 时账户映射必须一致', () => {
+test('逐源身份核验：千川账户 ID 为可选观测，缺失或不一致均不得因 ID 报 AUTH', () => {
   const shopAcc = { ...SHOP, accountId: 'acc-1' };
+  // 与配置一致
   assert.doesNotThrow(() => guard.checkSourceIdentity(costSummary({ accountId: 'acc-1' }), shopAcc, '全店推广费用'));
-  assert.throws(() => guard.checkSourceIdentity(costSummary({ accountId: 'acc-2' }), shopAcc, '全店推广费用'), AuthError);
-  assert.throws(() => guard.checkSourceIdentity(costSummary({ accountId: null }), shopAcc, '全店推广费用'), AuthError);
+  // 与配置不同：不得因 ID 本身拒绝（归属=Cookie+shopCfg.id）
+  assert.doesNotThrow(() => guard.checkSourceIdentity(costSummary({ accountId: 'acc-2' }), shopAcc, '全店推广费用'));
+  // 页面未读到 ID
+  assert.doesNotThrow(() => guard.checkSourceIdentity(costSummary({ accountId: null }), shopAcc, '全店推广费用'));
+  assert.doesNotThrow(() => guard.checkSourceIdentity(costSummary({ accountId: undefined }), shopAcc, '全店推广费用'));
+  // 订单源同样不因 ID 阻断
+  assert.doesNotThrow(() => guard.checkSourceIdentity(orderSummary({ accountId: 'acc-2' }), shopAcc, '全店订单数'));
+  // shopId 仍必须精确匹配
+  assert.throws(() => guard.checkSourceIdentity(costSummary({ accountId: null, shopId: 'WRONG' }), shopAcc, '全店推广费用'), AuthError);
 });
 
 test('业务日期必须是当天（上海）—— 跨日数据不用于关闭决策', () => {
@@ -115,6 +123,30 @@ test('广告控制页身份核验：不匹配/未读取都拒绝', () => {
   assert.throws(() => guard.checkControllerIdentity({ ok: true, pageShopId: 'shop-999' }, SHOP), AuthError);
   assert.throws(() => guard.checkControllerIdentity({ ok: false, reason: '身份校验未接入' }, SHOP), AuthError);
   assert.throws(() => guard.checkControllerIdentity(null, SHOP), AuthError);
+});
+
+test('广告控制页账户 ID 为可选观察：缺失或不一致不得因 ID 拒绝', () => {
+  const shopAcc = { ...SHOP, accountId: 'acc-1' };
+  // 缺失
+  assert.doesNotThrow(() => guard.checkControllerIdentity(
+    { ok: true, pageShopId: 'shop-001', pageShopName: '测试店铺一', pageAccountId: null },
+    shopAcc
+  ));
+  // 不一致
+  assert.doesNotThrow(() => guard.checkControllerIdentity(
+    { ok: true, pageShopId: 'shop-001', pageShopName: '测试店铺一', pageAccountId: 'acc-2' },
+    shopAcc
+  ));
+  // 一致（观察值原样）
+  assert.doesNotThrow(() => guard.checkControllerIdentity(
+    { ok: true, pageShopId: 'shop-001', pageShopName: '测试店铺一', pageAccountId: 'acc-1' },
+    shopAcc
+  ));
+  // 其他安全门禁仍在：shopId 不符仍拒绝
+  assert.throws(() => guard.checkControllerIdentity(
+    { ok: true, pageShopId: 'shop-999', pageAccountId: 'acc-2' },
+    shopAcc
+  ), AuthError);
 });
 
 test('广告清单分页核验：未读完（hasNext=true）必须拒绝；逐页身份核验', () => {

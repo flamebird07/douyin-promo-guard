@@ -151,16 +151,18 @@ test('每日开启对自动发现店正常进入开启批次', async (t) => {
   m.enableRunning = false;
 });
 
-test('显式配置的账户号不匹配时仍按原有 AUTH 校验阻止', async (t) => {
+test('显式配置的账户号不匹配：不因 ID 阻断，超标仍执行原有关闭路径，配置不被覆盖', async (t) => {
   const { m, controllers, disk } = setup(t, {
     shops: [{ id: 'shop-m', name: '甲店', cookieFile: '甲店', enabled: true, accountId: 'ACC-M' }],
     costAccountId: 'ACC-WRONG', pageAccountId: 'ACC-M', controllerAccountId: 'ACC-M',
   });
   const p = await m.pollOnce('test');
-  assert.strictEqual(p.results[0].status, 'stopped');
-  assert.strictEqual(p.results[0].code, 'AUTH');
-  assert.strictEqual(controllers.get('shop-m').state.closeCalls.length, 0);
-  assert.strictEqual(disk().shops[0].accountId, 'ACC-M');
+  // 归属=Cookie 文件+店铺 ID：费用源实测 ACC-WRONG / 乘方页 ACC-M 与配置 ACC-M 不一致
+  // 不得仅因此 AUTH 停机；本夹具费用 2000 分 > 10 单×100 分（超标）且广告投放中，
+  // 应与无账户号用例同构，照常执行原有整店关闭路径。
+  assert.notStrictEqual(p.results[0].status, 'stopped', '不得仅因账户 ID 不一致返回 AUTH 停机');
+  assert.strictEqual(controllers.get('shop-m').state.closeCalls.length, 1, '超标且投放中：使用该店 Cookie 会话执行原有关闭路径');
+  assert.strictEqual(disk().shops[0].accountId, 'ACC-M', '配置账户字段不被页面观察值覆盖');
 });
 
 test('已删除店不进入巡查和每日开启', async (t) => {

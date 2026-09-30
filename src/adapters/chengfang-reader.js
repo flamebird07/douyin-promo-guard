@@ -1445,19 +1445,19 @@ function createChengfangController(p) {
       if (!st.hasSubTabs) {
         return { ok: false, reason: '乘方页未找到"商品自选/全店托管"子标签' };
       }
-      if (shopCfg.accountId) {
-        const cfgAcc = String(shopCfg.accountId).trim();
-        if (!st.accountId || st.accountId !== cfgAcc) {
-          return { ok: false, reason: `账户不匹配：配置 ${cfgAcc}，页面 ${st.accountId || '(空)'}` };
-        }
+      if (!st.hasChengfangNav) {
+        return { ok: false, reason: '页面缺少乘方导航（未在乘方管理页导航上下文）' };
       }
+      // Cookie 绑定决定店铺归属；页面账户 ID 仅作可选观察，缺失/不同均不得阻断
+      // 广告状态读取或开关（2026-09-28）。不伪造、不写回配置。
       return {
         ok: true,
         pageShopId: String(shopCfg.id || ''),
         pageShopName: shopCfg.name || null,
-        pageAccountId: st.accountId,
-        pageAccountName: st.accountName,
+        pageAccountId: st.accountId || null,
+        pageAccountName: st.accountName || null,
         pageUrl: st.url,
+        accountIdOptional: true,
       };
     },
 

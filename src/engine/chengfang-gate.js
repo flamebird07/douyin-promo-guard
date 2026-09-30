@@ -81,9 +81,12 @@ function resolveChengfangEnableAllowed(config) {
  */
 /**
  * @param {'pause'|'enable'} [p.action]
- * @param {'daily_schedule'|'threshold_recovery'} [p.enableSource]
- *   daily_schedule：[enableHour, dailyStartHour)；
- *   threshold_recovery：值守窗口 dailyStartHour 起（周期低阈值恢复）。
+ * @param {'daily_schedule'|'threshold_recovery'|'manual_verify'} [p.enableSource]
+ *   daily_schedule：enableHour 起至当日结束（2026-09-29 第 10 阶段去除 dailyStartHour 上界，
+ *     支持 enableHour 晚于 dailyStartHour 的配置；每日一次由监控相位调度保证）；
+ *   threshold_recovery：值守窗口 dailyStartHour 起（周期低阈值恢复）；
+ *   manual_verify：人工按需验证（2026-09-29 第 10 阶段）——不设时段门槛（任意时刻可验证），
+ *     但保留停止信号、跨日、realMode、enableEnabled、dryRun 全部门禁（fail-closed 不变）。
  *   缺省/未识别按 daily_schedule（旧定时开启语义）；显式非法值拒绝。
  */
 function buildChengfangRequestGate({ config, nowFn, stopRequested, businessDate, action = 'pause', enableSource = 'daily_schedule' }) {
@@ -97,21 +100,21 @@ function buildChengfangRequestGate({ config, nowFn, stopRequested, businessDate,
       return { ok: false, reason: `停止信号：不再发出新的${label}请求` };
     }
     if (action === 'enable') {
-      if (src !== 'daily_schedule' && src !== 'threshold_recovery') {
+      if (src !== 'daily_schedule' && src !== 'threshold_recovery' && src !== 'manual_verify') {
         return { ok: false, reason: `未知开启来源 ${JSON.stringify(src)}：拒绝放行` };
       }
       const w = shanghaiWall(nowFn());
       if (src === 'daily_schedule') {
-        if (w.hour < enableHour || w.hour >= sch.dailyStartHour) {
+        if (w.hour < enableHour) {
           const hh = String(enableHour).padStart(2, '0');
-          const dh = String(sch.dailyStartHour).padStart(2, '0');
-          return { ok: false, reason: `未到允许开启时段（每日 ${hh}:00–${dh}:00，Asia/Shanghai）：不再发出新的开启请求` };
+          return { ok: false, reason: `未到允许开启时段（每日 ${hh}:00 起至当日结束，Asia/Shanghai）：不再发出新的开启请求` };
         }
-      } else if (!isAfterDailyStart(nowFn(), sch.dailyStartHour)) {
+      } else if (src === 'threshold_recovery' && !isAfterDailyStart(nowFn(), sch.dailyStartHour)) {
         // threshold_recovery：仅值守窗口（dailyStartHour 起）
         const hh = String(sch.dailyStartHour).padStart(2, '0');
         return { ok: false, reason: `未到值守窗口（每日 ${hh}:00 后，Asia/Shanghai）：周期恢复开启被拒绝` };
       }
+      // manual_verify：无时段门槛（人工显式验证可任意时刻），其余门禁照常
     } else if (!isAfterDailyStart(nowFn(), sch.dailyStartHour)) {
       const hh = String(sch.dailyStartHour).padStart(2, '0');
       return { ok: false, reason: `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：不再发出新的暂停请求` };

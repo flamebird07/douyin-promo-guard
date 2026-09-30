@@ -32,6 +32,7 @@ const {
   parseBalanceTextToCents,
   readQianchuanBalanceInPage,
   balanceCentsFromPageResult,
+  createChengfangController,
 } = require('../src/adapters/chengfang-reader');
 
 const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
@@ -579,4 +580,100 @@ test('行内开关：找不到目标行 → 拒绝', async () => {
   const r = await page.evaluate(clickChengfangRowSwitchByPlanId, '999999999999999999');
   assert.strictEqual(r.ok, false);
   assert.match(r.reason, /未找到计划ID/);
+});
+
+// ── verifyIdentity：账户 ID 可选观察（Cookie 归属）────────────────────
+
+async function loadIdentityPage(navText, urlPath) {
+  const html = `<!DOCTYPE html><html><body>
+    <div class="qc-page-navigator-container">${navText}</div>
+    <div role="tab">商品自选</div>
+    <div role="tab">全店托管</div>
+  </body></html>`;
+  const p = await browser.newPage();
+  await p.route('**/uni-prom/overall**', (route) => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html }));
+  await p.goto(urlPath, { waitUntil: 'load' });
+  return p;
+}
+
+test('verifyIdentity：账户 ID 缺失/不一致不因 ID 失败；错误 URL/缺子视图仍拒绝', async () => {
+  const controller = createChengfangController({ loadWaitMs: 10, tabWaitMs: 5 });
+  const shopCfg = { id: 'shop-iso-1', name: '隔离店', cookieFile: 'iso-ck', accountId: '1710242295996424' };
+  const QC = 'https://qianchuan.jinritemai.com/uni-prom/overall?aavid=x';
+  const BAD = 'https://qianchuan.jinritemai.com/home';
+
+  // 1) 页面 ID 与配置不同 → ok
+  let p = await loadIdentityPage('乘方 伊人美 ID：999000111222333', QC);
+  let r = await controller.verifyIdentity({ page: p, shopCfg });
+  assert.strictEqual(r.ok, true, `不得因 ID 不一致失败：${r.reason || ''}`);
+  assert.strictEqual(String(r.pageAccountId), '999000111222333', '观察值原样保留');
+  assert.notStrictEqual(String(r.pageAccountId), shopCfg.accountId);
+  await p.close();
+
+  // 2) 页面 ID 缺失 → ok
+  p = await loadIdentityPage('乘方 伊人美', QC);
+  r = await controller.verifyIdentity({ page: p, shopCfg });
+  assert.strictEqual(r.ok, true, `不得因 ID 缺失失败：${r.reason || ''}`);
+  assert.ok(!r.pageAccountId, '缺失不得伪造成配置 ID');
+  await p.close();
+
+  // 3) 错误 URL 仍拒绝
+  p = await loadIdentityPage('乘方 伊人美 ID：1710242295996424', BAD);
+  r = await controller.verifyIdentity({ page: p, shopCfg });
+  assert.strictEqual(r.ok, false);
+  assert.match(String(r.reason), /未在乘方管理页/);
+  await p.close();
+
+  // 4) 缺必需子视图仍拒绝
+  const p2 = await browser.newPage();
+  await p2.route('**/uni-prom/overall**', (route) => route.fulfill({
+    status: 200, contentType: 'text/html; charset=utf-8',
+    body: '<html><body><div class="qc-page-navigator-container">乘方 伊人美 ID：1710242295996424</div></body></html>',
+  }));
+  await p2.goto(QC, { waitUntil: 'load' });
+  r = await controller.verifyIdentity({ page: p2, shopCfg });
+  assert.strictEqual(r.ok, false);
+  assert.match(String(r.reason), /子标签/);
+  await p2.close();
+});
+
+test('verifyIdentity：正确 URL + 两子视图但无乘方导航 → 必须拒绝', async () => {
+  const controller = createChengfangController({ loadWaitMs: 10, tabWaitMs: 5 });
+  const shopCfg = { id: 'shop-iso-2', name: '隔离店2', cookieFile: 'iso-ck2', accountId: '1710242295996424' };
+  const QC = 'https://qianchuan.jinritemai.com/uni-prom/overall?aavid=x';
+  // URL 正确、子视图齐全，但导航文本不含「乘方」
+  const p = await browser.newPage();
+  await p.route('**/uni-prom/overall**', (route) => route.fulfill({
+    status: 200, contentType: 'text/html; charset=utf-8',
+    body: `<!DOCTYPE html><html><body>
+      <div class="qc-page-navigator-container">首页 全域投放 品牌投放 数据 工具 财务 伊人美 ID：1710242295996424</div>
+      <div role="tab">商品自选</div>
+      <div role="tab">全店托管</div>
+    </body></html>`,
+  }));
+  await p.goto(QC, { waitUntil: 'load' });
+  const st = await p.evaluate(readChengfangAccountInPage);
+  assert.strictEqual(st.hasSubTabs, true, 'fixture 须具备两子视图');
+  assert.strictEqual(st.hasChengfangNav, false, 'fixture 须无乘方导航');
+  const r = await controller.verifyIdentity({ page: p, shopCfg });
+  assert.strictEqual(r.ok, false, '正确 URL + 子视图仍不足以通过');
+  assert.match(String(r.reason), /乘方导航/);
+  await p.close();
+});
+
+test('verifyIdentity：有乘方导航时账户 ID 缺失/不同仍通过', async () => {
+  const controller = createChengfangController({ loadWaitMs: 10, tabWaitMs: 5 });
+  const shopCfg = { id: 'shop-iso-3', name: '隔离店3', cookieFile: 'iso-ck3', accountId: '1710242295996424' };
+  const QC = 'https://qianchuan.jinritemai.com/uni-prom/overall?aavid=x';
+
+  let p = await loadIdentityPage('乘方 伊人美', QC); // 有导航、无 ID
+  let r = await controller.verifyIdentity({ page: p, shopCfg });
+  assert.strictEqual(r.ok, true, `有导航+无 ID 应通过：${r.reason || ''}`);
+  await p.close();
+
+  p = await loadIdentityPage('乘方 伊人美 ID：999000111222333', QC); // 有导航、ID 不同
+  r = await controller.verifyIdentity({ page: p, shopCfg });
+  assert.strictEqual(r.ok, true, `有导航+ID 不同应通过：${r.reason || ''}`);
+  assert.strictEqual(String(r.pageAccountId), '999000111222333');
+  await p.close();
 });

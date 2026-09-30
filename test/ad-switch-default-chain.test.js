@@ -107,7 +107,9 @@ test('默认读取：全开→on；全关→off；混合→mixed（不注入 rea
 
 test('默认读取：身份失败 / 读取失败 → error(blocked)，零动作', async (t) => {
   const clock = makeClock(shanghaiMs('2026-09-12', '08:30'));
-  const bad = '首页 乘方 全域投放 品牌投放 伊人美 ID：1999888877776666';
+  // 结构性身份失败负例：URL 与子视图正常，但导航缺少"乘方"→ verifyIdentity 拒绝
+  //（页面账户 ID 变化已不构成身份失败）。
+  const bad = '首页 全域投放 品牌投放 数据 工具 财务 营销学堂';
   const a = await setupDefault(t, {
     clock, costCents: 5000,
     fixture: { plans: { '全店托管': ZIX(1), '商品自选': ZIX(1) }, navText: bad },
@@ -171,8 +173,10 @@ test('mixed 只开启暂停项（不点已开）', async (t) => {
   assert.strictEqual(pauseClicks(track.clickLog).length, 0);
 });
 
-test('07:00 定时开启仍受原窗口（窗外 blocked_window）', async (t) => {
-  const clock = makeClock(shanghaiMs('2026-09-12', '08:30'));
+test('07:00 定时开启窗口未到点拒绝（enableHour 前 blocked_window）', async (t) => {
+  // 窗口语义（2026-09-29 去上界后）：daily_schedule 自 enableHour 起至当日结束均放行，
+  // 窗外仅剩 enableHour 之前——08:30 已在窗口内会执行开启，故以 06:30 构造窗外场景。
+  const clock = makeClock(shanghaiMs('2026-09-12', '06:30'));
   const { mon } = await setupDefault(t, {
     clock, costCents: 5000,
     fixture: { plans: { '全店托管': [{ ...TUOGUAN, checked: false }], '商品自选': ZIX(1, false) } },

@@ -267,6 +267,129 @@ test('费用读取：evaluate 序列驱动下输出账户/口径/分项（stub �
   assert.strictEqual(stub.calls.closes, 1, '读取完成后由读取器释放浏览器');
 });
 
+test('费用读取：页面账户 ID 缺失仍可完成（Cookie 归属，ID 仅可选观测）', async () => {
+  const stub = makeStubPage({
+    urlQueue: ['https://fxg.jinritemai.com/ffa/mshop/homepage/index', 'https://qianchuan.jinritemai.com/home'],
+    evaluateResponses: [
+      { accountId: null, accountName: '店名无ID' },
+      ['2026-09-13', '2026-09-13'],
+      '账户整体消耗(元)3.21',
+      '更新于：09-13 11:20',
+      [{ item: '乘方计划消耗', raw: '3.21' }],
+    ],
+  });
+  const reader = createQianchuanCostReader({ loginCfg: LOGIN_CFG, nowFn: NOW, browserFactory: async () => stub.browser });
+  const summary = await reader.readCostSummary({
+    shopCfg: { id: '瑾漂亮潮流服饰', cookieFile: '测试店铺', accountId: '1710242295996424' },
+  });
+  assert.strictEqual(summary.accountId, null, '缺失不得伪造成配置 ID');
+  assert.strictEqual(summary.valueCents, 321);
+  assert.strictEqual(summary.shopId, '瑾漂亮潮流服饰');
+  assert.match(summary.accountIdAttribution, /可选观测/);
+  assert.strictEqual(stub.calls.closes, 1);
+});
+
+test('费用读取：页面账户 ID 与配置不同 → 仍返回数据，不因 ID 报 AUTH', async () => {
+  const stub = makeStubPage({
+    urlQueue: ['https://fxg.jinritemai.com/ffa/mshop/homepage/index', 'https://qianchuan.jinritemai.com/home?aavid=1710242295996424'],
+    evaluateResponses: [
+      { accountId: '999000111222333', accountName: '另一账户' },
+      ['2026-09-13', '2026-09-13'],
+      '账户整体消耗(元)8.00',
+      '更新于：09-13 11:21',
+      [],
+    ],
+  });
+  const reader = createQianchuanCostReader({ loginCfg: LOGIN_CFG, nowFn: NOW, browserFactory: async () => stub.browser });
+  const summary = await reader.readCostSummary({
+    shopCfg: { id: '瑾漂亮潮流服饰', cookieFile: '测试店铺', accountId: '1710242295996424' },
+  });
+  assert.strictEqual(summary.valueCents, 800);
+  assert.strictEqual(summary.accountId, '999000111222333', '观测原样保留，不回填配置');
+  assert.notStrictEqual(summary.accountId, '1710242295996424');
+});
+
+test('Cookie 归属：店A→FAKE_A 文件、店B→FAKE_B 文件，各一次且无混合', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qc-cookie-iso-'));
+  // 唯一假文件名，避免与真实 Cookie 重名
+  const nameA = `iso-ck-a-fake-${Date.now()}-A`;
+  const nameB = `iso-ck-b-fake-${Date.now()}-B`;
+  const valA = 'FAKE_ISO_A_ONLY';
+  const valB = 'FAKE_ISO_B_ONLY';
+  const cookieJson = (value) => JSON.stringify([
+    { name: 'sessionid', value, domain: '.fxg.jinritemai.com', path: '/', expires: Math.floor(Date.now() / 1000) + 86400, httpOnly: true, secure: true, sameSite: 'Lax' },
+  ]);
+  const applied = []; // addCookies 记录
+  const pathReads = []; // 解析到的 Cookie 文件路径（来自 cookieSession）
+
+  function wrapBrowser(stub) {
+    return async () => {
+      const b = stub.browser;
+      const origNewContext = b.newContext.bind(b);
+      b.newContext = async () => {
+        const ctx = await origNewContext();
+        const origAdd = ctx.addCookies.bind(ctx);
+        ctx.addCookies = async (cs) => {
+          applied.push({
+            values: (cs || []).map((c) => String(c.value)),
+            names: (cs || []).map((c) => String(c.name)),
+          });
+          return origAdd(cs);
+        };
+        return ctx;
+      };
+      return b;
+    };
+  }
+
+  try {
+    fs.writeFileSync(path.join(dir, `${nameA}.json`), cookieJson(valA));
+    fs.writeFileSync(path.join(dir, `${nameB}.json`), cookieJson(valB));
+    const cfg = {
+      cookieSourceDir: dir,
+      edgePath: 'x',
+      douyinHomeUrl: 'https://fxg.jinritemai.com/ffa/mshop/homepage/index',
+    };
+
+    // 不 catch：Cookie 加载前异常必须让用例失败
+    const stubA = makeStubPage({ urlQueue: [FXG_HOME, QC_HOME] });
+    const rA = await openQianchuanHome(
+      cfg,
+      { id: 'shop-a-iso', cookieFile: nameA, accountId: '1710242295996424' },
+      { browserFactory: wrapBrowser(stubA) }
+    );
+    const stubB = makeStubPage({ urlQueue: [FXG_HOME, QC_HOME] });
+    const rB = await openQianchuanHome(
+      cfg,
+      { id: 'shop-b-iso', cookieFile: nameB, accountId: '1710242295996424' },
+      { browserFactory: wrapBrowser(stubB) }
+    );
+
+    // 1) 两次调用分别解析到各自临时文件
+    assert.strictEqual(applied.length, 2, '必须恰好两次 addCookies（店A、店B 各一）');
+    pathReads.push(String(rA.cookieSession && rA.cookieSession.filePath || ''));
+    pathReads.push(String(rB.cookieSession && rB.cookieSession.filePath || ''));
+    assert.ok(pathReads[0].endsWith(`${nameA}.json`), `店A 必须解析到 ${nameA}.json，实际 ${pathReads[0]}`);
+    assert.ok(pathReads[1].endsWith(`${nameB}.json`), `店B 必须解析到 ${nameB}.json，实际 ${pathReads[1]}`);
+    assert.notStrictEqual(pathReads[0], pathReads[1], '两店 Cookie 文件路径必须不同');
+
+    // 2) addCookies 精确：A→FAKE_A、B→FAKE_B（顺序与归属）
+    assert.deepStrictEqual(applied[0].values, [valA], `第 1 次必须且只能是店A假值，实际 ${JSON.stringify(applied[0].values)}`);
+    assert.deepStrictEqual(applied[1].values, [valB], `第 2 次必须且只能是店B假值，实际 ${JSON.stringify(applied[1].values)}`);
+
+    // 3) 总次数为 2；每次仅含对应店假值（无混合、无对调）
+    assert.strictEqual(applied.filter((x) => x.values.includes(valA)).length, 1, 'FAKE_A 只允许出现一次');
+    assert.strictEqual(applied.filter((x) => x.values.includes(valB)).length, 1, 'FAKE_B 只允许出现一次');
+    assert.strictEqual(applied[0].values.includes(valB), false, '店A 不得混入店B Cookie');
+    assert.strictEqual(applied[1].values.includes(valA), false, '店B 不得混入店A Cookie');
+    // 对调必失败：店A 调用不得加载 B 文件路径
+    assert.ok(!pathReads[0].endsWith(`${nameB}.json`), '店A 不得解析到店B 文件');
+    assert.ok(!pathReads[1].endsWith(`${nameA}.json`), '店B 不得解析到店A 文件');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('控制器 getAd 参数链路：shopCfg.accountId 进入详情页 URL；计划ID 精确核验（前缀拒绝）', async () => {
   const fullId = '1794726122856516';
   const prefixId = '179472612285651'; // 前缀（少一位）

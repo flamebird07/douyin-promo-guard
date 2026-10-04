@@ -80,6 +80,7 @@ class Monitor {
     this._loopPromise = null;
     this._cycleRunning = false;
     this._activeTokens = new Set();
+    this._shopProcessing = new Set(); // WD-NEW-1 并发收口：同店处理互斥（巡查/接管/每日开启/手动验证共用）
 
     // ── 独立每日开启调度器（2026-09-15 上线）────────────────────────
     // 生命周期与"启动值守"（超额暂停巡查）完全分离：
@@ -993,6 +994,17 @@ class Monitor {
           results[idx] = { shopId: shopCfg.id, status: 'skipped', reason: '店铺已删除，跳过值守/轮询' };
           return;
         }
+        // 同店处理互斥（WD-NEW-1 并发收口）：该店正被登录接管/每日开启/手动验证处理 → 本轮跳过
+        // （零派发、如实记录；不阻塞其他店铺；该店由在途处理负责，下一轮常规巡查再核）
+        if (this._shopBusy(shopCfg.id)) {
+          results[idx] = { shopId: shopCfg.id, status: 'skipped', reason: '该店已有处理在途（登录接管/每日开启/手动验证），本轮跳过避免同店并发' };
+          this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'skipped', reason: 'shop-processing-busy' });
+          return;
+        }
+        if (!this._tryAcquireShop(shopCfg.id)) {
+          results[idx] = { shopId: shopCfg.id, status: 'skipped', reason: '同店处理互斥获取失败（并发防御），本轮跳过' };
+          return;
+        }
         try {
           results[idx] = { shopId: shopCfg.id, ...(await this._pollShop(shopCfg, token, trigger)) };
         } catch (e) {
@@ -1003,6 +1015,8 @@ class Monitor {
             reason: e.reason || e.message || '店铺处理异常',
             code: e.code || null,
           };
+        } finally {
+          this._releaseShop(shopCfg.id);
         }
       };
 
@@ -1233,12 +1247,15 @@ class Monitor {
    * 无任何页面回读或广告动作）；发现失败仅记录（绝不阻塞状态拉取）。
    * 返回语义（第 13 阶段补验证）：`ok` 与 `persisted` 一致反映"本次内存中的店铺已确认落盘"；
    * 落盘失败时 ok=false、persisted=false、pending=true 并附 reason——**不得返回持久化成功**。
+   * WD-NEW-1（2026-10-02）：新增 `opts.force`——事件驱动的立即发现（如登录成功后接管新店）
+   * 绕过 2s 节流。节流仍保护周期性 /state 拉取路径（无参调用行为完全不变）。
    * @returns {{ok:boolean, throttled?:boolean, added?:string[], persisted?:boolean, pending?:boolean, reason?:string|null}} 摘要（供测试与日志）
    */
-  requestShopDiscovery() {
+  requestShopDiscovery(opts = {}) {
     const now = this.nowFn();
     const minInterval = 2000;
-    if (this._lastShopDiscoveryAt && now - this._lastShopDiscoveryAt < minInterval) {
+    if (!((opts && opts.force === true))
+      && this._lastShopDiscoveryAt && now - this._lastShopDiscoveryAt < minInterval) {
       return { ok: true, throttled: true };
     }
     this._lastShopDiscoveryAt = now;
@@ -1341,6 +1358,41 @@ class Monitor {
       this._memPush(this.recentErrors, { scope: 'shop-config', error: reason }, undefined, 'error');
       return { ok: false, persisted: false, reason };
     }
+  }
+
+  /**
+   * SHOP-LIFE-1（2026-10-02）：用户主动登录（身份确认+Cookie 保存成功）= 明确重新加入——
+   * 恢复**同身份**的软删除条目：仅清除 deleted 标记、恢复 enabled，阈值/名称/账户等
+   * 全部人工设置原样保留；不新增条目（恢复后 Cookie 发现按既有条目原样保留）、
+   * 不恢复其他身份、不恢复错名条目（按登录确认的店铺身份精确匹配）。
+   * 普通自动发现（requestShopDiscovery/_discoverShopsFromCookies）语义**不变**：仍绝不复活。
+   * 持久化失败：回滚内存恢复并返回 ok=false（调用方如实报错，避免内存/磁盘漂移）。
+   * @param {string} shopId 登录确认的店铺身份（id/name/cookieFile 去后缀精确匹配）
+   * @param {{reason?:string}} [opts]
+   * @returns {{ok:boolean, restored:boolean, entry?:object, reason?:string}}
+   */
+  restoreDeletedShop(shopId, opts = {}) {
+    const norm = (v) => String(v == null ? '' : v).replace(/\.json$/i, '').trim();
+    const entry = (this.config.shops || []).find((s) => s && (s.id === shopId || s.name === shopId
+      || (s.cookieFile && norm(s.cookieFile) === shopId)));
+    if (!entry) return { ok: false, restored: false, reason: '未找到同身份条目（含软删除）' };
+    if (entry.deleted !== true) {
+      return { ok: true, restored: false, entry, reason: '条目本就活跃（未删除），无需恢复' };
+    }
+    const prevDeleted = entry.deleted;
+    const prevEnabled = entry.enabled;
+    entry.deleted = false;
+    if (entry.enabled === false) entry.enabled = true; // 恢复为启用
+    const persist = this._persistShopsToConfig();
+    if (!persist.ok) {
+      // 落盘失败：回滚内存恢复，保持与磁盘一致（不得假报恢复成功）
+      entry.deleted = prevDeleted;
+      entry.enabled = prevEnabled;
+      return { ok: false, restored: false, reason: '恢复已生效但配置落盘失败（已回滚）: ' + (persist.reason || '') };
+    }
+    this._audit({ kind: 'shop-restore', shopId: entry.id, trigger: (opts && opts.reason) || 'login-rejoin', persisted: true });
+    try { log.info(`店铺「${entry.id}」已由用户主动登录重新加入值守（人工设置保留）`); } catch (_) {}
+    return { ok: true, restored: true, entry };
   }
 
   /**
@@ -1450,6 +1502,102 @@ class Monitor {
       this._memPush(this.recentErrors, { scope: `shop:${shopId}`, error: reason }, undefined, 'error');
       this._audit({ kind: 'shop-refresh', shopId, ok: false, reason, zeroClick: true });
       return { ok: false, reason, zeroClick: true };
+    }
+  }
+
+  /**
+   * 同店处理互斥（WD-NEW-1 并发收口，2026-10-02）：所有会对同一店铺执行
+   * 「读取+决策+动作+回读」整段处理的入口共用一把每店锁——
+   *   - pollOnce（暂停巡查，逐店取得资格，busy 店本轮跳过零派发）；
+   *   - joinShopNow（登录接管，busy 时有界等待释放后再自行处理，绝不与巡查并发同店）；
+   *   - _runShopEnablePhase（每日开启循环与手动验证的共同单店入口，busy 即跳过零动作）。
+   * 广告开关串行门只约束开关点击，不覆盖重复读取/决策/共享运行时状态，不能替代本互斥。
+   * 每店独立：一把店锁绝不阻塞不相关店铺；取得资格后、派发前必须复核 running/删除/令牌；
+   * 正常完成、异常、取消都在 finally 释放，绝不留下忙状态。
+   */
+  _shopBusy(shopId) {
+    return this._shopProcessing.has(String(shopId));
+  }
+
+  _tryAcquireShop(shopId) {
+    const k = String(shopId);
+    if (this._shopProcessing.has(k)) return false;
+    this._shopProcessing.add(k);
+    return true;
+  }
+
+  _releaseShop(shopId) {
+    this._shopProcessing.delete(String(shopId));
+  }
+
+  /**
+   * WD-NEW-1 补修（2026-10-02）：登录成功后**只对目标店**立即执行一次单店巡查。
+   *
+   * 与 pollNowAndReschedule（全店周期 + 全局 nextRunAt 重排）刻意不同：
+   *  - 只处理目标店：不遍历其他店铺（其他店执行次数为 0）、不改写任何全局调度字段；
+   *  - 门禁齐全：配置待配置项拒绝；值守未运行拒绝（pollOnce 不查 running，本路径必须自查，
+   *    杜绝“停止后仍启动新的广告处理”）；店铺不存在/软删除/停用拒绝（软删除绝不复活）；
+   *  - 同店处理互斥（并发收口）：目标店正在被常规巡查/每日开启/手动验证处理时**有界等待其
+   *    释放**（每店锁，不阻塞不相关店铺）；等待结束后先复核 running（停止优先）、再试取得
+   *    资格，取得后派发前复核取消令牌与删除状态——等待期间停止/删除 → 零新派发；
+   *  - 取消机制复用：注册 kind:'pause' 令牌到 _activeTokens（stop() 即中止，已启动的
+   *    动作按既有取消/回读规则收尾）；
+   *  - 结果如实透出：{ ok, shopId, status, ... }，status ∈ ok/blocked/window_blocked/
+   *    stopped/skipped——调用方必须按目标店实际 status 与必要回读判定接管完成；
+   *    不与“全局周期是否处理过目标店”做隐式合并（等待后总是自行处理+回读，依据明确）；
+   *  - 绝不删除广告；动作是否落地仍由既有 fail-closed 门槛（realMode/dryRun/开关/窗口）决定。
+   *
+   * @param {string} shopId 店铺 ID（与 config.shops[].id 精确匹配）
+   * @param {{trigger?:string}} [opts]
+   * @returns {Promise<{ok:boolean, shopId?:string, status?:string, reason?:string, [k:string]:any}>}
+   */
+  async joinShopNow(shopId, opts = {}) {
+    if (this.pending.length > 0) {
+      return { ok: false, status: 'blocked', reason: `存在待配置/非法配置项，不允许处理: ${this.pending.join('；')}` };
+    }
+    if (this.running !== true) {
+      return { ok: false, status: 'stopped', reason: '值守未运行：不派发任何处理（零动作）' };
+    }
+    const shopCfg = this._findShop(shopId);
+    if (!shopCfg) return { ok: false, status: 'blocked', reason: '店铺不存在' };
+    if (!this._isShopActive(shopId)) {
+      return { ok: false, status: 'blocked', reason: '店铺已删除或停用，不再值守（软删除不复活）', deleted: shopCfg.deleted === true };
+    }
+    // 同店处理互斥：目标店正在被处理 → 有界等待释放；等待结束后先复核 running，再取得资格
+    if (this._shopBusy(shopId)) {
+      const sch = this.config.schedule || {};
+      const deadline = this.nowFn() + Math.max(2 * 60 * 1000, (sch.intervalMinutes || 30) * 60 * 1000);
+      while (this._shopBusy(shopId) && this.running === true && this.nowFn() < deadline) {
+        await new Promise((res) => setTimeout(res, 200));
+      }
+      if (this.running !== true) {
+        return { ok: false, status: 'stopped', reason: '值守已停止：未派发目标店处理（零动作）' };
+      }
+      if (this._shopBusy(shopId)) {
+        return { ok: false, status: 'skipped', reason: '目标店处理长时间未释放，本次立即处理未派发（店铺已在列表，常规巡查会处理）' };
+      }
+    }
+    if (!this._tryAcquireShop(shopId)) {
+      return { ok: false, status: 'skipped', reason: '该店已有处理在途（并发去重）' };
+    }
+    const token = { aborted: false, kind: 'pause' };
+    this._activeTokens.add(token);
+    try {
+      // 派发前最后一刻复核：停止/删除不得启动新的广告处理（已启动的按既有取消/回读规则收尾）
+      if (token.aborted || this.running !== true) {
+        return { ok: false, status: 'stopped', reason: '值守已停止：未派发目标店处理（零动作）' };
+      }
+      if (!this._isShopActive(shopId)) {
+        return { ok: false, status: 'blocked', reason: '店铺已被删除，取消本次处理' };
+      }
+      this._audit({ kind: 'join-shop', shopId, trigger: (opts && opts.trigger) || 'new-shop-join' });
+      const result = await this._pollShop(shopCfg, token, (opts && opts.trigger) || 'new-shop-join');
+      return { ok: true, shopId, ...(result || {}) };
+    } catch (e) {
+      return { ok: false, status: 'stopped', reason: (e && e.message) || String(e) };
+    } finally {
+      this._releaseShop(shopId);
+      this._activeTokens.delete(token);
     }
   }
 
@@ -2539,6 +2687,10 @@ class Monitor {
     if (this._cycleRunning) {
       return { ok: false, error: '已有巡查/开启周期进行中（互斥），本轮拒绝手动验证', code: 'cycle_busy' };
     }
+    if (this._shopBusy(shopId)) {
+      // WD-NEW-1 并发收口：登录接管等单店处理在途时，同店手动验证拒绝（不会设置 _cycleRunning，需单查）
+      return { ok: false, error: '该店已有处理在途（登录接管等），本轮拒绝手动验证', code: 'shop_busy' };
+    }
     const today = shanghaiDate(this.nowFn());
     if (this._enablePhaseDone(shopId, today)) {
       return { ok: false, error: `该店 ${today} 每日开启已成功（当日去重，不再重复执行）`, code: 'already_done_today', alreadyDone: true };
@@ -2582,7 +2734,28 @@ class Monitor {
    * source（2026-09-29 第 10 阶段）：'daily_schedule'（自动定时，默认）|'manual_verify'（人工按需验证）。
    * 手动验证走同一回读/身份/串行门/去重/审计链，仅 trigger 标记与 gate 时段门槛不同（见 chengfang-gate）。
    */
+  /**
+   * 每日开启预检与决策链（单店）——同店处理互斥外壳（WD-NEW-1 并发收口）：
+   * 登录接管/暂停巡查正在处理该店时，本次开启相位**跳过（零动作）**，绝不与其并发同店；
+   * 每日任务保持既有重试语义（skipped 不标记当日完成，窗口内重试），手动验证如实报未执行。
+   * 原预检与决策链整体移入 _runShopEnablePhaseInner，语义零改动。
+   */
   async _runShopEnablePhase(shopCfg, cycleToken, businessDate = null, source = 'daily_schedule') {
+    if (this._shopBusy(shopCfg.id)) {
+      this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-shop-busy', trigger: source });
+      return { status: 'skipped', zeroClick: true, reason: '该店已有处理在途（登录接管/巡查），本次开启相位跳过（零动作）' };
+    }
+    if (!this._tryAcquireShop(shopCfg.id)) {
+      return { status: 'skipped', zeroClick: true, reason: '同店处理互斥获取失败（并发防御），本次开启相位跳过（零动作）' };
+    }
+    try {
+      return await this._runShopEnablePhaseInner(shopCfg, cycleToken, businessDate, source);
+    } finally {
+      this._releaseShop(shopCfg.id);
+    }
+  }
+
+  async _runShopEnablePhaseInner(shopCfg, cycleToken, businessDate = null, source = 'daily_schedule') {
     const rt = this._runtime(shopCfg.id);
     const runner = this._getChengfangRunner(shopCfg);
     const opener = this._chengfangOpener || defaultChengfangOpener;

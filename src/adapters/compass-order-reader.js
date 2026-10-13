@@ -74,9 +74,33 @@ function extractOrderValueInPage(args) {
   }
   const valueNodes = cardItem.querySelectorAll('.aurora-data-card-value-main');
   if (valueNodes.length === 0) {
-    // 当前值节点缺失（昨日在不在都不接受）：明确不回退
+    // 当前值节点 .value-main 缺失。但罗盘在"暂无实时数值"时仍保留同一卡片 main-left 的
+    // 当前数据容器 .aurora-data-card-data（实测显示 "-" 占位；昨日值在 .aurora-data-card-information
+    // 兄弟节点，绝不在此读取）。严格只锁定与当前 pay_cnt 卡片 main-left 绑定的唯一数据容器，
+    // 据其文本区分"占位/加载中"与"真缺失/版式无法确认/歧义"；
+    // 绝不把容器里的数字当回退解析，也不把占位当 0。
+    const leftCol = cardItem.querySelector('.aurora-data-card-main-left');
+    const curData = leftCol ? leftCol.querySelectorAll('.aurora-data-card-data') : [];
     const hasYesterday = /昨日/.test(cardItem.textContent || '');
-    return { code: 'value_node_missing', reason: '当前值节点 .aurora-data-card-value-main 缺失', hasYesterday };
+    if (curData.length === 1) {
+      const curText = (curData[0].textContent || '').trim();
+      if (curText === '') {
+        return { code: 'value_loading', reason: '罗盘当前成交订单数为空（实时数据加载中），等待返回有效数值' };
+      }
+      if (/^[—\-–]+$/.test(curText)) {
+        return { code: 'value_placeholder', reason: `罗盘当前成交订单数暂未返回有效数值（显示"${curText}"），等待实时数据`, hasYesterday };
+      }
+      // 数据容器存在但无 .value-main 且内容非纯占位：版式无法确认，保持数据护栏，不回退解析数字
+      return { code: 'value_node_missing', reason: `当前值节点 .aurora-data-card-value-main 缺失，且左栏数据容器内容「${curText}」无法确认为有效当前值（不回退解析容器数字）`, hasYesterday };
+    }
+    // 当前数据容器缺失或重复：结构性问题，保持 value_node_missing，不回退
+    return {
+      code: 'value_node_missing',
+      reason: curData.length === 0
+        ? '当前值节点 .aurora-data-card-value-main 缺失'
+        : `当前值节点 .aurora-data-card-value-main 缺失，且左栏数据容器出现 ${curData.length} 处，无法唯一定位`,
+      hasYesterday,
+    };
   }
   if (valueNodes.length > 1) {
     return { code: 'value_node_missing', reason: `当前值节点出现 ${valueNodes.length} 处，无法唯一定位` };

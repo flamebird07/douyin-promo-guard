@@ -26,6 +26,7 @@
 const fs = require('fs');
 const path = require('path');
 const { loadShopCookieMeta } = require('../login/session');
+const { validateTargetRoi, DEFAULT_TARGET_ROI } = require('../config');
 const { createPromoReaderNotConnected, createMockPromoReader } = require('../adapters/promo-reader');
 const { createAdControllerNotConnected, createMockAdController } = require('../adapters/ad-controller');
 const { WholeShopCloseCoordinator } = require('./close-coordinator');
@@ -1602,12 +1603,15 @@ class Monitor {
   }
 
   /**
-   * 修改店铺**展示名称**与阈值。
+   * 修改店铺**展示名称**、阈值与目标 ROI（targetRoi）。
    * - 展示名写入 `displayName`，**绝不修改**身份字段 `name`/`id`/`compassShopName`/`accountId`/`cookieFile`；
-   * - 先持久化（原子写），成功后才报告 ok:true；写入失败回滚内存并返回失败。
+   * - targetRoi 采用 config.validateTargetRoi 严格合同：缺字段→默认 15；明确值只接受正有限 number
+   *   （支持 13.5），拒绝空/null/布尔/NaN/Infinity/0/负数/'15abc'；**只改 ROI**，不触发巡检启停、
+   *   不改阈值/身份/Cookie；
+   * - 先持久化（原子写），成功后才报告 ok:true；写入失败精确回滚内存并返回失败。
    * 不暴露/不修改 Cookie、令牌、密钥。
    */
-  updateShop(shopId, { displayName, name, thresholdCents } = {}) {
+  updateShop(shopId, { displayName, name, thresholdCents, targetRoi } = {}) {
     const shop = this._findShop(shopId);
     if (!shop) return { ok: false, reason: '店铺不存在' };
     if (shop.deleted === true) return { ok: false, reason: '店铺已删除，无法修改' };
@@ -1630,14 +1634,22 @@ class Monitor {
       }
       patch.thresholdCents = t;
     }
+    if (targetRoi !== undefined) {
+      const roiCheck = validateTargetRoi(targetRoi);
+      if (!roiCheck.ok) {
+        return { ok: false, reason: `目标 ROI 无效：${roiCheck.reason}`, roiInvalid: true };
+      }
+      patch.targetRoi = roiCheck.value;
+    }
     if (Object.keys(patch).length === 0) {
-      return { ok: false, reason: '未提供可修改字段（展示名称/阈值）' };
+      return { ok: false, reason: '未提供可修改字段（展示名称/阈值/目标 ROI）' };
     }
     // 整店浅快照：写入失败精确回滚（含字段是否存在）
     const snapshotBefore = { ...shop };
     const from = {
       displayName: shop.displayName !== undefined ? shop.displayName : (shop.name || shop.id),
       thresholdCents: shop.thresholdCents ?? this._thresholdCents(shop),
+      targetRoi: shop.targetRoi !== undefined ? shop.targetRoi : DEFAULT_TARGET_ROI,
     };
     // 只写允许修改的字段；身份字段由 Object.keys(shop) 原样保留
     Object.assign(shop, patch);
@@ -1656,7 +1668,11 @@ class Monitor {
       shopId,
       change: patch,
       from,
-      to: { displayName: shop.displayName || shop.name, thresholdCents: shop.thresholdCents ?? this._thresholdCents(shop) },
+      to: {
+        displayName: shop.displayName || shop.name,
+        thresholdCents: shop.thresholdCents ?? this._thresholdCents(shop),
+        targetRoi: shop.targetRoi !== undefined ? shop.targetRoi : DEFAULT_TARGET_ROI,
+      },
       identityUnchanged: true,
       persisted: true,
     });
@@ -1666,6 +1682,7 @@ class Monitor {
       shopId,
       displayName: shop.displayName || shop.name,
       thresholdCents: shop.thresholdCents ?? this._thresholdCents(shop),
+      targetRoi: shop.targetRoi !== undefined ? shop.targetRoi : DEFAULT_TARGET_ROI,
       from,
       identityUnchanged: true,
       persisted: true,
@@ -3195,6 +3212,9 @@ class Monitor {
         deleted: s.deleted === true,
         deletedAt: s.deletedAt || null,
         thresholdCents,
+        // 目标 ROI（2026-10-12 S6）：真实状态输出必须携带本店**已保存**的 targetRoi，
+        // 未配置时回落 DEFAULT_TARGET_ROI（15）；不写死店铺名/账号或 14/15 特例。
+        targetRoi: s.targetRoi !== undefined ? s.targetRoi : DEFAULT_TARGET_ROI,
         platform: s.platform || 'douyin',
         cookieInfo,
         lastError: rt.lastError || null,

@@ -99,6 +99,59 @@ function deepMerge(base, patch) {
   return out;
 }
 
+// 目标 ROI 默认值（缺字段时采用）：客户 2026-10-11 明确“缺字段默认 15”。
+const DEFAULT_TARGET_ROI = 15;
+
+// 每店每天计划数量的合法范围与全局默认（客户 2026-10-13 明确“每天几条加在目标 ROI 后面，可按店调整”）：
+// - 全局排程默认仍为 3（不配置就不自作主张多发）；
+// - 每店可用 shops[].plansPerShopPerDay 覆盖，合法整数 1..10；缺字段/非法一律回落全局默认 3。
+const DEFAULT_PLANS_PER_SHOP = 3;
+const MIN_PLANS_PER_SHOP = 1;
+const MAX_PLANS_PER_SHOP = 10;
+
+/**
+ * 每店每天计划数量严格整数校验（供配置校验与页面保存共用）。
+ * 只接受**整数**且落在 [MIN,MAX]；拒绝空串 / null / 布尔 / NaN / Infinity / 小数 / 0 / 11 等。
+ * 返回 { ok, value, reason }。UI 侧必须先做严格 Number 解析再调用本函数。
+ */
+function validatePlansPerShop(raw) {
+  if (typeof raw !== 'number' || !Number.isInteger(raw)) {
+    return { ok: false, value: null, reason: `必须是整数（当前 ${JSON.stringify(raw)}）` };
+  }
+  if (raw < MIN_PLANS_PER_SHOP || raw > MAX_PLANS_PER_SHOP) {
+    return { ok: false, value: null, reason: `必须在 ${MIN_PLANS_PER_SHOP}~${MAX_PLANS_PER_SHOP} 之间（当前 ${raw}）` };
+  }
+  return { ok: true, value: raw, reason: null };
+}
+
+/**
+ * 解析某店本日**有效**每日计划数量：优先该店已保存且合法的 plansPerShopPerDay，
+ * 否则回落全局默认（缺省 3）。两店相互独立，互不影响。
+ */
+function resolveEffectivePlansPerShop(shop, globalFallback) {
+  const fb = Number.isInteger(globalFallback) ? globalFallback : DEFAULT_PLANS_PER_SHOP;
+  if (shop && Object.prototype.hasOwnProperty.call(shop, 'plansPerShopPerDay')) {
+    const c = validatePlansPerShop(shop.plansPerShopPerDay);
+    if (c.ok) return c.value;
+  }
+  return fb;
+}
+
+/**
+ * 目标 ROI 严格校验（客户 2026-10-11 合同）：
+ * - 字段缺失（undefined）→ 采用默认 15（defaulted:true）；
+ * - 明确值只接受**正有限 number**（支持 13.5 这类小数）；
+ * - 拒绝：空串 / null / 布尔 / NaN / Infinity / 0 / 负数 / 形如 '15abc' 的字符串。
+ * 返回 { ok, value, reason, defaulted }。UI 侧必须先做严格 Number 解析再调用本函数。
+ */
+function validateTargetRoi(raw) {
+  if (raw === undefined) return { ok: true, value: DEFAULT_TARGET_ROI, reason: null, defaulted: true };
+  if (typeof raw !== 'number') return { ok: false, value: null, reason: `必须是数字（当前 ${JSON.stringify(raw)}）`, defaulted: false };
+  if (!Number.isFinite(raw)) return { ok: false, value: null, reason: `必须是有限数字（当前 ${String(raw)}）`, defaulted: false };
+  if (!(raw > 0)) return { ok: false, value: null, reason: `必须为正数（当前 ${raw}）`, defaulted: false };
+  return { ok: true, value: raw, reason: null, defaulted: false };
+}
+
 /** 严格整数校验：必须是整数且在 [min,max]。返回错误原因或 null。 */
 function intInRange(v, min, max, label) {
   if (typeof v !== 'number' || !Number.isInteger(v)) return `${label} 必须是整数（当前 ${JSON.stringify(v)}）`;
@@ -123,6 +176,16 @@ function collectPending(cfg) {
       }
       if (s.accountId !== undefined && s.accountId !== null && !isPlaceholder(String(s.accountId)) && !/^\d{8,20}$/.test(String(s.accountId).trim())) {
         push(`shops[${i}].accountId: 必须是 8~20 位数字的千川账户ID（页面实测值）`);
+      }
+      // 可选 targetRoi：仅在字段存在时严格校验（缺失采用默认 15，不报错）。
+      if (Object.prototype.hasOwnProperty.call(s, 'targetRoi')) {
+        const roiCheck = validateTargetRoi(s.targetRoi);
+        if (!roiCheck.ok) push(`shops[${i}].targetRoi: ${roiCheck.reason}`);
+      }
+      // 可选 plansPerShopPerDay：仅在字段存在时严格校验整数 1..10（缺字段回落全局默认 3，不报错）。
+      if (Object.prototype.hasOwnProperty.call(s, 'plansPerShopPerDay')) {
+        const ppCheck = validatePlansPerShop(s.plansPerShopPerDay);
+        if (!ppCheck.ok) push(`shops[${i}].plansPerShopPerDay: ${ppCheck.reason}`);
       }
     });
   }
@@ -250,4 +313,4 @@ function loadConfig() {
   return loadConfigFrom(source);
 }
 
-module.exports = { loadConfig, loadConfigFrom, isPlaceholder, intInRange, DEFAULTS, PROJECT_ROOT, CONFIG_PATH };
+module.exports = { loadConfig, loadConfigFrom, isPlaceholder, intInRange, collectPending, validateTargetRoi, validatePlansPerShop, resolveEffectivePlansPerShop, DEFAULT_TARGET_ROI, DEFAULT_PLANS_PER_SHOP, MIN_PLANS_PER_SHOP, MAX_PLANS_PER_SHOP, DEFAULTS, PROJECT_ROOT, CONFIG_PATH };

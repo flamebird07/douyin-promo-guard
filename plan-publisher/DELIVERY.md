@@ -51,4 +51,3 @@
   `confirmation-ui.cjs`、`shop-profile.cjs`、`启动计划发布.cmd`。
 - 说明：`README.md`（历史/只读，**不随本次上传**）、本 `DELIVERY.md`。
 - 本说明与随包配置不含任何真实运行期状态；上述 `wf.BUSINESS` 代码默认值除外。
-

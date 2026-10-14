@@ -241,6 +241,242 @@ function provePreparationZeroConsumption(stateRaw, attempts, businessDate) {
   };
 }
 
+// ── 预导航打开失败的"从未发布"证明（R43/S43）─────────────────────────────────
+// 正式排程 run 在 openShop 抛错（尚未取得任何活动页，结构上不可能有发布/消费）时，只有对当日
+// day-state 与 attempts store **新鲜回读**、正面证明"无任何发布/消费记录"才可返回可安全重试的
+// unsubmitted：**只认耐久状态/尝试事实，绝不认错误文本**（例如 ERR_CONNECTION_CLOSED）。
+//   允许收口：state 文件缺失（本店从未在此留下发布），或 active 处于 pre-consumption 相位
+//   （pending/preparing/preparation-stopped）且不含任何 frozen/CID/manifestHash/planId/nonce；
+//   plans 无 success、confirmationConsumptions 无本日记录、attempts 三表无本日记录。
+//   拒绝收口（保持原 failed）：文件不可读/损坏、任一消费痕迹、未决发布相位、本日成功记录。
+// 返回 { ok, proof? , reason? }。proof 与调度器 strictNoPublicationProof 形状逐字一致。
+function proveNoPublicationPreOpen(stateFile, attemptsFile, businessDate, scope) {
+  const date = String(businessDate || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { ok: false, reason: 'proof-date-invalid' };
+  // scope is OPTIONAL and only NARROWS the proof to ONE exact business plan:
+  //   { planNumber, accountId?, shop?, runId? } — used to resume a later plan whose pre-open
+  //   failed while an EARLIER same-day plan already succeeded (the blanket "any success on the
+  //   day" ban would wrongly permanently seal that recoverable remainder). Absent scope = whole-day.
+  //   When shop/accountId/planNumber/runId are supplied they are echoed back into the returned
+  //   proof so a downstream consumer can bind it to the EXACT run it came from (never a bare
+  //   generic flag). Absent fields are echoed as null so an unbound proof can never satisfy a
+  //   bound retry.
+  const sc = scope && typeof scope === 'object' && !Array.isArray(scope) ? scope : null;
+  const scopedPlan = sc && Number.isInteger(sc.planNumber) && sc.planNumber >= 1 ? sc.planNumber : null;
+  const bindShop = sc && typeof sc.shop === 'string' && sc.shop.trim() !== '' ? sc.shop.trim() : null;
+  const bindAccount = sc && sc.accountId != null && String(sc.accountId) !== '' ? String(sc.accountId) : null;
+  const bindRunId = sc && typeof sc.runId === 'string' && sc.runId !== '' ? sc.runId : null;
+  // Raw bytes actually read this run; fed into a deterministic sourceHash so a later mutation
+  // can re-verify the SAME store contents (changed / deleted bytes => a different hash => refuse).
+  let stateText = null, attemptsText = null;
+  if (fs.existsSync(stateFile)) {
+    let text;
+    try { text = fs.readFileSync(stateFile, 'utf8'); }
+    catch (_) { return { ok: false, reason: 'proof-state-unreadable' }; }
+    stateText = text;
+    let raw;
+    try { raw = JSON.parse(text); }
+    catch (_) { return { ok: false, reason: 'proof-state-unreadable' }; }
+    // A PRESENT-but-malformed day-state (JSON null / array / scalar) is NOT evidence of "never
+    // published": only a real object with the expected schema may prove absence. Missing file
+    // (never created) stays a valid proof; corrupt/malformed must refuse.
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'proof-state-malformed' };
+    // MANDATORY day-state schema: a present file must carry a REAL businessDate for THIS day and a
+    // REAL plans array with well-formed entries. The mere ABSENCE of a known consumption key is
+    // never treated as "no consumption" (an unrelated object like {lostState:1} must refuse).
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(raw.businessDate || ''))) return { ok: false, reason: 'proof-state-malformed' };
+    if (String(raw.businessDate) !== date) return { ok: false, reason: 'proof-state-date-mismatch' };
+    if (!Array.isArray(raw.plans)) return { ok: false, reason: 'proof-state-malformed' };
+    if (raw.plans.some(p => !p || typeof p !== 'object' || Array.isArray(p) || !Number.isInteger(Number(p.planNumber)) || Number(p.planNumber) < 1)) {
+      return { ok: false, reason: 'proof-state-malformed' };
+    }
+    const plans = raw.plans;
+    if (raw.confirmationConsumptions !== undefined && !Array.isArray(raw.confirmationConsumptions)) return { ok: false, reason: 'proof-state-malformed' };
+    if (raw.manualUiPublicationFacts !== undefined && !Array.isArray(raw.manualUiPublicationFacts)) return { ok: false, reason: 'proof-state-malformed' };
+    // S45 scoped boundary: a target plan T may be resumed when every publication/consumption
+    // artifact on the day belongs ONLY to an EARLIER plan that already succeeded. An artifact is
+    // tolerated iff it is unambiguously bound to a plan number < T that is a confirmed success in
+    // `plans`; an artifact bound to T, to a later plan, or UNBOUND/ambiguous (no numeric
+    // planNumber) is a real consumption risk and refuses. Unscoped (whole-day) keeps the blanket ban.
+    const successPlanNumbers = new Set(plans.filter(p => String(p.status) === 'success').map(p => Number(p.planNumber)));
+    const artifactRefusesTarget = (planNo) => {
+      if (scopedPlan == null) return true;
+      if (!Number.isInteger(planNo)) return true;
+      if (planNo === scopedPlan) return true;
+      if (planNo < scopedPlan && successPlanNumbers.has(planNo)) return false;
+      return true;
+    };
+    if (raw.firstPublishedPlan != null) {
+      const fp = raw.firstPublishedPlan;
+      if (typeof fp !== 'object' || Array.isArray(fp) || artifactRefusesTarget(Number(fp.planNumber))) {
+        return { ok: false, reason: 'proof-consumption-artifacts-present' };
+      }
+    }
+    const a = raw.active || null;
+    if (a != null && (typeof a !== 'object' || Array.isArray(a))) return { ok: false, reason: 'proof-state-malformed' };
+    if (a) {
+      if (a.frozen || a.confirmationId != null || a.manifestHash != null || a.planId != null || a.nonce != null) {
+        if (artifactRefusesTarget(Number(a.planNumber))) return { ok: false, reason: 'proof-consumption-artifacts-present' };
+      }
+      const st = String(a.status || '');
+      if (st && !['pending', 'preparing', 'preparation-stopped'].includes(st) && artifactRefusesTarget(Number(a.planNumber))) {
+        return { ok: false, reason: 'proof-unresolved-publication-phase:' + st };
+      }
+    }
+    // A plan record is a consumption artifact if it succeeded OR carries a planId/manifestHash.
+    const planConsumed = (p) => !!p && (String(p.status) === 'success' || p.planId != null || p.manifestHash != null);
+    if (scopedPlan != null) {
+      if (plans.some(p => Number(p.planNumber) === scopedPlan && planConsumed(p))) return { ok: false, reason: 'proof-plans-contain-success' };
+    } else if (plans.some(planConsumed)) {
+      return { ok: false, reason: 'proof-plans-contain-success' };
+    }
+    const cc = Array.isArray(raw.confirmationConsumptions) ? raw.confirmationConsumptions : [];
+    if (cc.some(r => r && String(r.businessDate || '') === date && (scopedPlan == null || r.planNumber == null || Number(r.planNumber) === scopedPlan))) {
+      return { ok: false, reason: 'proof-confirmation-consumption-recorded' };
+    }
+    const mu = Array.isArray(raw.manualUiPublicationFacts) ? raw.manualUiPublicationFacts : [];
+    if (mu.some(r => r && String(r.businessDate || '') === date && (scopedPlan == null || r.planNumber == null || Number(r.planNumber) === scopedPlan))) {
+      return { ok: false, reason: 'proof-manual-publication-recorded' };
+    }
+  }
+  if (fs.existsSync(attemptsFile)) {
+    // Validate the RAW store shape BEFORE trusting guard.loadAttemptsStore (whose ENOENT path
+    // silently fills absent maps and would read a malformed present file as "empty first try").
+    let rawAttempts;
+    try { attemptsText = fs.readFileSync(attemptsFile, 'utf8'); rawAttempts = JSON.parse(attemptsText); }
+    catch (_) { return { ok: false, reason: 'proof-attempts-unreadable' }; }
+    if (!rawAttempts || typeof rawAttempts !== 'object' || Array.isArray(rawAttempts)) return { ok: false, reason: 'proof-attempts-malformed' };
+    for (const mapName of ['consumed', 'finalConsumed', 'reopenConsumed']) {
+      const m = rawAttempts[mapName];
+      if (m !== undefined && (!m || typeof m !== 'object' || Array.isArray(m))) return { ok: false, reason: 'proof-attempts-malformed' };
+    }
+    let store;
+    try { store = guard.loadAttemptsStore(attemptsFile); }
+    catch (_) { return { ok: false, reason: 'proof-attempts-unreadable' }; }
+    // A present consume record MUST itself be well-formed: real YYYY-MM-DD businessDate, numeric
+    // planNumber, and a recognised status. A record whose scope is missing/invalid is UNKNOWN — it
+    // can never be silently dropped as "not for this day/plan" — so any such record refuses.
+    const RECOGNIZED_ATTEMPT_STATUS = new Set(['pending', 'dispatched', 'unknown', 'success', 'failed']);
+    for (const mapName of ['consumed', 'finalConsumed', 'reopenConsumed']) {
+      for (const rec of Object.values((store && store[mapName]) || {})) {
+        if (!rec || typeof rec !== 'object' || Array.isArray(rec)
+          || !/^\d{4}-\d{2}-\d{2}$/.test(String(rec.businessDate || ''))
+          || !Number.isInteger(Number(rec.planNumber)) || Number(rec.planNumber) < 1
+          || !RECOGNIZED_ATTEMPT_STATUS.has(String(rec.status || ''))) {
+          return { ok: false, reason: 'proof-attempt-record-malformed' };
+        }
+        if (String(rec.businessDate) !== date) continue;
+        if (scopedPlan != null && Number(rec.planNumber) !== scopedPlan) continue;
+        return { ok: false, reason: 'proof-attempt-record-for-date' };
+      }
+    }
+  }
+  return {
+    ok: true,
+    proof: {
+      method: 'pre-navigation-open-failed', businessDate: date,
+      opened: false, stateProven: true, attemptsProven: true,
+      shop: bindShop, accountId: bindAccount, planNumber: scopedPlan, runId: bindRunId,
+      sourceHash: preOpenSourceHash(stateText, attemptsText),
+    },
+  };
+}
+
+// Deterministic content hash of the two stores a zero-publication proof actually read. An absent
+// file maps to a distinct sentinel (never conflated with an empty/whitespace file), so a later
+// mutation-time re-read that finds CHANGED or DELETED bytes yields a different hash and refuses.
+const PRE_OPEN_ABSENT_SENTINEL = '\u0000ABSENT\u0000';
+function preOpenSourceHash(stateText, attemptsText) {
+  const s = stateText == null ? PRE_OPEN_ABSENT_SENTINEL : ('S:' + stateText);
+  const a = attemptsText == null ? PRE_OPEN_ABSENT_SENTINEL : ('A:' + attemptsText);
+  return sha256Hex(s + '\u0001' + a);
+}
+
+function readStoreTextSafe(file) {
+  try { return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null; }
+  catch (_) { return undefined; } // unreadable: distinct from absent, so a re-read never falsely matches
+}
+
+// Recompute the proof's sourceHash straight from the CURRENT on-disk stores. A caller that must
+// re-verify at mutation time under its own lock uses this to detect changed/deleted bytes.
+function currentPreOpenSourceHash(stateFile, attemptsFile) {
+  const s = readStoreTextSafe(stateFile);
+  const a = readStoreTextSafe(attemptsFile);
+  if (s === undefined || a === undefined) return null;
+  return preOpenSourceHash(s, a);
+}
+
+// Deterministic sha256 (hex) of an entry's recorded reason — the ONLY quantity used to bind a
+// release proof to the EXACT scheduler entry it targets (never a bare/reused boolean flag).
+function sha256Hex(text) { return crypto.createHash('sha256').update(String(text == null ? '' : text)).digest('hex'); }
+
+function readSchedulerLedgerRaw(ledgerFile) {
+  let text;
+  try { text = fs.readFileSync(ledgerFile, 'utf8'); }
+  catch (_) { return { ok: false, reason: 'release-ledger-unreadable' }; }
+  let parsed;
+  try { parsed = JSON.parse(text); }
+  catch (_) { return { ok: false, reason: 'release-ledger-corrupt' }; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !parsed.days || typeof parsed.days !== 'object' || Array.isArray(parsed.days)) {
+    return { ok: false, reason: 'release-ledger-corrupt' };
+  }
+  return { ok: true, ledger: parsed };
+}
+
+// ── Explicit trusted release binding (S44) ────────────────────────────────────
+// The ONLY supported way to release a per-day terminal `failed`/`blocked` scheduler entry for
+// the CURRENT business day without a raw ledger edit. A valid proof binds:
+//   (a) the EXACT current ledger entry (shop + date + plan + record status + entry status +
+//       sha256 of the entry's own recorded reason), and
+//   (b) an independent fresh zero-publication re-proof at the SAME shop/date/plan scope
+//       (proveNoPublicationPreOpen with that exact plan scope).
+// It never splices a different reason/fact, never another shop/date/plan, never an unauthenticated
+// or arbitrary claim: unknown/frozen/consumed/in-progress entries are structurally rejected.
+function proveSchedulerReleaseProof(ledgerFile, statePaths, spec) {
+  const s = spec && typeof spec === 'object' && !Array.isArray(spec) ? spec : {};
+  const businessDate = String(s.businessDate || '');
+  const shop = String(s.shop || '').trim();
+  const planNumber = s.planNumber;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(businessDate)) return { ok: false, reason: 'release-date-invalid' };
+  if (!shop) return { ok: false, reason: 'release-shop-missing' };
+  if (!Number.isInteger(planNumber) || planNumber < 1) return { ok: false, reason: 'release-plan-invalid' };
+  if (!statePaths || !statePaths.stateFile || !statePaths.attemptsFile) return { ok: false, reason: 'release-state-paths-missing' };
+  const led = readSchedulerLedgerRaw(ledgerFile);
+  if (!led.ok) return led;
+  const day = led.ledger.days[businessDate];
+  const rec = day && day.shops && day.shops[shop];
+  if (!rec || typeof rec !== 'object') return { ok: false, reason: 'release-no-current-entry' };
+  const entry = rec.entries && rec.entries[String(planNumber)];
+  if (!entry || typeof entry !== 'object') return { ok: false, reason: 'release-no-current-entry' };
+  if (rec.status !== 'failed' && rec.status !== 'blocked') return { ok: false, reason: 'release-record-not-terminal-failure:' + String(rec.status) };
+  if (entry.status !== 'failed' && entry.status !== 'preparation-stopped') return { ok: false, reason: 'release-entry-not-prepublication:' + String(entry.status) };
+  const pub = proveNoPublicationPreOpen(statePaths.stateFile, statePaths.attemptsFile, businessDate, { planNumber, accountId: s.accountId, shop });
+  if (!pub.ok) return { ok: false, reason: pub.reason };
+  // Bind the entry's OWN recorded runId when it carries one; a legacy entry (no runId) stays null
+  // — we never invent or splice a runId from an unrelated closure.
+  const entryRunId = (typeof entry.runId === 'string' && entry.runId)
+    ? entry.runId
+    : ((typeof entry.preparationRunId === 'string' && entry.preparationRunId) ? entry.preparationRunId : null);
+  const proof = {
+    status: 'scheduler-release-prepublication',
+    method: 'scheduler-release-prepublication',
+    businessDate, shop, planNumber,
+    accountId: s.accountId == null ? null : String(s.accountId),
+    recStatus: String(rec.status),
+    entryStatus: String(entry.status),
+    entryReasonHash: sha256Hex(entry.reason),
+    entryAt: entry.at != null ? String(entry.at) : null,
+    entryRunId,
+    // Fresh-source re-read anchors: the mutation-time releaser recomputes the source hash from
+    // these exact bound paths and refuses on any changed / deleted bytes.
+    sourceHash: pub.proof.sourceHash,
+    sourceStateFile: statePaths.stateFile,
+    sourceAttemptsFile: statePaths.attemptsFile,
+    publicationProof: pub.proof,
+  };
+  return { ok: true, proof };
+}
+
 // 严格零消费证明判据：六个字段必须恰好为规定值。缺字段/其它值/非对象一律不算证明——
 // 恢复入口与账本释放只认这个结构，绝不凭 status 文字或任意异常原因收口。
 function strictZeroConsumptionProof(p) {
@@ -323,6 +559,24 @@ const NATIVE_SCROLL_TABS = Object.freeze(NATIVE_SCROLL_CATEGORIES.map(c => CATEG
 const NATIVE_SCROLL_ROOT_SELECTOR = '.product-list';
 const NATIVE_SCROLL_MAX_ADVANCES = 40;
 const NATIVE_SCROLL_TIMEOUT_MS = 15000;
+
+// Single source of truth for the per-category native-scroll cursor decision (S44). The three
+// cases are DISTINCT and must never be conflated:
+//   'switch' — entering a fresh category: cursor is reset to page 1 with NO stale nativeEof /
+//              nativeAdvances carried over from a previous category.
+//   'eof'    — the transport PROVED hasMore=false and every accumulated id landed in the DOM:
+//              the ONLY honest exhaustion. Marks nativeEof:true for that category.
+//   'budget' — the bounded advance budget was exhausted WITHOUT an EOF proof: this is NOT an
+//              honest exhaust and must NEVER be persisted as nativeEof (it would make a later
+//              resume believe the category ended). nativeEof is explicitly cleared.
+function nativeAdvanceCursor(prev, cat, kind, nativeAdvances) {
+  const seen = Array.isArray(prev && prev.seenProductIds) ? prev.seenProductIds.slice() : [];
+  if (kind === 'eof') {
+    return { category: cat, page: 1, seenProductIds: seen, nativeEof: true, nativeAdvances: Number.isInteger(nativeAdvances) ? nativeAdvances : 0 };
+  }
+  // 'switch' and 'budget' both hold an honest non-EOF cursor: nativeEof is cleared, never stale.
+  return { category: cat, page: 1, seenProductIds: seen, nativeEof: false, nativeAdvances: Number.isInteger(nativeAdvances) ? nativeAdvances : 0 };
+}
 // S21 hard bound for the auto-pull off-page deselect walk-back: the All numeric pager
 // never shows more than a few dozen pages live; a proven position farther back than this
 // is treated as drift/unknown and stops honestly instead of walking.
@@ -3267,9 +3521,20 @@ function createRealDrivers(ctx) {
         }
         if(native){
           const adv=await nativeAdvance(tab);
-          if(adv.eof)break;
+          if(adv.eof){
+            // 真实 EOF：transport 已证明本类目 hasMore=false 且累计 id 全部落到 DOM。诚实耗尽。
+            dayState.cursor=nativeAdvanceCursor(dayState.cursor,cat,'eof',nativeAdvances);
+            await persist(dayState);
+            break;
+          }
           nativeAdvances++;
-          if(nativeAdvances>NATIVE_SCROLL_MAX_ADVANCES)throw new Error('native-scroll-advance-limit-exceeded');
+          // 有界推进预算用尽 ≠ 诚实 EOF：只停止本类目并转入下一个类目（绝不硬抛
+          // scheduled-run-exception 把整店卡死，也绝不放宽 nativeAdvance 内部的无进展/transport
+          // 异常硬判据、绝不重复发布）。cursor 显式清除可能残留的 nativeEof（预算耗尽不是 EOF），
+          // 常量刻意保持 40，不盲目抬高。
+          dayState.cursor=nativeAdvanceCursor(dayState.cursor,cat,'budget',nativeAdvances);
+          await persist(dayState);
+          if(nativeAdvances>=NATIVE_SCROLL_MAX_ADVANCES)break;
           continue;
         }
         const advanced=await changePage({cat,native,selectedIds,baseSelectedCount,expectedCapacity});
@@ -5074,6 +5339,9 @@ async function runScheduledPlan(businessInput, opts) {
   let legacyDefault = shopProfile.isLegacyDefaultProfile(business, legacyProfile);
   let paths = null, releaseLock = null, opened = null, readers = null, drivers = null;
   let preserveOwnedBrowser = false, cookiesSaved = false;
+  // runId is generated BEFORE navigation so a pre-open failure can bind its zero-publication proof
+  // to the exact run invocation (reuses the existing scheme, moved earlier — not a new one).
+  const runId = 'plan-scheduler-' + businessDate + '-' + crypto.randomBytes(8).toString('hex');
   try {
     if (legacyDefault) { paths = scheduledStatePaths(business, true, stateRoot); releaseLock = acquireLock(paths.lockFile); }
     readers = o.readers || require(path.join(adapterRoot, 'src/adapters/chengfang-reader'));
@@ -5145,7 +5413,6 @@ async function runScheduledPlan(businessInput, opts) {
     const guidanceScope = guidanceScopeFor(paths);
     const guidanceRestore = await installGuidanceRestore(context, business.accountId, guidanceScope.restoreOptions);
     log('info', 'scheduled-guidance-restore ' + (guidanceRestore.registered === true) + ' ' + (guidanceRestore.reason || ''));
-    const runId = 'plan-scheduler-' + businessDate + '-' + crypto.randomBytes(8).toString('hex');
     const history = wf.loadPublishedStore(PUBLISHED_FILE, paths.seedFile, business.accountId);
     const publishedIds = new Set(history.publishedIds.map(String));
     // 账本推导"本业务日的下一份"：调度器计数只是参考，耐久账本才是唯一权威。
@@ -5382,6 +5649,27 @@ async function runScheduledPlan(businessInput, opts) {
         });
       }
     }
+    if (!opened) {
+      // 预导航打开失败（尚未取得任何活动页 → 结构上不可能有任何发布/消费）。只有对当日日状态与
+      // attempts **新鲜回读**、正面证明"无任何发布/消费记录"（proveNoPublicationPreOpen）时，才以
+      // 可安全重试的 'unsubmitted' 返回并带回耐久无发布证明；证明不成立一律保持原 failed
+      // （绝不放宽、绝不按错误文本放行、绝不据此自动重发未知/已消费的份）。
+      let pub = null;
+      try {
+        const p = scheduledStatePaths(business, legacyDefault, stateRoot);
+        pub = proveNoPublicationPreOpen(p.stateFile, p.attemptsFile, businessDate, {
+          planNumber: Number.isInteger(o.planNumber) && o.planNumber >= 1 ? o.planNumber : null,
+          accountId: business.accountId == null ? null : String(business.accountId),
+          shop: business.shop, runId,
+        });
+      } catch (_) { pub = null; }
+      if (pub && pub.ok) {
+        preserveOwnedBrowser = false;
+        return result('unsubmitted', 'scheduled-pre-navigation-open-failed:' + reason, {
+          businessDate, runId, noAction: true, noReplay: false, publicationProof: pub.proof,
+        });
+      }
+    }
     preserveOwnedBrowser = !!opened;
     return result(opened ? 'unknown' : 'failed', 'scheduled-run-exception:' + reason, { noReplay: !!opened });
   } finally {
@@ -5497,15 +5785,18 @@ function readDaySuccessForShop(shopLike, businessDate, opts) {
 }
 
 // 账号发现（运行时能力）：配置 accountId=null 的店用**生产 openShop + 严格同店 Cookie
-// 身份验证**取真实千川账户；只读、零点击，关闭浏览器前保存 Cookie；身份未知或不符
-// 返回 null（调用方诚实 blocked），绝不借用其它店身份。
+// 身份验证**取真实千川账户；只读、零点击，关闭浏览器前保存 Cookie。为不预先要求人工填号、
+// 也**绝不借用其它店身份**而：成功返回 accountId 字符串；身份确实未知/未通过同店验证时返回
+// { error } **具体原因**（调用方据此 blocked 并逐字保留，绝不吞成通用 unknown-account，绝不
+// 据此自动重试或当作登录过期）；能力缺失返回 { error:'discovery-capability-unavailable' }。
+// headless 由调用方透传（内部免审核后台发布与 runPlan 一致走无窗口）。
 async function discoverShopAccountByLiveSession(shopCfg, business, opts) {
   const o = opts || {};
   const adapterRoot = o.projectRoot || guard.resolveProjectRoot(process.env);
   const readers = o.readers || require(path.join(adapterRoot, 'src/adapters/chengfang-reader'));
   const openShopFn = typeof o.openShop === 'function' ? o.openShop : readers.openChengfangShop;
   const readAccountFn = typeof o.readAccountInPage === 'function' ? o.readAccountInPage : readers.readChengfangAccountInPage;
-  if (typeof openShopFn !== 'function' || typeof readAccountFn !== 'function') return null;
+  if (typeof openShopFn !== 'function' || typeof readAccountFn !== 'function') return { error: 'discovery-capability-unavailable' };
   let loginCfg = o.loginCfg;
   if (loginCfg === undefined) {
     try {
@@ -5516,18 +5807,18 @@ async function discoverShopAccountByLiveSession(shopCfg, business, opts) {
   let opened = null, account = null;
   try {
     opened = await openShopFn({ loginCfg, shopCfg: navigationShopCfg(shopCfg, business && business.accountId), headless: o.headless === true });
-    if (!opened || !opened.target) return null;
+    if (!opened || !opened.target) return { error: 'discovery-open-incomplete' };
     const identity = await opened.target.evaluate(readAccountFn);
     const check = shopProfile.verifyLiveIdentity(business || { accountId: null }, String(identity && identity.accountId));
-    if (!check.ok) return null;
+    if (!check.ok) return { error: 'discovery-identity-unverified:' + (check.reason || 'unknown') };
     account = check.accountId;
     try {
       const drv = createRealDrivers({ page: opened.target, managerPage: opened.target, context: opened.context, dayState: {}, persist: () => {}, publishedIds: new Set(), attemptedSet: new Set(), hints: {}, accountId: account, business: { accountId: account }, opened, projectRoot: adapterRoot, planNumber: 1, runId: 'account-discovery' });
       await drv.saveCookies();
     } catch (_) {}
     return account;
-  } catch (_) {
-    return null;
+  } catch (e) {
+    return { error: 'discovery-open-failed:' + scheduledErrorText(e) };
   } finally {
     if (opened && opened.browser) {
       const closeFn = typeof o.closeBrowser === 'function' ? o.closeBrowser : readers.closeBrowser;
@@ -6094,6 +6385,6 @@ async function reconcileManualUiPublication(deps) {
   }
 }
 
-module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,main};
+module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,main};
 
 if(require.main===module)main();

@@ -664,7 +664,12 @@ function parseCatalogResponseBody(json) {
 // every action re-derives the exact visible row/control and reads back state.
 function openPickerInPage() {
   const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
-  if(location.origin!=='https://qianchuan.jinritemai.com'||!/^\/uni-creation\/overall-product-multi\/?$/.test(location.pathname))throw new Error('not-authorized-creation-page');
+  // Exact creation-route whitelist (R50): the platform canonically redirects the legacy
+  // creationUrl to EITHER /uni-creation/overall-product-multi OR /create-ad/overall-product
+  // for the SAME verified account (read-only Root snapshot reference-live-route.json). Only
+  // these two exact paths with an optional trailing slash pass; any other /create-ad/* or
+  // /uni-creation/* prefix, suffix or lookalike is refused exactly as before.
+  if(location.origin!=='https://qianchuan.jinritemai.com'||!/^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(location.pathname))throw new Error('not-authorized-creation-page');
   // '添加商品' is the empty-page native button; '继续添加商品' appears once products are already added.
   const buttons = [...document.querySelectorAll('button,[role="button"]')].filter(visible).filter(e => ['添加商品','继续添加商品'].includes((e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim()));
   if (buttons.length !== 1) throw new Error('product-picker-entry-not-unique');
@@ -827,7 +832,7 @@ function numericPickerPagingInPage(payload) {
 
   const mode = payload && payload.mode;
   if (mode !== 'read' && mode !== 'next' && mode !== 'prev') return { ok: false, reason: 'numeric-pager-mode-unknown', clicked: false };
-  if (location.origin !== 'https://qianchuan.jinritemai.com' || !/^\/uni-creation\/overall-product-multi\/?$/.test(location.pathname)) {
+  if (location.origin !== 'https://qianchuan.jinritemai.com' || !/^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(location.pathname)) {
     return { ok: false, reason: 'numeric-pager-creation-page-not-authorized', clicked: false };
   }
   // aavid must be a single exact value on the live URL, never inferred from cached host state
@@ -1189,7 +1194,7 @@ function removeNativeCardInPage(input) {
   // Self-contained: `input` is either the legacy bare product id string (old
   // tests / calls) or {productId, accountId} from the generic per-shop driver.
   const productId = (input && typeof input === 'object') ? String(input.productId) : String(input);
-  if (location.origin !== 'https://qianchuan.jinritemai.com' || !/^\/uni-creation\/overall-product-multi\/?$/.test(location.pathname)) throw new Error('draft-remove-not-authorized-creation-route');
+  if (location.origin !== 'https://qianchuan.jinritemai.com' || !/^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(location.pathname)) throw new Error('draft-remove-not-authorized-creation-route');
   const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
   const txt = e => (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
   const ACCOUNT=(input && typeof input === 'object' && input.accountId) ? String(input.accountId) : '1710242295996424';
@@ -1234,7 +1239,7 @@ function removeNativeCardInPage(input) {
 
 function confirmDraftRemovalInPage(input) {
   const productId = (input && typeof input === 'object') ? String(input.productId) : String(input);
-  if (location.origin !== 'https://qianchuan.jinritemai.com' || !/^\/uni-creation\/overall-product-multi\/?$/.test(location.pathname)) throw new Error('draft-remove-confirm-not-authorized-creation-route');
+  if (location.origin !== 'https://qianchuan.jinritemai.com' || !/^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(location.pathname)) throw new Error('draft-remove-confirm-not-authorized-creation-route');
   const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
   const txt = e => (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
   const ACCOUNT=(input && typeof input === 'object' && input.accountId) ? String(input.accountId) : '1710242295996424';
@@ -1306,7 +1311,7 @@ function confirmDraftRemovalInPage(input) {
     const proof=(input&&typeof input==='object')?input.removeProof:null;
     const proofOk=!!proof&&typeof proof==='object'&&proof.rowProof===true
       &&String(proof.productId)===String(productId)&&String(proof.accountId)===String(ACCOUNT)
-      &&proof.route==='uni-creation/overall-product-multi';
+      &&(proof.route==='uni-creation/overall-product-multi'||proof.route==='create-ad/overall-product');
     if(!proofOk) throw new Error('draft-remove-known-modal-unproven');
     const confirms=[...knownRoots[0].querySelectorAll('button,[role="button"]')].filter(visible).filter(b=>txt(b)==='确认'&&!isDisabled(b));
     if(confirms.length!==1) throw new Error('draft-remove-confirm-not-unique');
@@ -2204,7 +2209,17 @@ function guidanceActionInPage(payload) {
   // account. Substring matching would accept prefix collisions, aavid text
   // inside another parameter, or duplicated conflicting accounts.
   const aavid = new URLSearchParams(String(location.search || '')).getAll('aavid');
-  if (location.origin !== 'https://qianchuan.jinritemai.com' || !/^\/uni-creation\/overall-product-multi\/?$/.test(location.pathname) || aavid.length !== 1 || aavid[0] !== accountId) throw new Error('guidance-page-not-authorized');
+  // On refusal the error keeps the stable 'guidance-page-not-authorized' prefix
+  // and appends ONLY bounded desensitized diagnostics: the origin host, a
+  // route-shape boolean, the aavid parameter count / match flag and the
+  // EXPECTED account. The raw URL, other query parameters and cookies are
+  // never included, so a production stop can be triaged without leakage.
+  const originOk = location.origin === 'https://qianchuan.jinritemai.com';
+  const pathOk = /^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(location.pathname);
+  const aavidMatch = aavid.length === 1 && aavid[0] === accountId;
+  if (!originOk || !pathOk || !aavidMatch) {
+    throw new Error('guidance-page-not-authorized[origin=' + String(location.origin) + ',pathOk=' + pathOk + ',aavidCount=' + aavid.length + ',aavidMatch=' + aavidMatch + ',expectedAccount=' + accountId + ']');
+  }
   // Precise disabled evidence along the real guidance scope (shadow may cross
   // root/host): native disabled, aria-disabled, or an exact standalone disabled
   // token. Scroll-container boundary classes (--disabled-left/right) are not
@@ -2301,7 +2316,7 @@ function guidanceStorageCaptureInPage(accountId) {
 function guidanceRestoreInitScript(payload) {
   try {
     if (location.origin !== payload.origin) return;
-    if (!/^\/uni-creation\/overall-product-multi\/?$/.test(location.pathname)) return;
+    if (!/^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(location.pathname)) return;
     const aavid = new URLSearchParams(String(location.search || '')).getAll('aavid');
     if (aavid.length !== 1 || aavid[0] !== String(payload.accountId)) return;
     const allowed = key => (/^qc_lite_c_guide_/.test(key) || key === 'compeleted-fireflies' || key === 'user-guide-achieved-tasks' || key === 'UNI_PROM_GUIDE_FREQ_OVERALL_' + String(payload.accountId));
@@ -3989,8 +4004,17 @@ function createRealDrivers(ctx) {
       // 其它任何仍在的模态=零点击 fail-closed（附带有限脱敏诊断，便于下一轮取证）。
       // remove 不抛即证明：已在授权创建路由、精确账户、唯一目标草稿行内点了一次唯一"删除"。
       // 该狭义证明只在本 repairDraft 链构造并透传，绝不新增全局权限 API / 通用 nonce。
-      const removeProof=(removed&&removed.clicked===true&&String(removed.productId)===String(id))
-        ?{rowProof:true,productId:String(id),accountId:String(accountId),route:'uni-creation/overall-product-multi'}:null;
+      // R50：证明里的 route 取自点击后当前页面 URL 的**精确白名单路由**（两个平台规范创建
+      // 路由之一，去斜杠）；URL 缺失/漂移/非白名单 → removeProof 为 null，confirm 拒绝。
+      let liveRoute=null;
+      try{
+        const u=new URL(page.url());
+        if(u.origin==='https://qianchuan.jinritemai.com'
+          &&/^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(u.pathname))
+          liveRoute=u.pathname.replace(/^\//,'').replace(/\/+$/,'');
+      }catch(_){/* keep null: unproven route never becomes a proof */}
+      const removeProof=(removed&&removed.clicked===true&&String(removed.productId)===String(id)&&liveRoute)
+        ?{rowProof:true,productId:String(id),accountId:String(accountId),route:liveRoute}:null;
       try { await guidancePhase(); } catch (_) { /* guidance 未知/失败：不改动作，交由 confirm 严格停止 */ }
       await page.evaluate(confirmDraftRemovalInPage,{productId:String(id),accountId,removeProof});
       await until(readMainTable,rows=>!rows.some(r=>r.productId===String(id)),10000,'draft-row-removal');

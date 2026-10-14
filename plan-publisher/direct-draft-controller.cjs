@@ -18,7 +18,12 @@ const FILL_VALUES = ['15', '300']; // ROI15 / daily budget 300 only
 // no-row / possible-review-failure is never such a proof.
 const PUBLICATION_FAILURE_MARK = '发布失败';
 const DELISTED_MARK = '商品已下架';
-const CREATION_PATH_RE = /^\/uni-creation\/overall-product-multi/;
+// R50 exact creation-route whitelist: the platform canonically serves the SAME verified
+// account's creation page at EITHER /uni-creation/overall-product-multi OR
+// /create-ad/overall-product (Root read-only snapshot reference-live-route.json). Exact
+// paths with an optional trailing slash only — any other /create-ad/* or /uni-creation/*
+// prefix/suffix/lookalike stays refused.
+const CREATION_PATH_RE = /^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/;
 const QIANCHUAN_ORIGIN = 'https://qianchuan.jinritemai.com';
 
 function resolveProjectRoot(env) {
@@ -369,7 +374,7 @@ function pageObserve() {
     const idRe = /ID\s*[:：]\s*\d{15,20}/g;
     const stripId = s => s.replace(/ID\s*[:：]\s*/, '');
     const originOk = location.origin === 'https://qianchuan.jinritemai.com';
-    const pathOk = /^\/uni-creation\/overall-product-multi\/?$/.test(location.pathname);
+    const pathOk = /^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(location.pathname);
     // Account identity comes ONLY from a uniquely proven navigator header ID.
     // Prefer the exact account container (.qc-page-navigator-container, the
     // project chengfang identity reader root); only when NO exact root exists
@@ -529,7 +534,7 @@ function pageApply(action) {
   const productSignals = ['全部', '店铺新品', '破圈尖货', '流量扶持', '搜索趋势'];
   const regionSel = '[class*="pagination"],[class*="Pagination"],[class*="page-item"],[class*="pager"],[class*="Pager"],[class*="pages"]';
 
-  if (!/\/uni-creation\/overall-product-multi(?:\/|$)/.test(location.pathname)) throw new Error('Not the authorized new creation page');
+  if (!/^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(location.pathname)) throw new Error('Not the authorized new creation page');
   if (action.observation !== window.__directDraftObservation) throw new Error('Observation expired');
   if (!window.__directDraftModalRoot || !window.__directDraftPagSet || !window.__directDraftPagKind || !window.__directDraftPagPage) throw new Error('No observed pagination region');
 
@@ -709,7 +714,7 @@ function actionApply(action) {
     }
     return { ok: false, field: null, reason: 'no-unique-labeled-field', level, tag: null, cls: '', labelSample: '', ancestors };
   }
-  if (!/\/uni-creation\/overall-product-multi(?:\/|$)/.test(location.pathname) && action.expectedText !== '商品乘方') throw new Error('Not the authorized new creation page');
+  if (!/^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(location.pathname) && action.expectedText !== '商品乘方') throw new Error('Not the authorized new creation page');
   if (action.observation !== window.__directDraftObservation) throw new Error('Observation expired');
   const e = window.__directDraftElements[action.index];
   if (!e || !e.isConnected) throw new Error('Observed element unavailable');
@@ -793,7 +798,7 @@ function publishApply(cmd) {
   const text = e => (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
   const dialogSel = '[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="drawer"],[class*="Drawer"],[class*="modal"],[class*="Modal"]';
   if (location.origin !== 'https://qianchuan.jinritemai.com') throw new Error('Wrong origin');
-  if (!/^\/uni-creation\/overall-product-multi\/?$/.test(location.pathname)) throw new Error('Wrong path');
+  if (!/^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(location.pathname)) throw new Error('Wrong path');
   if (!cmd || cmd.observation !== window.__directDraftObservation) throw new Error('Observation expired');
   const idRe = /ID\s*[:：]\s*\d{15,20}/g;
   const stripId = s => s.replace(/ID\s*[:：]\s*/, '');

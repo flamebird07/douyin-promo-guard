@@ -429,11 +429,18 @@ async function reachQianchuanHome({ page, context, shopCfg }) {
   }
   // 有界只读后备（同 Cookie 上下文）：账户ID 未知时打开**不带账户ID的通用 /home**，
   // 供正式调用链在该页运行时严格唯一头部发现账户并与本店绑定。
-  await page.goto(qianchuanHomeUrl(shopCfg), { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-  await page.waitForTimeout(6000);
-  const url = page.url();
-  if (isQianchuanHomeUrl(url)) return { ok: true, target: page, url, mode: 'direct-home-url', attempts: 4 };
-  lastUrl = url;
+  // R74：兜底在同一 context **新建本次 owned 的千川页**导航，绝不再 goto 覆盖原 FXG 主页
+  //（旧实现把 cookieSession.identityPage 也变成了 QC 页，未知店铺检查点永远跳过保存）。
+  // 原 FXG 页始终原样保留供身份复验；兜底失败的残留页由上层 browser.close 保守清理。
+  let qcFallbackPage = null;
+  try {
+    qcFallbackPage = await context.newPage();
+    await qcFallbackPage.goto(qianchuanHomeUrl(shopCfg), { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    await qcFallbackPage.waitForTimeout(6000);
+  } catch (_) { qcFallbackPage = null; }
+  const url = qcFallbackPage ? String(qcFallbackPage.url()) : '';
+  if (qcFallbackPage && isQianchuanHomeUrl(url)) return { ok: true, target: qcFallbackPage, url, mode: 'direct-home-url', attempts: 4 };
+  lastUrl = url || lastUrl;
   lastReason = `${lastReason}（直连千川首页兜底亦未到达）`;
   return { ok: false, url: lastUrl || (page.url && page.url()) || '', reason: lastReason };
 }
@@ -595,9 +602,17 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
       throw new DataGuardError(`${reached.reason}（当前: ${reached.url}）；若需额外登录/授权请先人工完成一次`);
     }
     const target = reached.target;
+    // R73：把原抖店身份页以**非枚举临时引用**挂到本次 cookieSession 上，供会话检查点在
+    // 未知 accountId 时于同一 context 的原抖店页取严格语义店铺名正证据（自动发现账户）；
+    // 后续复用同一 cookieSession 的检查点（如乘方链路）同样可取得。非枚举：不进入
+    // JSON 序列化，不改变既有返回字段；检查点缺失该引用时按原有约定跳过，零写入。
+    Object.defineProperty(cookieSession, 'identityPage', {
+      value: page, enumerable: false, configurable: true, writable: true,
+    });
     // R58 会话检查点：已核验到达千川（严格可信来源+受支持路径）后、继续后续导航前，
     // 把本会话刷新后的 Cookie 经授权写入器持久化（当前新鲜同账户正证据成立时才写；
-    // 配置无 accountId 则跳过）。任何跳过/失败都不改写本次打开结果、不掩盖原始错误。
+    // 配置无 accountId 时仅在 R73 严格自动发现正证据成立时才写，否则跳过）。
+    // 任何跳过/失败都不改写本次打开结果、不掩盖原始错误。
     let cookieCheckpoint;
     try {
       const runCheckpoint = opts.sessionCheckpoint || checkpointQianchuanSessionCookies;

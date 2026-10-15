@@ -290,7 +290,13 @@ function createCompassOrderReader(p) {
       }
 
       // 2) 点击"成交订单数"文字入口；处理新标签页或当前页跳转
+      //    R54：SSO 收敛后首页 URL 已就绪但 SPA 入口渲染有延迟，首次 count=0
+      //    属瞬时渲染而非结构性缺失——先做有界被动等待（复用既有 locator，
+      //    ≤20s，无新定时器/服务）；等待后仍缺失才维持原 DataGuard 语义。
       const labelLoc = page.getByText(ORDER_LABEL, { exact: true });
+      if ((await labelLoc.count()) === 0 && typeof labelLoc.first().waitFor === 'function') {
+        await labelLoc.first().waitFor({ state: 'attached', timeout: 20000 }).catch(() => {});
+      }
       if ((await labelLoc.count()) === 0) {
         throw new DataGuardError('抖店主页面未找到"成交订单数"文字入口（页面结构可能变化），不使用主页外层数字');
       }

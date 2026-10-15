@@ -78,11 +78,13 @@ function makeStubCompassEnv({
   pageShopName = SHOP_CFG.name,
   overviewOk = true,
   entryCount = 1,
+  entryAppearAfterWait = 0,
   closeAfterFirstSettleSleep = false,
 } = {}) {
   const calls = { gotos: [], closes: 0, urlCalls: 0, sleeps: 0, evaluates: 0 };
   let urlIdx = 0;
   let closedFlag = false;
+  let entryWaitCalls = 0;
   const defaultProbe = () => ({
     code: 'ok', valueText: '0', labelText: '成交订单数', cardText: '成交订单数0昨日145同行基准114',
     saleScope: { realtimeActive: true, saleAllActive: true, realtimeFound: true, saleAllFound: true, tabs: [] },
@@ -109,7 +111,9 @@ function makeStubCompassEnv({
     },
     getByText: () => ({
       first() { return this; },
-      count: async () => entryCount,
+      // R54：精确入口延迟渲染 —— 首次 count 为 0，locator.waitFor 有界等待后被 SPA 挂载
+      count: async () => (entryWaitCalls >= entryAppearAfterWait ? entryCount : 0),
+      waitFor: async () => { entryWaitCalls += 1; },
       click: async () => {},
     }),
     getByRole: () => ({ count: async () => 0 }),
@@ -299,6 +303,45 @@ test('口径失效（实时选中但全店未选中）：DataGuard 阻止（双�
   await assert.rejects(
     () => makeReader(stub, clock).readOrderSummary({ shopCfg: SHOP_CFG }),
     (e) => e instanceof DataGuardError && /口径核验失败/.test(e.message),
+  );
+  assert.strictEqual(stub.calls.closes, 1);
+});
+
+// ── R54：SSO 后首页 SPA 入口延迟渲染（瞬时 count=0 非 结构性缺失） ──
+
+test('R54 延迟入口：首页已就绪但精确"成交订单数"标签初始 count=0，有界等待挂载后成功读取订单 10', async () => {
+  const clock = makeVirtualClock();
+  const stub = makeStubCompassEnv({
+    urlQueue: [FXG_HOME, COMPASS_URL, COMPASS_URL],
+    entryAppearAfterWait: 1, // 首次 count 为 0；waitFor 有界等待后才渲染
+    probe: () => ({
+      code: 'ok', valueText: '10', labelText: '成交订单数', cardText: '成交订单数10昨日145同行基准114',
+      saleScope: { realtimeActive: true, saleAllActive: true, realtimeFound: true, saleAllFound: true, tabs: [] },
+      overviewTimestamp: null,
+    }),
+  });
+  const reader = makeReader(stub, clock);
+  const r = await reader.readOrderSummary({ shopCfg: SHOP_CFG });
+  assert.strictEqual(r.valueCount, 10, '延迟挂载的精确入口被点击后正确读取实时全店订单');
+  assert.strictEqual(r.rawText, '10');
+  assert.match(r.dateScopeEvidence, /全店/);
+  assert.match(r.dateScopeEvidence, /实时/);
+  assert.strictEqual(r.identityEvidence.pageShopName, SHOP_CFG.name);
+  assert.strictEqual(stub.calls.closes, 1);
+});
+
+test('R54 持久缺失：有界等待后精确标签仍不存在 → 原 DataGuard 语义保留（非 Auth、不重扫）+ 清理', async () => {
+  const clock = makeVirtualClock();
+  const stub = makeStubCompassEnv({
+    urlQueue: [FXG_HOME, COMPASS_URL, COMPASS_URL],
+    entryCount: 0, // 等待后仍无精确入口
+  });
+  await assert.rejects(
+    () => makeReader(stub, clock).readOrderSummary({ shopCfg: SHOP_CFG }),
+    (e) => e instanceof DataGuardError
+      && !(e instanceof AuthError)
+      && !/登录失效|请重新扫码登录/.test(e.message)
+      && /未找到"成交订单数"文字入口/.test(e.message),
   );
   assert.strictEqual(stub.calls.closes, 1);
 });

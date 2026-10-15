@@ -448,7 +448,9 @@ function proveSchedulerReleaseProof(ledgerFile, statePaths, spec) {
   if (!rec || typeof rec !== 'object') return { ok: false, reason: 'release-no-current-entry' };
   const entry = rec.entries && rec.entries[String(planNumber)];
   if (!entry || typeof entry !== 'object') return { ok: false, reason: 'release-no-current-entry' };
-  if (rec.status !== 'failed' && rec.status !== 'blocked') return { ok: false, reason: 'release-record-not-terminal-failure:' + String(rec.status) };
+  // S56: failed-permanent is releasable ONLY when the bound entry is exactly preparation-stopped
+  // (3 proven preparation stops, zero publication) — all other failed-permanent shapes stay sealed.
+  if (rec.status !== 'failed' && rec.status !== 'blocked' && !(rec.status === 'failed-permanent' && entry.status === 'preparation-stopped')) return { ok: false, reason: 'release-record-not-terminal-failure:' + String(rec.status) };
   if (entry.status !== 'failed' && entry.status !== 'preparation-stopped') return { ok: false, reason: 'release-entry-not-prepublication:' + String(entry.status) };
   const pub = proveNoPublicationPreOpen(statePaths.stateFile, statePaths.attemptsFile, businessDate, { planNumber, accountId: s.accountId, shop });
   if (!pub.ok) return { ok: false, reason: pub.reason };
@@ -2188,6 +2190,10 @@ const GUIDANCE_ORIGIN = 'https://qianchuan.jinritemai.com';
 // after this bounded stable-empty window elapses with no root reappearing.
 const GUIDANCE_SETTLE_MS = 600;
 const GUIDANCE_SETTLE_POLL_MS = 150;
+// R55: bounded passive window for the post-fill plan-settings readback settle (see
+// configurePlan). A writeback that lands later than this is a persistent mismatch and
+// keeps the honest fail-closed stop with diagnostics.
+const SETTINGS_READBACK_SETTLE_MS = 4000;
 
 function isAllowedGuidanceKey(key, accountId) {
   const k = String(key == null ? '' : key);
@@ -2655,6 +2661,9 @@ function createRealDrivers(ctx) {
   // frozen default; tests may shrink it to keep no-progress stops fast. The
   // bound only limits waiting — it never converts a timeout into EOF.
   const nativeTimeoutMs = Number.isInteger(ctx.nativeScrollTimeoutMs) && ctx.nativeScrollTimeoutMs > 0 ? ctx.nativeScrollTimeoutMs : NATIVE_SCROLL_TIMEOUT_MS;
+  // R55 offline seam: bounded window for the passive plan-settings readback settle. The
+  // production default is fixed below; only tests may shrink it. No behavior change.
+  const settingsReadbackSettleMs = Number.isInteger(ctx.settingsReadbackSettleMs) && ctx.settingsReadbackSettleMs > 0 ? ctx.settingsReadbackSettleMs : SETTINGS_READBACK_SETTLE_MS;
   // Bounded read-only waits for the management SPA. These never convert a timeout
   // into success and never click: they gate the tab click behind a real, hydrated
   // account identity. The identity must report the target accountId (a premature
@@ -3000,7 +3009,35 @@ function createRealDrivers(ctx) {
     if (String(scope.accountId) !== String(accountId)) throw new Error('numeric-leaf-scope-account-drift');
     const guide = await page.evaluate(guidanceActionInPage, { mode: 'snapshot', accountId });
     if (guide && guide.unknown) throw new Error(String(guide.unknown));
-    if (guide && guide.present) throw new Error('numeric-leaf-guide-overlay-present');
+    // R55: a KNOWN late guide (close / 下一步 / 我知道了 via the SAME real guidance phase
+    // the native-scroll path already uses — real clicks, cookie writeback, private flag
+    // readback, fresh absent probe) is handled here instead of the old unconditional stop.
+    // The guide callback may itself mutate the DOM or the main selection, so EVERY
+    // pre-handling observation (before drawer, scope read, main-table identity) is stale
+    // once the phase ran: re-settle the SAME page from scratch (drawer / category / footer /
+    // checked subset / main table through the existing settleProductPage) and re-prove the
+    // numeric scope (page / account / footer / capacity / checkedIds) from a FRESH drawer
+    // before any pager click. Any drift or unproven state keeps the honest zero-click stop —
+    // never a stale-observation click, never a fallback to the svg bypass. A phase that
+    // handled 0 (overlay vanished on its own) continues only through the same fresh reads.
+    let effective = before;
+    if (guide && guide.present) {
+      await handleLateGuidanceBeforeNativeAdvance(page, accountId, guidancePhase);
+      await settleProductPage({ cat: context.cat, native: false, pageNo: currentPage, selectedIds, baseSelectedCount: context.baseSelectedCount });
+      const freshBefore = await drawer();
+      if (!freshBefore || freshBefore.ok !== true) throw new Error('numeric-leaf-post-guide-drawer-not-unique');
+      if (freshBefore.selectedCount !== before.selectedCount || freshBefore.remainingCapacity !== before.remainingCapacity) throw new Error('numeric-leaf-post-guide-footer-drift');
+      if ((freshBefore.activeTabs || []).map(x => String(x).replace(/\s/g, '')).sort().join('|') !== (before.activeTabs || []).map(x => String(x).replace(/\s/g, '')).sort().join('|')) throw new Error('numeric-leaf-post-guide-category-drift');
+      const rescope = await page.evaluate(numericPickerPagingInPage, {
+        mode: 'read', expectedCurrentPage: currentPage,
+        expectedSelectedCount: freshBefore.selectedCount, expectedCapacity: freshBefore.remainingCapacity,
+        selectedIds, accountId,
+      });
+      if (!rescope || rescope.ok !== true) throw new Error('numeric-leaf-post-guide-scope-not-proven:' + (rescope && rescope.reason || 'unknown'));
+      if (rescope.currentPage !== currentPage) throw new Error('numeric-leaf-post-guide-page-drift');
+      if (String(rescope.accountId) !== String(accountId)) throw new Error('numeric-leaf-post-guide-account-drift');
+      effective = freshBefore;
+    }
     const targetObs = await observe();
     if (!targetObs || !targetObs.pagination || targetObs.pagination.modalPresent !== true
       || targetObs.pagination.inProductModal !== true || targetObs.pagination.currentPage !== currentPage) {
@@ -3011,8 +3048,8 @@ function createRealDrivers(ctx) {
     if (!target || target.mode !== 'click' || target.expectKind !== 'number' || target.expectPage !== nextPage) {
       throw new Error('numeric-leaf-target-not-number-click');
     }
-    const beforeIds = before.cards.map(c => c.id).filter(Boolean).sort().join(',');
-    const activeBefore = (before.activeTabs || []).map(x => String(x).replace(/\s/g, '')).sort().join('|');
+    const beforeIds = effective.cards.map(c => c.id).filter(Boolean).sort().join(',');
+    const activeBefore = (effective.activeTabs || []).map(x => String(x).replace(/\s/g, '')).sort().join('|');
     await page.evaluate(guard.pageApply, { ...target, observation: targetObs.observation });
     const after = await until(async () => ({
       obs: await observe(),
@@ -3021,8 +3058,8 @@ function createRealDrivers(ctx) {
     }), x => x.obs.pagination && x.obs.pagination.currentPage === nextPage
       && x.result.ok === true && x.result.currentPage === nextPage
       && String(x.result.accountId) === String(accountId)
-      && x.result.footerSelectedCount === before.selectedCount
-      && x.result.footerRemainingCapacity === before.remainingCapacity
+      && x.result.footerSelectedCount === effective.selectedCount
+      && x.result.footerRemainingCapacity === effective.remainingCapacity
       && x.result.checkedIds.every(id => selectedIds.includes(id))
       && x.snap.ok === true && categoryIsActive(x.snap, '全部') && listPageComplete(x.snap)
       && x.snap.cards.map(c => c.id).filter(Boolean).sort().join(',') !== beforeIds,
@@ -4048,8 +4085,29 @@ function createRealDrivers(ctx) {
     if(String(budgetNow[0].value)!==String(targetBudget))await page.evaluate(guard.actionApply,{observation:fresh.observation,index:budgetNow[0].index,op:'fill',value:String(targetBudget),kind:'budget'});
     const planName=shanghaiPlanName(businessDate,planNumber);
     await page.evaluate(creationPlanNameInPage,planName);
-    const verified=await observe();
-    if(String(verified.creation.roi)!==String(targetRoi)||String(verified.creation.budget)!==String(targetBudget)||verified.creation.commissionChecked!==true||verified.creation.optionalDirectPayChecked!==false||verified.creation.planName!==planName)return {ok:false,reason:'plan-settings-readback-mismatch'};
+    // R55: the ROI / budget / name writebacks can land asynchronously, so a single
+    // immediate read may still show the pre-write state. Bounded PASSIVE fresh same-account
+    // reads (existing until; no new fill, no retry click, no value normalization, STRICT
+    // targets untouched) wait for the exact settings to appear; only a persistent mismatch
+    // keeps the honest stop — now with desensitized expected/observed settings fields
+    // instead of raw DOM / Cookie / publish success. Offline tests may shrink the window
+    // through ctx.settingsReadbackSettleMs.
+    const settingsMatch=v=>v&&v.creation&&v.creation.accountId===accountId&&v.creation.mainTableUnique===true&&String(v.creation.roi)===String(targetRoi)&&String(v.creation.budget)===String(targetBudget)&&v.creation.commissionChecked===true&&v.creation.optionalDirectPayChecked===false&&v.creation.planName===planName;
+    let verified=null;
+    try { verified=await until(observe,settingsMatch,settingsReadbackSettleMs,'plan-settings-readback-settle'); }
+    catch(_) {
+      let finalRead=null;
+      try { finalRead=await observe(); } catch(_) { finalRead=null; }
+      const creation=finalRead&&finalRead.creation;
+      return {ok:false,reason:'plan-settings-readback-mismatch',
+        expected:{roi:String(targetRoi),budget:String(targetBudget),commissionChecked:true,optionalDirectPayChecked:false,planName},
+        observed:creation?{roi:creation.roi===undefined?null:String(creation.roi),budget:creation.budget===undefined?null:String(creation.budget),commissionChecked:creation.commissionChecked===true,optionalDirectPayChecked:creation.optionalDirectPayChecked===true,planName:creation.planName===undefined?null:String(creation.planName)}:null};
+    }
+    // S56: a final FRESH identity read must block at readiness — settings alone (same ROI/budget/
+    // name) never authorize a plan whose creation surface drifted to a foreign account or lost
+    // main-table uniqueness after the settings settled.
+    const readiness=await observe();
+    if(!readiness||!readiness.creation||readiness.creation.accountId!==accountId||readiness.creation.mainTableUnique!==true)return {ok:false,reason:'creation-settings-identity-drift-at-readiness'};
     // Post-configuration guidance (including a config-stage 下一步) must be
     // handled and read back before this plan can reach ready-awaiting-confirmation.
     await guidancePhase();
@@ -4289,6 +4347,10 @@ function createRealDrivers(ctx) {
     } catch(error){ return {absenceConfirmed:false,present:false,reason:'absence-scan-failed:'+(error&&error.message||'unknown')}; }
   }
   async function saveCookies() {
+    // R55 offline seam: tests substitute the whole live writeback (fingerprinted file
+    // write + probe) with a stub result so the guidance phase's cookie-persisted contract
+    // can be proven offline. Production callers pass no override and are unchanged.
+    if (typeof ctx.saveCookies === 'function') return ctx.saveCookies();
     const session=opened&&opened.cookieSession;
     if(!session||!context||!session.filePath||!session.startFingerprint)return {status:'skipped',reason:'live-cookie-session-unavailable'};
     const probe=await managerPage.evaluate(guard.cookieIdentityProbe,accountId);
@@ -4318,7 +4380,7 @@ function createRealDrivers(ctx) {
     }
     return {status:summary.status,reason:summary.reason||null,count:summary.count||null,bytes:summary.bytes||null,domains:summary.domains||null,conflict:summary.conflict===true};
   }
-  const guidancePhase=()=>runGuidancePhase(page,{accountId,saveCookies,persistFlags:async()=>{
+  const guidancePhase=()=>runGuidancePhase(page,{accountId,saveCookies,persistFlags:typeof ctx.persistFlags==='function'?ctx.persistFlags:async()=>{
     const captured=await page.evaluate(guidanceStorageCaptureInPage,accountId);
     return persistPrivateGuidanceState(guidanceFilePath(accountId,ctx.guidancePrivateDir),accountId,(captured&&captured.values)||[]);
   }});

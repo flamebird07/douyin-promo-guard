@@ -802,6 +802,89 @@ function planPostPublishEnable(currentState, deps) {
   };
 }
 
+// ── S65 preparation diagnostics: whitelist sanitizers (fail-closed to null; unknown fields dropped) ──
+// These helpers never invent values; they only copy through what the real driver already returned,
+// after field-level whitelisting. Any unexpected / secret-shaped field is dropped to null. The full
+// driver object, row text, accounts, IDs, URLs, cookies and paths are never propagated.
+const SETTINGS_NUMBER_RE = /^\d+(?:\.\d{1,4})?$/;
+const SETTINGS_PLAN_NAME_RE = /^[\u3400-\u4DBF\u4E00-\u9FFF0-9_:.\-]{1,48}$/;
+function sanitizeSettingsScalar(value, kind) {
+  if (value === null || value === undefined) return null;
+  if (kind === 'number') {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.length <= 16 && SETTINGS_NUMBER_RE.test(value)) return value;
+    return null;
+  }
+  if (kind === 'bool') return value === true || value === false ? value : null;
+  if (kind === 'planName') {
+    if (typeof value !== 'string' || value.length === 0 || value.length > 48) return null;
+    return SETTINGS_PLAN_NAME_RE.test(value) ? value : null;
+  }
+  return null;
+}
+function sanitizeSettingsSide(side) {
+  if (!side || typeof side !== 'object') return null;
+  return {
+    roi: sanitizeSettingsScalar(side.roi, 'number'),
+    budget: sanitizeSettingsScalar(side.budget, 'number'),
+    commissionChecked: sanitizeSettingsScalar(side.commissionChecked, 'bool'),
+    optionalDirectPayChecked: sanitizeSettingsScalar(side.optionalDirectPayChecked, 'bool'),
+    planName: sanitizeSettingsScalar(side.planName, 'planName'),
+  };
+}
+function sanitizeSettingsDiagnostic(expected, observed) {
+  const e = sanitizeSettingsSide(expected), o = sanitizeSettingsSide(observed);
+  if (!e && !o) return null;
+  return { expected: e, observed: o };
+}
+const BINDING_DIAG_PHASE_ENUM = new Set([
+  'initial-auto-drawer', 'reopened-anchor', 'panel-candidate', 'pre-header',
+  'panel-navigation', 'before-header',
+]);
+function sanitizeBindingDiagnostic(diag) {
+  if (!diag || typeof diag !== 'object') return null;
+  const numOr = v => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const phase = typeof diag.phase === 'string' && BINDING_DIAG_PHASE_ENUM.has(diag.phase) ? diag.phase : null;
+  return {
+    phase,
+    rowCount: numOr(diag.rowCount),
+    knownCheckedCount: numOr(diag.knownCheckedCount),
+    unknownStateCount: numOr(diag.unknownStateCount),
+    selectedCount: numOr(diag.selectedCount),
+    totalCount: numOr(diag.totalCount),
+  };
+}
+function readinessSummary(readiness, phase, round) {
+  if (!readiness || typeof readiness !== 'object') return null;
+  const numOr = v => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const arrLen = v => (Array.isArray(v) ? v.length : null);
+  return {
+    phase: typeof phase === 'string' ? phase.slice(0, 24) : null,
+    round: numOr(round),
+    rowCount: numOr(readiness.rowCount),
+    uniqueCount: numOr(readiness.uniqueCount),
+    deficientCount: arrLen(readiness.deficientIds),
+    unknownManualCount: arrLen(readiness.unknownManualIds),
+    reviewFailedCount: arrLen(readiness.reviewFailedIds),
+    ambiguousCount: numOr(readiness.ambiguousCount),
+    capacity: numOr(readiness.capacity),
+    ready: readiness.ready === true,
+  };
+}
+// Callback errors are CAUGHT here — a diagnostic callback must never alter business behavior.
+// Hard cap 31 per plan (existing round cap 30 → initial + 30 emissions max).
+function makePreparationEmitter(cb) {
+  if (typeof cb !== 'function') return () => {};
+  let count = 0;
+  return (readiness, phase, round) => {
+    if (count >= 31) return;
+    const summary = readinessSummary(readiness, phase, round);
+    if (!summary) return;
+    count++;
+    try { cb(summary); } catch (_) { /* swallow: diagnostics must never leak failure into flow */ }
+  };
+}
+
 // ── high-level orchestration (DI; prepared => ready-awaiting-confirmation) ──
 // preparePlan NEVER publishes. It assembles the frozen manifest and stops at
 // 'ready-awaiting-confirmation'. publishConfirmedPlan requires a validated
@@ -821,6 +904,7 @@ async function preparePlan(deps) {
   }
   const publishedSet = d.publishedSet instanceof Set ? d.publishedSet : new Set((d.publishedIds || []).map(String));
   const attemptedSet = new Set((dayState.attempted || []).map(String));
+  const emitReadiness = makePreparationEmitter(d.onPreparationDiagnostic);
   let workingState = { ...dayState, attempted: [...(dayState.attempted || [])], lastSelected: [...(dayState.lastSelected || [])], hints: { ...(dayState.hints || {}) } };
   const persistState = typeof d.persistState === 'function' ? d.persistState : async () => {};
   workingState.active = { status: 'preparing', planNumber: d.planNumber || null, runId: d.runId || null, businessDate };
@@ -890,7 +974,8 @@ async function preparePlan(deps) {
   //    each with at least 1 manually bound target account (R32; 2 is also fine).
   const binding = await d.bindAccountsToAll({ productIds: selected });
   if (d.requireRealDrivers === true && (!binding || binding.ok !== true)) {
-    return { status: 'stopped', stage: 'account-binding', reason: (binding && binding.reason) || 'native-binding-not-confirmed', businessDate };
+    const bindingDiag = sanitizeBindingDiagnostic(binding && binding.diag);
+    return { status: 'stopped', stage: 'account-binding', reason: (binding && binding.reason) || 'native-binding-not-confirmed', bindingDiag, businessDate };
   }
   let mainRows = await d.readMainTable();
   hints = mergeCardHints(hints, mainRows.map(r => ({
@@ -900,6 +985,7 @@ async function preparePlan(deps) {
   workingState = { ...workingState, hints };
   await persistState(workingState);
   let readiness = evaluateReadiness(mainRows, biz.productsPerPlan);
+  emitReadiness(readiness, 'initial', 0);
   let finalRows = mainRows;
   for (let round = 0; !readiness.ready && round < biz.productsPerPlan; round++) {
     if (readiness.unknownManualIds.length) {
@@ -940,7 +1026,8 @@ async function preparePlan(deps) {
     }
     const rebound = await d.bindAccountsToAll({ productIds: afterRepair.uniqueIds, repairRound: round + 1 });
     if (d.requireRealDrivers === true && (!rebound || rebound.ok !== true)) {
-      return { status: 'stopped', stage: 'account-rebinding', reason: (rebound && rebound.reason) || 'repair-rebinding-not-confirmed', businessDate };
+      const rebindDiag = sanitizeBindingDiagnostic(rebound && rebound.diag);
+      return { status: 'stopped', stage: 'account-rebinding', reason: (rebound && rebound.reason) || 'repair-rebinding-not-confirmed', bindingDiag: rebindDiag, businessDate };
     }
     mainRows = await d.readMainTable();
     hints = mergeCardHints(hints, mainRows.map(r => ({
@@ -950,6 +1037,7 @@ async function preparePlan(deps) {
     workingState = { ...workingState, hints };
     await persistState(workingState);
     readiness = evaluateReadiness(mainRows, biz.productsPerPlan);
+    emitReadiness(readiness, 'after-rebind', round + 1);
     finalRows = mainRows;
     if (readiness.ready) break;
   }
@@ -959,7 +1047,11 @@ async function preparePlan(deps) {
   if (typeof d.configurePlan === 'function') {
     configured = await d.configurePlan({ planNumber: d.planNumber, businessDate, mainRows: finalRows });
     if (!configured || configured.ok !== true || !configured.planName) {
-      return { status: 'stopped', stage: 'plan-settings', reason: (configured && configured.reason) || 'settings-not-confirmed', businessDate };
+      const reason = (configured && configured.reason) || 'settings-not-confirmed';
+      const settingsDiag = reason === 'plan-settings-readback-mismatch'
+        ? sanitizeSettingsDiagnostic(configured && configured.expected, configured && configured.observed)
+        : null;
+      return { status: 'stopped', stage: 'plan-settings', reason, settingsDiag, businessDate };
     }
   } else if (d.requireRealDrivers === true) {
     return { status: 'stopped', stage: 'plan-settings', reason: 'real-plan-settings-driver-missing', businessDate };
@@ -1131,5 +1223,6 @@ module.exports = {
   classifyPublishOutcome, planPostPublishEnable,
   hasUnresolvedPlan,
   preparePlan, publishConfirmedPlan,
+  sanitizeSettingsDiagnostic, sanitizeBindingDiagnostic, readinessSummary, makePreparationEmitter,
   collectProductCardsInPage, resolveFinalConfirmButtonInPage,
 };

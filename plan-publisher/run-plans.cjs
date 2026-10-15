@@ -2468,16 +2468,72 @@ async function runGuidanceOnPage(page, accountId, maxSteps = 8) {
 // After real guidance clicks land, cookies are written back once and the allowed
 // guidance flags persist to the private per-account file with readback. Zero
 // guidance means zero clicks, zero cookie writes and zero flag writes.
+// S65: the returned phase and any thrown-and-rethrown guidance error carry ONLY the
+// whitelisted diagnostic shape (fixed enums, counts, booleans). Raw cookie reason /
+// persistFlag reason / arbitrary strings NEVER leave this function.
+const GUIDANCE_COOKIE_STATUS_ENUM = new Set(['saved', 'failed', 'skipped', 'not-needed']);
+const GUIDANCE_FLAGS_REASON_ENUM = new Set([
+  'cookie-not-saved', 'guidance-persist-exception', 'guidance-state-not-saved', 'unknown',
+]);
+function categorizeCookieReason(reason, conflict) {
+  if (conflict === true) return 'conflict';
+  const s = String(reason || '').toLowerCase();
+  if (!s) return 'unknown';
+  if (s.includes('identity-not-confirmed') || s.includes('identity-mismatch') || s.includes('account-identity')) return 'identity-not-confirmed';
+  if (s.includes('live-cookie-session-unavailable') || s.includes('no-live-session') || s.includes('session-missing')) return 'no-live-session';
+  if (s.includes('validation')) return 'validation';
+  if (s.includes('conflict')) return 'conflict';
+  if (s.includes('fingerprint') || s.includes('readback-mismatch') || s.includes('write-failure') || s.includes('rename') || s.includes('write-error')) return 'write-failure';
+  return 'unknown';
+}
+function sanitizeGuidanceDiagnostic(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const phase = typeof raw.phase === 'string' && /^[a-z][a-z0-9-]{0,32}$/.test(raw.phase) ? raw.phase : 'guidance';
+  const handled = Number.isInteger(raw.handled) && raw.handled >= 0 ? raw.handled : 0;
+  const cs = GUIDANCE_COOKIE_STATUS_ENUM.has(String(raw.cookieStatus)) ? String(raw.cookieStatus) : 'failed';
+  const conflict = raw.conflict === true;
+  const cookieReason = conflict ? 'conflict' : categorizeCookieReason(raw.cookieReason);
+  const flagsSaved = raw.flagsSaved === true;
+  const fr = raw.flagsReason === null || raw.flagsReason === undefined ? null
+    : (GUIDANCE_FLAGS_REASON_ENUM.has(String(raw.flagsReason)) ? String(raw.flagsReason) : 'unknown');
+  return { phase, handled, cookieStatus: cs, conflict, cookieReason, flagsSaved, flagsReason: fr };
+}
 async function runGuidancePhase(page, deps) {
   const { accountId, saveCookies, persistFlags, maxSteps = 8 } = deps;
-  const processed = await runGuidanceOnPage(page, accountId, maxSteps);
-  if (!processed.handled.length) return { handled: 0, cookieStatus: 'not-needed', flagsSaved: false, flagsReason: null };
+  let processed;
+  try {
+    processed = await runGuidanceOnPage(page, accountId, maxSteps);
+  } catch (error) {
+    // R65 C: preserve EXACT original error.message; attach only the whitelisted diagnostic.
+    if (error && typeof error === 'object' && !error.guidanceDiagnostic) {
+      error.guidanceDiagnostic = sanitizeGuidanceDiagnostic({
+        phase: 'guidance', handled: 0, cookieStatus: 'not-needed',
+        conflict: false, cookieReason: 'unknown', flagsSaved: false, flagsReason: null,
+      });
+    }
+    throw error;
+  }
+  if (!processed.handled.length) return { handled: 0, cookieStatus: 'not-needed', flagsSaved: false, flagsReason: null, conflict: false, cookieReason: 'unknown', diagnostic: sanitizeGuidanceDiagnostic({ phase: 'guidance', handled: 0, cookieStatus: 'not-needed', conflict: false, cookieReason: 'unknown', flagsSaved: false, flagsReason: null }) };
   let cookie;
   try { cookie = await saveCookies(); } catch (error) { cookie = { status: 'failed', reason: String((error && error.message) || error) }; }
-  if (!cookie || cookie.status !== 'saved' || cookie.conflict === true) return { handled: processed.handled.length, cookieStatus: (cookie && cookie.status) || 'failed', flagsSaved: false, flagsReason: 'cookie-not-saved' };
+  if (!cookie || cookie.status !== 'saved' || cookie.conflict === true) {
+    const diag = sanitizeGuidanceDiagnostic({
+      phase: 'guidance', handled: processed.handled.length,
+      cookieStatus: (cookie && cookie.status) || 'failed',
+      conflict: !!(cookie && cookie.conflict === true),
+      cookieReason: cookie && cookie.reason,
+      flagsSaved: false, flagsReason: 'cookie-not-saved',
+    });
+    return { handled: processed.handled.length, cookieStatus: diag.cookieStatus, flagsSaved: false, flagsReason: 'cookie-not-saved', conflict: diag.conflict, cookieReason: diag.cookieReason, diagnostic: diag };
+  }
   let flags;
   try { flags = await persistFlags(); } catch (_) { flags = { saved: false, reason: 'guidance-persist-exception' }; }
-  return { handled: processed.handled.length, cookieStatus: 'saved', flagsSaved: flags.saved === true, flagsReason: flags.saved === true ? null : (flags.reason || 'guidance-state-not-saved'), flagCount: flags.count || 0 };
+  const rawFlagsReason = flags.saved === true ? null : (flags.reason || 'guidance-state-not-saved');
+  const diag = sanitizeGuidanceDiagnostic({
+    phase: 'guidance', handled: processed.handled.length, cookieStatus: 'saved',
+    conflict: false, cookieReason: 'unknown', flagsSaved: flags.saved === true, flagsReason: rawFlagsReason,
+  });
+  return { handled: processed.handled.length, cookieStatus: 'saved', flagsSaved: flags.saved === true, flagsReason: diag.flagsReason, conflict: false, cookieReason: 'unknown', flagCount: flags.count || 0, diagnostic: diag };
 }
 
 // A guidance overlay can appear LATE, right before a native-scroll advance: the probe
@@ -2509,7 +2565,16 @@ async function handleLateGuidanceBeforeNativeAdvance(page, accountId, runGuidanc
   const phase = await runGuidancePhase();
   const handled = phase && Number.isInteger(phase.handled) ? phase.handled : 0;
   if (handled > 0 && (phase.cookieStatus !== 'saved' || phase.flagsSaved !== true)) {
-    throw new Error('native-advance-guide-state-not-persisted');
+    const error = new Error('native-advance-guide-state-not-persisted');
+    error.guidanceDiagnostic = sanitizeGuidanceDiagnostic({
+      phase: 'native-advance', handled,
+      cookieStatus: phase && phase.cookieStatus,
+      conflict: phase && phase.conflict,
+      cookieReason: phase && phase.cookieReason,
+      flagsSaved: phase && phase.flagsSaved,
+      flagsReason: phase && phase.flagsReason,
+    });
+    throw error;
   }
   const fresh = await page.evaluate(guidanceActionInPage, { mode: 'snapshot', accountId });
   if (fresh && fresh.unknown) throw new Error(String(fresh.unknown));
@@ -4142,10 +4207,10 @@ function createRealDrivers(ctx) {
     const roi=toggles.elements.filter(e=>e.fillField&&e.fillField.recognized&&e.fillField.kind==='roi');
     const budget=toggles.elements.filter(e=>e.fillField&&e.fillField.recognized&&e.fillField.kind==='budget');
     if(roi.length!==1||budget.length!==1)return {ok:false,reason:'roi-budget-fields-not-unique'};
-    if(String(roi[0].value)!==String(targetRoi))await page.evaluate(guard.actionApply,{observation:toggles.observation,index:roi[0].index,op:'fill',value:String(targetRoi),kind:'roi'});
+    if(!guard.samePositiveDecimalValue(roi[0].value,targetRoi))await page.evaluate(guard.actionApply,{observation:toggles.observation,index:roi[0].index,op:'fill',value:String(targetRoi),kind:'roi'});
     const fresh=await observe();const budgetNow=fresh.elements.filter(e=>e.fillField&&e.fillField.recognized&&e.fillField.kind==='budget');
     if(budgetNow.length!==1) return {ok:false,reason:'budget-field-drift'};
-    if(String(budgetNow[0].value)!==String(targetBudget))await page.evaluate(guard.actionApply,{observation:fresh.observation,index:budgetNow[0].index,op:'fill',value:String(targetBudget),kind:'budget'});
+    if(!guard.samePositiveDecimalValue(budgetNow[0].value,targetBudget))await page.evaluate(guard.actionApply,{observation:fresh.observation,index:budgetNow[0].index,op:'fill',value:String(targetBudget),kind:'budget'});
     const planName=shanghaiPlanName(businessDate,planNumber);
     await page.evaluate(creationPlanNameInPage,planName);
     // R55: the ROI / budget / name writebacks can land asynchronously, so a single
@@ -4155,7 +4220,7 @@ function createRealDrivers(ctx) {
     // keeps the honest stop — now with desensitized expected/observed settings fields
     // instead of raw DOM / Cookie / publish success. Offline tests may shrink the window
     // through ctx.settingsReadbackSettleMs.
-    const settingsMatch=v=>v&&v.creation&&v.creation.accountId===accountId&&v.creation.mainTableUnique===true&&String(v.creation.roi)===String(targetRoi)&&String(v.creation.budget)===String(targetBudget)&&v.creation.commissionChecked===true&&v.creation.optionalDirectPayChecked===false&&v.creation.planName===planName;
+    const settingsMatch=v=>v&&v.creation&&v.creation.accountId===accountId&&v.creation.mainTableUnique===true&&guard.samePositiveDecimalValue(v.creation.roi,targetRoi)&&guard.samePositiveDecimalValue(v.creation.budget,targetBudget)&&v.creation.commissionChecked===true&&v.creation.optionalDirectPayChecked===false&&v.creation.planName===planName;
     let verified=null;
     try { verified=await until(observe,settingsMatch,settingsReadbackSettleMs,'plan-settings-readback-settle'); }
     catch(_) {
@@ -5387,6 +5452,47 @@ function recoveryReadbackDrivers(o, opened, business, adapterRoot, readAccountFn
   });
 }
 
+// R65 A/B: whitelisted preparation-diagnostic packet that crosses the parent boundary.
+// Only fixed-enum strings, numeric counts, booleans and short generated planName pass.
+// Identity presence is boolean-only, no IDs, no row text, no URLs, no cookies, no paths.
+// R67: stage and reason are CLOSED enums/whitelists — an arbitrary prep.reason (cookie,
+// token, URL or path material is never screened by length) becomes 'other-preparation-stop'.
+// Only the diagnostic packet is hardened; prep itself is never mutated.
+const PREP_DIAG_STAGES = new Set(['driver-contract','state-recovery','creation-header','selection','selection-incomplete','account-binding','account-rebinding','readiness','readiness-after-repair','plan-settings']);
+const PREP_DIAG_REASONS = new Set(['plan-settings-readback-mismatch','account-drawer-footer-row-state-conflict']);
+function buildScheduledPreparationDiagnostic(prep) {
+  if (!prep || typeof prep !== 'object') return null;
+  const numStr = v => (typeof v === 'string' && /^\d+(?:\.\d{1,4})?$/.test(v) && v.length <= 16) ? v : null;
+  const numVal = v => (typeof v === 'number' && Number.isFinite(v)) ? v : numStr(v);
+  const boolVal = v => (v === true || v === false) ? v : null;
+  const planName = v => (typeof v === 'string' && /^[\u3400-\u4DBF\u4E00-\u9FFF0-9_:.\-]{1,48}$/.test(v)) ? v : null;
+  const stage = PREP_DIAG_STAGES.has(prep.stage) ? prep.stage : null;
+  const reason = (typeof prep.reason !== 'string' || prep.reason.length === 0) ? null
+    : (PREP_DIAG_REASONS.has(prep.reason) ? prep.reason : 'other-preparation-stop');
+  const packet = { stage, reason };
+  const diag = prep.settingsDiag && typeof prep.settingsDiag === 'object' ? prep.settingsDiag : null;
+  if (diag) {
+    const pick = side => side && typeof side === 'object' ? {
+      roi: numVal(side.roi), budget: numVal(side.budget),
+      commissionChecked: boolVal(side.commissionChecked),
+      optionalDirectPayChecked: boolVal(side.optionalDirectPayChecked),
+      planName: planName(side.planName),
+    } : null;
+    packet.settings = { expected: pick(diag.expected), observed: pick(diag.observed) };
+  }
+  const bd = prep.bindingDiag && typeof prep.bindingDiag === 'object' ? prep.bindingDiag : null;
+  if (bd) {
+    const phase = typeof bd.phase === 'string' && /^(initial-auto-drawer|reopened-anchor|panel-candidate|pre-header|panel-navigation|before-header)$/.test(bd.phase) ? bd.phase : null;
+    const cnt = v => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+    packet.binding = { phase, rowCount: cnt(bd.rowCount), knownCheckedCount: cnt(bd.knownCheckedCount), unknownStateCount: cnt(bd.unknownStateCount), selectedCount: cnt(bd.selectedCount), totalCount: cnt(bd.totalCount) };
+  }
+  if (prep.guidanceDiagnostic && typeof prep.guidanceDiagnostic === 'object') {
+    packet.guidance = sanitizeGuidanceDiagnostic(prep.guidanceDiagnostic);
+  }
+  packet.identityPresent = !!(prep.businessDate && prep.stage);
+  return packet;
+}
+
 async function runScheduledPlan(businessInput, opts) {
   const o = opts || {};
   const nowOf = () => (typeof o.nowMs === 'function' ? o.nowMs() : (Number.isFinite(o.nowMs) ? o.nowMs : Date.now()));
@@ -5592,8 +5698,17 @@ async function runScheduledPlan(businessInput, opts) {
       requireRealDrivers: true, openCreationPage: drivers.openCreationPage, browseProducts: drivers.browseProducts,
       bindAccountsToAll: drivers.bindAccountsToAll, readMainTable: drivers.readMainTable, repairDraft: drivers.repairDraft,
       configurePlan: drivers.configurePlan, persistState: persist, hints, nowMs: nowOf(),
+      onPreparationDiagnostic: typeof o.onPreparationDiagnostic === 'function' ? o.onPreparationDiagnostic : (summary => { try { log('info', 'scheduled-readiness-summary ' + JSON.stringify(summary)); } catch (_) {} }),
     });
     if (prep.status !== 'ready-awaiting-confirmation') {
+      // R65 A/B: emit ONE sanitized preparation-diagnostic packet BEFORE the existing zero-close
+      // return/closure path. Only whitelisted settings/binding/guidance fields are copied; identity
+      // presence is boolean-only. Raw expected/observed, driver objects, row text, IDs, URLs,
+      // cookies and paths are NEVER propagated.
+      try {
+        const safePacket = buildScheduledPreparationDiagnostic(prep);
+        if (safePacket) log('warn', 'scheduled-preparation-diagnostic ' + JSON.stringify(safePacket));
+      } catch (_) { /* diagnostics must never alter business flow */ }
       // prep 以"停止"返回（非 ready）但**不抛异常**：旧代码在此直接 blocked 返回，把当日该份永久
       // 留在 active:preparing，只能靠只读恢复事后收口。这里复用与 scheduled-run-catch **同一**严格
       // 耐久判据 applyProvenPreparationClose：在**持锁**下**新鲜重读**两份文件，只有正面证明本日该份
@@ -5775,6 +5890,15 @@ async function runScheduledPlan(businessInput, opts) {
     });
   } catch (error) {
     const reason = scheduledErrorText(error);
+    // R65 C: emit one safe guidance diagnostic BEFORE the existing zero-close logic,
+    // without masking the original error text or changing any downstream result/status.
+    try {
+      const gd = error && error.guidanceDiagnostic;
+      if (gd) {
+        const packet = { stage: 'guidance', reason: null, guidance: sanitizeGuidanceDiagnostic(gd), identityPresent: !!businessDate };
+        log('warn', 'scheduled-preparation-diagnostic ' + JSON.stringify(packet));
+      }
+    } catch (_) { /* diagnostics never alter the flow */ }
     if (/read-only recovery|pending\/unknown/i.test(reason)) {
       preserveOwnedBrowser = true;
       return result('blocked', 'read-only-recovery-required:' + reason, { noAction: true, noReplay: true });
@@ -6534,6 +6658,6 @@ async function reconcileManualUiPublication(deps) {
   }
 }
 
-module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,main};
+module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,buildScheduledPreparationDiagnostic,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,main};
 
 if(require.main===module)main();

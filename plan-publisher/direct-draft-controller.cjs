@@ -907,12 +907,26 @@ function publishApply(cmd) {
   }
   // 目标 ROI/日预算动态合同：DOM 的 ROI 必须等于本店已授权的 ROI（cmd.roi；缺省 15 兼容旧调用）；
   // 预算在携带 cmd.budget 的新授权调用里等于已授权预算（如 450），旧调用（无 budget）保持原
-  // 严格 300 与原错误文案，绝不放松。
-  const expectedRoi = cmd && cmd.roi != null ? String(cmd.roi) : '15';
-  if (uniqueLabeledValue('roi') !== expectedRoi) throw new Error('ROI value in DOM does not match the authorized ROI');
+  // 300 合同与原错误文案，绝不放松。UI 失焦后会把 15 重排为 "15.00"，故按规范化十进制
+  // 字符串等价比较（15==15.00、300==300.00），位数不同/非法形状仍拒。
+  const expectedRoi = cmd && cmd.roi != null ? cmd.roi : 15;
+  // Serialized into the page: this comparator is intentionally self-contained
+  // (no reference to the host helper). decimal-guard-r66.test.cjs proves parity
+  // of both implementations by running THIS function's real serialized source.
+  const canonPosDec = v => {
+    let s = typeof v === 'number' ? (Number.isFinite(v) && v > 0 ? String(v) : null)
+      : (typeof v === 'string' ? v.trim() : null);
+    if (s === null || s.length === 0 || s.length > 128 || !/^\d+(?:\.\d+)?$/.test(s)) return null;
+    let [i, f = ''] = s.split('.');
+    i = i.replace(/^0+(?=\d)/, ''); f = f.replace(/0+$/, '');
+    const t = i + (f ? '.' + f : '');
+    return t === '0' ? null : t;
+  };
+  const sameDec = (x, y) => { const a = canonPosDec(x), b = canonPosDec(y); return a !== null && b !== null && a === b; };
+  if (!sameDec(uniqueLabeledValue('roi'), expectedRoi)) throw new Error('ROI value in DOM does not match the authorized ROI');
   if (cmd && cmd.budget != null) {
-    if (uniqueLabeledValue('budget') !== String(cmd.budget)) throw new Error('Daily budget value in DOM does not match the authorized budget');
-  } else if (uniqueLabeledValue('budget') !== '300') throw new Error('Daily budget value in DOM is not 300');
+    if (!sameDec(uniqueLabeledValue('budget'), cmd.budget)) throw new Error('Daily budget value in DOM does not match the authorized budget');
+  } else if (!sameDec(uniqueLabeledValue('budget'), 300)) throw new Error('Daily budget value in DOM is not 300');
   if (labeledCheckboxChecked(/含达人佣金/) !== true) throw new Error('Commission checkbox not checked');
   const nameInputs = [...document.querySelectorAll('input,textarea')].filter(visible).filter(inp => {
     if (/计划名称/.test(inp.getAttribute('placeholder') || '')) return true;
@@ -1073,6 +1087,34 @@ function configuredPlanCap(contract) {
 function isBoundedDurablePlanNumber(n) {
   return Number.isInteger(n) && n >= 1 && n <= 10;
 }
+// Strict canonical base-10 decimal equivalence for the ROI/budget guard gates
+// (UI reformats a filled 15 into "15.00" after blur). Accepts only finite
+// positive numbers or plain positive decimal strings (single dot, digits only,
+// length bounded to 128); canonicalization trims leading integer zeros and
+// trailing fraction zeros ONLY -- no float rounding, so 15.00000000000000001
+// stays distinct from 15. Zero, negatives, exponents, hex, units, commas,
+// blanks, booleans, null/undefined, objects, NaN/Infinity are rejected.
+const PLAIN_POS_DEC_RE = /^\d+(?:\.\d+)?$/;
+function canonicalizePositiveDecimal(value) {
+  let s;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || value <= 0) return null;
+    s = String(value);
+  } else if (typeof value === 'string') {
+    s = value.trim();
+  } else return null;
+  if (s.length === 0 || s.length > 128 || !PLAIN_POS_DEC_RE.test(s)) return null;
+  let [int, frac = ''] = s.split('.');
+  int = int.replace(/^0+(?=\d)/, '');
+  frac = frac.replace(/0+$/, '');
+  const canon = int + (frac ? '.' + frac : '');
+  return canon === '0' ? null : canon;
+}
+function samePositiveDecimalValue(actual, expected) {
+  const a = canonicalizePositiveDecimal(actual);
+  const b = canonicalizePositiveDecimal(expected);
+  return a !== null && b !== null && a === b;
+}
 function validatePublishAuthorization(cmd, obs, configuredAccountId, expectedRunId, approvedFirstPlan, contract) {
   const c = contract || {};
   // The approved account contract. An explicit contract with boundAccounts wins.
@@ -1120,7 +1162,7 @@ function validatePublishAuthorization(cmd, obs, configuredAccountId, expectedRun
   if (cr.productRowCount !== expProducts || cr.uniqueProductCount !== expProducts || cr.eachRowHasManualAccount !== true) throw new Error('DOM product table mismatch');
   const domSet = new Set(cr.productIds.map(String));
   if (domSet.size !== expProducts || a.productIds.map(String).some(id => !domSet.has(id))) throw new Error('Authorized product ids differ from the DOM table');
-  if (String(cr.roi) !== String(expRoi) || String(cr.budget) !== String(expBudget)) throw new Error('DOM ROI/budget values mismatch');
+  if (!samePositiveDecimalValue(cr.roi, expRoi) || !samePositiveDecimalValue(cr.budget, expBudget)) throw new Error('DOM ROI/budget values mismatch');
   if (cr.commissionChecked !== true) throw new Error('DOM commission checkbox not checked');
   if (cr.planName === 'unknown' || cr.planName !== a.planName) throw new Error('DOM plan name mismatch');
   if (cr.publishButtonCount !== 1 || cr.publishEnabledUnique !== true) throw new Error('Publish button not unique+enabled');
@@ -1791,7 +1833,7 @@ module.exports = {
   pageObserve, pageApply, actionApply, publishApply,
   popupDismissApply, cookieIdentityProbe,
   validatePublishAuthorization, loadApprovedFirstPlan, runPublishPlan,
-  configuredPlanCap, isBoundedDurablePlanNumber,
+  configuredPlanCap, isBoundedDurablePlanNumber, samePositiveDecimalValue,
   runSaveCookies,
   updateCookieSessionFingerprint,
   loadAttemptsStore, persistAttemptsStore, consumePublicationOnce, recordPublicationOutcome,

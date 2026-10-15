@@ -2152,14 +2152,20 @@ function dialogLandscapeSnapshotInPage() {
   } catch (e) { return {ok:false, noBlockingModal:false, reason:'modal-landscape-read-failed'}; }
 }
 
-// The known final mutual-exclusion modal is nested (ovui-modal__wrap >
-// ovui-modal > header/body/footer/close). Every one of those nodes carries the
-// keyword or lives inside a node that does, so a naive class-substring match
-// counted the SAME dialog three times and returned 'final-dialog-not-unique'.
-// Merge nested duplicates by keeping only the OUTERMOST candidate (drop any
-// candidate another candidate contains); two truly independent identical modals
-// are two roots and are refused. The business body is assembled from the header
-// title + body only, so footer button labels never participate in the equality.
+// The known final mutual-exclusion modal is nested. TWO shapes are known: the old
+// OVUI tree (ovui-modal__wrap > ovui-modal > modal__header/modal__body/footer) and the
+// R68-observed Aurora tree (.aurora-qc-modal-wrap > .aurora-qc-modal[role=dialog] >
+// .aurora-qc-modal-container > .aurora-qc-modal-header / .aurora-qc-modal-body /
+// .aurora-qc-modal-footer). Every one of those nodes carries the keyword or lives
+// inside a node that does, so a naive class-substring match counted the SAME dialog
+// multiple times and returned 'final-dialog-not-unique'. Merge nested duplicates by
+// keeping only the OUTERMOST candidate (drop any candidate another candidate
+// contains); two truly independent identical modals are two roots and are refused.
+// The business body is assembled from EXACTLY ONE visible known header + ONE visible
+// known body INSIDE that unique root (a nested title/body copy collapses into its
+// outermost section, so its text can never duplicate); missing, duplicated or foreign
+// sections refuse. There is NO full-root innerText fallback, footer button labels
+// never participate in the equality, and unknown copy is never accepted generically.
 function finalDialogSnapshotInPage() {
   const visible=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(e).visibility!=='hidden';};
   const txt=e=>(e.innerText||e.textContent||'').replace(/\s+/g,' ').trim();
@@ -2169,9 +2175,11 @@ function finalDialogSnapshotInPage() {
   const roots=matching.filter(m=>!matching.some(o=>o!==m&&o.contains(m)));
   if(roots.length!==1)return {visible:matching.length>0,text:'',confirmTarget:null,reason:'final-dialog-not-unique'};
   const d=roots[0];
-  const parts=[];
-  for(const sel of ['[class*="modal__header"]','[class*="modal__body"]']) for(const el of [...d.querySelectorAll(sel)].filter(visible)){const t=txt(el);if(t)parts.push(t);}
-  const text=parts.join(' ');
+  const section=sels=>{const ns=[];for(const s of sels)for(const el of [...d.querySelectorAll(s)])if(visible(el)&&!ns.includes(el))ns.push(el);return ns.filter(el=>!ns.some(o=>o!==el&&o.contains(el)));};
+  const headers=section(['[class*="modal__header"]','.aurora-qc-modal-header']);
+  const bodies=section(['[class*="modal__body"]','.aurora-qc-modal-body']);
+  if(headers.length!==1||bodies.length!==1)return {visible:true,text:'',confirmTarget:null,reason:'final-dialog-sections-not-unique'};
+  const text=[txt(headers[0]),txt(bodies[0])].filter(t=>t).join(' ');
   const nodes=[...d.querySelectorAll('button,span,a,[role="button"]')].filter(visible).filter(e=>txt(e)==='确认发布');
   const buttons=[...new Set(nodes.map(e=>e.tagName==='BUTTON'?e:e.closest('button')).filter(Boolean))];
   if(buttons.length!==1)return {visible:true,text,confirmTarget:null,reason:'final-button-not-unique'};
@@ -2180,10 +2188,14 @@ function finalDialogSnapshotInPage() {
 }
 
 // Fresh re-derivation immediately before the single click: re-merge to one modal
-// root, re-check the SAME business body equals the expected constant, then resolve
-// exactly one enabled semantic BUTTON (a SPAN whose closest button is the control),
-// and click it once. Any drift, non-unique modal, or missing/multi/disabled button
-// throws and performs zero clicks. No generalized unknown-text acceptance.
+// root, re-require EXACTLY ONE visible known header + ONE visible known body inside it
+// (old OVUI modal__header/modal__body AND the R68-observed Aurora
+// .aurora-qc-modal-header/.aurora-qc-modal-body selectors), re-check the SAME business
+// body equals the expected constant (whitespace-only normalization), then resolve
+// exactly one enabled semantic BUTTON (a SPAN whose closest button is the control) and
+// click it once. Any drift, non-unique modal, missing/duplicated/foreign section, or
+// missing/multi/disabled button throws and performs zero clicks. No generalized
+// unknown-text acceptance, no full-root innerText fallback.
 function clickFinalConfirmInPage(expectedText) {
   const visible=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(e).visibility!=='hidden';};
   const norm=s=>String(s||'').replace(/\s+/g,'');
@@ -2193,9 +2205,12 @@ function clickFinalConfirmInPage(expectedText) {
   const roots=ds.filter(m=>!ds.some(o=>o!==m&&o.contains(m)));
   if(roots.length!==1)throw new Error('final-dialog-not-unique');
   const d=roots[0];
-  const parts=[];
-  for(const sel of ['[class*="modal__header"]','[class*="modal__body"]']) for(const el of [...d.querySelectorAll(sel)].filter(visible)){const t=txt(el);if(t)parts.push(t);}
-  if(norm(parts.join(' '))!==norm(expectedText))throw new Error('final-dialog-drift');
+  const section=sels=>{const ns=[];for(const s of sels)for(const el of [...d.querySelectorAll(s)])if(visible(el)&&!ns.includes(el))ns.push(el);return ns.filter(el=>!ns.some(o=>o!==el&&o.contains(el)));};
+  const headers=section(['[class*="modal__header"]','.aurora-qc-modal-header']);
+  const bodies=section(['[class*="modal__body"]','.aurora-qc-modal-body']);
+  if(headers.length!==1||bodies.length!==1)throw new Error('final-dialog-sections-not-unique');
+  const text=[txt(headers[0]),txt(bodies[0])].filter(t=>t).join(' ');
+  if(norm(text)!==norm(expectedText))throw new Error('final-dialog-drift');
   const nodes=[...d.querySelectorAll('button,span,a,[role="button"]')].filter(visible).filter(e=>txt(e)==='确认发布');
   const buttons=[...new Set(nodes.map(e=>e.tagName==='BUTTON'?e:e.closest('button')).filter(Boolean))];
   if(buttons.length!==1||buttons[0].disabled||buttons[0].getAttribute('aria-disabled')==='true'||buttons[0].closest('[aria-disabled="true"],[disabled]'))throw new Error('final-confirm-button-not-uniquely-enabled');
@@ -4592,9 +4607,33 @@ async function inspectRecoveryOnly({root, unresolved, state, business}) {
 //     published-success (next main may continue to the next plan), while paused/mixed/
 //     unknown or an unverified hook reports post-publish-enable-stopped WITHOUT discarding
 //     the published fact and WITHOUT ever assuming it was enabled.
-async function resumeKnownFinalOnly(deps) {
-  const d = deps || {};
-  const now = typeof d.nowMs === 'function' ? d.nowMs() : (d.nowMs != null ? d.nowMs : Date.now());
+// S68: two exported entries share ONE private core. resumeKnownFinalOnly keeps its
+// EXACT public manual contract (fresh humanAuth + durable manual consumption record
+// required; it NEVER falls back to the scheduled policy). resumeScheduledKnownFinalOnly
+// is the separate scheduled authority for the same single stopped final: same frozen/
+// hash/day/initial-unknown/final-unconsumed/absence/30-goods/readback/durable-persist
+// guards, but authorized by the durable recurring-user-policy marker + an exactly
+// matching recurringAuth record + a TRUSTED fresh recurringPolicyProvider revalidation
+// (before the absence scan, immediately before the final consumption and AGAIN
+// immediately before the final click). It never requires or writes a manual
+// consumption, never fabricates a human authorization, and NEVER allows the reopen /
+// native-initial-click path. No API route and no runtime loop call it; the Root
+// one-shot operator invokes it on the retained page only after acceptance.
+const RECURRING_POLICY_AUTHORITY = 'recurring-user-policy';
+
+async function resumeKnownFinalOnly(deps) { return resumeKnownFinalCore(deps || {}, 'manual'); }
+
+async function resumeScheduledKnownFinalOnly(deps) {
+  const dd = deps || {};
+  const policyAuthorizedAt = new Date(typeof dd.nowMs === 'function' ? dd.nowMs() : (dd.nowMs != null ? dd.nowMs : Date.now())).toISOString();
+  const r = await resumeKnownFinalCore(dd, 'scheduled');
+  return (r && typeof r === 'object') ? Object.assign({}, r, { authorizedBy: RECURRING_POLICY_AUTHORITY, humanApproved: false, policyAuthorizedAt }) : r;
+}
+
+async function resumeKnownFinalCore(d, authorityMode) {
+  const auto = authorityMode === 'scheduled';
+  const nowOf = () => (typeof d.nowMs === 'function' ? d.nowMs() : (d.nowMs != null ? d.nowMs : Date.now()));
+  const now = nowOf();
   // trusted business（客户 2026-10-11）：默认回落 legacy 冻结默认（accountId/roi/30 商品），
   // 显式传入则按该店身份/ROI 泛化；默认路径行为不变（legacy 兼容）。
   const business = wf.bizOf(d.business);
@@ -4622,6 +4661,9 @@ async function resumeKnownFinalOnly(deps) {
   try { state = wf.loadDayState(d.stateFile, businessDate); } catch (e) { return refuse('day-state-unreadable:' + (e && e.message)); }
   const active = state.active;
   if (!active || active.status !== 'publish-unknown' || active.reason !== 'unknown-or-new-final-dialog') return refuse('not-the-unique-stopped-final-confirm');
+  // Scheduled mode rides ONLY a durable active that itself records the recurring
+  // policy authority; a manual-only stopped final never enters the auto path.
+  if (auto && active.authorizedBy !== RECURRING_POLICY_AUTHORITY) return refuse('recurring-authority-marker-missing');
   const af = active.frozen;
   if (!af || af.confirmationId !== frozen.confirmationId || af.manifestHash !== frozen.manifestHash
     || Number(af.planNumber) !== Number(frozen.planNumber) || String(af.runId) !== String(frozen.runId)
@@ -4632,14 +4674,28 @@ async function resumeKnownFinalOnly(deps) {
   if (wf.manifestHash(af) !== af.manifestHash) return refuse('frozen-manifest-tampered');
   if ((af.productIds || []).map(String).join(',') !== (frozen.productIds || []).map(String).join(',')) return refuse('frozen-product-ids-mismatch');
 
-  // Latest same-day human authorization (host passes the user's explicit acceptance)
-  // plus the durable human-consumption record already written by the confirmation UI.
-  const ha = d.humanAuth;
-  if (!ha || ha.authorized !== true || ha.confirmationId !== frozen.confirmationId
-    || ha.manifestHash !== frozen.manifestHash || Number(ha.planNumber) !== Number(frozen.planNumber)
-    || String(ha.businessDate) !== businessDate || ha.planName !== frozen.planName) return refuse('human-authorization-mismatch');
-  const consumed = (state.confirmationConsumptions || []).filter(c => c && c.confirmationId === frozen.confirmationId && c.manifestHash === frozen.manifestHash && Number(c.planNumber) === Number(frozen.planNumber));
-  if (consumed.length === 0) return refuse('human-consumption-record-missing');
+  // Authority block. MANUAL (unchanged contract): latest same-day human authorization
+  // (host passes the user's explicit acceptance) plus the durable human-consumption
+  // record already written by the confirmation UI; missing either still refuses and
+  // there is NO scheduled fallback. SCHEDULED: an exactly-matching recurringAuth
+  // record (authorizedBy recurring-user-policy, humanApproved:false — never a forged
+  // human authorization) plus a TRUSTED fresh policy provider; the manual consumption
+  // list is never required and never written on this path.
+  const ha = auto ? null : d.humanAuth;
+  if (auto) {
+    const ra = d.recurringAuth;
+    if (!ra || ra.authorizedBy !== RECURRING_POLICY_AUTHORITY || ra.humanApproved !== false
+      || ra.confirmationId !== frozen.confirmationId || ra.manifestHash !== frozen.manifestHash
+      || Number(ra.planNumber) !== Number(frozen.planNumber) || String(ra.businessDate) !== businessDate
+      || ra.planName !== frozen.planName || String(ra.accountId) !== account) return refuse('recurring-authorization-mismatch');
+    if (typeof d.recurringPolicyProvider !== 'function') return refuse('recurring-policy-provider-missing');
+  } else {
+    if (!ha || ha.authorized !== true || ha.confirmationId !== frozen.confirmationId
+      || ha.manifestHash !== frozen.manifestHash || Number(ha.planNumber) !== Number(frozen.planNumber)
+      || String(ha.businessDate) !== businessDate || ha.planName !== frozen.planName) return refuse('human-authorization-mismatch');
+    const consumed = (state.confirmationConsumptions || []).filter(c => c && c.confirmationId === frozen.confirmationId && c.manifestHash === frozen.manifestHash && Number(c.planNumber) === Number(frozen.planNumber));
+    if (consumed.length === 0) return refuse('human-consumption-record-missing');
+  }
 
   // Initial attempt must exist as 'unknown' (the official stop overwrote dispatched);
   // finalConsumed must be absent (this is the FIRST final attempt, never a replay).
@@ -4651,10 +4707,56 @@ async function resumeKnownFinalOnly(deps) {
     || Number(init.planNumber) !== Number(frozen.planNumber)) return refuse('initial-attempt-not-unknown');
   if (Object.prototype.hasOwnProperty.call(attempts.finalConsumed, frozen.confirmationId)) return refuse('final-already-consumed');
 
+  // Fresh scheduled-authority revalidation (auto mode only). Root passes a TRUSTED
+  // provider that reads the actual verified localhost policy state fresh on EVERY
+  // call; any provider error, unreadable shape, disabled / autoConfirm-off policy,
+  // budget drift, removed/disabled/foreign shop, ROI drift, an out-of-range cap or a
+  // frozen planNumber above the cap, and any Shanghai-day change fail closed here
+  // with ZERO future marks/clicks. Manual mode never calls this.
+  async function scheduledAuthorityDrift() {
+    if (wf.shanghaiDate(nowOf()) !== businessDate) return 'business-date-changed';
+    let fresh;
+    try { fresh = await d.recurringPolicyProvider(); } catch (e) { return 'recurring-policy-provider-failed:' + (e && e.message); }
+    const policy = fresh && fresh.policy;
+    const shop = fresh && fresh.shop;
+    if (!policy || typeof policy !== 'object') return 'recurring-policy-unreadable';
+    if (policy.enabled !== true) return 'recurring-policy-disabled';
+    if (policy.autoConfirm !== true) return 'recurring-policy-autoconfirm-off';
+    if (!guard.samePositiveDecimalValue(policy.dailyBudget, expectedBudget)) return 'recurring-policy-budget-drift';
+    if (!shop || typeof shop !== 'object' || shop.missing === true) return 'recurring-policy-shop-missing';
+    if (shop.deleted === true) return 'recurring-policy-shop-deleted';
+    // Real provider shape: `shop.id` is the shop NAME / internal application identifier,
+    // NEVER the ad accountId, so it is deliberately NOT compared to the account. Identity
+    // is proven ONLY by the four strict checks below; a MISSING identity/ROI field is never
+    // defaulted to "allowed" (fail closed), and enabled must be exactly true.
+    if (shop.enabled !== true) return 'recurring-policy-shop-disabled';
+    if (shop.name == null || String(shop.name) !== String(business.shop)) return 'recurring-policy-shop-name-drift';
+    if (shop.accountId == null || String(shop.accountId) === '' || String(shop.accountId) !== account) return 'recurring-policy-shop-account-drift';
+    if (shop.targetRoi == null || String(shop.targetRoi) === '' || !guard.samePositiveDecimalValue(shop.targetRoi, expectedRoi)) return 'recurring-policy-roi-drift';
+    // Per-shop cap: a valid 1..10 shop value wins, else a valid 1..10 policy value,
+    // else the legacy default 3; the frozen planNumber must fit under it.
+    let cap = 3;
+    if (Number.isInteger(shop.plansPerShopPerDay) && shop.plansPerShopPerDay >= 1 && shop.plansPerShopPerDay <= 10) cap = shop.plansPerShopPerDay;
+    else if (Number.isInteger(policy.plansPerShopPerDay) && policy.plansPerShopPerDay >= 1 && policy.plansPerShopPerDay <= 10) cap = policy.plansPerShopPerDay;
+    if (Number(frozen.planNumber) > cap) return 'recurring-policy-plan-cap-exceeded';
+    // S71 (Root date-boundary counterexample): the provider await above is a real async
+    // boundary. The check at the TOP of this function proves the day was still correct
+    // BEFORE the await, but the Shanghai business day may flip DURING it — the Root
+    // reproduction shows a call that started on day D and resumed on day D+1 still
+    // reaching the actual click. Re-verify the current Shanghai day AFTER the await so
+    // that every await-to-click path (gate before absence, gate B before the final
+    // consumption, gate C immediately before the final click) stays same-day fresh. A
+    // flip here is still pre-click: gate B refuses with ZERO marks, gate C leaves the
+    // already-reserved final 'unknown' (never replayed) and performs ZERO clicks.
+    if (wf.shanghaiDate(nowOf()) !== businessDate) return 'business-date-changed';
+    return null;
+  }
+
   // Trusted read-only absence BEFORE anything is consumed or clicked. Only a fully
   // exhausted, correct-account scan that reports absenceConfirmed===true with a
   // complete seenPlanIds may proceed; the frozen old-id set is taken from here and is
   // the ONLY set used to judge the new plan id as "new" after the click.
+  if (auto) { const drift = await scheduledAuthorityDrift(); if (drift) return refuse('scheduled-policy-drift-before-absence:' + drift); }
   const abs = await d.readManagementAbsence({ planName: frozen.planName, accountId: account });
   if (abs && abs.present === true) return refuse('already-published-in-manager');
   if (!abs || abs.absenceConfirmed !== true) return refuse('management-absence-untrusted');
@@ -4675,7 +4777,11 @@ async function resumeKnownFinalOnly(deps) {
   const rows = Array.isArray(o.rows) ? o.rows : [];
   if (o.eachRowHasManualAccount !== true || rows.length !== productsPerPlan
     || !rows.every(r => r && Number.isInteger(Number(r.manualAccounts)) && Number(r.manualAccounts) >= 1)) return refuse('creation-manual-account-drift');
-  if (String(o.roi) !== String(expectedRoi) || String(o.budget) !== String(expectedBudget) || o.commissionChecked !== true
+  // S67/S68: ROI/budget equality uses the accepted strict decimal guard, so an
+  // observed '15.00'/'300.00' is the same authorized value without Number rounding;
+  // every other creation gate (origin/path/account/planName/30 ids/manual>=1/
+  // commission/direct-pay/publish-button-count) is unchanged.
+  if (!guard.samePositiveDecimalValue(o.roi, expectedRoi) || !guard.samePositiveDecimalValue(o.budget, expectedBudget) || o.commissionChecked !== true
     || o.optionalDirectPayChecked !== false || Number(o.publishButtonCount) !== 1) return refuse('creation-config-drift');
 
   // ── shared success/failure persistence ─────────────────────────────────────
@@ -4747,11 +4853,45 @@ async function resumeKnownFinalOnly(deps) {
   // that brought the known dialog back (reopenClicks 1). The "is this planId new?" test
   // uses ONLY the pre-click frozen old-id set; the management page is never re-scanned.
   async function finalizeKnownDialogClick(reopenClicks) {
+    // Gate B (auto): fresh policy + Shanghai-day revalidation IMMEDIATELY before the
+    // final consumption; drift here is still pre-mark -> plain refuse, ZERO marks and
+    // ZERO clicks on any ledger.
+    if (auto) {
+      const drift = await scheduledAuthorityDrift();
+      if (drift) return { status: 'refused', reason: 'scheduled-policy-drift-before-final-consume:' + drift, clicked: false, clicks: 0, reopenClicks, finalClicks: 0, noAction: true };
+    }
     try {
-      guard.consumeFinalConfirmationOnce(d.attemptsFile, frozen.confirmationId, frozen.manifestHash, {
+      guard.consumeFinalConfirmationOnce(d.attemptsFile, frozen.confirmationId, frozen.manifestHash, auto ? {
+        // Scheduled (auto) recovery rides an INDEPENDENT strict policy context: it is the
+        // recurring-user-policy authority (humanApproved:false) bound to the exact frozen
+        // scope, with a real ISO policyAuthorizedAt. It NEVER carries a human authorization
+        // field and NEVER falls back to the manual path; the guard stores only structured
+        // policy fields on record.recovery.
+        authorizedBy: RECURRING_POLICY_AUTHORITY,
+        humanApproved: false,
+        policyAuthorizedAt: new Date(nowOf()).toISOString(),
+        confirmationId: frozen.confirmationId,
+        manifestHash: frozen.manifestHash,
+        runId: String(frozen.runId),
+        businessDate,
+        planNumber: Number(frozen.planNumber),
+        accountId: account,
+        planName: frozen.planName,
+      } : {
         reason: 'unknown-or-new-final-dialog', humanAuthorizedAt: String(ha.at || new Date(now).toISOString()), humanConfirmation: '确认发布',
       });
     } catch (e) { return { status: 'refused', reason: 'final-confirm-consume-failed:' + (e && e.message), clicked: false, clicks: 0, reopenClicks, finalClicks: 0 }; }
+    // Gate C (auto): revalidate AGAIN immediately before the final click. The final is
+    // already durably reserved, so drift here performs ZERO actual clicks, marks the
+    // reserved final 'unknown' (the reservation is NEVER cleared -> no replay) and
+    // never claims a click happened.
+    if (auto) {
+      const drift = await scheduledAuthorityDrift();
+      if (drift) {
+        try { guard.recordFinalConfirmationOutcome(d.attemptsFile, frozen.confirmationId, 'unknown'); } catch (_) {}
+        return { status: 'unknown', reason: 'scheduled-policy-drift-before-final-click:' + drift, clicked: false, clicks: 0, reopenClicks, finalClicks: 0, noReplay: true };
+      }
+    }
     let finalClick;
     try {
       finalClick = await d.clickFinalConfirm({ expectedText: wf.FINAL_EXCLUSION_TEXT, confirmationId: frozen.confirmationId, manifestHash: frozen.manifestHash });
@@ -4775,13 +4915,15 @@ async function resumeKnownFinalOnly(deps) {
   const knownFinalNow = !!dlg && dlg.visible === true && wf.matchFinalExclusionDialog(dlg.text).known && wf.resolveFinalPublishButton(dlg.confirmTarget).ok;
   if (knownFinalNow) return finalizeKnownDialogClick(0);
 
-  // The known final dialog is NOT present. Default stays final-only -> refuse. Only an
-  // EXPLICIT opt-in, one-shot, controlled reopen may proceed, and only after we can
-  // DEFINITIVELY prove no final or other blocking modal is present (a bare visible:false
-  // with an ambiguous reason is never treated as "no modal"). This path never generalises
-  // to an unknown retry: it is the single already-authorized first plan whose final modal
-  // disappeared, with the final still unconsumed.
-  if (d.allowReopenMissingFinal !== true) return refuse('final-dialog-unknown-or-new');
+  // The known final dialog is NOT present. Default stays final-only -> refuse, and the
+  // scheduled AUTO mode NEVER opens this controlled reopen (no native initial click, no
+  // allowReopenMissingFinal honouring). Only an EXPLICIT opt-in, one-shot, controlled
+  // reopen in MANUAL mode may proceed, and only after we can DEFINITIVELY prove no final
+  // or other blocking modal is present (a bare visible:false with an ambiguous reason is
+  // never treated as "no modal"). This path never generalises to an unknown retry: it is
+  // the single already-authorized first plan whose final modal disappeared, with the
+  // final still unconsumed.
+  if (auto || d.allowReopenMissingFinal !== true) return refuse('final-dialog-unknown-or-new');
   for (const fn of ['readModalLandscape', 'clickNativePublishPlan', 'awaitFinalDialog']) {
     if (typeof d[fn] !== 'function') return refuse('reopen-dependency-missing:' + fn);
   }
@@ -6658,6 +6800,322 @@ async function reconcileManualUiPublication(deps) {
   }
 }
 
-module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,buildScheduledPreparationDiagnostic,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,main};
+// ── S71：前一业务日「已知最终确认未提交」的一次性只读式收口（导出，仅 Root 显式调用）──
+// 现场事实：某业务日的排程 run 停在「已知最终互斥弹窗」上（active = publish-unknown /
+// unknown-or-new-final-dialog，初始消费耐久 unknown，finalConsumed 与 reopenConsumed 都缺席），
+// 随后浏览器会话丢失（原进程已退出且未复活），最终确认从未真正提交。若原样保留，这个跨日的
+// dangling unknown 会阻塞**次日**的正常任务。
+//
+// 本入口只解除该陈旧范围的阻塞，它**不是**一次发布、**不是**平台失败判定、**不是**重试授权：
+//   * 绝不打开浏览器 / CDP / 网络，绝不点击、绝不发布、绝不重放；
+//   * 绝不写 finalConsumed / reopenConsumed 标记，绝不删除原确认记录，绝不写 explicitFailure /
+//     重试授权，绝不改动 cap / 预算 / 成功计数 / published 文件；
+//   * 仅有两处耐久改写：(1) 本 CID 的初始记录由 'unknown' 转为终态 'failed' 并附结构化
+//     resolution（kind = expired-known-final-unsubmitted，显式标注 NOT 平台发布失败），完整保留
+//     previousStatus / 原记录 / 冻结清单 / 已知 final 观测 / 会话丢失证明 / 新鲜 absence 证明与时间、
+//     以及 closureHash；(2) 当日 active 变为明确终态 'closed-unsubmitted'（保留原 frozen 与
+//     resolutionRef 引用，历史追加进 expiredUnsubmittedClosures，绝不丢历史）。
+//
+// 失败即保守（fail-closed）：下列每一条都必须由**可信 host 证据**新鲜成立；任何缺失 / 漂移 /
+// 身份变化 / 管理页 present / absence 不完整 / 同日或未来业务日 / 已存在 final 或 reopen 记录 /
+// 存在其他未决范围 / callbacks 前后状态或账本哈希漂移，一律**零存储改写**。收口为原子写
+// (tmp+rename)、持有真实 publisher lock、带 CAS 防并发漂移，且幂等：半完成（账本已终态而 active
+// 仍 publish-unknown）在重新新鲜验证同一 scope 后可续完；两者皆完成时报告 already-closed。
+const EXPIRED_UNSUBMITTED_KIND = 'expired-known-final-unsubmitted';
+
+function expiredCloseScopeHash(parts) {
+  return sha256Hex((parts || []).map(p => (p == null ? '\u0000null' : String(p))).join('\u0001'));
+}
+
+async function closeExpiredScheduledKnownFinalUnsubmitted(deps) {
+  const d = deps || {};
+  const nowOf = () => (typeof d.nowMs === 'function' ? d.nowMs() : (d.nowMs != null ? d.nowMs : Date.now()));
+  const refuse = (reason) => ({ status: 'refused', reason, changed: false, clicks: 0, finalWrites: 0, noAction: true });
+
+  const business = wf.bizOf(d.business);
+  const account = String(business.accountId);
+  const stateFile = d.stateFile;
+  const attemptsFile = d.attemptsFile;
+  if (!stateFile || !attemptsFile) throw new Error('expired-close-file-scope-missing');
+  for (const fn of ['knownFinalObservationProvider', 'sessionLossProvider', 'readManagementAbsence']) {
+    if (typeof d[fn] !== 'function') throw new Error('expired-close-dependency-missing:' + fn);
+  }
+
+  const frozen = d.frozen;
+  if (!frozen || typeof frozen !== 'object' || !frozen.confirmationId || !frozen.manifestHash || !frozen.planName
+    || !(Number.isInteger(frozen.planNumber) && frozen.planNumber >= 1 && frozen.planNumber <= 10)
+    || !/^\d{4}-\d{2}-\d{2}$/.test(String(frozen.businessDate || '')) || !frozen.runId
+    || String(frozen.accountId) !== account) return refuse('expected-frozen-incomplete');
+  const businessDate = String(frozen.businessDate);
+  const cid = String(frozen.confirmationId);
+  const expectedFrozenHash = String(frozen.manifestHash);
+
+  // (1) 严格「旧」业务日：old < **入口冻结的本次当前上海日**。同日/未来一律拒绝。入口冻结
+  //     currentDay 后，所有 await callbacks 之后与任何写前都必须复核同一 currentDay（只比
+  //     oldDay<newDay 会漏掉证明期间「今天翻明天」的漂移：明天仍 > oldDay 却已不是本次当前日）。
+  const currentDay = wf.shanghaiDate(nowOf());
+  const dayStillFrozen = () => wf.shanghaiDate(nowOf()) === currentDay;
+  const closeStartedMs = nowOf();
+  const CLOSE_FRESH_MS = 5 * 60 * 1000;
+  // loss/abs 的 observedAt 必须来自本次新鲜 callback 的观测窗口：有效、非未来、且不早于入口
+  // （旧 JSON 重放会因 observedAt 陈旧而在此拒绝）。
+  const freshObserved = (ms) => Number.isFinite(ms) && ms <= nowOf() && ms >= closeStartedMs - CLOSE_FRESH_MS;
+  if (!(businessDate < currentDay)) return refuse('business-date-not-old');
+
+  const readRaw = (file) => {
+    try { return fs.readFileSync(file, 'utf8'); }
+    catch (e) { if (e && e.code === 'ENOENT') return null; throw new Error('expired-close-unreadable:' + ((e && e.code) || (e && e.message))); }
+  };
+  let stateText; let attemptsText; let state; let attempts;
+  try {
+    stateText = readRaw(stateFile);
+    attemptsText = readRaw(attemptsFile);
+    if (stateText === null || attemptsText === null) return refuse('durable-state-missing');
+    state = JSON.parse(stateText);
+    attempts = guard.loadAttemptsStore(attemptsFile);
+  } catch (e) { return refuse('expired-close-unreadable:' + (e && e.message)); }
+  const scopeHash0 = expiredCloseScopeHash([stateText, attemptsText]);
+
+  // (2) durable active 必须是**本 scope**：排程停在已知 final 的未提交态，或（幂等续完）
+  //     同一 scope 已 closed-unsubmitted。冻结必须自洽、可重算，且 shop/account 精确绑定。
+  const active = state && state.active;
+  if (!active || typeof active !== 'object') return refuse('no-active-scope');
+  const stoppedOpen = active.status === 'publish-unknown' && active.reason === 'unknown-or-new-final-dialog';
+  const closedActive = active.status === 'closed-unsubmitted';
+  if (!stoppedOpen && !closedActive) return refuse('not-the-unique-stopped-final-confirm');
+  if (stoppedOpen && active.authorizedBy !== RECURRING_POLICY_AUTHORITY) return refuse('recurring-authority-marker-missing');
+  if (closedActive && active.reason !== EXPIRED_UNSUBMITTED_KIND) return refuse('closed-active-not-expired-unsubmitted');
+  if (String(state.businessDate || '') !== businessDate) return refuse('state-business-date-mismatch');
+  const af = active.frozen;
+  if (!af || String(af.confirmationId) !== cid || String(af.manifestHash) !== expectedFrozenHash
+    || Number(af.planNumber) !== Number(frozen.planNumber) || String(af.runId) !== String(frozen.runId)
+    || String(af.businessDate) !== businessDate || String(af.accountId) !== account
+    || String(af.planName) !== String(frozen.planName)) return refuse('active-frozen-mismatch');
+  if (wf.manifestHash(af) !== af.manifestHash) return refuse('frozen-manifest-tampered');
+  if ((af.productIds || []).map(String).join(',') !== (frozen.productIds || []).map(String).join(',')) return refuse('frozen-product-ids-mismatch');
+  if (String(af.shop != null ? af.shop : business.shop) !== String(business.shop)) return refuse('frozen-shop-mismatch');
+  if (frozen.productsPerPlan != null && Number(frozen.productsPerPlan) !== Number(business.productsPerPlan)) return refuse('frozen-products-per-plan-drift');
+
+  // (3) 同 CID 初始消费：unknown（待收口）或已是同一 resolution 的终态 failed（幂等续完）。
+  //     finalConsumed 与 reopenConsumed 必须**双双缺席**。
+  const init = (attempts.consumed || {})[cid];
+  if (!init || typeof init !== 'object') return refuse('initial-attempt-missing');
+  const terminal = init.status === 'failed' && !!init.resolution && init.resolution.kind === EXPIRED_UNSUBMITTED_KIND;
+  if (!terminal && init.status !== 'unknown') return refuse('initial-attempt-not-unknown');
+  if (String(init.manifestHash) !== expectedFrozenHash || String(init.runId) !== String(frozen.runId)
+    || String(init.businessDate) !== businessDate || Number(init.planNumber) !== Number(frozen.planNumber)) return refuse('initial-attempt-scope-mismatch');
+  if (init.accountId != null && String(init.accountId) !== account) return refuse('initial-attempt-account-mismatch');
+  if (init.planName != null && String(init.planName) !== String(frozen.planName)) return refuse('initial-attempt-planName-mismatch');
+  if (terminal !== closedActive) {
+    // 账本终态与 active 终态必须同步：只终态一半 = 半完成（续完）或状态被外力改写（拒绝）。
+    if (terminal && !stoppedOpen) return refuse('inconsistent-half-close-state');
+    if (closedActive && !terminal) return refuse('inconsistent-closed-state');
+  }
+  if (Object.prototype.hasOwnProperty.call(attempts.finalConsumed || {}, cid)) return refuse('final-record-present');
+  if (Object.prototype.hasOwnProperty.call(attempts.reopenConsumed || {}, cid)) return refuse('reopen-record-present');
+
+  // (4) 本份无人工消费记录，且不存在**其他**未决范围；本份号也从未被记为成功。
+  if ((Array.isArray(state.confirmationConsumptions) ? state.confirmationConsumptions : []).some(c => c && String(c.confirmationId) === cid)) return refuse('human-consumption-recorded');
+  if (listManualUnresolved(attempts).some(u => String(u.id) !== cid)) return refuse('other-unresolved-scope-present');
+  if ((Array.isArray(state.plans) ? state.plans : []).some(p => p && Number(p.planNumber) === Number(frozen.planNumber))) return refuse('plan-number-already-recorded');
+  // 不绑定本 CID 的日级 unknown/pending 旗标：语义无法归因到本范围，一律拒绝且**绝不顺手清空**。
+  if (state.unknown === true || state.pending === true) return refuse('unbound-day-unknown-flag');
+
+  // 幂等短路：已完整收口。
+  if (terminal && closedActive) {
+    return { status: 'already-closed', changed: false, clicks: 0, finalWrites: 0, noAction: true,
+      closedBusinessDate: businessDate, closureHash: (init.resolution && init.resolution.closureHash) || null };
+  }
+
+  // (5) 可信 host 观测到的「已知最终警告」：身份 / planName / frozen scope 匹配、严格命中
+  //     wf.FINAL_EXCLUSION_TEXT，且时间有序有效（shownAt <= lostAt）。
+  let obs;
+  try { obs = await d.knownFinalObservationProvider(); }
+  catch (e) { return refuse('known-final-observation-failed:' + (e && e.message)); }
+  if (!obs || typeof obs !== 'object') return refuse('known-final-observation-missing');
+  if (String(obs.accountId || '') !== account || String(obs.planName || '') !== String(frozen.planName)
+    || String(obs.confirmationId || '') !== cid || String(obs.manifestHash || '') !== expectedFrozenHash
+    || String(obs.runId || '') !== String(frozen.runId) || String(obs.businessDate || '') !== businessDate
+    || Number(obs.planNumber) !== Number(frozen.planNumber)) return refuse('known-final-observation-scope-mismatch');
+  if ((obs.productIds || []).map(String).join(',') !== (frozen.productIds || []).map(String).join(',')) return refuse('known-final-observation-product-ids-mismatch');
+  if (obs.shop != null && String(obs.shop) !== String(business.shop)) return refuse('known-final-observation-shop-mismatch');
+  if (!wf.matchFinalExclusionDialog(obs.text).known) return refuse('known-final-observation-text-not-known');
+  const shownAt = Date.parse(String(obs.shownAt || ''));
+  const lostAt = Date.parse(String(obs.lostAt || ''));
+  if (!Number.isFinite(shownAt) || !Number.isFinite(lostAt) || !(shownAt <= lostAt)) return refuse('known-final-warning-time-invalid');
+  // shownAt 必须是真实、非未来、且不早于冻结时刻的可信 host 观测（frozen 之前不可能出现该警告）。
+  const frozenAtMs = Date.parse(String(frozen.frozenAt || ''));
+  if (!Number.isFinite(frozenAtMs) || shownAt < frozenAtMs) return refuse('known-final-observation-before-freeze');
+  const nowAtObs = nowOf();
+  if (shownAt > nowAtObs || lostAt > nowAtObs) return refuse('known-final-observation-time-future');
+  // 观测必须携带原会话 owner pid；后续会话丢失证明须严格匹配同一 pid。
+  const obsPid = Number(obs.pid);
+  if (!Number.isSafeInteger(obsPid) || obsPid <= 0) return refuse('known-final-observation-pid-missing');
+
+  // (6) 可信会话丢失证明：原会话进程已退出且未复活，身份匹配 frozen scope，时间晚于会话丢失。
+  let loss;
+  try { loss = await d.sessionLossProvider(); }
+  catch (e) { return refuse('session-loss-proof-failed:' + (e && e.message)); }
+  if (!loss || typeof loss !== 'object') return refuse('session-loss-proof-missing');
+  if (String(loss.accountId || '') !== account || String(loss.planName || '') !== String(frozen.planName)
+    || String(loss.confirmationId || '') !== cid || String(loss.manifestHash || '') !== expectedFrozenHash
+    || String(loss.runId || '') !== String(frozen.runId) || String(loss.businessDate || '') !== businessDate
+    || Number(loss.planNumber) !== Number(frozen.planNumber)) return refuse('session-loss-proof-scope-mismatch');
+  // 显式证明：会话确实退出（exited===true）且未复活（revived===false），缺字段一律拒绝。
+  if (loss.exited !== true) return refuse('session-loss-exit-unconfirmed');
+  if (loss.revived !== false) return refuse('session-revived-not-lost');
+  const lossPid = Number(loss.pid);
+  if (!Number.isSafeInteger(lossPid) || lossPid <= 0) return refuse('session-loss-pid-invalid');
+  // 会话丢失证明必须指向观测中记录的同一原会话 owner pid，任意「正 pid」不得通过。
+  if (lossPid !== obsPid) return refuse('session-loss-pid-mismatch');
+  const exitedAt = Date.parse(String(loss.exitedAt || ''));
+  if (!Number.isFinite(exitedAt) || !(lostAt <= exitedAt)) return refuse('session-loss-time-invalid');
+  const nowAtLoss = nowOf();
+  if (exitedAt > nowAtLoss) return refuse('session-loss-time-future');
+  // 会话丢失证明必须来自**本次新鲜 callback** 的观测窗口，不能是旧 JSON 重放。
+  const lossObservedAt = Date.parse(String(loss.observedAt || ''));
+  if (!freshObserved(lossObservedAt)) return refuse('session-loss-observed-at-stale');
+  if (lossObservedAt < exitedAt) return refuse('session-loss-observed-before-exit');
+
+  // (7) 新鲜、完整、同账户的管理页 absence 回读：present / 未确认 / 身份不符 / 非完整遍历 / 重复 id /
+  //     total 不匹配 / 无 pages 证据，一律拒绝。超时绝不当 absence。
+  let abs;
+  try { abs = await d.readManagementAbsence({ planName: String(frozen.planName), accountId: account }); }
+  catch (e) { return refuse('management-absence-read-failed:' + (e && e.message)); }
+  if (!abs || typeof abs !== 'object') return refuse('management-absence-missing');
+  if (abs.present === true || abs.found === true) return refuse('plan-present-in-management');
+  if (abs.absenceConfirmed !== true) return refuse('management-absence-untrusted');
+  if (String(abs.accountId != null ? abs.accountId : abs.account) !== account) return refuse('management-absence-account-mismatch');
+  if (!Array.isArray(abs.seenPlanIds)) return refuse('management-absence-seen-ids-missing');
+  const seenPlanIds = abs.seenPlanIds.map(String);
+  if (new Set(seenPlanIds).size !== seenPlanIds.length) return refuse('management-absence-seen-ids-not-unique');
+  if (!Number.isInteger(abs.total) || abs.total !== seenPlanIds.length) return refuse('management-absence-total-mismatch');
+  if (!Number.isInteger(abs.pages) || abs.pages < 1) return refuse('management-absence-pages-unverified');
+  // absence 回读必须来自本次新鲜窗口（有效、非未来、不早于入口）。
+  const absObservedAt = Date.parse(String(abs.observedAt || ''));
+  if (!freshObserved(absObservedAt)) return refuse('management-absence-observed-at-stale');
+
+  // (8) callbacks 期间身份 / 日期 / 状态哈希不得漂移。
+  let stateText2; let attemptsText2;
+  try { stateText2 = readRaw(stateFile); attemptsText2 = readRaw(attemptsFile); }
+  catch (e) { return refuse('expired-close-recheck-unreadable:' + (e && e.message)); }
+  if (expiredCloseScopeHash([stateText2, attemptsText2]) !== scopeHash0) return refuse('scope-drift-during-proofs');
+  if (!dayStillFrozen()) return refuse('current-day-changed-during-proof');
+
+  const nowIso = new Date(nowOf()).toISOString();
+  const lockFile = d.lockFile || path.join(path.dirname(stateFile), 'plan-publisher.lock');
+  const writeState = typeof d.atomicWriteState === 'function' ? d.atomicWriteState : atomicWrite;
+  let releaseLock;
+  try { releaseLock = (typeof d.acquireLock === 'function' ? d.acquireLock : acquireLock)(lockFile); }
+  catch (e) { return refuse('expired-close-lock-unavailable:' + ((e && e.message) || e)); }
+  try {
+    // CAS：持锁后**完整重读 state + attempts 原始字节**并与证明窗口 snapshot 精确比对；
+    // 任意额外 CID/字段/状态变化（例如 frozen.roi 被改而 manifest 字符串未变）都必须拒绝，
+    // 不能只比 manifest 字符串。随后再由同一份字节重新校验 frozen 自洽与身份。
+    let stateText3; let attemptsText3;
+    try { stateText3 = readRaw(stateFile); attemptsText3 = readRaw(attemptsFile); }
+    catch (e) { return refuse('expired-close-cas-unreadable:' + (e && e.message)); }
+    if (stateText3 === null || attemptsText3 === null) return refuse('scope-drift-before-close');
+    if (expiredCloseScopeHash([stateText3, attemptsText3]) !== scopeHash0) return refuse('scope-drift-before-close');
+    if (!dayStillFrozen()) return refuse('current-day-changed-during-proof');
+    let casAttempts;
+    try { casAttempts = guard.loadAttemptsStore(attemptsFile); } catch (e) { return refuse('expired-close-cas-unreadable:' + (e && e.message)); }
+    const casInit = (casAttempts.consumed || {})[cid];
+    if (!casInit || typeof casInit !== 'object') return refuse('scope-drift-before-close');
+    const casTerminal = casInit.status === 'failed' && !!casInit.resolution && casInit.resolution.kind === EXPIRED_UNSUBMITTED_KIND;
+    if (casInit.status !== 'unknown' && !casTerminal) return refuse('scope-drift-before-close');
+    if (String(casInit.manifestHash) !== expectedFrozenHash || String(casInit.runId) !== String(frozen.runId)
+      || String(casInit.businessDate) !== businessDate || Number(casInit.planNumber) !== Number(frozen.planNumber)) return refuse('scope-drift-before-close');
+    if (casInit.accountId != null && String(casInit.accountId) !== account) return refuse('initial-attempt-account-mismatch');
+    if (casInit.planName != null && String(casInit.planName) !== String(frozen.planName)) return refuse('initial-attempt-planName-mismatch');
+    if (Object.prototype.hasOwnProperty.call(casAttempts.finalConsumed || {}, cid)) return refuse('final-record-present');
+    if (Object.prototype.hasOwnProperty.call(casAttempts.reopenConsumed || {}, cid)) return refuse('reopen-record-present');
+    let casState;
+    try { casState = JSON.parse(stateText3); } catch (_) { return refuse('state-unreadable-at-close'); }
+    const casActive = casState && casState.active;
+    if (!casActive || String((casActive.frozen || {}).confirmationId || '') !== cid) return refuse('state-changed-before-close');
+    if (casActive.status === 'closed-unsubmitted') {
+      return { status: 'already-closed', changed: false, clicks: 0, finalWrites: 0, noAction: true, closedBusinessDate: businessDate };
+    }
+    if (casActive.status !== 'publish-unknown' || casActive.reason !== 'unknown-or-new-final-dialog') return refuse('state-changed-before-close');
+    // 持锁后重新校验 frozen 自洽（可重算 hash）与完整身份，任一字段漂移即拒绝。
+    const casFrozen = casActive.frozen;
+    if (!casFrozen || wf.manifestHash(casFrozen) !== casFrozen.manifestHash) return refuse('state-changed-before-close');
+    if (String(casFrozen.manifestHash) !== expectedFrozenHash || String(casFrozen.confirmationId) !== cid
+      || String(casFrozen.runId) !== String(frozen.runId) || String(casFrozen.businessDate) !== businessDate
+      || Number(casFrozen.planNumber) !== Number(frozen.planNumber) || String(casFrozen.accountId) !== account
+      || String(casFrozen.planName) !== String(frozen.planName)) return refuse('state-changed-before-close');
+    if ((casFrozen.productIds || []).map(String).join(',') !== (frozen.productIds || []).map(String).join(',')) return refuse('state-changed-before-close');
+    if (String(casFrozen.shop != null ? casFrozen.shop : business.shop) !== String(business.shop)) return refuse('state-changed-before-close');
+    // 不绑定本 CID 的日级 unknown/pending 旗标：持锁后同样拒绝，绝不顺手清旗标。
+    if (casState.unknown === true || casState.pending === true) return refuse('unbound-day-unknown-flag');
+
+    let closureHash;
+    let wroteAttempts = false;
+    if (!casTerminal) {
+      const resolution = {
+        kind: EXPIRED_UNSUBMITTED_KIND,
+        notPlatformFailure: true,
+        notPublishSuccess: true,
+        previousStatus: 'unknown',
+        originalRecord: casInit,
+        frozen: casActive.frozen || af,
+        knownFinalObservation: {
+          accountId: account, planName: String(frozen.planName), confirmationId: cid, manifestHash: expectedFrozenHash,
+          runId: String(frozen.runId), businessDate, planNumber: Number(frozen.planNumber),
+          productIds: (frozen.productIds || []).map(String), textKnown: true,
+          shownAt: String(obs.shownAt), lostAt: String(obs.lostAt),
+        },
+        sessionLoss: { pid: Number(loss.pid), exitedAt: String(loss.exitedAt), revived: false, accountId: account, observedAt: String(loss.observedAt || '') },
+        absenceProof: { accountId: account, present: false, absenceConfirmed: true, seenPlanIds, total: abs.total, pages: abs.pages, observedAt: String(abs.observedAt || '') },
+        closedBusinessDate: businessDate,
+        closedAt: nowIso,
+        closedBy: 'expired-known-final-unsubmitted',
+      };
+      resolution.closureHash = expiredCloseScopeHash([businessDate, cid, expectedFrozenHash, 'unknown', seenPlanIds.join(','), nowIso]);
+      closureHash = resolution.closureHash;
+      const nextAttempts = { ...casAttempts, consumed: { ...casAttempts.consumed, [cid]: { ...casInit, status: 'failed', at: nowIso, resolution } } };
+      try { guard.persistAttemptsStore(attemptsFile, nextAttempts); wroteAttempts = true; }
+      catch (e) {
+        return { status: 'half-completed', reason: 'expired-close-attempts-write-failed:' + (e && e.message), changed: false, wroteAttempts: false, wroteState: false, clicks: 0, finalWrites: 0, noReplay: true };
+      }
+    } else {
+      closureHash = (casInit.resolution && casInit.resolution.closureHash) || null;
+    }
+
+    // 账本写后、state 写前：确认 state 原始字节未漂移，且当前日仍为入口冻结日。若漂移则
+    // 报告 half-completed（账本已终态），**绝不覆盖并发写**；重新新鲜验证同一 scope 后可幂等续完。
+    let stateText4;
+    try { stateText4 = readRaw(stateFile); }
+    catch (e) { return { status: 'half-completed', reason: 'expired-close-state-recheck-failed:' + (e && e.message), changed: wroteAttempts, wroteAttempts, wroteState: false, clicks: 0, finalWrites: 0, noReplay: true }; }
+    if (stateText4 !== stateText3) return { status: 'half-completed', reason: 'expired-close-state-drift-before-write', changed: wroteAttempts, wroteAttempts, wroteState: false, clicks: 0, finalWrites: 0, noReplay: true };
+    if (!dayStillFrozen()) return { status: 'half-completed', reason: 'current-day-changed-before-write', changed: wroteAttempts, wroteAttempts, wroteState: false, clicks: 0, finalWrites: 0, noReplay: true };
+
+    const nextState = { ...casState };
+    nextState.expiredUnsubmittedClosures = Array.isArray(casState.expiredUnsubmittedClosures) ? casState.expiredUnsubmittedClosures.slice() : [];
+    nextState.expiredUnsubmittedClosures.push({
+      businessDate, planNumber: Number(frozen.planNumber), confirmationId: cid, manifestHash: expectedFrozenHash,
+      kind: EXPIRED_UNSUBMITTED_KIND, closureHash, closedAt: nowIso,
+      priorDayFlags: { unknown: casState.unknown === true, pending: casState.pending === true },
+    });
+    // 不绑定本 CID 的日级 unknown/pending 旗标一律不清（上面已对其零改写拒绝）。
+    nextState.active = {
+      ...casActive, status: 'closed-unsubmitted', reason: EXPIRED_UNSUBMITTED_KIND, closedBusinessDate: businessDate,
+      resolutionRef: { kind: EXPIRED_UNSUBMITTED_KIND, closureHash, closedAt: nowIso, confirmationId: cid, manifestHash: expectedFrozenHash },
+    };
+    try { writeState(stateFile, nextState); }
+    catch (e) {
+      return { status: 'half-completed', reason: 'expired-close-state-write-failed:' + (e && e.message), changed: wroteAttempts, wroteAttempts, wroteState: false, clicks: 0, finalWrites: 0, noReplay: true };
+    }
+    return {
+      status: casTerminal ? 'completed' : 'closed', changed: true, wroteAttempts, wroteState: true,
+      clicks: 0, finalWrites: 0, noReplay: true, closedBusinessDate: businessDate, closureHash,
+    };
+  } finally {
+    try { if (typeof releaseLock === 'function') releaseLock(); } catch (_) {}
+  }
+}
+
+module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,buildScheduledPreparationDiagnostic,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,resumeScheduledKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,closeExpiredScheduledKnownFinalUnsubmitted,main};
 
 if(require.main===module)main();

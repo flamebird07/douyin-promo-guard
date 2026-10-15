@@ -1443,36 +1443,80 @@ function recordExplicitPlatformFailure(file, originalFrozen, proof) {
 }
 
 // One-shot durable final-confirm reservation. Normal path requires the initial
-// publish to be durably 'dispatched'. The ONLY exception is a narrow, explicitly
-// controlled recovery context (resumeKnownFinalOnly): it is honoured for an
-// initial whose status is 'unknown' when and only when reason is exactly
-// 'unknown-or-new-final-dialog' AND the manifest hash matches AND a fresh human
-// authorization is supplied. It never generalises: an 'unknown' initial without
-// that exact controlled context is refused, the initial record is left untouched,
-// and the reservation is still a strict one-shot (replay refused).
+// publish to be durably 'dispatched'. TWO narrow, explicitly controlled recovery
+// contexts are honoured for an initial whose status is 'unknown' (the manifest hash
+// must ALWAYS match and the reservation is ALWAYS a strict one-shot -- replay refused):
+//   * MANUAL (resumeKnownFinalOnly): reason exactly 'unknown-or-new-final-dialog' plus a
+//     fresh human authorization string; stores the human recovery metadata verbatim.
+//   * SCHEDULED (resumeScheduledKnownFinalOnly): an INDEPENDENT strict recurring-user-
+//     policy context (authorizedBy 'recurring-user-policy', humanApproved:false, a real
+//     ISO policyAuthorizedAt) bound to the exact confirmationId/manifestHash/runId/
+//     businessDate/planNumber/accountId/planName, each of which must also strictly match
+//     the corresponding field CARRIED by the initial record. The auto branch REJECTS any
+//     human/manual field mixed in and NEVER falls back to the manual path; only the
+//     structured policy fields are stored on record.recovery.
+// An 'unknown' initial without exactly one of those controlled contexts is refused and
+// the initial record is left untouched.
+const RECURRING_POLICY_AUTHORITY = 'recurring-user-policy';
+const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/;
 function consumeFinalConfirmationOnce(file, confirmationId, manifestHash, recoveryContext) {
   if (!confirmationId || typeof confirmationId !== 'string' || !manifestHash) throw new Error('Final confirmation identity missing');
   const store = loadAttemptsStore(file);
   const initial = store.consumed[confirmationId];
   if (!initial || initial.manifestHash !== manifestHash) throw new Error('Initial publish dispatch not durably confirmed; final confirm refused');
-  const controlledRecovery = !!recoveryContext
-    && recoveryContext.reason === 'unknown-or-new-final-dialog'
-    && typeof recoveryContext.humanAuthorizedAt === 'string' && recoveryContext.humanAuthorizedAt.length > 0
-    && initial.status === 'unknown';
+  const rc = (recoveryContext && typeof recoveryContext === 'object') ? recoveryContext : null;
+  const scheduled = !!rc && rc.authorizedBy === RECURRING_POLICY_AUTHORITY;
+  let controlledRecovery = false;
+  let recoveryRecord = null;
+  if (scheduled) {
+    // The auto branch NEVER mixes in a human field and NEVER falls back to manual.
+    for (const banned of ['humanAuthorizedAt', 'humanConfirmation', 'humanAuth', 'humanConfirmed', 'humanApprovedAt', 'reason']) {
+      if (Object.prototype.hasOwnProperty.call(rc, banned)) throw new Error('Scheduled recovery context must not carry human/manual field: ' + banned);
+    }
+    if (rc.humanApproved !== false) throw new Error('Scheduled recovery requires humanApproved === false');
+    if (typeof rc.policyAuthorizedAt !== 'string' || !ISO_TIMESTAMP_RE.test(rc.policyAuthorizedAt)) throw new Error('Scheduled recovery policyAuthorizedAt missing or not ISO');
+    if (rc.confirmationId !== confirmationId || rc.manifestHash !== manifestHash) throw new Error('Scheduled recovery identity binding mismatch');
+    if (!rc.runId || !/^\d{4}-\d{2}-\d{2}$/.test(String(rc.businessDate || '')) || !isBoundedDurablePlanNumber(rc.planNumber) || !rc.accountId || !rc.planName) throw new Error('Scheduled recovery scope binding incomplete');
+    if (initial.status !== 'unknown') throw new Error('Scheduled recovery requires the initial publish to be durably unknown');
+    // Every scope field the initial record CARRIES must strictly match the binding.
+    if (String(initial.runId) !== String(rc.runId) || String(initial.businessDate) !== String(rc.businessDate) || Number(initial.planNumber) !== Number(rc.planNumber)) throw new Error('Scheduled recovery initial scope mismatch');
+    if (initial.accountId != null && String(initial.accountId) !== String(rc.accountId)) throw new Error('Scheduled recovery initial account mismatch');
+    if (initial.planName != null && String(initial.planName) !== String(rc.planName)) throw new Error('Scheduled recovery initial planName mismatch');
+    controlledRecovery = true;
+    recoveryRecord = {
+      authorizedBy: RECURRING_POLICY_AUTHORITY,
+      humanApproved: false,
+      policyAuthorizedAt: rc.policyAuthorizedAt,
+      initialStatus: 'unknown',
+      confirmationId: String(rc.confirmationId),
+      manifestHash: String(rc.manifestHash),
+      runId: String(rc.runId),
+      businessDate: String(rc.businessDate),
+      planNumber: Number(rc.planNumber),
+      accountId: String(rc.accountId),
+      planName: String(rc.planName),
+    };
+  } else {
+    controlledRecovery = !!rc
+      && rc.reason === 'unknown-or-new-final-dialog'
+      && typeof rc.humanAuthorizedAt === 'string' && rc.humanAuthorizedAt.length > 0
+      && initial.status === 'unknown';
+    if (controlledRecovery) {
+      recoveryRecord = {
+        reason: rc.reason,
+        initialStatus: 'unknown',
+        humanAuthorizedAt: rc.humanAuthorizedAt,
+        humanConfirmation: String(rc.humanConfirmation || 'user-confirmed'),
+      };
+    }
+  }
   if (initial.status !== 'dispatched' && !controlledRecovery) throw new Error('Initial publish dispatch not durably confirmed; final confirm refused');
   if (Object.prototype.hasOwnProperty.call(store.finalConsumed, confirmationId)) throw new Error('Final confirmation already consumed; replay refused');
   const record = {
     planNumber: initial.planNumber, runId: initial.runId, businessDate: initial.businessDate,
     manifestHash, status: 'pending', at: new Date().toISOString(),
   };
-  if (controlledRecovery) {
-    record.recovery = {
-      reason: recoveryContext.reason,
-      initialStatus: 'unknown',
-      humanAuthorizedAt: recoveryContext.humanAuthorizedAt,
-      humanConfirmation: String(recoveryContext.humanConfirmation || 'user-confirmed'),
-    };
-  }
+  if (controlledRecovery) record.recovery = recoveryRecord;
   store.finalConsumed[confirmationId] = record;
   persistAttemptsStore(file, store);
   return record;

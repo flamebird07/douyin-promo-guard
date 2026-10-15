@@ -1228,6 +1228,7 @@ module.exports = {
   isQianchuanHomeUrl,
   isDoudianHomepageUrl,
   waitForDoudianHomepageSettled,
+  collectLoginExpiryEvidence,
   DEFAULT_SETTLE_TIMEOUT_MS,
   DEFAULT_SETTLE_INTERVAL_MS,
   MAX_SETTLE_ATTEMPTS,

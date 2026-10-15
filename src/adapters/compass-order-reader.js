@@ -32,6 +32,14 @@ const { AuthError, DataGuardError } = require('../lib/errors');
 const { parseIntegerCount } = require('../lib/money');
 const { shanghaiDate, shanghaiMs } = require('../lib/time');
 const { resolveCookieFile } = require('../login/session');
+// R53：单向复用 R51 的抖店首页自动 SSO 有界收敛与登录正证据分类
+// （qianchuan-reader 不 import 本文件，无循环依赖）。
+const {
+  waitForDoudianHomepageSettled,
+  collectLoginExpiryEvidence,
+  DEFAULT_SETTLE_TIMEOUT_MS,
+  sanitizePositiveMs,
+} = require('./qianchuan-reader');
 
 const HOME_URL = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
 const ORDER_LABEL = '成交订单数';
@@ -247,23 +255,38 @@ function createCompassOrderReader(p) {
   async function readOrderSummary({ shopCfg }) {
     const startedAt = nowFn();
     const resolved = resolveCookieFile(loginCfg, shopCfg.cookieFile);
-    const { chromium } = require('playwright');
-    const browser = await chromium.launch({
-      headless,
-      executablePath: loginCfg.edgePath,
-      args: ['--window-size=1920,1080'],
-    });
+    // browserFactory 可注入（离线测试）；默认行为与原实现完全一致。
+    const browser = p.browserFactory
+      ? await p.browserFactory()
+      : await require('playwright').chromium.launch({
+        headless,
+        executablePath: loginCfg.edgePath,
+        args: ['--window-size=1920,1080'],
+      });
     try {
       const context = await browser.newContext({ viewport: { width: 1920, height: 1080 }, timezoneId: 'Asia/Shanghai' });
       const cookies = JSON.parse(fs.readFileSync(resolved.path, 'utf-8'));
       await context.addCookies(cookies);
       const page = await context.newPage();
 
-      // 1) 抖店主页面（入口），核验登录态
+      // 1) 抖店主页面（入口），核验登录态（R53：复用 R51 有界自动 SSO 收敛）。
+      //    根证：有效 Cookie 装入全新浏览器后先停在 /login/common 中转，~30s 才落首页；
+      //    旧实现固定等 6s 即把中转地址判 AuthError → 伪登录过期（误要求重扫）。
+      //    收敛成功才继续；上界到达才做登录正证据分类：
+      //    真过期（登录页地址/可见登录表单控件）仍 AuthError；
+      //    页面被关闭/教程/未知导航按 DataGuard 导航事实处理，不触发重扫。
       await page.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await page.waitForTimeout(6000);
-      if (!page.url().includes('fxg.jinritemai.com/ffa/mshop/homepage')) {
-        throw new AuthError(`登录失效：抖店主页面未进入登录后地址（当前 ${page.url()}），请重新扫码登录`);
+      const settled = await waitForDoudianHomepageSettled(page, p);
+      if (!settled.ok) {
+        if (settled.reason === 'settle-page-closed') {
+          throw new DataGuardError(`抖店主页面在自动登录收敛期内被关闭（最后地址 ${settled.url || '未知'}）；按导航事实处理，需人工核实`);
+        }
+        const evidence = await collectLoginExpiryEvidence(page);
+        if (evidence.loginUrl || evidence.loginControlVisible || evidence.loginFormVisible || evidence.loginDialogVisible) {
+          throw new AuthError(`登录失效：抖店页面在 ${settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(p.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${page.url()}），请重新扫码登录`);
+        }
+        throw new DataGuardError(`抖店主页面在有界自动登录收敛期内未到达首页（${settled.attempts} 次探测，当前 ${settled.url || page.url()}）；未见登录正证据，按导航事实处理，需人工核实`);
       }
 
       // 2) 点击"成交订单数"文字入口；处理新标签页或当前页跳转

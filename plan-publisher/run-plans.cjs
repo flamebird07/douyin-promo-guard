@@ -450,8 +450,28 @@ function proveSchedulerReleaseProof(ledgerFile, statePaths, spec) {
   if (!entry || typeof entry !== 'object') return { ok: false, reason: 'release-no-current-entry' };
   // S56: failed-permanent is releasable ONLY when the bound entry is exactly preparation-stopped
   // (3 proven preparation stops, zero publication) — all other failed-permanent shapes stay sealed.
-  if (rec.status !== 'failed' && rec.status !== 'blocked' && !(rec.status === 'failed-permanent' && entry.status === 'preparation-stopped')) return { ok: false, reason: 'release-record-not-terminal-failure:' + String(rec.status) };
-  if (entry.status !== 'failed' && entry.status !== 'preparation-stopped') return { ok: false, reason: 'release-entry-not-prepublication:' + String(entry.status) };
+  // S57: one further zero-publication shape — entry 'unsubmitted' whose recorded reason is a
+  // scheduler pre-navigation open failure AND whose OWN durable retryHistory carries a matching
+  // record (same planNumber + exact reason + proof.method 'pre-navigation-open-failed'). The bare
+  // 'unsubmitted' label or an arbitrary error string never suffices; the history binding is
+  // re-verified at mutation time in applySchedulerReleaseToRecord.
+  let entryProvenanceMethod = null;
+  if (rec.status === 'failed-permanent' && entry.status === 'unsubmitted') {
+    const entryReasonText = typeof entry.reason === 'string' ? entry.reason : '';
+    if (!entryReasonText.startsWith('scheduled-pre-navigation-open-failed:')) {
+      return { ok: false, reason: 'release-entry-not-prepublication:' + entry.status };
+    }
+    const history = Array.isArray(rec.retryHistory) ? rec.retryHistory : [];
+    const proven = history.some((h) => h && typeof h === 'object'
+      && Number(h.planNumber) === planNumber
+      && h.reason === entryReasonText
+      && h.proof && typeof h.proof === 'object' && !Array.isArray(h.proof)
+      && h.proof.method === 'pre-navigation-open-failed');
+    if (!proven) return { ok: false, reason: 'release-entry-provenance-unbound' };
+    entryProvenanceMethod = 'pre-navigation-open-failed';
+  }
+  if (rec.status !== 'failed' && rec.status !== 'blocked' && !(rec.status === 'failed-permanent' && (entry.status === 'preparation-stopped' || entry.status === 'unsubmitted'))) return { ok: false, reason: 'release-record-not-terminal-failure:' + String(rec.status) };
+  if (entry.status !== 'failed' && entry.status !== 'preparation-stopped' && entry.status !== 'unsubmitted') return { ok: false, reason: 'release-entry-not-prepublication:' + String(entry.status) };
   const pub = proveNoPublicationPreOpen(statePaths.stateFile, statePaths.attemptsFile, businessDate, { planNumber, accountId: s.accountId, shop });
   if (!pub.ok) return { ok: false, reason: pub.reason };
   // Bind the entry's OWN recorded runId when it carries one; a legacy entry (no runId) stays null
@@ -469,6 +489,9 @@ function proveSchedulerReleaseProof(ledgerFile, statePaths, spec) {
     entryReasonHash: sha256Hex(entry.reason),
     entryAt: entry.at != null ? String(entry.at) : null,
     entryRunId,
+    // S57: only set (and only trusted) for the failed-permanent / unsubmitted pre-navigation
+    // shape proven above from the record's OWN durable retry history.
+    entryProvenanceMethod,
     // Fresh-source re-read anchors: the mutation-time releaser recomputes the source hash from
     // these exact bound paths and refuses on any changed / deleted bytes.
     sourceHash: pub.proof.sourceHash,

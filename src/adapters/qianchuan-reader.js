@@ -47,6 +47,65 @@ const HOME_URL = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
 const QC_HOME_MARKER = 'qianchuan.jinritemai.com';
 const CONSUME_LABEL = '账户整体消耗';
 
+// ── 抖店首页自动 SSO 收敛（R51）────────────────────────────────────
+// 根证 reference-readonly-session.json（2026-10-15 只读复测）：同一已保存 Cookie 装入
+// 全新无头 Edge 后，DOMContentLoaded 后 5s/15s 仍在 /login/common（自动 SSO 中转），
+// 30s 才自动落到 /ffa/mshop/homepage/index（title=首页），全程零人工/零点击/零写入。
+// 旧实现固定等 5s 后立即把中转 URL 判成 AuthError → FALSE-EXPIRED（伪登录过期），
+// 上层 requiresLogin=true 要求重扫。修复：先做**有界被动收敛等待**（只在已打开页面
+// 上轮询地址，不点击/不导航/零请求），收敛成功才继续；到达上界仍未到首页才做登录
+// 正证据分类。上界 45s > 实测 30s 收敛点；快路径（已是首页）零额外等待。
+const HOME_HOST = 'fxg.jinritemai.com';
+const HOME_PATH_PREFIX = '/ffa/mshop/homepage';
+const DEFAULT_SETTLE_TIMEOUT_MS = 45000;
+const DEFAULT_SETTLE_INTERVAL_MS = 3000;
+const MAX_SETTLE_ATTEMPTS = 1000;
+
+/** 是否已真正落在抖店首页：严格 origin+path 解析（防 lookalike 域名/子串伪造，
+ *  如 https://fxg.jinritemai.com.evil.test/ffa/mshop/homepage/index 不得算成功）。 */
+function isDoudianHomepageUrl(u) {
+  if (typeof u !== 'string' || u.length === 0) return false;
+  let p;
+  try { p = new URL(u); } catch (_) { return false; }
+  return p.protocol === 'https:' && p.hostname === HOME_HOST && p.pathname.startsWith(HOME_PATH_PREFIX);
+}
+
+/**
+ * 有界被动等待抖店首页自动 SSO 收敛：轮询 page.url()（零点击/零导航/零请求），
+ * 直到严格命中首页 host/path 或到达上界。快路径：已是首页 → attempts=0 立即返回。
+ * 双保险上界：墙钟 deadline（nowFn 单调前进时）+ 独立硬限次（nowFn 冻结/回拨也收敛）。
+ * 页面被关闭 → 有界返回 {ok:false, reason:'settle-page-closed'}，绝不空转。
+ * 依赖注入：settleNowFn/settleSleep 可注入（离线测试，免真实等待）。
+ */
+async function waitForDoudianHomepageSettled(page, opts = {}) {
+  const timeoutMs = sanitizePositiveMs(opts.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS);
+  const intervalMs = sanitizePositiveMs(opts.settleIntervalMs, DEFAULT_SETTLE_INTERVAL_MS);
+  const nowFn = opts.settleNowFn || opts.nowFn || (() => Date.now());
+  const sleep = opts.settleSleep || opts.sleep || ((ms) => page.waitForTimeout(ms));
+  const maxAttempts = Math.max(1, Math.min(MAX_SETTLE_ATTEMPTS, Math.ceil(timeoutMs / intervalMs) + 1));
+  const deadline = nowFn() + timeoutMs;
+  const urlNow = () => {
+    try { return String(page.url()); } catch (_) { return ''; }
+  };
+  const pageClosed = () => {
+    try { return typeof page.isClosed === 'function' ? page.isClosed() === true : false; } catch (_) { return true; }
+  };
+  const first = urlNow();
+  if (isDoudianHomepageUrl(first)) return { ok: true, url: first, attempts: 0, waited: false };
+  let attempts = 0;
+  let url = first;
+  for (;;) {
+    attempts += 1;
+    url = urlNow();
+    if (isDoudianHomepageUrl(url)) return { ok: true, url, attempts, waited: true };
+    if (pageClosed()) return { ok: false, reason: 'settle-page-closed', url, attempts };
+    if (attempts >= maxAttempts) break;              // 硬限次上界：冻结/回拨时钟下也收敛
+    if (!(nowFn() + intervalMs <= deadline)) break;  // 墙钟上界：不再空转
+    try { await sleep(intervalMs); } catch (_) { /* 页面关闭等：下一轮 pageClosed 收敛 */ }
+  }
+  return { ok: false, reason: 'settle-timeout', url, attempts };
+}
+
 // 费用卡就绪等待的有界默认（仅在已打开页面上被动重读 DOM：不 reload、不点击、不导航、零网络请求）。
 const DEFAULT_READINESS_TIMEOUT_MS = 60000;
 const DEFAULT_READINESS_INTERVAL_MS = 3000;
@@ -516,12 +575,19 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     const page = await context.newPage();
     await page.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(5000);
-    if (!page.url().includes('fxg.jinritemai.com/ffa/mshop/homepage')) {
+    // R51：自动 SSO 中转（/login/common → 首页，实测 ~30s）不得在 5s 处被判伪过期。
+    // 先有界被动收敛（仅轮询地址，零点击/零导航/零请求）；收敛成功才继续既有链路；
+    // 上界到达才做登录正证据分类（真过期仍 AuthError；其余按导航事实 DataGuard）。
+    const settled = await waitForDoudianHomepageSettled(page, opts);
+    if (!settled.ok) {
+      if (settled.reason === 'settle-page-closed') {
+        throw new DataGuardError(`抖店主页面在自动登录收敛期内被关闭（最后地址 ${settled.url || '未知'}）；按导航事实处理，需人工核实`);
+      }
       const evidence = await collectLoginExpiryEvidence(page);
       if (evidence.loginUrl || evidence.loginControlVisible || evidence.loginFormVisible || evidence.loginDialogVisible) {
-        throw new AuthError(`登录失效：抖店页面命中登录页地址或可见登录控件/表单（当前 ${page.url()}），请重新扫码登录`);
+        throw new AuthError(`登录失效：抖店页面在 ${settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(opts.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${page.url()}），请重新扫码登录`);
       }
-      throw new DataGuardError(`抖店主页面导航未完成（当前 ${page.url()}）；未见登录正证据，按导航事实处理，需人工核实`);
+      throw new DataGuardError(`抖店主页面在有界自动登录收敛期内未到达首页（${settled.attempts} 次探测，当前 ${settled.url || page.url()}）；未见登录正证据，按导航事实处理，需人工核实`);
     }
     const reached = await reachQianchuanHome({ page, context, shopCfg });
     if (!reached.ok) {
@@ -1160,6 +1226,11 @@ module.exports = {
   reachQianchuanHome,
   qianchuanHomeUrl,
   isQianchuanHomeUrl,
+  isDoudianHomepageUrl,
+  waitForDoudianHomepageSettled,
+  DEFAULT_SETTLE_TIMEOUT_MS,
+  DEFAULT_SETTLE_INTERVAL_MS,
+  MAX_SETTLE_ATTEMPTS,
   QC_STATUS_WORDS,
   KNOWN_AD_TYPES,
   CONSUME_LABEL,

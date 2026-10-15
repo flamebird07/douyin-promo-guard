@@ -147,9 +147,13 @@ function makeStubPage({ url = 'https://qianchuan.jinritemai.com/home?aavid=17102
     },
     getByText: () => ({
       first() { return this; },
+      nth() { return this; },
       count: async () => entryCount,
       click: async () => { calls.clicks += 1; },
       waitFor: async () => {},
+      // locateQianchuanEntry/entryCandidateHref 需要候选自身最近 <a> 的 href（空=非教程链接）
+      evaluate: async () => '',
+      isVisible: async () => false,
     }),
     locator: () => ({
       nth: () => ({
@@ -241,21 +245,29 @@ test('入口点击后落到登录/授权中转页：不算到达千川，仍走�
   assert.strictEqual(stub.calls.clicks, 2, '登录中转页不算成功 → 重试一次');
 });
 
+// 费用读取的 evaluate 序列已含就绪探测（probeQianchuanConsumeReadiness 先于显式读取，
+// 且每次探测消费 2 个 evaluate：周期+卡片），旧的按次序 evaluateResponses 会错位 ——
+// 改为按序列化探针源码特征应答（shop-name/datepicker/out.push 分项/summaryCard 卡片/refreshTime）。
+function costEvaluateByFn(over = {}) {
+  return (src) => {
+    if (/shop-name/.test(src)) return over.account !== undefined ? over.account : { accountId: '1710242295996424', accountName: '伊人美' };
+    if (/report-shortcuts-datepicker/.test(src)) return ['2026-09-13', '2026-09-13'];
+    if (/out\.push/.test(src)) return over.breakdown !== undefined ? over.breakdown : [
+      { item: '乘方计划消耗', raw: '14.98' },
+      { item: '标准投放消耗', raw: '0.00' },
+      { item: '全域投放消耗', raw: '0.00' },
+      { item: '品牌投放消耗', raw: '0.00' },
+    ];
+    if (/summaryCard/.test(src)) return over.card !== undefined ? over.card : '账户整体消耗(元)16.45相比上周期+70.03%';
+    if (/refreshTime/.test(src)) return over.updatedAt !== undefined ? over.updatedAt : '更新于：09-13 11:17';
+    return undefined;
+  };
+}
+
 test('费用读取：evaluate 序列驱动下输出账户/口径/分项（stub 页面）', async () => {
   const stub = makeStubPage({
     urlQueue: ['https://fxg.jinritemai.com/ffa/mshop/homepage/index', 'https://qianchuan.jinritemai.com/home?aavid=1710242295996424'],
-    evaluateResponses: [
-      { accountId: '1710242295996424', accountName: '伊人美' },
-      ['2026-09-13', '2026-09-13'],
-      '账户整体消耗(元)16.45相比上周期+70.03%',
-      '更新于：09-13 11:17',
-      [
-        { item: '乘方计划消耗', raw: '14.98' },
-        { item: '标准投放消耗', raw: '0.00' },
-        { item: '全域投放消耗', raw: '0.00' },
-        { item: '品牌投放消耗', raw: '0.00' },
-      ],
-    ],
+    evaluateByFn: costEvaluateByFn(),
   });
   const reader = createQianchuanCostReader({ loginCfg: LOGIN_CFG, nowFn: NOW, browserFactory: async () => stub.browser });
   const summary = await reader.readCostSummary({ shopCfg: { id: '瑾漂亮潮流服饰', cookieFile: '测试店铺', accountId: '1710242295996424' } });
@@ -270,13 +282,7 @@ test('费用读取：evaluate 序列驱动下输出账户/口径/分项（stub �
 test('费用读取：页面账户 ID 缺失仍可完成（Cookie 归属，ID 仅可选观测）', async () => {
   const stub = makeStubPage({
     urlQueue: ['https://fxg.jinritemai.com/ffa/mshop/homepage/index', 'https://qianchuan.jinritemai.com/home'],
-    evaluateResponses: [
-      { accountId: null, accountName: '店名无ID' },
-      ['2026-09-13', '2026-09-13'],
-      '账户整体消耗(元)3.21',
-      '更新于：09-13 11:20',
-      [{ item: '乘方计划消耗', raw: '3.21' }],
-    ],
+    evaluateByFn: costEvaluateByFn({ account: { accountId: null, accountName: '店名无ID' }, card: '账户整体消耗(元)3.21', updatedAt: '更新于：09-13 11:20', breakdown: [{ item: '乘方计划消耗', raw: '3.21' }] }),
   });
   const reader = createQianchuanCostReader({ loginCfg: LOGIN_CFG, nowFn: NOW, browserFactory: async () => stub.browser });
   const summary = await reader.readCostSummary({
@@ -292,13 +298,7 @@ test('费用读取：页面账户 ID 缺失仍可完成（Cookie 归属，ID 仅
 test('费用读取：页面账户 ID 与配置不同 → 仍返回数据，不因 ID 报 AUTH', async () => {
   const stub = makeStubPage({
     urlQueue: ['https://fxg.jinritemai.com/ffa/mshop/homepage/index', 'https://qianchuan.jinritemai.com/home?aavid=1710242295996424'],
-    evaluateResponses: [
-      { accountId: '999000111222333', accountName: '另一账户' },
-      ['2026-09-13', '2026-09-13'],
-      '账户整体消耗(元)8.00',
-      '更新于：09-13 11:21',
-      [],
-    ],
+    evaluateByFn: costEvaluateByFn({ account: { accountId: '999000111222333', accountName: '另一账户' }, card: '账户整体消耗(元)8.00', updatedAt: '更新于：09-13 11:21', breakdown: [] }),
   });
   const reader = createQianchuanCostReader({ loginCfg: LOGIN_CFG, nowFn: NOW, browserFactory: async () => stub.browser });
   const summary = await reader.readCostSummary({

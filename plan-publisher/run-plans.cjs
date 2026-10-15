@@ -3710,14 +3710,54 @@ function createRealDrivers(ctx) {
       const checkedN=s.rows.filter(r=>r.checked===true).length;
       return s.selectedCount===checkedN&&s.totalCount===30;
     };
+    // R63 sanitized footer/row-state diagnostics for the persistent-conflict stops: numeric
+    // counts and a phase label only — never row text, account ids, cookie material or URLs.
+    // Attached alongside (never replacing) the existing public reason string.
+    const footerStateDiag=(s,phase)=>{
+      const rows=(s&&Array.isArray(s.rows))?s.rows:null;
+      return {
+        phase,
+        rowCount:rows?rows.length:null,
+        knownCheckedCount:rows?rows.filter(r=>r&&r.checked===true).length:null,
+        unknownStateCount:rows?rows.filter(r=>!r||(r.checked!==true&&r.checked!==false)).length:null,
+        selectedCount:(s&&typeof s.selectedCount==='number')?s.selectedCount:null,
+        totalCount:(s&&typeof s.totalCount==='number')?s.totalCount:null
+      };
+    };
     // A legitimate reuse target is any product that is itself bound to at least 1 manual
     // account in THIS batch's main table read — not only the first rows.find anchor. This
     // lets a drawer whose active is already a second legitimately-bound product be reused
     // directly.
     const isBoundManual2InBatch=pid=>rows.some(r=>String(r.productId)===String(pid)&&Number.isInteger(r.manualAccounts)&&r.manualAccounts>=1);
     async function readDrawer() {
-      try { return await until(()=>page.evaluate(bindingDrawerSnapshotInPage),x=>x.ok&&exactTwo(x),10000,'account-drawer'); }
-      catch(_) { return await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null); }
+      // R63 bounded PASSIVE settle of the auto-opened drawer (read-only, zero clicks): wait
+      // for ok+exactTwo PLUS a consistent selection state before returning a usable snapshot,
+      // so a transiently-rendering row/footer no longer becomes a false footer-row-state-conflict
+      // at the caller gate. Budget = the configured native timeout (a shorter test override is
+      // honored), capped at the pre-existing 10s production window — never a fixed 10s per
+      // offline case. The FIRST positively-trusted identity (exact batch 30-panel set, single
+      // in-batch active, unique 1..2 row account ids) is FROZEN across the whole poll: unknown
+      // or missing rows may still settle, but once a trustworthy identity was observed a later
+      // read whose active or account ids switched is never adopted, and the post-timeout
+      // fallback read returns null on such drift so the existing caller guards fail closed
+      // with their EXACT original reasons.
+      const trustedIdentity=s=>!!s&&s.ok===true&&panelSetEqualsIds(s)&&Array.isArray(s.activeProductIds)&&s.activeProductIds.length===1&&ids.some(id=>String(s.activeProductIds[0])===id);
+      let frozenActive=null,frozenAccountIds=null;
+      const noteIdentity=s=>{
+        if(!trustedIdentity(s))return true;
+        const a=String(s.activeProductIds[0]);
+        if(frozenActive===null)frozenActive=a;else if(frozenActive!==a)return false;
+        if(Array.isArray(s.rows)&&s.rows.length>=1&&s.rows.length<=2&&s.rows.every(r=>Array.isArray(r&&r.ids)&&r.ids.length===1)){
+          const key=[...new Set(s.rows.map(r=>String(r.ids[0])))].sort().join(',');
+          if(key.split(',').length!==s.rows.length)return false;
+          if(frozenAccountIds===null)frozenAccountIds=key;else if(frozenAccountIds!==key)return false;
+        }
+        return true;
+      };
+      const fresh=()=>page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null);
+      const usable=s=>!!s&&s.ok===true&&exactTwo(s)&&consistentSelectionState(s);
+      try { return await until(fresh,x=>noteIdentity(x)&&usable(x),Math.min(nativeTimeoutMs,10000),'account-drawer-settled'); }
+      catch(_) { const fin=await fresh(); if(!trustedIdentity(fin))return fin; return noteIdentity(fin)?fin:null; }
     }
     async function reopenBoundAnchor() {
       if(!anchor) return null;
@@ -3835,7 +3875,7 @@ function createRealDrivers(ctx) {
     // navigation / header / batch the drawer must expose a trustworthy 30-product panel list whose
     // set is exactly this batch, with a SINGLE active product that belongs to it (provePanelSet is
     // defined above reopenBoundAnchor). The real batch target is ALWAYS the strict object form.
-    if(!consistentSelectionState(snap))return {ok:false,reason:'account-drawer-footer-row-state-conflict'};
+    if(!consistentSelectionState(snap))return {ok:false,reason:'account-drawer-footer-row-state-conflict',diag:footerStateDiag(snap,'initial-auto-drawer')};
     let batchAnchorId=provePanelSet(snap);
     if(!batchAnchorId)return {ok:false,reason:'account-drawer-panel-identity-unverified'};
     let state=snap.rows.map(r=>r.checked);
@@ -3865,7 +3905,7 @@ function createRealDrivers(ctx) {
       // anchor or another bound manual2 and is unblocked, fall through and header it directly.)
       snap=await reopenBoundAnchor();
       if(!snap||!snap.ok||!exactTwo(snap))return {ok:false,reason:rowsBlockedUnchecked(snap)?'native-account-rows-label-disabled':'native-account-header-select-all-disabled'};
-      if(!consistentSelectionState(snap))return {ok:false,reason:'account-drawer-footer-row-state-conflict'};
+      if(!consistentSelectionState(snap))return {ok:false,reason:'account-drawer-footer-row-state-conflict',diag:footerStateDiag(snap,'reopened-anchor')};
       const reopenedAnchor=provePanelSet(snap);
       if(!reopenedAnchor)return {ok:false,reason:'anchor-account-panel-identity-unverified'};
       if(String(reopenedAnchor)!==String(anchor.productId))return {ok:false,reason:'anchor-active-management-product-mismatch'};
@@ -3907,7 +3947,7 @@ function createRealDrivers(ctx) {
         // account-anchor-no-usable-product 诚实停止（零假成功）。
         const noEligibleForProduct=fresh.ok===true&&Array.isArray(fresh.rows)&&fresh.rows.length===0&&Number(fresh.selectedCount)===0&&Number(fresh.totalCount)===30&&panelSetEqualsIds(fresh)&&provePanelSet(fresh)===String(pid);
         if(noEligibleForProduct) continue;
-        if(!consistentSelectionState(fresh)) return {ok:false,reason:'account-drawer-footer-row-state-conflict'};
+        if(!consistentSelectionState(fresh)) return {ok:false,reason:'account-drawer-footer-row-state-conflict',diag:footerStateDiag(fresh,'panel-candidate')};
         // Distinguish a broken 30-panel SET from a broken ACTIVE product so the stop reason is
         // meaningful: first prove the panel set still equals this batch, then prove the single
         // active still equals the candidate we navigated to.
@@ -3927,7 +3967,7 @@ function createRealDrivers(ctx) {
     if(anchor&&String(batchAnchorId)!==String(anchor.productId)&&!isBoundManual2InBatch(batchAnchorId))return {ok:false,reason:'anchor-active-management-product-mismatch'};
     const fullyUnchecked=state.every(x=>x===false);
     const checkedNow=snap.rows.filter(r=>r.checked===true).length;
-    if(snap.selectedCount===0&&!fullyUnchecked||snap.selectedCount>0&&(!fullyChecked||snap.selectedCount!==checkedNow))return {ok:false,reason:'account-drawer-footer-row-state-conflict'};
+    if(snap.selectedCount===0&&!fullyUnchecked||snap.selectedCount>0&&(!fullyChecked||snap.selectedCount!==checkedNow))return {ok:false,reason:'account-drawer-footer-row-state-conflict',diag:footerStateDiag(snap,'pre-header')};
     if(!fullyChecked){
       await page.evaluate(selectAllAccountsInPage, targetPayload());
       let after;

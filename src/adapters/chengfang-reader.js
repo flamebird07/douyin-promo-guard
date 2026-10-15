@@ -25,6 +25,7 @@
 const path = require('path');
 const { AuthError, DataGuardError } = require('../lib/errors');
 const { openQianchuanHome, closeBrowser } = require('./qianchuan-reader');
+const { checkpointQianchuanSessionCookies } = require('../login/session-cookie-checkpoint');
 
 // 自动会话始终保持后台运行；仅控件定位失败时，另开一份同店铺可见会话供人工检查。
 // 每店最多保留一个窗口，用户关闭窗口后下一轮才允许再次尝试。
@@ -1330,12 +1331,29 @@ async function openChengfangShop(p) {
     if (!hasTabs) {
       throw new DataGuardError('乘方页未找到"商品自选/全店托管"子标签（尝试进入"商品→计划视图"后仍未出现），拒绝继续');
     }
-    return { browser, target, account: st, context, cookieSession };
+    // R58 会话检查点（manager-ready 返回）：到达乘方管理页并见到子标签后，再以
+    // 当前时刻正证据持久化一次刷新 Cookie；跳过/失败不改写本次成功结果。
+    let cookieCheckpoint;
+    try {
+      const runCheckpoint = p.sessionCheckpoint || checkpointQianchuanSessionCookies;
+      cookieCheckpoint = await runCheckpoint({ context, cookieSession, target, shopCfg: p.shopCfg, audit: p.audit });
+    } catch (e) {
+      cookieCheckpoint = { saved: false, skipped: true, reason: `会话检查点异常（不影响本次打开结果）: ${(e && e.message) || e}` };
+    }
+    return { browser, target, account: st, context, cookieSession, cookieCheckpoint };
   } catch (e) {
     await holdOnMissingChengfangControl(e, {
       context, target, shopCfg: p.shopCfg, loginCfg: p.loginCfg,
       browserFactory: p.browserFactory, reviewBrowserFactory: p.reviewBrowserFactory,
     });
+    // R58 失败路径检查点：关闭浏览器前再尝试一次——仅当当前时刻地址/身份仍是
+    // 新鲜的同账户千川正证据才会写（登录页/foreign/身份缺失由检查点自身跳过）。
+    // 结果只丢弃不传播：原始错误原样抛出，绝不掩盖或改写。
+    try {
+      await (p.sessionCheckpoint || checkpointQianchuanSessionCookies)({
+        context, cookieSession, target, shopCfg: p.shopCfg, audit: p.audit,
+      });
+    } catch (_) { /* 检查点失败不得影响原始错误的如实传播 */ }
     await closeBrowser(browser);
     throw e;
   }

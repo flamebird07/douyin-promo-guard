@@ -41,6 +41,7 @@ const { parseMoneyCents } = require('../lib/money');
 const { shanghaiDate } = require('../lib/time');
 const { resolveCookieFile } = require('../login/session');
 const { fingerprintFile } = require('../login/cookie-writeback');
+const { checkpointQianchuanSessionCookies } = require('../login/session-cookie-checkpoint');
 const { closableSideOfAd } = require('./ad-controller');
 
 const HOME_URL = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
@@ -594,7 +595,17 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
       throw new DataGuardError(`${reached.reason}（当前: ${reached.url}）；若需额外登录/授权请先人工完成一次`);
     }
     const target = reached.target;
-    return { browser, context, page, target, cookieSession, navMode: reached.mode };
+    // R58 会话检查点：已核验到达千川（严格可信来源+受支持路径）后、继续后续导航前，
+    // 把本会话刷新后的 Cookie 经授权写入器持久化（当前新鲜同账户正证据成立时才写；
+    // 配置无 accountId 则跳过）。任何跳过/失败都不改写本次打开结果、不掩盖原始错误。
+    let cookieCheckpoint;
+    try {
+      const runCheckpoint = opts.sessionCheckpoint || checkpointQianchuanSessionCookies;
+      cookieCheckpoint = await runCheckpoint({ context, cookieSession, target, shopCfg, audit: opts.audit });
+    } catch (e) {
+      cookieCheckpoint = { saved: false, skipped: true, reason: `会话检查点异常（不影响本次打开结果）: ${(e && e.message) || e}` };
+    }
+    return { browser, context, page, target, cookieSession, navMode: reached.mode, cookieCheckpoint };
   } catch (e) {
     // 任意初始化失败：关闭本次创建的浏览器，再抛出原始错误
     if (browser) await browser.close().catch(() => {});

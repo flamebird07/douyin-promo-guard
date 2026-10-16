@@ -620,6 +620,16 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     } catch (e) {
       cookieCheckpoint = { saved: false, skipped: true, reason: `会话检查点异常（不影响本次打开结果）: ${(e && e.message) || e}` };
     }
+    // R87 关闭前收尾检查点登记：把同一检查点实现登记到以本次 owned browser 为键的 WeakMap，
+    // 供 closeBrowser 在关闭前以**当前时刻事实**（同 context + 严格可信 URL + 新鲜语义身份）
+    // 再保存一次。管理/发布/发现共用 closeBrowser 均走同一检查；未知/非受支持页面由检查点自身
+    // 安全跳过。登记失败不影响本次打开结果；绝不 monkeypatch browser.close、不引入全局服务。
+    try {
+      const runFinalize = opts.sessionCheckpoint || checkpointQianchuanSessionCookies;
+      browserFinalizers.set(browser, {
+        finalize: () => runFinalize({ context, cookieSession, target, shopCfg, audit: opts.audit }),
+      });
+    } catch (_) { /* 登记失败不改变打开结果 */ }
     return { browser, context, page, target, cookieSession, navMode: reached.mode, cookieCheckpoint };
   } catch (e) {
     // 任意初始化失败：关闭本次创建的浏览器，再抛出原始错误
@@ -628,7 +638,33 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
   }
 }
 
+/**
+ * 本次 owned 浏览器 → 关闭前收尾保存处理器（R87/R89）。仅登记 openQianchuanHome 成功返回的
+ * browser。**同一个已登记 promise 同时包含收尾最终化与 browser.close()**：重复/并发 closeBrowser
+ * 复用同一 promise，故至多 save 1 次、close 1 次。登记项不再删除，保留已完成 promise，由 WeakMap
+ * 键（本次 owned browser）的生命周期自然释放，因此已结束后再次调用也不会二次最终化或二次关闭。
+ * 收尾最终化抛错既不吞掉调用方原业务错误，也不阻止关闭；未登记 browser 的原关闭行为不变。
+ * 绝不 monkeypatch browser.close，不引入全局服务。
+ */
+const browserFinalizers = new WeakMap();
+
 async function closeBrowser(browser) {
+  if (browser && typeof browser === 'object') {
+    const entry = browserFinalizers.get(browser);
+    if (entry) {
+      let p = entry.promise;
+      if (!p) {
+        p = (async () => {
+          // 收尾保存失败/异常绝不阻止正常关闭，也不改变已确认的业务结果。
+          try { await entry.finalize(); } catch (_) { /* ignore */ }
+          await browser.close().catch(() => {});
+        })();
+        entry.promise = p;
+      }
+      await p;
+      return;
+    }
+  }
   await browser.close().catch(() => {});
 }
 

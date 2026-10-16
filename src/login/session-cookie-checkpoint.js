@@ -37,6 +37,7 @@
  */
 
 const crypto = require('crypto');
+const path = require('path');
 const { writebackSessionCookies, fingerprintFile } = require('./cookie-writeback');
 
 const QC_HOST = 'qianchuan.jinritemai.com';
@@ -493,15 +494,290 @@ async function checkpointQianchuanSessionCookies(p) {
   };
 }
 
+// ── 电商罗盘（compass）经营页收尾检查点（R87）──────────────────────────────
+// 使用缺口：compass-order-reader.readOrderSummary 在成功读数/身份核验后的 finally 直接
+// browser.close()，会话期间浏览器内刷新的 Cookie 从未回写；qianchuan-reader 的
+// openQianchuanHome 也只在入口保存一次、closeBrowser 直接关闭。本检查点在**关闭前**以
+// 当前时刻事实重新核验罗盘经营页的严格语义店铺名身份，成立时才经既有授权写入器回写。
+// 严格限定：仅 https compass.jinritemai.com 的 /shop 经营页；登录/中转/伪域/任意路径拒绝。
+// 绝不用更早时刻（如指标读取时）的身份观测当当前授权；绝不用 QC 显示账户名当店名。
+
+const COMPASS_HOST = 'compass.jinritemai.com';
+/** 受支持的罗盘经营页路径（严格前缀 + 边界；实测 /shop、/shop/dashboard/index、
+ *  /shop/commodity/product-list 均属经营页，pathname 不含 query/hash）。 */
+const COMPASS_SUPPORTED_PATH_RE = /^\/shop(?:\/|$)/;
+/** 登录/授权中转特征（与千川同口径）。 */
+const COMPASS_LOGIN_PATH_RE = /\/login|\/passport|\/signin|sso\.jinritemai/i;
+
+/** 严格可信罗盘经营页判定（URL 解析，绝不子串匹配）。 */
+function isVerifiedCompassUrl(u) {
+  if (typeof u !== 'string' || u.length === 0) return false;
+  let p;
+  try { p = new URL(u); } catch (_) { return false; }
+  if (p.origin !== `https://${COMPASS_HOST}`) return false;
+  if (COMPASS_LOGIN_PATH_RE.test(p.pathname)) return false;
+  return COMPASS_SUPPORTED_PATH_RE.test(p.pathname);
+}
+
+/**
+ * 罗盘右上角身份探针（自包含：会被序列化进真实页面 evaluate 执行，不能引用闭包；
+ * 同时导出供本地 DOM fixture 测试直接调用）。
+ * 只认可见 [class*="userName"] 元素（与 compass-order-reader 既有读法同口径）；
+ * 候选必须恰好 1 个不同文本，多候选/缺失 → unique=false。可见性判定 fail-closed：
+ * getBoundingClientRect 抛错 → 不可见；有 getComputedStyle 时进一步排除 display:none/
+ * visibility:hidden。同地址可见登录控件 → loginVisible=true 显式负证据。
+ */
+function probeCompassShopNameInPage() {
+  const out = { name: null, distinct: [], candidates: 0, unique: false, loginVisible: false };
+  const doc = (typeof document !== 'undefined' && document) ? document : null;
+  if (!doc || typeof doc.querySelectorAll !== 'function') return out;
+  const visible = (el) => {
+    let r;
+    try { r = el.getBoundingClientRect(); } catch (_) { return false; }
+    if (!r || !(r.width > 0 && r.height > 0)) return false;
+    if (typeof getComputedStyle === 'function') {
+      let cs;
+      try { cs = getComputedStyle(el); } catch (_) { cs = null; }
+      if (cs) {
+        if (String(cs.display || '').toLowerCase() === 'none') return false;
+        if (String(cs.visibility || '').toLowerCase() === 'hidden') return false;
+      }
+    }
+    return true;
+  };
+  try {
+    const loginEls = doc.querySelectorAll(
+      'input[placeholder*="手机"], input[placeholder*="账号"], input[placeholder*="验证码"],'
+      + ' input[type="password"], button, [class*="login"]'
+    );
+    for (let i = 0; i < loginEls.length; i += 1) {
+      const el = loginEls[i];
+      if (!visible(el)) continue;
+      const tag = String((el.tagName || '')).toLowerCase();
+      const t = String((el.textContent || '')).replace(/\s+/g, '').trim();
+      if (tag === 'input' || /^登\s*录$/.test(t)) { out.loginVisible = true; break; }
+    }
+  } catch (_) { /* 登录负证据探测失败不构成放行依据，仅不置位 */ }
+  const texts = [];
+  const els = doc.querySelectorAll('[class*="userName"]');
+  for (let i = 0; i < els.length; i += 1) {
+    const el = els[i];
+    if (!visible(el)) continue;
+    const t = String((el.textContent || '')).replace(/\s+/g, ' ').trim();
+    if (t) texts.push(t);
+  }
+  out.candidates = texts.length;
+  out.distinct = [...new Set(texts)];
+  if (out.candidates >= 1 && out.distinct.length === 1) {
+    out.unique = true;
+    out.name = out.distinct[0];
+  }
+  return out;
+}
+
+/**
+ * 纯判定：当前事实（地址 + 罗盘 [class*=userName] 语义店名观测）是否构成本店当前登录正证据。
+ * 名称只 trim 后与配置候选 compassShopName/name 全等（不模糊/不黑名单/不正文匹配）。
+ * 返回 {ok:true, name} 或 {ok:false, skipped:true, reason}（reason 不含 Cookie 值）。
+ */
+function decideCompassCheckpoint({ url, expectedNames, observed }) {
+  const names = (Array.isArray(expectedNames) ? expectedNames : [])
+    .map((n) => String(n == null ? '' : n).trim())
+    .filter((n) => n.length > 0);
+  if (names.length === 0) {
+    return { ok: false, skipped: true, reason: '店铺配置未提供 compassShopName/name，无法对罗盘页做严格店铺名核验：跳过会话收尾检查点' };
+  }
+  if (!isVerifiedCompassUrl(url)) {
+    return { ok: false, skipped: true, reason: `当前地址不是可信罗盘经营页 /shop（严格 origin+path 解析）: ${String(url).slice(0, 120)}` };
+  }
+  if (!observed || typeof observed !== 'object' || observed.unique !== true || !observed.name) {
+    return { ok: false, skipped: true, reason: '罗盘页 [class*=userName] 语义店铺名缺失或候选不唯一：跳过会话收尾检查点' };
+  }
+  if (observed.loginVisible === true) {
+    return { ok: false, skipped: true, reason: '罗盘页存在可见登录表单/控件（同地址残留身份不算当前登录证据）：跳过会话收尾检查点' };
+  }
+  const name = String(observed.name).trim();
+  if (!names.includes(name)) {
+    return { ok: false, skipped: true, reason: `罗盘页可见店铺名与配置 compassShopName/name 不严格匹配（仅 trim 全等）: ${name.slice(0, 40)}` };
+  }
+  return { ok: true, name };
+}
+
+/** 安全文件名（沿用 login-shop-identity.safeNameOf 既有规则：替换 \/:*?"<>| 为下划线）。 */
+function safeShopFileName(rawName) {
+  return String(rawName == null ? '' : rawName).replace(/[\\/:*?"<>|]/g, '_');
+}
+
+/**
+ * 罗盘会话收尾 Cookie 检查点（R87）：在"当前时刻"罗盘经营页严格语义店铺名正证据成立、
+ * 且目标文件 basename 与该语义店名的安全文件名精确一致时，把本会话（context 内）刷新后的
+ * Cookie 经既有授权写入器持久化到本次实际加载的精确文件；成功且落盘与自有 owned 序列化
+ * 逐字节一致时推进会话起始指纹。任何跳过/失败都只如实返回（含 audit 记录），绝不抛出业务语义。
+ *
+ * @param {object} p
+ * @param {object} p.context        本次会话 BrowserContext（须支持 cookies()；不支持则跳过）
+ * @param {object} p.cookieSession  {filePath, startFingerprint}（加载前捕获）
+ * @param {object} p.target         当前罗盘页（须支持 url()/evaluate()）
+ * @param {object} p.shopCfg        店铺配置（compassShopName/name 严格匹配；shopId 仅日志归属）
+ * @param {(e:object)=>void} [p.audit] 审计回调（内容不含 Cookie 值）
+ * @returns {Promise<{saved:boolean, skipped?:boolean, fingerprintAdvanced?:boolean,
+ *                    reason?:string|null, count?:number, bytes?:number, shopName?:string}>}
+ */
+async function checkpointCompassSessionCookies(p) {
+  const { context, cookieSession, target, shopCfg } = p || {};
+  const audit = (p && typeof p.audit === 'function') ? p.audit : () => {};
+  const shopId = (shopCfg && shopCfg.id) || null;
+  const skip = (reason) => {
+    try { audit({ kind: 'cookie-writeback', shopId, ok: false, skipped: true, reason }); } catch (_) { /* 审计失败不影响结果 */ }
+    return { saved: false, skipped: true, reason };
+  };
+
+  if (!cookieSession || typeof cookieSession.filePath !== 'string' || !cookieSession.startFingerprint) {
+    return skip('缺少会话 Cookie 元信息（路径/起始指纹）：跳过罗盘收尾检查点');
+  }
+  if (!context || typeof context.cookies !== 'function') {
+    return skip('context 不具备 cookies 能力（离线/注入会话）：跳过罗盘收尾检查点');
+  }
+  if (!target || typeof target.evaluate !== 'function' || typeof target.url !== 'function') {
+    return skip('未提供可用罗盘页：跳过罗盘收尾检查点');
+  }
+  // R89 会话绑定复验：真实 Playwright 页恒有 context()，且必须与本次会话 context **对象全等**。
+  // 每一个 async 边界之后（身份探针返回、Cookie 取回、取回后复验探针返回）都要重新核验目标页
+  // 仍存在、未关闭、绑定未漂移；缺方法 / context() 抛错 / foreign 页 / 已关闭一律拒绝且零回写。
+  // CookieSession 文件 basename 同名不是 context 绑定的证据，不能替代本项检查。
+  const bindingLoss = (where) => {
+    if (!target || typeof target.evaluate !== 'function' || typeof target.url !== 'function') {
+      return `${where}：罗盘页不可用（缺失或无 url/evaluate 能力）`;
+    }
+    if (typeof target.context !== 'function') {
+      return `${where}：罗盘页不提供 context()，无法证明属于本次会话 context`;
+    }
+    let bound = null;
+    try { bound = target.context(); } catch (_) {
+      return `${where}：罗盘页 context() 抛错（页面对象已失效）`;
+    }
+    if (bound !== context) {
+      return `${where}：罗盘页 context() 与本次会话 context 不全等（foreign/跨会话页；文件同名不构成绑定证据）`;
+    }
+    try {
+      if (typeof target.isClosed === 'function' && target.isClosed() === true) {
+        return `${where}：罗盘页已关闭`;
+      }
+    } catch (_) {
+      return `${where}：罗盘页 isClosed() 抛错（按已关闭处理）`;
+    }
+    return null;
+  };
+  const lossAtEntry = bindingLoss('收尾入口（身份探针前）');
+  if (lossAtEntry) return skip(lossAtEntry);
+  const expectedNames = [];
+  for (const n of [shopCfg && shopCfg.compassShopName, shopCfg && shopCfg.name]) {
+    const t = String(n == null ? '' : n).trim();
+    if (t && !expectedNames.includes(t)) expectedNames.push(t);
+  }
+
+  let url = '';
+  try { url = String(target.url()); } catch (_) { return skip('当前页面地址不可读：跳过罗盘收尾检查点'); }
+  let observed = null;
+  try { observed = await target.evaluate(probeCompassShopNameInPage); } catch (_) { observed = null; }
+  // 探针是 async 边界：返回后先复验绑定，再判定（漂移 → 零回写）
+  const lossAfterProbe = bindingLoss('身份探针返回后');
+  if (lossAfterProbe) return skip(lossAfterProbe);
+  const decision = decideCompassCheckpoint({ url, expectedNames, observed });
+  if (!decision.ok) return skip(decision.reason);
+
+  // 目标文件名与当前语义身份绑定：basename 必须精确等于该店名的安全文件名（拒跨店/default/错文件）。
+  const expectedBase = safeShopFileName(decision.name) + '.json';
+  const actualBase = path.basename(cookieSession.filePath);
+  if (actualBase !== expectedBase) {
+    return skip(`目标文件 basename ${JSON.stringify(actualBase)} 与当前语义店铺名 ${JSON.stringify(decision.name)} 的安全文件名 ${JSON.stringify(expectedBase)} 不符（跨店/default/错文件）：跳过罗盘收尾检查点`);
+  }
+
+  // 单一 Cookie 读取 + 取回后新鲜复验（同千川检查点口径）：任何 URL/店名/会话绑定漂移 → 抛错 → 零写。
+  let ownedArray = null;
+  const ownedContext = new Proxy(context, {
+    get(t, prop) {
+      if (prop === 'cookies') {
+        return async function ownedCookiesOnce() {
+          const arr = await t.cookies();
+          if (!Array.isArray(arr) || arr.length === 0) {
+            throw new Error('本次会话 Cookie 为空（登录态可疑）：取消罗盘收尾检查点');
+          }
+          const lossAfterCookies = bindingLoss('Cookie 取回后');
+          if (lossAfterCookies) throw new Error(`${lossAfterCookies}：取消罗盘收尾检查点`);
+          let urlNow = '';
+          try { urlNow = String(p.target.url()); } catch (e) {
+            throw new Error(`Cookie 取回后复验页面地址不可读：${e.message}`);
+          }
+          let obsNow = null;
+          try { obsNow = await p.target.evaluate(probeCompassShopNameInPage); } catch (_) { obsNow = null; }
+          const lossAfterReprobe = bindingLoss('Cookie 取回后身份探针返回后');
+          if (lossAfterReprobe) throw new Error(`${lossAfterReprobe}：取消罗盘收尾检查点`);
+          let urlAfter = '';
+          try { urlAfter = String(p.target.url()); } catch (_) { urlAfter = ''; }
+          const re = decideCompassCheckpoint({ url: urlNow, expectedNames, observed: obsNow });
+          if (!re.ok) throw new Error(`Cookie 取回后当前事实复验失败（${re.reason}）`);
+          if (re.name !== decision.name) throw new Error('复验期间罗盘页语义店铺名漂移：取消罗盘收尾检查点');
+          if (urlAfter !== urlNow || !isVerifiedCompassUrl(urlAfter)) {
+            throw new Error('复验期间页面发生导航：取消罗盘收尾检查点');
+          }
+          ownedArray = arr;
+          return arr;
+        };
+      }
+      const v = Reflect.get(t, prop, t);
+      return typeof v === 'function' ? v.bind(t) : v;
+    },
+  });
+
+  const res = await writebackSessionCookies({
+    context: ownedContext,
+    cookieFilePath: cookieSession.filePath,
+    sessionStartFingerprint: cookieSession.startFingerprint,
+    identityOk: true,
+    loginOk: true,
+    shopId,
+    audit,
+  });
+  if (!res || res.ok !== true) {
+    return { saved: false, skipped: true, reason: (res && res.reason) || '罗盘会话 Cookie 回写未执行' };
+  }
+
+  let expectedSha = null;
+  if (ownedArray) {
+    expectedSha = crypto.createHash('sha256')
+      .update(JSON.stringify(ownedArray, null, 2)).digest('hex');
+  }
+  const fp = fingerprintFile(cookieSession.filePath);
+  if (fp.exists === true && expectedSha !== null && fp.sha256 === expectedSha) {
+    cookieSession.startFingerprint = fp;
+    return {
+      saved: true, skipped: false, fingerprintAdvanced: true, reason: null,
+      count: res.count, bytes: res.bytes, shopName: decision.name,
+    };
+  }
+  return {
+    saved: true, skipped: false, fingerprintAdvanced: false,
+    reason: '落盘内容与会话 owned Cookie 序列化不一致：不推进会话起始指纹（保留原指纹，后续回写继续受冲突保护）',
+    count: res.count, shopName: decision.name,
+  };
+}
+
 module.exports = {
   isVerifiedQianchuanUrl,
   isVerifiedDoudianIdentityUrl,
+  isVerifiedCompassUrl,
   probeQianchuanHeaderIdentityInPage,
   probeDoudianShopIdentityInPage,
+  probeCompassShopNameInPage,
   decideQianchuanCheckpoint,
   decideDoudianIdentity,
+  decideCompassCheckpoint,
   discoverUnknownShopAccountId,
   checkpointQianchuanSessionCookies,
+  checkpointCompassSessionCookies,
+  safeShopFileName,
   QC_HOST,
   FXG_HOST,
+  COMPASS_HOST,
 };

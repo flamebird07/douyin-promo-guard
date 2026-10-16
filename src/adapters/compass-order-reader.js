@@ -32,6 +32,9 @@ const { AuthError, DataGuardError } = require('../lib/errors');
 const { parseIntegerCount } = require('../lib/money');
 const { shanghaiDate, shanghaiMs } = require('../lib/time');
 const { resolveCookieFile } = require('../login/session');
+const { fingerprintFile } = require('../login/cookie-writeback');
+// R87：关闭前罗盘会话收尾检查点（同 context 严格语义店名 + 目标文件名绑定 + 既有写入器 CAS）。
+const { checkpointCompassSessionCookies } = require('../login/session-cookie-checkpoint');
 // R53：单向复用 R51 的抖店首页自动 SSO 有界收敛与登录正证据分类
 // （qianchuan-reader 不 import 本文件，无循环依赖）。
 const {
@@ -255,6 +258,11 @@ function createCompassOrderReader(p) {
   async function readOrderSummary({ shopCfg }) {
     const startedAt = nowFn();
     const resolved = resolveCookieFile(loginCfg, shopCfg.cookieFile);
+    // R87：会话收尾保存元信息——加载前指纹必须在 addCookies 之前捕获（冲突保护基线）。
+    const cookieSession = {
+      filePath: resolved.path,
+      startFingerprint: fingerprintFile(resolved.path),
+    };
     // browserFactory 可注入（离线测试）；默认行为与原实现完全一致。
     const browser = p.browserFactory
       ? await p.browserFactory()
@@ -263,8 +271,12 @@ function createCompassOrderReader(p) {
         executablePath: loginCfg.edgePath,
         args: ['--window-size=1920,1080'],
       });
+    // R87：finally 中收尾保存所需的当前会话引用（try 块内 const 在 finally 不可见）。
+    let sessionCtx = null;
+    let sessionTarget = null;
     try {
       const context = await browser.newContext({ viewport: { width: 1920, height: 1080 }, timezoneId: 'Asia/Shanghai' });
+      sessionCtx = context;
       const cookies = JSON.parse(fs.readFileSync(resolved.path, 'utf-8'));
       await context.addCookies(cookies);
       const page = await context.newPage();
@@ -307,6 +319,7 @@ function createCompassOrderReader(p) {
       await navPromise;
       await page.waitForTimeout(2000);
       const target = popup && !popup.isClosed() ? popup : page;
+      sessionTarget = target;
 
       // 3) 落点核验：电商罗盘 + 经营概况
       await target.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
@@ -409,6 +422,19 @@ function createCompassOrderReader(p) {
         valueCount: parsed.count,
       };
     } finally {
+      // R87 收尾检查点：关闭前以当前时刻事实重新核验罗盘经营页的严格语义店铺名身份
+      // （同 context + 可信 /shop 页 + 唯一可见 [class*=userName] 店名 + 目标文件名绑定），
+      // 成立时才经既有授权写入器回写刷新 Cookie。任何跳过/异常都只如实记录，绝不掩盖原始
+      // 读取结果或原始异常、绝不把跳过标成 Cookie 过期；无身份/登录/foreign/关闭页即零写。
+      try {
+        await checkpointCompassSessionCookies({
+          context: sessionCtx,
+          cookieSession,
+          target: sessionTarget,
+          shopCfg,
+          audit: p.audit,
+        });
+      } catch (_) { /* 收尾保存失败不得阻止关闭，也不改变已确认的业务结果 */ }
       await browser.close().catch(() => {});
     }
   }

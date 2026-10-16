@@ -16,6 +16,8 @@
  *     的 URL/账户ID/关闭状态漂移（零写、单次读取）；直连兜底在同 context 新建 owned QC
  *     页而**不覆盖原 FXG 身份页**（native popup 缺失 / school 教程链接两种兜底均保持
  *     FXG header 并真正调用检查点保存；未知不带ID、已知带 aavid 的 URL 语义不变）。
+ * S99：真实接线用例改为在独立工作根（login.cookieWorkDir）上断言刷新，只读上游来源
+ *     字节/mtime 全程不变；helper 直测与零写拒绝矩阵语义不变。
  * 运行：npm test（本 Worker 阶段无执行授权，由 Root 独立运行取退出码）。
  */
 
@@ -44,12 +46,28 @@ const FXG_LOGIN = 'https://fxg.jinritemai.com/login/common';
 const QC_HOME = 'https://qianchuan.jinritemai.com/home';
 
 let dir = null;
+const workRoots = [];
 before(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-discovery-r73-'));
 });
 after(() => {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+  for (const w of workRoots) { try { fs.rmSync(w, { recursive: true, force: true }); } catch (_) { /* ignore */ } }
 });
+
+/**
+ * S99 迁移：真实接线用例（openQianchuanHome → resolveCookieFile）把 cookieSourceDir 当
+ * **只读上游**，检查点保存只落在本项目独立工作副本上。每个接线用例使用自己的临时工作根
+ * （login.cookieWorkDir），假 Cookie 绝不落到真实生产根，也不与其它测试进程共享同名文件；
+ * 断言改为「工作副本被刷新为 owned 集合 + 来源字节/mtime 不变」。helper 直测用例（显式传
+ * cookieSession.filePath）语义不变。
+ */
+function newWorkDir(tag) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), `session-discovery-r73-work-${tag}-`));
+  workRoots.push(d);
+  return d;
+}
+function workFilePath(workDir, name = '测试店铺R73') { return path.join(workDir, `${name}.json`); }
 
 /** 假 Cookie 数组（无真实凭证；满足写入器域完整性/数量守卫）。 */
 function fakeCookies(n = 3) {
@@ -620,12 +638,14 @@ function makeWiringBrowser(opts = {}) {
   return { browser, fxgPage, qcPage, calls, state, getContext: () => context, getFallbackPage: () => fallbackPage };
 }
 
-test('实际接线：openQianchuanHome 把同 context 原抖店页经 cookieSession 非枚举引用交给真实检查点，未知账户端到端发现并保存', async () => {
+test('实际接线：openQianchuanHome 把同 context 原抖店页经 cookieSession 非枚举引用交给真实检查点，未知账户端到端发现并保存（落在独立工作副本）', async () => {
+  const workDir = newWorkDir('wiring-discover');
   writeCookieFile(fakeCookies(3));
+  const srcBefore = fingerprintFile(cookieFilePath());
   const wiring = makeWiringBrowser();
   let captured = null;
   const r = await openQianchuanHome(
-    { cookieSourceDir: dir, edgePath: 'edge' },
+    { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
     { cookieFile: '测试店铺R73', accountId: null, compassShopName: SHOP_NAME, name: SHOP_NAME },
     {
       browserFactory: async () => wiring.browser,
@@ -643,35 +663,43 @@ test('实际接线：openQianchuanHome 把同 context 原抖店页经 cookieSess
   assert.strictEqual(r.cookieSession.identityPage, wiring.fxgPage);
   assert.ok(!Object.keys(r.cookieSession).includes('identityPage'), 'identityPage 非枚举：不出现在可枚举键');
   assert.ok(!JSON.stringify(r.cookieSession).includes('identityPage'), 'identityPage 非枚举：不进入 JSON 序列化');
+  assert.strictEqual(r.cookieSession.filePath, workFilePath(workDir), '本次实际加载/保存路径=本项目独立工作副本（非共享上游）');
   assert.strictEqual(r.cookieCheckpoint.saved, true, '未知账户经真实接线自动发现并保存');
   assert.strictEqual(r.cookieCheckpoint.discoveredAccountId, ACCOUNT);
   assert.strictEqual(r.cookieCheckpoint.fingerprintAdvanced, true);
   assert.strictEqual(wiring.calls.cookieReads, 1, '接线链路 Cookie 数组恰好只读一次');
-  assert.strictEqual(JSON.parse(fs.readFileSync(cookieFilePath(), 'utf-8')).length, 4, '真实写盘为刷新后的 owned 集合');
+  assert.strictEqual(JSON.parse(fs.readFileSync(r.cookieSession.filePath, 'utf-8')).length, 4, '工作副本真实写盘为刷新后的 owned 集合');
+  assert.deepStrictEqual(fingerprintFile(cookieFilePath()), srcBefore, '只读上游来源字节与 mtime 全程不变');
 });
 
 test('实际接线：显式 accountId 店铺旧链端到端不变（保存成功、无发现字段）', async () => {
+  const workDir = newWorkDir('wiring-known');
   writeCookieFile(fakeCookies(3));
+  const srcBefore = fingerprintFile(cookieFilePath());
   const wiring = makeWiringBrowser();
   const r = await openQianchuanHome(
-    { cookieSourceDir: dir, edgePath: 'edge' },
+    { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
     { cookieFile: '测试店铺R73', accountId: ACCOUNT },
     { browserFactory: async () => wiring.browser }
   );
   assert.strictEqual(r.cookieCheckpoint.saved, true);
   assert.strictEqual(r.cookieCheckpoint.fingerprintAdvanced, true);
   assert.strictEqual(r.cookieCheckpoint.discoveredAccountId, undefined);
-  assert.strictEqual(JSON.parse(fs.readFileSync(cookieFilePath(), 'utf-8')).length, 4);
+  assert.strictEqual(r.cookieSession.filePath, workFilePath(workDir));
+  assert.strictEqual(JSON.parse(fs.readFileSync(r.cookieSession.filePath, 'utf-8')).length, 4);
+  assert.deepStrictEqual(fingerprintFile(cookieFilePath()), srcBefore, '只读上游来源不变');
 });
 
 // ── R74 Root 反例接线：直连兜底不得覆盖原 FXG 身份页 ────────────────
 
 async function runFallbackWiring(fallbackMode, shopOver = {}) {
+  const workDir = newWorkDir(`fallback-${fallbackMode}-${shopOver.accountId ? 'known' : 'unknown'}`);
   writeCookieFile(fakeCookies(3));
+  const srcBefore = fingerprintFile(cookieFilePath());
   const wiring = makeWiringBrowser({ fallbackMode });
   let captured = null;
   const r = await openQianchuanHome(
-    { cookieSourceDir: dir, edgePath: 'edge' },
+    { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
     { cookieFile: '测试店铺R73', accountId: null, compassShopName: SHOP_NAME, name: SHOP_NAME, ...shopOver },
     {
       browserFactory: async () => wiring.browser,
@@ -681,10 +709,10 @@ async function runFallbackWiring(fallbackMode, shopOver = {}) {
       },
     }
   );
-  return { wiring, captured, r };
+  return { wiring, captured, r, workDir, srcBefore };
 }
 
-function assertFallbackPreservesFxgIdentity(wiring, captured, r) {
+function assertFallbackPreservesFxgIdentity(wiring, captured, r, workDir, srcBefore) {
   assert.strictEqual(r.navMode, 'direct-home-url');
   assert.ok(captured, '兜底路径真实调用了新检查点');
   assert.strictEqual(captured.cookieSession.identityPage, wiring.fxgPage, '原 FXG 身份页未被兜底导航覆盖');
@@ -695,29 +723,33 @@ function assertFallbackPreservesFxgIdentity(wiring, captured, r) {
   assert.strictEqual(r.cookieCheckpoint.discoveredAccountId, ACCOUNT);
   assert.strictEqual(r.cookieCheckpoint.fingerprintAdvanced, true);
   assert.strictEqual(wiring.calls.cookieReads, 1, '兜底链路 Cookie 数组恰好只读一次');
-  assert.strictEqual(JSON.parse(fs.readFileSync(cookieFilePath(), 'utf-8')).length, 4, '真实写盘为刷新后的 owned 集合');
+  assert.strictEqual(r.cookieSession.filePath, workFilePath(workDir), '保存路径=本项目独立工作副本');
+  assert.strictEqual(JSON.parse(fs.readFileSync(r.cookieSession.filePath, 'utf-8')).length, 4, '工作副本真实写盘为刷新后的 owned 集合');
+  assert.deepStrictEqual(fingerprintFile(cookieFilePath()), srcBefore, '只读上游来源字节与 mtime 全程不变');
 }
 
 test('Root反例接线（native popup 不存在）：兜底新建 QC 页、FXG header 保持，未知账户端到端保存', async () => {
-  const { wiring, captured, r } = await runFallbackWiring('absent');
-  assertFallbackPreservesFxgIdentity(wiring, captured, r);
+  const { wiring, captured, r, workDir, srcBefore } = await runFallbackWiring('absent');
+  assertFallbackPreservesFxgIdentity(wiring, captured, r, workDir, srcBefore);
   assert.strictEqual(captured.target.url(), QC_HOME, '未知账户兜底 URL 不带账户ID（通用 /home）');
 });
 
 test('Root反例接线（点击被带到 school 教程链接）：兜底新建 QC 页、FXG header 保持，未知账户端到端保存', async () => {
-  const { wiring, captured, r } = await runFallbackWiring('school');
-  assertFallbackPreservesFxgIdentity(wiring, captured, r);
+  const { wiring, captured, r, workDir, srcBefore } = await runFallbackWiring('school');
+  assertFallbackPreservesFxgIdentity(wiring, captured, r, workDir, srcBefore);
   assert.strictEqual(captured.target.url(), QC_HOME, '未知账户兜底 URL 不带账户ID（通用 /home）');
   assert.strictEqual(wiring.state.schoolClosed, true, '非千川残留标签按原错误分类保守关闭');
 });
 
 test('兜底 URL 语义保持：已知 accountId 店铺直连兜底带 ?aavid 精确直连，旧链保存不变', async () => {
-  const { wiring, captured, r } = await runFallbackWiring('school', { accountId: ACCOUNT });
+  const { wiring, captured, r, workDir, srcBefore } = await runFallbackWiring('school', { accountId: ACCOUNT });
   assert.strictEqual(r.navMode, 'direct-home-url');
   assert.strictEqual(captured.target, wiring.getFallbackPage());
   assert.strictEqual(captured.target.url(), `${QC_HOME}?aavid=${ACCOUNT}`, '已知账户兜底 URL 带 aavid（语义不变）');
   assert.strictEqual(captured.cookieSession.identityPage, wiring.fxgPage);
   assert.strictEqual(r.cookieCheckpoint.saved, true);
   assert.strictEqual(r.cookieCheckpoint.discoveredAccountId, undefined, '显式账户不产生发现字段');
-  assert.strictEqual(JSON.parse(fs.readFileSync(cookieFilePath(), 'utf-8')).length, 4);
+  assert.strictEqual(r.cookieSession.filePath, workFilePath(workDir));
+  assert.strictEqual(JSON.parse(fs.readFileSync(r.cookieSession.filePath, 'utf-8')).length, 4);
+  assert.deepStrictEqual(fingerprintFile(cookieFilePath()), srcBefore, '只读上游来源不变');
 });

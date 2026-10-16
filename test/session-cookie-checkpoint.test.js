@@ -13,6 +13,8 @@
  *  7. R59 回归：严格 origin（:443 允许、:444 拒绝）；单一 cookies 读取 + 取回后
  *     URL/账户复验（TOCTOU）；探针期间导航；同地址可见登录表单负证据；隐藏/rect 抛错
  *     头部 fail-closed；行内 "店铺名 ID：" 账户名解析；恰好一次 cookies 调用。
+ * S99：真实链路用例改为在独立工作根（login.cookieWorkDir）上断言刷新，来源只读不变；
+ *     失败/拒绝路径仍要求「来源与工作副本均字节不变」。
  * 运行：npm test（本 Worker 阶段未执行命令，由主脑验收时统一运行）。
  */
 
@@ -39,12 +41,28 @@ const FXG_HOME = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
 const FXG_LOGIN = 'https://fxg.jinritemai.com/login/common';
 
 let dir = null;
+const workRoots = [];
 before(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'session-checkpoint-test-'));
 });
 after(() => {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+  for (const w of workRoots) { try { fs.rmSync(w, { recursive: true, force: true }); } catch (_) { /* ignore */ } }
 });
+
+/**
+ * S99 迁移：真实入口（openQianchuanHome → resolveCookieFile）把 cookieSourceDir 当
+ * **只读上游**，会话回写只落在本项目独立工作副本上。每个真实链路用例使用自己的临时
+ * 工作根（login.cookieWorkDir），假 Cookie 绝不落到真实生产根，也不与其它测试进程共享
+ * 同名文件；断言改为「工作副本被刷新 + 来源字节/mtime 不变」。helper 直测用例（显式
+ * 传 cookieSession.filePath）语义不变，仍直接对目标文件断言。
+ */
+function newWorkDir(tag) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), `session-checkpoint-work-${tag}-`));
+  workRoots.push(d);
+  return d;
+}
+function workFilePath(workDir, name = '测试店铺') { return path.join(workDir, `${name}.json`); }
 
 /** 假 Cookie 数组（无真实凭证；满足写入器域完整性/数量守卫）。 */
 function fakeCookies(n = 3) {
@@ -266,71 +284,88 @@ function makeStubPage({
 
 // ── 检查点主链路（真实 openQianchuanHome 生命周期 + helper 直测）────
 
-test('已验证入口保存：owned 刷新 Cookie 在后续导航前落盘，起始指纹推进；发布器同指纹回写不再被自身冲突保护误伤', async () => {
+test('已验证入口保存：owned 刷新 Cookie 在后续导航前落盘（独立工作副本），来源只读不变；起始指纹推进，发布器同指纹回写不再被自身冲突保护误伤', async () => {
+  const workDir = newWorkDir('entry-save');
   writeCookieFile(fakeCookies(3));
+  const srcBefore = fingerprintFile(cookieFilePath());
   const refreshed = fakeCookies(4); // 会话内刷新：多一条
   const stub = makeStubPage({ cookies: refreshed, urlQueue: [FXG_HOME, FXG_HOME, QC_HOME] });
   const r = await openQianchuanHome(
-    { cookieSourceDir: dir, edgePath: 'edge' },
+    { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
     { cookieFile: '测试店铺', accountId: ACCOUNT },
     { browserFactory: async () => stub.browser }
   );
+  assert.strictEqual(r.cookieSession.filePath, workFilePath(workDir), '本次实际加载路径=本项目独立工作副本（非共享上游）');
   assert.strictEqual(r.cookieCheckpoint.saved, true, '入口检查点保存成功');
   assert.strictEqual(r.cookieCheckpoint.fingerprintAdvanced, true, '指纹推进');
-  const onDisk = JSON.parse(fs.readFileSync(cookieFilePath(), 'utf-8'));
-  assert.strictEqual(onDisk.length, 4, '落盘为刷新后的 owned 集合');
-  assert.deepStrictEqual(r.cookieSession.startFingerprint, fingerprintFile(cookieFilePath()), '会话起始指纹=落盘指纹');
+  const onDisk = JSON.parse(fs.readFileSync(r.cookieSession.filePath, 'utf-8'));
+  assert.strictEqual(onDisk.length, 4, '工作副本落盘为刷新后的 owned 集合');
+  assert.deepStrictEqual(r.cookieSession.startFingerprint, fingerprintFile(r.cookieSession.filePath), '会话起始指纹=工作副本落盘指纹');
+  assert.deepStrictEqual(fingerprintFile(cookieFilePath()), srcBefore, '只读上游来源字节与 mtime 全程不变');
   const later = await writebackSessionCookies({
-    context: stub.context, cookieFilePath: cookieFilePath(),
+    context: stub.context, cookieFilePath: r.cookieSession.filePath,
     sessionStartFingerprint: r.cookieSession.startFingerprint,
     identityOk: true, loginOk: true,
   });
   assert.strictEqual(later.ok, true, '自有写入推进指纹后，同会话后续回写不再冲突');
+  assert.deepStrictEqual(fingerprintFile(cookieFilePath()), srcBefore, '后续回写也只碰工作副本，来源仍未变');
 });
 
 test('失败且当前停在登录中转页：跳过保存，原始错误如实抛出，Cookie 文件字节不变', async () => {
+  const workDir = newWorkDir('login-fail');
   writeCookieFile(fakeCookies(3));
   const before = fs.readFileSync(cookieFilePath());
+  const srcBefore = fingerprintFile(cookieFilePath());
   const stub = makeStubPage({ cookies: fakeCookies(4), urlQueue: [FXG_LOGIN] });
   await assert.rejects(
     () => openQianchuanHome(
-      { cookieSourceDir: dir, edgePath: 'edge' },
+      { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
       { cookieFile: '测试店铺', accountId: ACCOUNT },
       { browserFactory: async () => stub.browser }
     ),
     /登录失效|未到达首页/
   );
-  assert.deepStrictEqual(fs.readFileSync(cookieFilePath()), before, '登录页绝不保存');
+  assert.deepStrictEqual(fs.readFileSync(cookieFilePath()), before, '登录页绝不保存（来源字节不变）');
+  assert.deepStrictEqual(fingerprintFile(cookieFilePath()), srcBefore, '来源 mtime 也不变');
+  if (fs.existsSync(workFilePath(workDir))) {
+    assert.strictEqual(JSON.parse(fs.readFileSync(workFilePath(workDir), 'utf-8')).length, 3, '独立工作副本同样未被刷新');
+  }
 });
 
 test('到达千川但头部为 foreign 账户：打开成功、检查点跳过，文件保持原样', async () => {
+  const workDir = newWorkDir('foreign');
   writeCookieFile(fakeCookies(3));
+  const srcBefore = fingerprintFile(cookieFilePath());
   const stub = makeStubPage({
     cookies: fakeCookies(4),
     accountId: '999999999999999999',
     urlQueue: [FXG_HOME, FXG_HOME, QC_HOME],
   });
   const r = await openQianchuanHome(
-    { cookieSourceDir: dir, edgePath: 'edge' },
+    { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
     { cookieFile: '测试店铺', accountId: ACCOUNT },
     { browserFactory: async () => stub.browser }
   );
   assert.strictEqual(r.cookieCheckpoint.saved, false, 'foreign：不保存');
   assert.match(r.cookieCheckpoint.reason, /不一致|foreign/);
-  assert.strictEqual(JSON.parse(fs.readFileSync(cookieFilePath(), 'utf-8')).length, 3);
+  assert.strictEqual(JSON.parse(fs.readFileSync(r.cookieSession.filePath, 'utf-8')).length, 3, '工作副本保持导入时的原样');
+  assert.deepStrictEqual(fingerprintFile(cookieFilePath()), srcBefore, '只读上游来源不变');
 });
 
 test('配置缺 accountId（未知账户）：跳过检查点，不要求新增配置', async () => {
+  const workDir = newWorkDir('no-account');
   writeCookieFile(fakeCookies(3));
+  const srcBefore = fingerprintFile(cookieFilePath());
   const stub = makeStubPage({ cookies: fakeCookies(4), urlQueue: [FXG_HOME, FXG_HOME, QC_HOME] });
   const r = await openQianchuanHome(
-    { cookieSourceDir: dir, edgePath: 'edge' },
+    { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
     { cookieFile: '测试店铺', accountId: null },
     { browserFactory: async () => stub.browser }
   );
   assert.strictEqual(r.cookieCheckpoint.saved, false);
   assert.match(r.cookieCheckpoint.reason, /配置未提供千川账户ID/);
-  assert.strictEqual(JSON.parse(fs.readFileSync(cookieFilePath(), 'utf-8')).length, 3, '文件保持原样');
+  assert.strictEqual(JSON.parse(fs.readFileSync(r.cookieSession.filePath, 'utf-8')).length, 3, '工作副本保持原样');
+  assert.deepStrictEqual(fingerprintFile(cookieFilePath()), srcBefore, '只读上游来源不变');
 });
 
 test('await context.cookies() 异步空隙期间新登录改写文件：冲突保护跳过，保留较新文件（保护新文件不被旧会话覆盖）', async () => {
@@ -380,10 +415,11 @@ test('写入后落盘又被其他进程改写：不采用新指纹；原（过�
 });
 
 test('检查点链路零广告动作：全程无广告开关/批量按钮点击，成功路径不关浏览器', async () => {
+  const workDir = newWorkDir('zero-ad');
   writeCookieFile(fakeCookies(3));
   const stub = makeStubPage({ cookies: fakeCookies(4), urlQueue: [FXG_HOME, FXG_HOME, QC_HOME] });
   const r = await openQianchuanHome(
-    { cookieSourceDir: dir, edgePath: 'edge' },
+    { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
     { cookieFile: '测试店铺', accountId: ACCOUNT },
     { browserFactory: async () => stub.browser }
   );

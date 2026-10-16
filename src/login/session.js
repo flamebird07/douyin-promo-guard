@@ -23,38 +23,119 @@
 const fs = require('fs');
 const path = require('path');
 const { AuthError } = require('../lib/errors');
+const { safeCookieBaseName, ensureWorkCopy } = require('./cookie-workcopy');
 
 const PROJECT_COOKIES_DIR = path.join(__dirname, '..', '..', 'cookies');
 
 /**
- * 解析指定店铺的 Cookie 文件路径。
- * 优先本项目 cookies/（新登录），其次配置的只读来源目录（电商助手，只读）。
- *
- * 关于 readOnly（2026-09-16 更新）：来源目录仍标记 readOnly=true（本模块只读加载，
- * 不做任何模糊匹配/兜底写入）。用户已明确授权**仅对本次实际加载的该店铺 Cookie 文件**
- * 做回写，供下次复用——该写入由 `src/login/cookie-writeback.js` 独占承担
- * （原子写入 + 域完整性 + 会话期冲突保护 + 身份/登录态校验），
- * 不改动电商助手其他业务与其他文件。
+ * 工作根（写回链落盘目录）：默认固定本项目 cookies/；guard 配置可用
+ * `login.cookieWorkDir`（必须绝对路径）显式指定隔离工作根（例如离线测试或多实例部署）。
+ * 配置存在但非法 → 如实抛错，绝不静默回落到生产根写入。
  */
-function resolveCookieFile(loginCfg, cookieFile) {
-  if (!cookieFile || typeof cookieFile !== 'string' || cookieFile.startsWith('TODO')) {
-    throw new AuthError('店铺 Cookie 文件名未配置（待配置项）');
+function resolveWorkDir(loginCfg, opts) {
+  if (opts && typeof opts.workDir === 'string' && opts.workDir.trim()) return opts.workDir;
+  const cfg = loginCfg && typeof loginCfg.cookieWorkDir === 'string' ? loginCfg.cookieWorkDir.trim() : '';
+  if (!cfg) return PROJECT_COOKIES_DIR;
+  if (!path.isAbsolute(cfg)) {
+    throw new AuthError(`login.cookieWorkDir 配置非法（必须是绝对路径，拒绝相对路径写入未知位置）: ${cfg}`);
   }
-  const name = cookieFile.endsWith('.json') ? cookieFile : `${cookieFile}.json`;
-  if (name.includes('/') || name.includes('\\') || name.includes('..')) {
-    throw new AuthError(`Cookie 文件名非法: ${cookieFile}`);
+  return cfg;
+}
+
+/**
+ * 本地工作根文件返回前的隔离门：必须是工作根内的**普通文件**（符号链接/junction/目录
+ * 一律拒绝），否则等于把共享上游或别名路径交给自动写回链。结构/登录有效性仍由
+ * inspectCookieFile 与业务身份门判定，本函数不放宽任何既有条件。
+ */
+function localWorkFile(fsm, filePath, workDir, sourceSync) {
+  let lst = null;
+  try { lst = fsm.lstatSync(filePath); } catch (_) { lst = null; }
+  if (!lst || !lst.isFile()) {
+    throw new AuthError(
+      `本项目 Cookie 文件不是工作根内的普通文件（符号链接/目录/不可判定: ${filePath}）：拒绝把路径别名或共享上游返回给自动写回链`
+    );
   }
-  const candidates = [
-    { dir: PROJECT_COOKIES_DIR, readOnly: false },
-    { dir: loginCfg.cookieSourceDir, readOnly: true },
-  ];
-  for (const c of candidates) {
-    if (!c.dir) continue;
-    const p = path.join(c.dir, name);
-    if (fs.existsSync(p)) return { path: p, dir: c.dir, readOnly: c.readOnly };
+  const out = { path: filePath, dir: workDir, readOnly: false };
+  if (sourceSync) out.sourceSync = sourceSync;
+  return out;
+}
+
+/**
+ * 解析指定店铺的 Cookie 文件路径。
+ *
+ * S97 起（共享上游保护）：配置了**不同于本项目 cookies/** 的 cookieSourceDir 且存在
+ * 精确同名来源文件时，来源目录被当作只读上游——绝不把来源路径返回给自动写回链
+ * （cookie-writeback / session-cookie-checkpoint 用返回 path 建 cookieSession 回写，
+ * 旧的 readOnly 标记并不能阻止写共享来源）。改为经 `cookie-workcopy.ensureWorkCopy`
+ * 复制到本项目 cookies/ 的该店独立工作副本后返回：
+ *   { path: 本项目副本, dir: 本项目 cookies/, readOnly: false, sourceSync: {...} }
+ * QC / compass / 发布控制器等现有调用者无需修改，自动写回只会落在独立副本上。
+ * 来源目录零写入（无 write/rename/unlink/chmod/mkdir/sidecar/tmp）；来源坏/缺失时
+ * 保留已有健康副本或抛 AuthError，绝不返回来源路径兜底。
+ *
+ * S99 起（用户目标：两份 Cookie 各自刷新、互不影响）：普通解析**不再**因为来源内容
+ * 变化就替换结构健康的独立工作副本（商品分析普通读取的收尾保存也会改写上游，来源
+ * hash 变化不等于用户重新扫码）；只有 app 侧「本次已验证新登录」的 authorizedFreshLogin
+ * 调用才按冻结 commit.sha256 更新副本。差异如实出现在 sourceSync.status/reason 中。
+ *
+ * 无来源配置（或来源目录与本项目 cookies/ 是同一字面目录）时保留原独立登录兼容：
+ * 直接用本项目 cookies/ 文件，不反向写任何来源。字面不同但 realpath 重合的
+ * junction/symlink 别名属于伪隔离 → 拒绝（不返回上游可写路径给写回链）。
+ *
+ * @param {object} loginCfg 配置 login 段（cookieSourceDir / cookieWorkDir 可为空）
+ * @param {string} cookieFile 精确店铺文件名（不含 .json 亦可；拒绝路径穿越）
+ * @param {object} [opts] 仅离线测试注入：{ workDir, fsMod }；生产调用不传，
+ *                        工作根为 PROJECT_COOKIES_DIR（或 login.cookieWorkDir）
+ */
+function resolveCookieFile(loginCfg, cookieFile, opts = {}) {
+  const fsm = (opts && opts.fsMod) || fs;
+  const workDir = resolveWorkDir(loginCfg, opts);
+  const name = safeCookieBaseName(cookieFile);
+  const projectPath = path.join(workDir, name);
+  const sourceDir = loginCfg && typeof loginCfg.cookieSourceDir === 'string' && loginCfg.cookieSourceDir.trim()
+    ? loginCfg.cookieSourceDir.trim() : null;
+
+  if (sourceDir) {
+    // realpath 比较：symlink/junction 别名视同同一目录（不把路径别名当隔离，也不对同目录做复制）
+    let srcReal = null;
+    let workReal = null;
+    try { srcReal = fsm.realpathSync(sourceDir); } catch (_) { srcReal = null; }
+    try { workReal = fsm.realpathSync(workDir); } catch (_) { workReal = null; }
+    const sameLiteralDir = path.resolve(sourceDir) === path.resolve(workDir);
+    if (!sameLiteralDir && srcReal !== null && workReal !== null && srcReal === workReal) {
+      // 配置成"另一个目录"却解析到上游本身（junction/symlink 别名）：伪隔离，必须拒绝
+      throw new AuthError(
+        `来源目录与工作目录是同一目录的路径别名（realpath 重合: ${srcReal}）：拒绝把共享上游当独立隔离返回给写回链`
+      );
+    }
+    const separate = srcReal !== null && srcReal !== workReal;
+    if (separate) {
+      const srcPath = path.join(sourceDir, name);
+      let srcIsFile = false;
+      try { srcIsFile = fsm.lstatSync(srcPath).isFile(); } catch (_) { srcIsFile = false; }
+      if (srcIsFile) {
+        const r = ensureWorkCopy({ sourceDir, fileName: name, workDir, fsMod: fsm });
+        return { path: r.path, dir: r.dir, readOnly: false, sourceSync: r.sourceSync };
+      }
+      // 来源文件缺失：本项目已有副本（如上游文件被移走）→ 继续用本地副本，不反向写来源
+      if (fsm.existsSync(projectPath)) {
+        return localWorkFile(fsm, projectPath, workDir, {
+          status: 'source-file-missing-local-only',
+          reason: '来源目录存在但缺少该店文件：使用本项目既有副本（已核验为工作根内普通文件，非共享上游别名）',
+        });
+      }
+      throw new AuthError(
+        `未找到店铺「${cookieFile}」的 Cookie 文件（已查找: ${workDir} 与 ${sourceDir}）`
+      );
+    }
+    // 来源目录与工作根是同一字面目录（或来源目录不可解析）→ 按无独立来源的本地兼容处理
+  }
+
+  if (fsm.existsSync(projectPath)) {
+    return localWorkFile(fsm, projectPath, workDir, null);
   }
   throw new AuthError(
-    `未找到店铺「${cookieFile}」的 Cookie 文件（已查找: ${PROJECT_COOKIES_DIR} 与 ${loginCfg.cookieSourceDir}）`
+    `未找到店铺「${cookieFile}」的 Cookie 文件（已查找: ${workDir}${sourceDir ? ` 与 ${sourceDir}` : ''}）`
   );
 }
 

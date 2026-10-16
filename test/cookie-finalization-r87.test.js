@@ -14,7 +14,9 @@
  *    多候选拒绝、可见登录控件负证据）；
  *  - checkpointCompassSessionCookies 直测：成功 + 起始指纹推进 + 同会话后续回写不自冲突；
  *    目标文件名不绑定/登录页/身份缺失/URL 漂移/并发外部新文件 → 全部零写或保留较新文件；
- *  - 真实关闭链集成（假 context 闭环）：readOrderSummary 成功读数 → 关浏览器前已回写刷新 Cookie；
+ *  - 真实关闭链集成（假 context 闭环）：readOrderSummary 成功读数 → 关浏览器前已回写刷新
+ *    Cookie（S99：回写落在本项目**独立工作副本**上，配置来源目录作为只读上游零写入，
+ *    断言取自真实返回/独立工作路径，来源字节与 mtime 保持不变）；
  *    读取失败仍原样抛错且浏览器照常关闭、文件字节不变；
  *  - 千川 closeBrowser：openQianchuanHome + closeBrowser 收尾保存；并发关闭只最终化一次；
  *    打开失败路径浏览器原样关闭、不做收尾保存。
@@ -51,8 +53,25 @@ const QC_HOME = 'https://qianchuan.jinritemai.com/home';
 const QC_ACCOUNT = '1710242295996424';
 
 let dir = null;
+const workRoots = [];
 before(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cookie-finalization-r87-')); });
-after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ignore */ } });
+after(() => {
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ignore */ }
+  for (const w of workRoots) { try { fs.rmSync(w, { recursive: true, force: true }); } catch (_) { /* ignore */ } }
+});
+
+/**
+ * S99 迁移：真实链路（openQianchuanHome / readOrderSummary）经 resolveCookieFile 把
+ * 「配置来源目录」当只读上游，回写只落在**本项目独立工作副本**上。为保证隔离，每个
+ * 集成用例使用自己的临时工作根（login.cookieWorkDir），假 Cookie 绝不落到真实生产根，
+ * 也不与其它测试进程共享同名文件；断言改为「工作副本被刷新 + 来源字节/mtime 不变」。
+ */
+function newWorkDir(tag) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), `cookie-finalization-r87-work-${tag}-`));
+  workRoots.push(d);
+  return d;
+}
+function workFilePath(workDir, name = SHOP_NAME) { return path.join(workDir, `${name}.json`); }
 
 /** 假 Cookie 数组（无真实凭证；满足写入器域完整性/数量守卫）。 */
 function fakeCookies(n = 3) {
@@ -523,10 +542,18 @@ test('罗盘收尾保存：目标页已关闭 / context() 抛错 → 拒绝，�
 
 // ── 真实关闭链集成（compass-order-reader）──────────────────────
 
-const LOGIN_CFG = { cookieSourceDir: dir, edgePath: 'edge', douyinHomeUrl: FXG_HOME };
-function makeCompassReader(stub) {
+/**
+ * 每个集成用例现取自己的登录配置：来源目录 = 本文件临时目录（只读上游），
+ * 工作根 = 该用例独有的临时目录（login.cookieWorkDir）。旧写法在模块加载期求值
+ * `cookieSourceDir: dir`（此时 dir 仍为 null），会退化成真实生产根 guard/cookies
+ * 并与其他测试进程的同名假 Cookie 互相污染，已修正。
+ */
+function compassLoginCfg(workDir) {
+  return { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge', douyinHomeUrl: FXG_HOME };
+}
+function makeCompassReader(stub, workDir) {
   return createCompassOrderReader({
-    loginCfg: LOGIN_CFG,
+    loginCfg: compassLoginCfg(workDir),
     nowFn: () => Date.parse('2026-10-16T10:00:00+08:00'),
     sleep: async () => {},
     settleSleep: async () => {},
@@ -535,25 +562,38 @@ function makeCompassReader(stub) {
   });
 }
 
-test('集成：readOrderSummary 成功读数 → 关闭浏览器前已回写本会话刷新 Cookie（原文件旧→关前新）', async () => {
+test('集成：readOrderSummary 成功读数 → 关闭浏览器前已回写本会话刷新 Cookie（独立副本旧→关前新，来源零写入）', async () => {
+  const workDir = newWorkDir('orders-ok');
   writeCookieFile(fakeCookies(3));
+  const srcBefore = fingerprintFile(cookieFilePath());
   const stub = makeCompassStub({ cookies: fakeCookies(4) });
   bindCompassTarget(stub);
-  const r = await makeCompassReader(stub).readOrderSummary({ shopCfg: SHOP_CFG });
+  const r = await makeCompassReader(stub, workDir).readOrderSummary({ shopCfg: SHOP_CFG });
   assert.strictEqual(r.identitySource.adapter, 'compass-order-reader');
   assert.strictEqual(stub.calls.closes, 1, '读取结束关闭浏览器');
   assert.ok(stub.calls.userNameProbes >= 1, '收尾检查点重新做了当前时刻身份核验');
-  assert.strictEqual(JSON.parse(fs.readFileSync(cookieFilePath(), 'utf-8')).length, 4, '关前回写刷新后的 owned 集合');
+  const workPath = workFilePath(workDir);
+  assert.strictEqual(JSON.parse(fs.readFileSync(workPath, 'utf-8')).length, 4, '关前回写刷新后的 owned 集合（落在独立工作副本）');
+  assert.deepStrictEqual(fingerprintFile(cookieFilePath()), srcBefore, '只读上游来源字节与 mtime 全程不变');
+  assert.strictEqual(JSON.parse(fs.readFileSync(cookieFilePath(), 'utf-8')).length, 3, '来源仍是关前旧内容');
+  assert.deepStrictEqual(
+    fs.readdirSync(workDir).filter((f) => f.endsWith('.lock') || f.includes('.tmp-')), [],
+    '工作根无锁/tmp 残留'
+  );
 });
 
 test('集成：读取失败（登录页）→ 原始错误原样抛出、浏览器照常关闭、Cookie 文件字节不变', async () => {
+  const workDir = newWorkDir('orders-login-fail');
   writeCookieFile(fakeCookies(3));
   const before = fs.readFileSync(cookieFilePath());
   const stub = makeCompassStub({ cookies: fakeCookies(4), urlQueue: [FXG_LOGIN] });
   bindCompassTarget(stub);
-  await assert.rejects(() => makeCompassReader(stub).readOrderSummary({ shopCfg: SHOP_CFG }), /登录失效|未到达首页/);
+  await assert.rejects(() => makeCompassReader(stub, workDir).readOrderSummary({ shopCfg: SHOP_CFG }), /登录失效|未到达首页/);
   assert.strictEqual(stub.calls.closes, 1, '失败路径仍关闭浏览器');
-  assert.deepStrictEqual(fs.readFileSync(cookieFilePath()), before, '未登录/未读数不保存');
+  assert.deepStrictEqual(fs.readFileSync(cookieFilePath()), before, '未登录/未读数不保存（来源不变）');
+  if (fs.existsSync(workFilePath(workDir))) {
+    assert.strictEqual(JSON.parse(fs.readFileSync(workFilePath(workDir), 'utf-8')).length, 3, '独立工作副本也未被刷新');
+  }
 });
 
 // ── 千川 closeBrowser 收尾最终化 ────────────────────────────────
@@ -597,7 +637,9 @@ function withQcEntryApi(stub) {
 }
 
 test('千川 closeBrowser：打开成功 + 关闭前以当前时刻事实收尾保存（打开时注入跳过，关闭时真实保存）', async () => {
+  const workDir = newWorkDir('qc-close-save');
   writeCookieFile(fakeCookies(3));
+  const srcBefore = fingerprintFile(cookieFilePath());
   const stub = withQcEntryApi(makeQcStub({ cookies: fakeCookies(4) }));
   let calls = 0;
   const injected = async (args) => {
@@ -606,19 +648,22 @@ test('千川 closeBrowser：打开成功 + 关闭前以当前时刻事实收尾�
     return checkpointQianchuanSessionCookies(args);
   };
   const opened = await openQianchuanHome(
-    { cookieSourceDir: dir, edgePath: 'edge' },
+    { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
     { cookieFile: SHOP_NAME, accountId: QC_ACCOUNT },
     { browserFactory: async () => stub.browser, sessionCheckpoint: injected }
   );
   assert.strictEqual(calls, 1, '打开时注入检查点被调用一次');
   assert.strictEqual(opened.cookieCheckpoint.saved, false, '打开时跳过');
+  assert.strictEqual(opened.cookieSession.filePath, workFilePath(workDir), '本次实际加载路径=本项目独立工作副本（非共享上游）');
   await closeBrowser(opened.browser);
   assert.strictEqual(calls, 2, '关闭时收尾检查点再次被调用');
   assert.strictEqual(stub.calls.closes, 1, '关闭浏览器一次');
-  assert.strictEqual(JSON.parse(fs.readFileSync(cookieFilePath(), 'utf-8')).length, 4, '关闭前已回写刷新 Cookie');
+  assert.strictEqual(JSON.parse(fs.readFileSync(opened.cookieSession.filePath, 'utf-8')).length, 4, '关闭前已回写刷新 Cookie（落在独立工作副本）');
+  assert.deepStrictEqual(fingerprintFile(cookieFilePath()), srcBefore, '只读上游来源字节与 mtime 全程不变');
 });
 
 test('千川 closeBrowser：同一浏览器并发关闭 → 收尾最终化至多一次，浏览器关闭一次', async () => {
+  const workDir = newWorkDir('qc-close-concurrent');
   writeCookieFile(fakeCookies(3));
   const stub = withQcEntryApi(makeQcStub({ cookies: fakeCookies(4) }));
   let calls = 0;
@@ -628,7 +673,7 @@ test('千川 closeBrowser：同一浏览器并发关闭 → 收尾最终化至�
     return checkpointQianchuanSessionCookies(args);
   };
   const opened = await openQianchuanHome(
-    { cookieSourceDir: dir, edgePath: 'edge' },
+    { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
     { cookieFile: SHOP_NAME, accountId: QC_ACCOUNT },
     { browserFactory: async () => stub.browser, sessionCheckpoint: injected }
   );
@@ -638,7 +683,9 @@ test('千川 closeBrowser：同一浏览器并发关闭 → 收尾最终化至�
 });
 
 test('千川 closeBrowser：最终化完成后再调用 closeBrowser → 不二次最终化、不二次关闭', async () => {
+  const workDir = newWorkDir('qc-close-twice');
   writeCookieFile(fakeCookies(3));
+  const srcBefore = fingerprintFile(cookieFilePath());
   const stub = withQcEntryApi(makeQcStub({ cookies: fakeCookies(4) }));
   let calls = 0;
   const injected = async (args) => {
@@ -647,19 +694,23 @@ test('千川 closeBrowser：最终化完成后再调用 closeBrowser → 不二�
     return checkpointQianchuanSessionCookies(args);
   };
   const opened = await openQianchuanHome(
-    { cookieSourceDir: dir, edgePath: 'edge' },
+    { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
     { cookieFile: SHOP_NAME, accountId: QC_ACCOUNT },
     { browserFactory: async () => stub.browser, sessionCheckpoint: injected }
   );
   await closeBrowser(opened.browser);
-  const after = JSON.parse(fs.readFileSync(cookieFilePath(), 'utf-8'));
+  const after = JSON.parse(fs.readFileSync(opened.cookieSession.filePath, 'utf-8'));
+  const srcAfterFirstClose = fingerprintFile(cookieFilePath());
   await closeBrowser(opened.browser);
   assert.strictEqual(calls, 2, '已收尾的登记不触发第二次最终化（打开1 + 关闭1）');
   assert.strictEqual(stub.calls.closes, 1, '浏览器只关闭一次');
-  assert.deepStrictEqual(JSON.parse(fs.readFileSync(cookieFilePath(), 'utf-8')), after, '第二次调用不再改文件');
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(opened.cookieSession.filePath, 'utf-8')), after, '第二次调用不再改工作副本');
+  assert.deepStrictEqual(fingerprintFile(cookieFilePath()), srcAfterFirstClose, '第二次调用也不改来源');
+  assert.deepStrictEqual(srcAfterFirstClose, srcBefore, '只读上游来源全程字节/mtime 不变');
 });
 
 test('千川 closeBrowser：收尾最终化抛错 → 不阻止关闭、不改变业务结果', async () => {
+  const workDir = newWorkDir('qc-close-throw');
   writeCookieFile(fakeCookies(3));
   const before = fs.readFileSync(cookieFilePath());
   const stub = withQcEntryApi(makeQcStub({ cookies: fakeCookies(4) }));
@@ -668,7 +719,7 @@ test('千川 closeBrowser：收尾最终化抛错 → 不阻止关闭、不改�
     return { saved: false, skipped: true, reason: 'open-time skip (test)' };
   };
   const opened = await openQianchuanHome(
-    { cookieSourceDir: dir, edgePath: 'edge' },
+    { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
     { cookieFile: SHOP_NAME, accountId: QC_ACCOUNT },
     {
       browserFactory: async () => stub.browser,
@@ -677,10 +728,15 @@ test('千川 closeBrowser：收尾最终化抛错 → 不阻止关闭、不改�
   );
   await closeBrowser(opened.browser);
   assert.strictEqual(stub.calls.closes, 1, '最终化异常仍关闭浏览器一次');
-  assert.deepStrictEqual(fs.readFileSync(cookieFilePath()), before, '最终化异常不落盘');
+  assert.deepStrictEqual(fs.readFileSync(cookieFilePath()), before, '最终化异常不落盘（来源不变）');
+  assert.deepStrictEqual(
+    fs.readFileSync(opened.cookieSession.filePath), before,
+    '最终化异常也不改独立工作副本（仍等于导入时的来源快照）'
+  );
 });
 
 test('千川 closeBrowser：打开失败路径浏览器原样关闭、不做收尾最终化', async () => {
+  const workDir = newWorkDir('qc-open-fail');
   writeCookieFile(fakeCookies(3));
   const before = fs.readFileSync(cookieFilePath());
   const stub = withQcEntryApi(makeQcStub({ cookies: fakeCookies(4), urlQueue: [FXG_LOGIN] }));
@@ -688,12 +744,15 @@ test('千川 closeBrowser：打开失败路径浏览器原样关闭、不做收�
   const injected = async (args) => { calls += 1; return checkpointQianchuanSessionCookies(args); };
   await assert.rejects(
     () => openQianchuanHome(
-      { cookieSourceDir: dir, edgePath: 'edge' },
+      { cookieSourceDir: dir, cookieWorkDir: workDir, edgePath: 'edge' },
       { cookieFile: SHOP_NAME, accountId: QC_ACCOUNT },
       { browserFactory: async () => stub.browser, sessionCheckpoint: injected }
     ),
     /登录失效|未到达首页/
   );
   assert.strictEqual(stub.calls.closes, 1, '失败路径关闭本次创建浏览器');
-  assert.deepStrictEqual(fs.readFileSync(cookieFilePath()), before, '未到达千川不保存');
+  assert.deepStrictEqual(fs.readFileSync(cookieFilePath()), before, '未到达千川不保存（来源不变）');
+  if (fs.existsSync(workFilePath(workDir))) {
+    assert.deepStrictEqual(fs.readFileSync(workFilePath(workDir)), before, '失败路径也不刷新独立工作副本');
+  }
 });

@@ -98,6 +98,11 @@ const AUTO_PULL_MARK = '已存在自动拉取投放计划，添加后将会关�
 const MIGRATION_MARK = '该商品已创建「全店托管」计划';
 const PRECHECK_MARK = '根据系统前置检测，当前商品可能审核不通过';
 const REVIEW_FAILED_MARK = '当前商品广告审核不通过';
+// The ONLY positive platform copy that proves a product/account pair already has a
+// plan. It comes from the real disabled checkbox of the account drawer (live hover
+// text "商品与该抖音号已存在商品投放计划查看详情"). A gray/disabled checkbox alone is
+// NOT duplicate evidence — it can be an incomplete load or an unauthorized account.
+const ALREADY_PLANNED_MARK = '商品与该抖音号已存在商品投放计划';
 
 // ── S17 手动原生 UI 发布入账（仅 Root 操作者显式调用）────────────────────────
 // 用户在原生千川页面上亲自完成的一次真实发布，既不是本机 controller 的一次
@@ -400,6 +405,57 @@ function chooseAnchorProduct(mainRows) {
 }
 
 // ── main-table parsing + readiness gate + removal/backfill (req 7) ──────────
+// Pure availability classification for ONE product/account observation. The only
+// proven "already planned / unbindable" evidence is explicit platform copy or a
+// definite current-row manual count of 0 with manual evidence. A gray checkbox, an
+// empty load, a still-spinning panel, an unauthorized account and any unreadable
+// state are 'disabled-unknown'/'unknown' and must STOP — never be deleted as a
+// duplicate. `settled` is the caller's own proof that the panel finished loading
+// (spinner gone, exact panel set, rows/footer stable); an unsettled observation is
+// always unknown regardless of its visible text.
+function classifyAvailabilityEvidence(input) {
+  const o = input || {};
+  const text = String(o.text || '');
+  const settled = o.settled !== false;
+  if (!settled) return { kind: 'unknown', proven: false, actionable: 'stop', reason: 'panel-not-settled' };
+  if (text.includes(ALREADY_PLANNED_MARK)) return { kind: 'already-planned', proven: true, actionable: 'remove-and-continue', reason: 'explicit-already-planned-copy' };
+  if (o.reviewFailed === true || text.includes(REVIEW_FAILED_MARK)) return { kind: 'review-failed', proven: true, actionable: 'remove-and-continue', reason: 'explicit-review-failed-copy' };
+  if (Number.isInteger(o.manualAccounts) && o.manualAccounts >= 1) return { kind: 'bound', proven: false, actionable: 'keep', reason: 'manual-account-present' };
+  if (o.autoPullOnly === true) return { kind: 'unbindable', proven: true, actionable: 'remove-and-continue', reason: 'auto-pull-only-no-manual' };
+  if (o.manualEvidence === true && Number.isInteger(o.manualAccounts) && o.manualAccounts < 1) return { kind: 'unbindable', proven: true, actionable: 'remove-and-continue', reason: 'manual-count-zero' };
+  if (o.checkboxState === 'disabled') return { kind: 'disabled-unknown', proven: false, actionable: 'stop', reason: 'gray-or-disabled-without-explicit-copy' };
+  return { kind: 'unknown', proven: false, actionable: 'stop', reason: 'availability-evidence-unknown' };
+}
+
+// The fresh main table is the source of truth for COUNTS, but it cannot show a hover-only
+// duplicate tooltip. When a failed bind already proved per-product explicit evidence for
+// THIS batch, that evidence is merged onto the matching fresh row — only the explicit
+// alreadyPlanned / reviewFailed / autoPullOnly flags, never a count, never a foreign id.
+// Fresh rows keep their own manualAccounts / manualEvidence, so a good row can never turn
+// into a removal just because an old (or another product's) proof existed.
+function mergeSettledPanelEvidence(freshRows, evidenceRows) {
+  const rows = Array.isArray(freshRows) ? freshRows : [];
+  const evidence = new Map((Array.isArray(evidenceRows) ? evidenceRows : [])
+    .filter(r => r && r.productId)
+    .map(r => [String(r.productId), r]));
+  return rows.map(r => {
+    const ev = r && r.productId ? evidence.get(String(r.productId)) : null;
+    if (!ev) return r;
+    const already = ev.alreadyPlanned === true;
+    const review = ev.reviewFailed === true;
+    const auto = ev.autoPullOnly === true;
+    if (!already && !review && !auto) return r;
+    const text = String(r.text || '');
+    return {
+      ...r,
+      text: (already && !text.includes(ALREADY_PLANNED_MARK)) ? (text + ' ' + ALREADY_PLANNED_MARK).trim() : text,
+      alreadyPlanned: r.alreadyPlanned === true || already,
+      reviewFailed: r.reviewFailed === true || review,
+      autoPullOnly: r.autoPullOnly === true || auto,
+    };
+  });
+}
+
 function parseMainTableRow(rowText) {
   const text = String(rowText || '');
   const idMatches = [];
@@ -431,6 +487,7 @@ function parseMainTableRow(rowText) {
     manualCountKnown: !!mm || singleManual || autoPullOnly,
     autoPullOnly,
     reviewFailed: text.includes(REVIEW_FAILED_MARK),
+    alreadyPlanned: text.includes(ALREADY_PLANNED_MARK),
     precheck: text.includes(PRECHECK_MARK),
   };
 }
@@ -441,13 +498,14 @@ function evaluateReadiness(rows, capacity, business) {
   const parsed = (rows || []).map(r => (r.productId !== undefined ? r : parseMainTableRow(r.text || r)));
   const withId = parsed.filter(r => r.productId);
   const uniqueIds = [...new Set(withId.map(r => String(r.productId)))];
-  const deficientIds = withId.filter(r => r.autoPullOnly === true || r.manualEvidence !== false && Number.isInteger(r.manualAccounts) && r.manualAccounts < 1).map(r => String(r.productId));
-  const unknownManualIds = withId.filter(r => r.autoPullOnly !== true && (r.manualEvidence === false || !Number.isInteger(r.manualAccounts))).map(r => String(r.productId));
+  const deficientIds = withId.filter(r => r.alreadyPlanned === true || r.reviewFailed === true || r.autoPullOnly === true || r.manualEvidence !== false && Number.isInteger(r.manualAccounts) && r.manualAccounts < 1).map(r => String(r.productId));
+  const unknownManualIds = withId.filter(r => r.alreadyPlanned !== true && !r.reviewFailed && r.autoPullOnly !== true && (r.manualEvidence === false || !Number.isInteger(r.manualAccounts))).map(r => String(r.productId));
   const reviewFailedIds = withId.filter(r => r.reviewFailed).map(r => String(r.productId));
+  const alreadyPlannedIds = withId.filter(r => r.alreadyPlanned).map(r => String(r.productId));
   const ambiguousCount = parsed.filter(r => r.ambiguous || r.idCount === 0).length;
   const ready = uniqueIds.length === cap
     && withId.length === cap
-    && withId.every(r => r.autoPullOnly !== true && r.manualEvidence !== false && Number.isInteger(r.manualAccounts) && r.manualAccounts >= 1 && !r.reviewFailed);
+    && withId.every(r => r.alreadyPlanned !== true && r.autoPullOnly !== true && r.manualEvidence !== false && Number.isInteger(r.manualAccounts) && r.manualAccounts >= 1 && !r.reviewFailed);
   return {
     ready,
     uniqueCount: uniqueIds.length,
@@ -456,6 +514,7 @@ function evaluateReadiness(rows, capacity, business) {
     deficientIds: [...new Set(deficientIds)],
     unknownManualIds: [...new Set(unknownManualIds)],
     reviewFailedIds: [...new Set(reviewFailedIds)],
+    alreadyPlannedIds: [...new Set(alreadyPlannedIds)],
     ambiguousCount,
     capacity: cap,
   };
@@ -473,19 +532,24 @@ function planRemovalAndBackfill(input) {
   const biz = bizOf(input.business);
   const capacity = Number.isInteger(input.capacity) ? input.capacity : biz.productsPerPlan;
   const rows = (input.rows || []).map(r => (r.productId !== undefined ? r : parseMainTableRow(r.text || r)));
+  const evidenceById = input.evidenceById && typeof input.evidenceById === 'object' ? input.evidenceById : {};
+  const classifications = [];
   const removeIds = [];
   const removeReasons = {};
   for (const r of rows) {
     if (!r.productId) continue; // unknown/ambiguous parse => keep, never delete
     const id = String(r.productId);
+    const cls = classifyAvailabilityEvidence({ ...r, ...(evidenceById[id] || {}) });
+    classifications.push({ productId: id, kind: cls.kind, proven: cls.proven, actionable: cls.actionable, reason: cls.reason });
     if (r.reviewFailed) { removeIds.push(id); removeReasons[id] = 'review-failed'; }
+    else if (r.alreadyPlanned) { removeIds.push(id); removeReasons[id] = 'already-planned'; }
     else if (r.autoPullOnly === true || r.manualEvidence !== false && Number.isInteger(r.manualAccounts) && r.manualAccounts < 1) {
       removeIds.push(id); removeReasons[id] = 'manual-accounts-' + r.manualAccounts;
     }
   }
   const uniqueRemove = [...new Set(removeIds)];
-  const unknownIds = rows.filter(r => r.productId && r.autoPullOnly !== true && (r.manualEvidence === false || !Number.isInteger(r.manualAccounts)) && !r.reviewFailed).map(r => String(r.productId));
-  const currentValid = new Set(rows.filter(r => r.productId && r.manualEvidence !== false && Number.isInteger(r.manualAccounts) && r.manualAccounts >= 1 && !r.reviewFailed && !uniqueRemove.includes(String(r.productId))).map(r => String(r.productId)));
+  const unknownIds = rows.filter(r => r.productId && !r.alreadyPlanned && !r.reviewFailed && r.autoPullOnly !== true && (r.manualEvidence === false || !Number.isInteger(r.manualAccounts))).map(r => String(r.productId));
+  const currentValid = new Set(rows.filter(r => r.productId && !r.alreadyPlanned && r.manualEvidence !== false && Number.isInteger(r.manualAccounts) && r.manualAccounts >= 1 && !r.reviewFailed && !uniqueRemove.includes(String(r.productId))).map(r => String(r.productId)));
   const need = Math.max(0, capacity - currentValid.size);
   const attempted = input.attemptedSet instanceof Set ? input.attemptedSet : new Set((input.attempted || []).map(String));
   const published = input.publishedSet instanceof Set ? input.publishedSet : new Set((input.published || []).map(String));
@@ -496,7 +560,78 @@ function planRemovalAndBackfill(input) {
     if (currentValid.has(s) || attempted.has(s) || published.has(s) || backfillIds.includes(s)) continue;
     backfillIds.push(s);
   }
-  return { removeIds: uniqueRemove, removeReasons, backfillIds, need, unknownIds: [...new Set(unknownIds)], catalogExhausted: backfillIds.length < need };
+  // Whole-batch vs partial is derived ONLY from the proven removal set: all 30 proven
+  // duplicate/unbindable/review-failed is the real batch case (remove the batch, then
+  // continue from the durable forward cursor); a mixed batch removes only the proven
+  // bad rows and keeps the good ones. Any unknown row blocks removals entirely (the
+  // caller's existing stop) and is reported explicitly, never silently deleted.
+  const mode = uniqueRemove.length === 0 ? 'no-removal'
+    : (uniqueRemove.length >= capacity ? 'whole-batch-removal' : 'partial-removal');
+  return {
+    removeIds: uniqueRemove,
+    removeReasons,
+    backfillIds,
+    need,
+    mode,
+    requireNextPage: uniqueRemove.length > 0,
+    blockedUnknownIds: [...new Set(unknownIds)],
+    classifications,
+    unknownIds: [...new Set(unknownIds)],
+    catalogExhausted: backfillIds.length < need,
+  };
+}
+
+// ── durable cursor forward-proof + post-binding review stability ────────────
+// The catalog cursor is durable and shop-scoped (persisted in that shop's day state).
+// A cursor may only move FORWARD on real proof: for a numeric category the platform's
+// own observed page number must be exactly previous+1; a native scroll category keeps
+// its category/tab cursor and NEVER claims a numeric page; a category switch resets to
+// page 1. A late guidance/cancel/backfill callback can therefore never rewind the
+// cursor or fabricate EOF. EOF is a state, not a timeout.
+function advanceCatalogCursor(cursor, proof) {
+  const prev = { category: null, page: 1, ...(cursor || {}) };
+  const p = proof || {};
+  if (p.kind === 'switch') {
+    if (!p.category) return { ok: false, reason: 'cursor-switch-category-missing', cursor: prev };
+    return { ok: true, cursor: { ...prev, category: String(p.category), page: 1, nativeEof: false } };
+  }
+  if (p.kind === 'native') {
+    if (!p.category || String(p.category) !== String(prev.category)) return { ok: false, reason: 'cursor-native-category-drift', cursor: prev };
+    if (p.eofProven === true) return { ok: true, cursor: { ...prev, page: 1, nativeEof: true } };
+    if (p.freshDistinctIds !== true) return { ok: false, reason: 'cursor-native-advance-unproven', cursor: prev };
+    return { ok: true, cursor: { ...prev, page: 1, nativeEof: false } };
+  }
+  if (p.kind === 'numeric') {
+    const observed = Number(p.observedPage);
+    const expected = Number.isInteger(p.expectedPage) ? p.expectedPage : Number(prev.page);
+    if (!Number.isInteger(observed) || observed < 1) return { ok: false, reason: 'cursor-page-unknown', cursor: prev };
+    if (observed !== expected + 1) return { ok: false, reason: observed <= expected ? 'cursor-not-forward' : 'cursor-page-skipped', cursor: prev };
+    return { ok: true, cursor: { ...prev, page: observed, nativeEof: false } };
+  }
+  return { ok: false, reason: 'cursor-proof-kind-unknown', cursor: prev };
+}
+
+// Final fresh gate before any publish: 30 unique rows, each with >=1 manual account,
+// no review-failed row, and the exact settings, observed on at least two consecutive
+// stable reads. Unknown / not-yet-stable / drifting settings is never ready.
+function reviewStabilityContract(input) {
+  const o = input || {};
+  const cap = Number.isInteger(o.capacity) ? o.capacity : bizOf(o.business).productsPerPlan;
+  const readiness = o.readiness && typeof o.readiness === 'object' ? o.readiness : evaluateReadiness(o.rows || [], cap, o.business);
+  const reasons = [];
+  if (readiness.ready !== true) reasons.push('readiness-not-ready');
+  if (readiness.reviewFailedIds && readiness.reviewFailedIds.length) reasons.push('review-failed');
+  if (readiness.alreadyPlannedIds && readiness.alreadyPlannedIds.length) reasons.push('already-planned');
+  if (!(Number.isInteger(o.stableReads) && o.stableReads >= 2)) reasons.push('rows-not-stable');
+  if (o.settingsRequired === true) {
+    const s = o.settings || {};
+    if (s.accountId == null || String(s.accountId) !== String((o.business || BUSINESS).accountId)) reasons.push('settings-account-unknown');
+    if (s.commissionChecked !== true) reasons.push('commission-not-confirmed');
+    if (s.optionalDirectPayChecked !== false) reasons.push('direct-pay-not-off');
+    if (o.roi != null && Number(s.roi) !== Number(o.roi)) reasons.push('roi-mismatch');
+    if (o.dailyBudget != null && Number(s.budget) !== Number(o.dailyBudget)) reasons.push('budget-mismatch');
+  }
+  return { ready: reasons.length === 0, reasons, readiness };
 }
 
 // ── add-confirmation dialog classification (req 8) ──────────────────────────
@@ -973,11 +1108,90 @@ async function preparePlan(deps) {
   //    + batch apply), then read the main table and remove/backfill until 30 valid,
   //    each with at least 1 manually bound target account (R32; 2 is also fine).
   const binding = await d.bindAccountsToAll({ productIds: selected });
+  // Account binding and plan configuration are both followed by a bounded PASSIVE read
+  // of the CURRENT 30 rows: the platform can raise 广告审核不通过 a few seconds after the
+  // first ready read. When the real driver exposes awaitMainTableStable the contract
+  // uses its stable rows ONLY when the read itself proved stability (ok===true); a
+  // timed-out / unproven read never donates its partial rows as ready. Otherwise the
+  // plain read is used exactly as before.
+  const readRows = async () => {
+    if (typeof d.awaitMainTableStable === 'function') {
+      const stable = await d.awaitMainTableStable({ capacity: biz.productsPerPlan });
+      if (!stable || stable.ok !== true) {
+        return { ok: false, reason: (stable && stable.reason) || 'main-table-not-stable', rows: [], stableReads: stable && stable.stableReads };
+      }
+      return { ok: true, rows: Array.isArray(stable.rows) ? stable.rows : [], stableReads: stable.stableReads };
+    }
+    return { ok: true, rows: await d.readMainTable(), stableReads: null };
+  };
+  let bindingFailedIds = (binding && Array.isArray(binding.failedIds)) ? binding.failedIds.map(String) : [];
+  const bindingRows = (binding && Array.isArray(binding.rows)) ? binding.rows : null;
+  const batchIdSet = new Set(selected.map(String));
+  // Explicit per-product proofs that are allowed to survive into repair: only alreadyPlanned
+  // flags (explicit platform copy / settled hover tooltip) for THIS batch's exact ids.
+  const duplicateIdsOf = rows => [...new Set((Array.isArray(rows) ? rows : [])
+    .filter(r => r && r.alreadyPlanned === true && batchIdSet.has(String(r.productId)))
+    .map(r => String(r.productId)))];
+  let provenDuplicateIds = [];
+  let mainRows;
   if (d.requireRealDrivers === true && (!binding || binding.ok !== true)) {
-    const bindingDiag = sanitizeBindingDiagnostic(binding && binding.diag);
-    return { status: 'stopped', stage: 'account-binding', reason: (binding && binding.reason) || 'native-binding-not-confirmed', bindingDiag, businessDate };
+    // A failed bind is NOT automatically a stop any more: when the binder itself returns
+    // the REAL current rows, or the main table can be read, a WHOLE batch whose every row
+    // carries explicit platform evidence (already planned / review failed / definite zero
+    // manual) is exactly the incident's whole-batch repair case. Anything less than a fully
+    // proven batch (a missing row, an unknown manual state, a gray checkbox, a partial set)
+    // keeps the original zero-removal stop.
+    let candidates = null;
+    if (typeof d.awaitMainTableStable === 'function') {
+      const rr = await readRows();
+      if (!rr.ok) {
+        return { status: 'stopped', stage: 'stable-read', reason: 'binding-failure-' + rr.reason, businessDate };
+      }
+      candidates = rr.rows;
+    } else {
+      candidates = bindingRows && bindingRows.length ? bindingRows : (await readRows()).rows;
+    }
+    // A stable fresh read must not silently DROP the binder's explicit per-product proof
+    // (that is how a hover-proven duplicate batch used to fall back to "unknown"). Merge
+    // only the explicit flags, keyed by the exact id, and only for this batch's selection.
+    if (candidates && bindingRows && bindingRows.length) {
+      const batchIds = new Set(selected.map(String));
+      candidates = mergeSettledPanelEvidence(candidates, bindingRows.filter(r => r && batchIds.has(String(r.productId))));
+    }
+    const readback = candidates && candidates.length ? evaluateReadiness(candidates, biz.productsPerPlan, biz) : null;
+    const proof = candidates && candidates.length
+      ? planRemovalAndBackfill({ rows: candidates, capacity: biz.productsPerPlan, attemptedSet, publishedSet, catalogRemainingIds: d.catalogRemainingIds || [] })
+      : null;
+    const allProven = !!proof
+      && candidates.length === biz.productsPerPlan
+      && readback.uniqueCount === biz.productsPerPlan
+      && readback.unknownManualIds.length === 0
+      && readback.ambiguousCount === 0
+      && proof.blockedUnknownIds.length === 0
+      && proof.removeIds.length === biz.productsPerPlan
+      // A whole batch is only replaceable on EXPLICIT per-product platform copy
+      // (already planned / review failed / auto-pull-only). A gray checkbox or a
+      // merely-unbound row (manual 0 before any bind) is NEVER such proof.
+      && candidates.every(r => r.alreadyPlanned === true || r.reviewFailed === true || r.autoPullOnly === true);
+    if (!allProven) {
+      const bindingDiag = sanitizeBindingDiagnostic(binding && binding.diag);
+      return {
+        status: 'stopped', stage: 'account-binding',
+        reason: (binding && binding.reason) || 'native-binding-not-confirmed',
+        bindingDiag, bindingEvidence: { proven: false, rowCount: candidates ? candidates.length : 0, removable: proof ? proof.removeIds.length : 0, unknown: readback ? readback.unknownManualIds.length : null },
+        businessDate,
+      };
+    }
+    bindingFailedIds = proof.removeIds.slice();
+    mainRows = candidates;
+  } else {
+    const rr = await readRows();
+    if (!rr.ok) {
+      return { status: 'stopped', stage: 'stable-read', reason: 'pre-configuration-' + rr.reason, businessDate };
+    }
+    mainRows = rr.rows;
   }
-  let mainRows = await d.readMainTable();
+  provenDuplicateIds = duplicateIdsOf(mainRows);
   hints = mergeCardHints(hints, mainRows.map(r => ({
     productId: r.productId, text: r.text || '', migrationWarning: r.migrationWarning,
     precheckRisk: r.precheckRisk || r.precheck, reviewFailed: r.reviewFailed,
@@ -1007,13 +1221,26 @@ async function preparePlan(deps) {
       publishedSet,
       attemptedSet,
       hints,
+      // Bind-failure information and the ACTUAL main rows enter the prepare/repair
+      // contract. The repair driver may use them only as provenance (attempted /
+      // diagnostics); removal still requires explicit current-row evidence, so an
+      // unknown/failed binder message can never delete a good product.
+      failedIds: bindingFailedIds,
+      bindingRows: bindingRows || mainRows,
+      provenDuplicateIds,
+      repairMode: plan.mode,
+      requireNextPage: plan.requireNextPage,
       onProgress: saveProgress,
     });
     if (!repaired || repaired.ok === false) {
       return { status: 'stopped', stage: 'repair', reason: (repaired && repaired.reason) || 'repair-not-confirmed', readiness, plan, businessDate };
     }
     if (Array.isArray(repaired.mainRows)) finalRows = repaired.mainRows;
-    else finalRows = await d.readMainTable();
+    else {
+      const rr = await readRows();
+      if (!rr.ok) return { status: 'stopped', stage: 'stable-read', reason: 'after-repair-' + rr.reason, businessDate };
+      finalRows = rr.rows;
+    }
     hints = mergeCardHints(hints, finalRows.map(r => ({
       productId: r.productId, text: r.text || '', migrationWarning: r.migrationWarning,
       precheckRisk: r.precheckRisk || r.precheck, reviewFailed: r.reviewFailed,
@@ -1029,7 +1256,9 @@ async function preparePlan(deps) {
       const rebindDiag = sanitizeBindingDiagnostic(rebound && rebound.diag);
       return { status: 'stopped', stage: 'account-rebinding', reason: (rebound && rebound.reason) || 'repair-rebinding-not-confirmed', bindingDiag: rebindDiag, businessDate };
     }
-    mainRows = await d.readMainTable();
+    const rrAfter = await readRows();
+    if (!rrAfter.ok) return { status: 'stopped', stage: 'stable-read', reason: 'after-rebind-' + rrAfter.reason, businessDate };
+    mainRows = rrAfter.rows;
     hints = mergeCardHints(hints, mainRows.map(r => ({
       productId: r.productId, text: r.text || '', migrationWarning: r.migrationWarning,
       precheckRisk: r.precheckRisk || r.precheck, reviewFailed: r.reviewFailed,
@@ -1055,6 +1284,88 @@ async function preparePlan(deps) {
     }
   } else if (d.requireRealDrivers === true) {
     return { status: 'stopped', stage: 'plan-settings', reason: 'real-plan-settings-driver-missing', businessDate };
+  }
+  // Configuration is followed by a bounded, PASSIVE stability read of the SAME 30 rows.
+  // A late 广告审核不通过 / newly duplicated row that appears after the settings were written
+  // is NOT a passive stop when its evidence is explicit: the exact deficient rows are
+  // replaced (continue from the durable forward cursor), the batch is rebound and the
+  // trusted parameters are configured again, then the stable gate is re-proven. The loop is
+  // bounded (at most 2 post-configuration repair rounds) and every unknown/ambiguous row
+  // still stops with ZERO removal. Only the real driver (which can prove two consecutive
+  // stable reads) participates; legacy offline drivers keep their exact previous behavior.
+  if (typeof d.awaitMainTableStable === 'function') {
+    let postRepairs = 0;
+    for (;;) {
+      const post = await d.awaitMainTableStable({ capacity: biz.productsPerPlan });
+      if (!post || post.ok !== true) {
+        return { status: 'stopped', stage: 'stable-read', reason: 'post-configuration-' + ((post && post.reason) || 'main-table-not-stable'), businessDate };
+      }
+      const postRows = Array.isArray(post.rows) ? post.rows : [];
+      const gate = reviewStabilityContract({ rows: postRows, capacity: biz.productsPerPlan, business: biz, stableReads: post && post.stableReads });
+      if (gate.ready) { finalRows = postRows; break; }
+      const postReadiness = gate.readiness || evaluateReadiness(postRows, biz.productsPerPlan, biz);
+      if (postReadiness.unknownManualIds.length || postReadiness.ambiguousCount > 0) {
+        return { status: 'stopped', stage: 'readiness-after-configuration', reason: 'review-or-rows-not-stable-after-configuration', gateReasons: gate.reasons, readiness: postReadiness, businessDate };
+      }
+      const latePlan = planRemovalAndBackfill({
+        rows: postRows, capacity: biz.productsPerPlan,
+        attemptedSet, publishedSet, catalogRemainingIds: d.catalogRemainingIds || [],
+      });
+      if (!latePlan.removeIds.length) {
+        return { status: 'stopped', stage: 'readiness-after-configuration', reason: 'review-or-rows-not-stable-after-configuration', gateReasons: gate.reasons, readiness: postReadiness, businessDate };
+      }
+      if (postRepairs >= 2) {
+        return { status: 'stopped', stage: 'readiness-after-configuration', reason: 'configuration-repair-round-limit', gateReasons: gate.reasons, readiness: postReadiness, businessDate };
+      }
+      postRepairs++;
+      const repaired = await d.repairDraft({
+        removeIds: latePlan.removeIds,
+        backfillIds: latePlan.backfillIds,
+        backfillCount: latePlan.need,
+        rows: postRows,
+        state: workingState,
+        publishedSet,
+        attemptedSet,
+        hints,
+        failedIds: bindingFailedIds,
+        bindingRows: postRows,
+        provenDuplicateIds: duplicateIdsOf(postRows),
+        repairMode: latePlan.mode,
+        requireNextPage: latePlan.requireNextPage,
+        onProgress: saveProgress,
+      });
+      if (!repaired || repaired.ok === false) {
+        return { status: 'stopped', stage: 'repair', reason: (repaired && repaired.reason) || 'repair-not-confirmed', readiness: postReadiness, plan: latePlan, businessDate };
+      }
+      let repairedRows = Array.isArray(repaired.mainRows) ? repaired.mainRows : null;
+      if (!repairedRows) {
+        const rr = await readRows();
+        if (!rr.ok) return { status: 'stopped', stage: 'stable-read', reason: 'after-configuration-repair-' + rr.reason, businessDate };
+        repairedRows = rr.rows;
+      }
+      const afterRepair = evaluateReadiness(repairedRows, biz.productsPerPlan, biz);
+      hints = mergeCardHints(hints, repairedRows.map(r => ({
+        productId: r.productId, text: r.text || '', migrationWarning: r.migrationWarning,
+        precheckRisk: r.precheckRisk || r.precheck, reviewFailed: r.reviewFailed,
+      })));
+      workingState = { ...workingState, hints };
+      await persistState(workingState);
+      const rebound = await d.bindAccountsToAll({ productIds: afterRepair.uniqueIds, repairRound: 'post-configuration' });
+      if (d.requireRealDrivers === true && (!rebound || rebound.ok !== true)) {
+        const rebindDiag = sanitizeBindingDiagnostic(rebound && rebound.diag);
+        return { status: 'stopped', stage: 'account-rebinding', reason: (rebound && rebound.reason) || 'post-configuration-rebinding-not-confirmed', bindingDiag: rebindDiag, businessDate };
+      }
+      const rrStable = await readRows();
+      if (!rrStable.ok) return { status: 'stopped', stage: 'stable-read', reason: 'post-configuration-rebind-' + rrStable.reason, businessDate };
+      mainRows = rrStable.rows;
+      finalRows = mainRows;
+      const reconfigured = await d.configurePlan({ planNumber: d.planNumber, businessDate, mainRows: finalRows });
+      if (!reconfigured || reconfigured.ok !== true || !reconfigured.planName) {
+        const reason = (reconfigured && reconfigured.reason) || 'settings-not-confirmed';
+        return { status: 'stopped', stage: 'plan-settings', reason, businessDate };
+      }
+      configured = reconfigured;
+    }
   }
   const finalIds = evaluateReadiness(finalRows, biz.productsPerPlan).uniqueIds;
   // The frozen target set: live-discovered binding first, then an explicitly
@@ -1219,6 +1530,8 @@ module.exports = {
   verifyCreationHeader, parseAccountDrawer, verifyAccountBinding, chooseAnchorProduct,
   parseMainTableRow, evaluateReadiness, planRemovalAndBackfill,
   classifyAddDialog, normalizeSpace, matchFinalExclusionDialog, resolveFinalPublishButton,
+  classifyAvailabilityEvidence, advanceCatalogCursor, reviewStabilityContract,
+  ALREADY_PLANNED_MARK,
   canonicalManifest, manifestHash, makeNonce, freezePlan, validateConfirmation,
   classifyPublishOutcome, planPostPublishEnable,
   hasUnresolvedPlan,

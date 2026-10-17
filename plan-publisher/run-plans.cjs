@@ -641,7 +641,85 @@ function readSchedulerLedgerRaw(ledgerFile) {
   return { ok: true, ledger: parsed };
 }
 
-// ── Explicit trusted release binding (S44) ────────────────────────────────────
+const PRE_INITIAL_POLICY_CANCEL_REASON = 'scheduled-policy-drift-before-initial:policy-disabled-or-not-autoconfirmed';
+function provePreInitialPolicyCancelState(stateFile, attemptsFile, businessDate, scope) {
+  const date = String(businessDate || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { ok: false, reason: 'policy-cancel-date-invalid' };
+  const sc = scope && typeof scope === 'object' ? scope : {};
+  const planNumber = Number(sc.planNumber);
+  if (!Number.isInteger(planNumber) || planNumber < 1) return { ok: false, reason: 'policy-cancel-plan-invalid' };
+  const shop = String(sc.shop || '').trim();
+  const account = sc.accountId == null || String(sc.accountId) === '' ? null : String(sc.accountId);
+  let stateText = null, attemptsText = null;
+  try {
+    if (!fs.existsSync(stateFile)) return { ok: false, reason: 'policy-cancel-state-missing' };
+    stateText = fs.readFileSync(stateFile, 'utf8');
+    if (!fs.existsSync(attemptsFile)) return { ok: false, reason: 'policy-cancel-attempts-missing' };
+    attemptsText = fs.readFileSync(attemptsFile, 'utf8');
+  } catch (_) { return { ok: false, reason: 'policy-cancel-state-unreadable' }; }
+  let raw = null, attempts = null;
+  try { raw = JSON.parse(stateText); attempts = JSON.parse(attemptsText); }
+  catch (_) { return { ok: false, reason: 'policy-cancel-state-unreadable' }; }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'policy-cancel-state-malformed' };
+  if (String(raw.businessDate || '') !== date) return { ok: false, reason: 'policy-cancel-date-mismatch' };
+  if (raw.unknown === true || raw.pending === true) return { ok: false, reason: 'policy-cancel-day-unresolved' };
+  if (!Array.isArray(raw.plans) || raw.plans.length !== 0) return { ok: false, reason: 'policy-cancel-plans-not-empty' };
+  if (!Array.isArray(raw.confirmationConsumptions)) return { ok: false, reason: 'policy-cancel-state-malformed' };
+  if (raw.confirmationConsumptions.some(r => r && String(r.businessDate || '') === date)) {
+    return { ok: false, reason: 'policy-cancel-confirmation-consumed' };
+  }
+  if (raw.manualUiPublicationFacts !== undefined
+    && (!Array.isArray(raw.manualUiPublicationFacts)
+      || raw.manualUiPublicationFacts.some(r => r && String(r.businessDate || '') === date))) {
+    return { ok: false, reason: 'policy-cancel-manual-publication-present' };
+  }
+  if (raw.firstPublishedPlan != null) return { ok: false, reason: 'policy-cancel-first-published-present' };
+  const a = raw.active;
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return { ok: false, reason: 'policy-cancel-active-malformed' };
+  if (String(a.status || '') !== 'preparation-stopped') return { ok: false, reason: 'policy-cancel-active-not-preparation-stopped' };
+  if (Number(a.planNumber) !== planNumber) return { ok: false, reason: 'policy-cancel-plan-mismatch' };
+  if (String(a.reason || '') !== PRE_INITIAL_POLICY_CANCEL_REASON) return { ok: false, reason: 'policy-cancel-reason-mismatch' };
+  if (a.frozen || a.confirmationId != null || a.manifestHash != null || a.planId != null
+    || a.nonce != null || (a.runId != null && String(a.runId) !== '')) {
+    return { ok: false, reason: 'policy-cancel-artifacts-present' };
+  }
+  if (a.businessDate != null && String(a.businessDate) !== date) return { ok: false, reason: 'policy-cancel-active-date-mismatch' };
+  if (a.accountId != null && String(a.accountId) !== '' && account !== null && String(a.accountId) !== account) {
+    return { ok: false, reason: 'policy-cancel-account-mismatch' };
+  }
+  if (a.shop != null && String(a.shop).trim() !== '' && shop !== '' && String(a.shop).trim() !== shop) {
+    return { ok: false, reason: 'policy-cancel-shop-mismatch' };
+  }
+  if (!attempts || typeof attempts !== 'object' || Array.isArray(attempts)) return { ok: false, reason: 'policy-cancel-attempts-malformed' };
+  const RECOGNIZED = new Set(['pending', 'dispatched', 'unknown', 'success', 'failed']);
+  for (const mapName of ['consumed', 'finalConsumed', 'reopenConsumed']) {
+    const m = attempts[mapName];
+    if (!m || typeof m !== 'object' || Array.isArray(m)) return { ok: false, reason: 'policy-cancel-attempts-malformed' };
+    for (const rec of Object.values(m)) {
+      if (!rec || typeof rec !== 'object' || Array.isArray(rec)
+        || !/^\d{4}-\d{2}-\d{2}$/.test(String(rec.businessDate || ''))
+        || !Number.isInteger(Number(rec.planNumber)) || Number(rec.planNumber) < 1
+        || !RECOGNIZED.has(String(rec.status || ''))) {
+        return { ok: false, reason: 'policy-cancel-attempt-record-malformed' };
+      }
+      if (String(rec.businessDate) === date) return { ok: false, reason: 'policy-cancel-attempt-record-for-date' };
+    }
+  }
+  return {
+    ok: true,
+    proof: {
+      method: 'pre-initial-policy-cancel', businessDate: date, shop, planNumber,
+      accountId: account, stateActiveStatus: 'preparation-stopped',
+      stateReasonHash: sha256Hex(PRE_INITIAL_POLICY_CANCEL_REASON),
+      sourceHash: preOpenSourceHash(stateText, attemptsText),
+      zeroConsumptionProof: {
+        initialConsumptions: 0, finalConsumptions: 0, reopenConsumptions: 0,
+        manualUnresolved: 0, plansContainsNumber: false, confirmationConsumptionsRecorded: false,
+      },
+    },
+  };
+}
+
 // The ONLY supported way to release a per-day terminal `failed`/`blocked` scheduler entry for
 // the CURRENT business day without a raw ledger edit. A valid proof binds:
 //   (a) the EXACT current ledger entry (shop + date + plan + record status + entry status +
@@ -674,6 +752,7 @@ function proveSchedulerReleaseProof(ledgerFile, statePaths, spec) {
   // 'unsubmitted' label or an arbitrary error string never suffices; the history binding is
   // re-verified at mutation time in applySchedulerReleaseToRecord.
   let entryProvenanceMethod = null;
+  let policyCancelProof = null;
   if (rec.status === 'failed-permanent' && entry.status === 'unsubmitted') {
     const entryReasonText = typeof entry.reason === 'string' ? entry.reason : '';
     if (!entryReasonText.startsWith('scheduled-pre-navigation-open-failed:')) {
@@ -688,10 +767,38 @@ function proveSchedulerReleaseProof(ledgerFile, statePaths, spec) {
     if (!proven) return { ok: false, reason: 'release-entry-provenance-unbound' };
     entryProvenanceMethod = 'pre-navigation-open-failed';
   }
-  if (rec.status !== 'failed' && rec.status !== 'blocked' && !(rec.status === 'failed-permanent' && (entry.status === 'preparation-stopped' || entry.status === 'unsubmitted'))) return { ok: false, reason: 'release-record-not-terminal-failure:' + String(rec.status) };
-  if (entry.status !== 'failed' && entry.status !== 'preparation-stopped' && entry.status !== 'unsubmitted') return { ok: false, reason: 'release-entry-not-prepublication:' + String(entry.status) };
+  // S126: the EXACT legacy pre-initial policy-cancel unknown shape. Everything here is strict:
+  // record unknown/plans 0, exactly one entry '1' unknown with the exact cancel reason, rec.error
+  // equal to 'unknown:'+reason, no entry/rec artifacts, and an independent fresh day-state proof
+  // (preparation-stopped plan 1, no runId/frozen/CID/nonce, zero plans/consumed attempts).
+  if (rec.status === 'unknown' && entry.status === 'unknown') {
+    if (Number(planNumber) !== 1) return { ok: false, reason: 'release-policy-cancel-plan-not-first' };
+    if (Number(rec.plans) !== 0) return { ok: false, reason: 'release-policy-cancel-plans-not-zero' };
+    if (!rec.entries || typeof rec.entries !== 'object' || Array.isArray(rec.entries)) return { ok: false, reason: 'release-policy-cancel-entries-malformed' };
+    const keys = Object.keys(rec.entries);
+    if (keys.length !== 1 || keys[0] !== '1') return { ok: false, reason: 'release-policy-cancel-entry-not-unique' };
+    if (Number(entry.planNumber) !== 1) return { ok: false, reason: 'release-policy-cancel-entry-plan-mismatch' };
+    if (String(entry.reason || '') !== PRE_INITIAL_POLICY_CANCEL_REASON) return { ok: false, reason: 'release-policy-cancel-reason-mismatch' };
+    if (String(rec.error || '') !== 'unknown:' + PRE_INITIAL_POLICY_CANCEL_REASON) return { ok: false, reason: 'release-policy-cancel-error-mismatch' };
+    if (entry.confirmationId != null || entry.planId != null || entry.manifestHash != null
+      || entry.nonce != null || entry.frozen) return { ok: false, reason: 'release-policy-cancel-entry-artifacts' };
+    if (rec.confirmationId != null || rec.frozen || rec.nonce != null) return { ok: false, reason: 'release-policy-cancel-record-artifacts' };
+    const st = provePreInitialPolicyCancelState(statePaths.stateFile, statePaths.attemptsFile, businessDate, {
+      planNumber, accountId: s.accountId, shop,
+    });
+    if (!st.ok) return { ok: false, reason: st.reason };
+    if (st.proof.stateReasonHash !== sha256Hex(entry.reason)) return { ok: false, reason: 'release-policy-cancel-entry-source-mismatch' };
+    policyCancelProof = st.proof;
+    entryProvenanceMethod = 'pre-initial-policy-cancel';
+  }
+  const policyCancel = entryProvenanceMethod === 'pre-initial-policy-cancel';
+  if (!policyCancel && rec.status !== 'failed' && rec.status !== 'blocked' && !(rec.status === 'failed-permanent' && (entry.status === 'preparation-stopped' || entry.status === 'unsubmitted'))) return { ok: false, reason: 'release-record-not-terminal-failure:' + String(rec.status) };
+  if (!policyCancel && entry.status !== 'failed' && entry.status !== 'preparation-stopped' && entry.status !== 'unsubmitted') return { ok: false, reason: 'release-entry-not-prepublication:' + String(entry.status) };
   const pub = proveNoPublicationPreOpen(statePaths.stateFile, statePaths.attemptsFile, businessDate, { planNumber, accountId: s.accountId, shop });
   if (!pub.ok) return { ok: false, reason: pub.reason };
+  if (policyCancel && String(pub.proof.sourceHash) !== String(policyCancelProof.sourceHash)) {
+    return { ok: false, reason: 'release-policy-cancel-source-drift' };
+  }
   // Bind the entry's OWN recorded runId when it carries one; a legacy entry (no runId) stays null
   // — we never invent or splice a runId from an unrelated closure.
   const entryRunId = (typeof entry.runId === 'string' && entry.runId)
@@ -710,6 +817,9 @@ function proveSchedulerReleaseProof(ledgerFile, statePaths, spec) {
     // S57: only set (and only trusted) for the failed-permanent / unsubmitted pre-navigation
     // shape proven above from the record's OWN durable retry history.
     entryProvenanceMethod,
+    // S126: only set for the exact legacy pre-initial policy-cancel unknown shape, carrying the
+    // independent fresh day-state proof (not just the error string / 6-zero booleans).
+    policyCancelProof,
     // Fresh-source re-read anchors: the mutation-time releaser recomputes the source hash from
     // these exact bound paths and refuses on any changed / deleted bytes.
     sourceHash: pub.proof.sourceHash,
@@ -765,6 +875,119 @@ function applyProvenPreparationClose(stateFile, attemptsFile, businessDate, clos
   raw.active = {
     status: 'preparation-stopped', planNumber: chk.planNumber, runId: chk.runId, businessDate: String(businessDate),
     originalPhase: 'preparing', reason: fact.reason, source: fact.source, closedAt: fact.closedAt,
+  };
+  atomicWrite(stateFile, raw);
+  return { closed: true, fact };
+}
+
+// ── S126: durable pre-initial policy-cancel close for the FUTURE writer ───────
+// The drift-before-initial branch used to overwrite ready-awaiting-confirmation with a runId-less
+// preparation-stopped and return blocked, which the scheduler stored as unknown forever. This
+// close reads the ORIGINAL state (frozen still present), proves from independent stores that the
+// prepared plan was never consumed (no initial/final/reopen/manual record for this run/CID/
+// same-day plan; no plan record; no confirmationConsumptions), and only THEN flips active to
+// preparation-stopped. The frozen confirmationId/nonce are retained as an audit disposition
+// (clicked:false, consumed:false) — they are never replayed and no consumption is fabricated.
+function provePreInitialPolicyCancelReadyZeroConsumption(stateRaw, attempts, businessDate, closure) {
+  const c = closure || {};
+  const a = (stateRaw && stateRaw.active) || null;
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return { ok: false, reason: 'not-ready-phase' };
+  if (a.status !== 'ready-awaiting-confirmation') return { ok: false, reason: 'not-ready-phase' };
+  if (stateRaw.unknown || stateRaw.pending) return { ok: false, reason: 'day-state-unresolved-flag-present' };
+  if (String(stateRaw.businessDate || '') !== String(businessDate)) return { ok: false, reason: 'state-business-date-mismatch' };
+  if (a.businessDate != null && String(a.businessDate) !== String(businessDate)) return { ok: false, reason: 'active-business-date-mismatch' };
+  const planNumber = Number(a.planNumber);
+  if (!Number.isInteger(planNumber) || planNumber < 1) return { ok: false, reason: 'active-plan-number-invalid' };
+  const f = a.frozen;
+  if (!f || typeof f !== 'object' || Array.isArray(f)) return { ok: false, reason: 'frozen-missing' };
+  // The ready active record carries the run identity inside frozen (production shape), so the
+  // original runId is taken from frozen when the outer active has none. It is never invented.
+  const runId = String(a.runId || f.runId || '');
+  const origin = SCHEDULED_RUN_ORIGIN_RE.exec(runId);
+  if (!origin || origin[1] !== String(businessDate)) return { ok: false, reason: 'run-origin-not-scheduled' };
+  if (String(f.businessDate || '') !== String(businessDate)) return { ok: false, reason: 'frozen-business-date-mismatch' };
+  if (Number(f.planNumber) !== planNumber) return { ok: false, reason: 'frozen-plan-number-mismatch' };
+  if (String(f.runId || '') !== runId) return { ok: false, reason: 'frozen-run-id-mismatch' };
+  if (typeof f.confirmationId !== 'string' || f.confirmationId.trim() === '') return { ok: false, reason: 'frozen-confirmation-id-missing' };
+  if (typeof f.nonce !== 'string' || f.nonce.trim() === '') return { ok: false, reason: 'frozen-nonce-missing' };
+  if (!/^[a-f0-9]{64}$/i.test(String(f.manifestHash || ''))) return { ok: false, reason: 'frozen-manifest-missing' };
+  let manifestOk = false;
+  try { manifestOk = String(wf.manifestHash(f)).toLowerCase() === String(f.manifestHash).toLowerCase(); }
+  catch (_) { manifestOk = false; }
+  if (!manifestOk) return { ok: false, reason: 'frozen-manifest-conflict' };
+  if (!/^\d{12,20}$/.test(String(f.accountId || ''))) return { ok: false, reason: 'frozen-account-invalid' };
+  if (c.accountId != null && String(c.accountId) !== '' && String(f.accountId) !== String(c.accountId)) {
+    return { ok: false, reason: 'frozen-account-mismatch' };
+  }
+  if (!Array.isArray(stateRaw.plans)) return { ok: false, reason: 'plans-list-unreadable' };
+  if (stateRaw.plans.some(p => p && Number(p.planNumber) === planNumber)) return { ok: false, reason: 'plan-number-already-in-plans' };
+  if (!Array.isArray(stateRaw.confirmationConsumptions)) return { ok: false, reason: 'confirmation-consumptions-unreadable' };
+  if (stateRaw.confirmationConsumptions.some(r => r && (String(r.runId || '') === runId
+    || String(r.confirmationId || '') === String(f.confirmationId)
+    || (String(r.businessDate || '') === String(businessDate) && Number(r.planNumber) === planNumber)))) {
+    return { ok: false, reason: 'confirmation-consumption-recorded' };
+  }
+  if (!attempts || typeof attempts !== 'object' || Array.isArray(attempts)) return { ok: false, reason: 'attempts-store-unreadable' };
+  for (const mapName of ['consumed', 'finalConsumed', 'reopenConsumed']) {
+    const m = attempts[mapName];
+    if (m === undefined) continue;
+    if (!m || typeof m !== 'object' || Array.isArray(m)) return { ok: false, reason: 'attempts-store-unreadable' };
+    for (const [key, rec] of Object.entries(m)) {
+      if (!rec) continue;
+      if (key === String(f.confirmationId)) return { ok: false, reason: mapName + '-consumption-for-confirmation' };
+      if (String(rec.runId || '') === runId) return { ok: false, reason: mapName + '-consumption-for-run' };
+      if (String(rec.confirmationId || '') === String(f.confirmationId)) return { ok: false, reason: mapName + '-consumption-for-confirmation' };
+      if (String(rec.businessDate || '') === String(businessDate) && Number(rec.planNumber) === planNumber) {
+        return { ok: false, reason: mapName + '-consumption-for-same-day-plan' };
+      }
+    }
+  }
+  if (listManualUnresolved(attempts).length > 0) return { ok: false, reason: 'manual-unresolved-present' };
+  return {
+    ok: true, planNumber, runId,
+    proof: { initialConsumptions: 0, finalConsumptions: 0, reopenConsumptions: 0, manualUnresolved: 0, plansContainsNumber: false, confirmationConsumptionsRecorded: false },
+  };
+}
+function applyProvenPreInitialPolicyCancelClose(stateFile, attemptsFile, businessDate, closure, opts) {
+  const o = opts || {};
+  const now = typeof o.nowMs === 'function' ? o.nowMs() : Date.now();
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(stateFile, 'utf8')); }
+  catch (error) { return { closed: false, reason: 'policy-cancel-close-state-unreadable:' + scheduledErrorText(error) }; }
+  if (!fs.existsSync(attemptsFile)) return { closed: false, reason: 'policy-cancel-close-attempts-file-missing' };
+  let attempts;
+  try { attempts = JSON.parse(fs.readFileSync(attemptsFile, 'utf8')); }
+  catch (error) { return { closed: false, reason: 'policy-cancel-close-attempts-unreadable:' + scheduledErrorText(error) }; }
+  const chk = provePreInitialPolicyCancelReadyZeroConsumption(raw, attempts, businessDate, closure);
+  if (!chk.ok) return { closed: false, reason: 'policy-cancel-close-recheck-failed:' + chk.reason };
+  const f = raw.active.frozen;
+  const c = closure || {};
+  const fastReason = String(c.reason || 'scheduled-policy-drift-before-initial');
+  const fact = {
+    status: 'preparationClosed', phase: 'preparing',
+    reason: fastReason,
+    source: String(c.source || 'scheduled-policy-cancel-before-initial'),
+    runId: chk.runId, planNumber: chk.planNumber, businessDate: String(businessDate),
+    shop: String(c.shop || ''), accountId: String(c.accountId == null ? '' : c.accountId),
+    zeroConsumptionProof: chk.proof, closedAt: new Date(now).toISOString(),
+    policyCancel: {
+      kind: 'pre-initial-policy-cancel', reason: fastReason,
+      originalActiveStatus: 'ready-awaiting-confirmation',
+      frozenDisposition: {
+        planNumber: chk.planNumber, businessDate: String(businessDate),
+        confirmationId: String(f.confirmationId), nonce: String(f.nonce), manifestHash: String(f.manifestHash),
+        clicked: false, consumed: false,
+      },
+    },
+  };
+  raw.preparationClosureFacts = Array.isArray(raw.preparationClosureFacts) ? raw.preparationClosureFacts.slice(-9) : [];
+  if (!raw.preparationClosureFacts.some(x => x && String(x.runId) === fact.runId && String(x.businessDate) === fact.businessDate)) {
+    raw.preparationClosureFacts.push(fact);
+  }
+  raw.active = {
+    status: 'preparation-stopped', planNumber: chk.planNumber, runId: chk.runId, businessDate: String(businessDate),
+    originalPhase: 'ready-awaiting-confirmation', reason: fact.reason, source: fact.source, closedAt: fact.closedAt,
+    canceledBeforeInitial: true, frozenDisposition: fact.policyCancel.frozenDisposition,
   };
   atomicWrite(stateFile, raw);
   return { closed: true, fact };
@@ -1586,12 +1809,17 @@ function bindingDrawerSnapshotInPage() {
   const roots = dialogs.filter(el => !dialogs.some(o => o !== el && o.contains(el)));
   if (roots.length !== 1) return { ok: false, reason: 'account-drawer-not-unique', count: roots.length };
   const root = roots[0];
-  const rows = [...root.querySelectorAll('tr,[role="row"],.ovui-table__row')].filter(visible).filter(row => !row.closest('thead') && !row.querySelector('th')).map(row => {
+    const rows = [...root.querySelectorAll('tr,[role="row"],.ovui-table__row')].filter(visible).filter(row => !row.closest('thead') && !row.querySelector('th')).map(row => {
     const text = txt(row);
+    // Hover tooltips may live in title / aria-label instead of row text (the real
+    // disabled checkbox copy appears on hover). Capture them additively so explicit
+    // duplicate evidence is readable WITHOUT treating a gray checkbox as proof.
+    const hover = [...row.querySelectorAll('[title],[aria-label]')]
+      .map(e => e.getAttribute('title') || e.getAttribute('aria-label') || '').filter(Boolean).join(' ');
     const accountIds = [...text.matchAll(/ID\s*[:：]?\s*([A-Za-z0-9_-]{8,32})/g)].map(m => m[1]);
     const checks = [...row.querySelectorAll('input[type="checkbox"]')].filter(visible);
     const label = checks.length === 1 ? checks[0].closest('label') : null;
-    return { text: text.slice(0,300), ids: accountIds, checked: checks.length === 1 ? checks[0].checked === true : null, labelDisabled: label ? disabledEl(label) : null };
+    return { text: (text + (hover ? ' ' + hover : '')).slice(0,300), ids: accountIds, checked: checks.length === 1 ? checks[0].checked === true : null, labelDisabled: label ? disabledEl(label) : null };
   }).filter(r => r.ids.length > 0);
   const headers = [...root.querySelectorAll('thead label.ovui-checkbox,th label.ovui-checkbox,[class*="table-header"] label.ovui-checkbox')].filter(visible);
   const footer = txt(root).match(/当前商品已选\s*[：:]?\s*(\d+)\s*\/\s*(\d+)/);
@@ -1611,7 +1839,103 @@ function bindingDrawerSnapshotInPage() {
   const activeProductIds = panelEls
     .filter(el => String(el.className || '').split(/\s+/).includes('active'))
     .map(panelId).filter(id => /^\d{15,20}$/.test(id));
-  return { ok: true, rows, headerSelectAllCount: headers.length, headerLabelDisabled: headers.length === 1 ? disabledEl(headers[0]) : null, selectedCount: footer ? Number(footer[1]) : null, totalCount: footer ? Number(footer[2]) : null, batchButtonCount: batchBtns.length, batchEnabled, confirmButtonCount: buttons.length, panelProductIds, activeProductIds };
+  // A switched product panel keeps the PREVIOUS panel's cached rows / disabled checkboxes
+  // on screen while its own request is still in flight; the ovui spinner is the only
+  // positive "still loading" signal. It is reported here (never inferred) so the caller
+  // can refuse to judge availability until it is gone AND two consecutive reads agree.
+  const spinnerCount = [...root.querySelectorAll('.ovui-spin__block')].filter(visible).length;
+  const rowSignature = rows.map(r => [r.text, r.checked === true ? 1 : r.checked === false ? 0 : 'u', r.labelDisabled === true ? 1 : 0].join('|')).join('~');
+  return { ok: true, rows, headerSelectAllCount: headers.length, headerLabelDisabled: headers.length === 1 ? disabledEl(headers[0]) : null, selectedCount: footer ? Number(footer[1]) : null, totalCount: footer ? Number(footer[2]) : null, batchButtonCount: batchBtns.length, batchEnabled, confirmButtonCount: buttons.length, panelProductIds, activeProductIds, spinnerCount, rowSignature };
+}
+
+// Hover-bound duplicate evidence for ONE account row of the CURRENTLY ACTIVE product panel.
+// The real duplicate copy "商品与该抖音号已存在商品投放计划" is NOT in the row text / title /
+// aria-label: the platform renders it in a floating tooltip that only appears after the
+// disabled ovui checkbox label is hovered. This callback therefore never greps the body:
+// it (1) re-proves the unique 为商品添加抖音号 drawer, (2) requires the target .panel to exist
+// exactly once AND to be the SINGLE active panel, (3) locates the ONE account row that owns
+// the exact account id and must not belong to another panel, (4) for 'hover' dispatches the
+// mouse events a human hover sends on that row's unique disabled label, and (5) for 'read'
+// returns only tooltip/popover nodes that are attributable to THIS label (inside the row, or
+// aria-describedby-linked to it, or anchored next to it) and never one living in another
+// product panel / another account row. 'leave' sends the matching leave events so the caller
+// can prove the tooltip did not stay behind. A gray/disabled checkbox alone is never copy.
+function bindingRowTooltipInPage(payload) {
+  const mode = String((payload && payload.mode) || 'snapshot');
+  const productId = String((payload && payload.productId) || '');
+  const accountId = String((payload && payload.accountId) || '');
+  const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
+  const txt = e => (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
+  const sel = '[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="drawer"],[class*="Drawer"],[class*="modal"],[class*="Modal"]';
+  const all = [...document.querySelectorAll(sel)].filter(visible);
+  const roots = all.filter(el => !all.some(o => o !== el && o.contains(el))).filter(e => /为商品添加抖音号/.test(txt(e)));
+  if (roots.length !== 1) throw new Error('tooltip-drawer-not-unique');
+  const root = roots[0];
+  if (!/^\d{15,20}$/.test(productId)) throw new Error('tooltip-product-id-invalid');
+  if (!/^[0-9A-Za-z_-]{4,32}$/.test(accountId)) throw new Error('tooltip-account-id-invalid');
+  const panelId = el => String((el.getAttribute && el.getAttribute('id')) || '');
+  const panels = [...root.querySelectorAll('.panel')].filter(visible);
+  if (panels.filter(el => panelId(el) === productId).length !== 1) throw new Error('tooltip-panel-not-unique');
+  const active = panels.filter(el => String(el.className || '').split(/\s+/).includes('active')).map(panelId).filter(Boolean);
+  if (active.length !== 1 || active[0] !== productId) throw new Error('tooltip-active-panel-mismatch');
+  const rows = [...root.querySelectorAll('tr,[role="row"],.ovui-table__row')].filter(visible).filter(r => !r.closest('thead') && !r.querySelector('th'));
+  const quoted = accountId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const idRe = new RegExp('(^|[^0-9A-Za-z_-])' + quoted + '([^0-9A-Za-z_-]|$)');
+  const matched = rows.filter(r => idRe.test(txt(r)));
+  if (matched.length !== 1) throw new Error('tooltip-account-row-not-unique');
+  const row = matched[0];
+  const rowPanel = row.closest ? row.closest('.panel') : null;
+  if (rowPanel && panelId(rowPanel) !== productId) throw new Error('tooltip-account-row-foreign-panel');
+  const boxes = [...row.querySelectorAll('input[type="checkbox"]')].filter(visible);
+  if (boxes.length !== 1) throw new Error('tooltip-checkbox-not-unique');
+  const label = boxes[0].closest('label');
+  if (!label) throw new Error('tooltip-label-missing');
+  const classOf = el => String((typeof el.className === 'string' ? el.className : (el.getAttribute && el.getAttribute('class'))) || '');
+  const disabled = /\bovui-checkbox--disabled\b/.test(classOf(label)) || (label.getAttribute && label.getAttribute('aria-disabled') === 'true') || label.disabled === true;
+  const tipSel = '[role="tooltip"],[class*="tooltip"],[class*="Tooltip"],[class*="popover"],[class*="Popover"]';
+  const near = el => {
+    const a = el.getBoundingClientRect(); const b = label.getBoundingClientRect();
+    if (!a.width || !a.height) return false;
+    // A floating tooltip is anchored to the hovered label: one row-height above/below it.
+    const vGap = Math.min(Math.abs(a.top - b.bottom), Math.abs(b.top - a.bottom), Math.abs(a.top - b.top));
+    return vGap <= 96;
+  };
+  const described = el => {
+    const refs = String((label.getAttribute && label.getAttribute('aria-describedby')) || '').split(/\s+/).filter(Boolean);
+    if (!refs.length) return false;
+    return refs.includes(String((el.getAttribute && el.getAttribute('id')) || ''));
+  };
+  const tips = () => [...document.querySelectorAll(tipSel)].filter(visible).filter(el => {
+    if (el === label || label.contains(el)) return false;
+    if (row.contains(el) || el.contains(label)) return true;
+    const p = el.closest ? el.closest('.panel') : null;
+    if (p && panelId(p) !== productId) return false;
+    const other = el.closest ? el.closest('tr,[role="row"],.ovui-table__row') : null;
+    if (other && other !== row) return false;
+    return described(el) || near(el);
+  });
+  if (mode === 'snapshot') return { ok: true, productId, accountId, disabled, tooltipCount: tips().length };
+  if (mode === 'hover' || mode === 'leave') {
+    const fire = type => {
+      let ev = null;
+      try { ev = new MouseEvent(type, { bubbles: true, cancelable: true }); }
+      catch (_) { try { ev = new Event(type, { bubbles: true }); } catch (__) { ev = null; } }
+      if (!ev || typeof label.dispatchEvent !== 'function') return;
+      try { label.dispatchEvent(ev); } catch (_) { /* a failed synthetic hover is never proof */ }
+    };
+    if (mode === 'hover') {
+      const before = tips().length;
+      fire('pointerover'); fire('mouseover'); fire('mouseenter'); fire('mousemove');
+      return { hovered: true, productId, accountId, before };
+    }
+    fire('mouseout'); fire('mouseleave'); fire('pointerout');
+    return { left: true, productId, accountId };
+  }
+  if (mode === 'read') {
+    const t = tips();
+    return { ok: true, present: t.length === 1, count: t.length, texts: t.map(txt).filter(Boolean).slice(0, 2), productId, accountId };
+  }
+  throw new Error('tooltip-mode-unknown');
 }
 
 // True only when the freshest binding snapshot shows a valid unique 1..2 (R32 min-1)
@@ -1629,6 +1953,28 @@ function bindingDrawerSnapshotInPage() {
 // unsettled partial and a fake selected2/footer2 can never pass. This is the identity
 // gate re-applied at every bounded wait and the final judgment, so a row id that changes
 // while the header/batch checkbox is landing cannot submit.
+// Pure readiness gate for a product panel inside the account drawer: the spinner must be
+// gone, the panel set must be EXACTLY the batch's 30 ids, the unique active must be the
+// expected product, and rows+footer must read a definite settled selection. A previous
+// panel's cached rows, an empty load, or a not-yet-loaded disabled row therefore fails
+// here and can never be misreported as "already planned / duplicated".
+function bindingPanelSettled(snap, expectedIds, activeId) {
+  if (!snap || snap.ok !== true) return false;
+  if (snap.spinnerCount !== 0) return false;
+  const ids = (expectedIds || []).map(String);
+  const pidList = Array.isArray(snap.panelProductIds) ? snap.panelProductIds.map(String) : [];
+  const uniq = [...new Set(pidList)];
+  if (pidList.length !== ids.length || uniq.length !== ids.length || !ids.every(id => uniq.includes(id))) return false;
+  if (!Array.isArray(snap.activeProductIds) || snap.activeProductIds.length !== 1) return false;
+  if (activeId != null && String(snap.activeProductIds[0]) !== String(activeId)) return false;
+  if (!Array.isArray(snap.rows) || snap.rows.length < 1 || snap.rows.length > 2) return false;
+  if (snap.rows.some(r => !Array.isArray(r.ids) || r.ids.length !== 1)) return false;
+  if (new Set(snap.rows.flatMap(r => r.ids).map(String)).size !== snap.rows.length) return false;
+  if (snap.rows.some(r => r.checked !== true && r.checked !== false)) return false;
+  const checked = snap.rows.filter(r => r.checked === true).length;
+  return snap.selectedCount === checked && snap.totalCount === 30;
+}
+
 function bindingAccountsSnapshotSettled(snap, expectedIds, productsPerPlan) {
   const cap = Number.isInteger(productsPerPlan) ? productsPerPlan : 30;
   if (!snap || snap.ok !== true) return false;
@@ -2173,6 +2519,95 @@ function cancelAutoOpenedDrawerInPage() {
   return {cancelled:true};
 }
 
+// Known cancel-confirm of the account drawer: after 取消 the platform can show
+// "确定要取消选择抖音号吗？ 不选择抖音号商品将无法正常进行投放，确定取消吗 再想想 确定".
+// Recognition is copy-bound and scoped to the unique visible drawer confirm root; the
+// 确定 must be the ONLY visible ENABLED button in that root. It never forces, never edits
+// disabled props and never clicks behind the overlay. Returning present/known lets the
+// driver decide; the POSITIVE close proof is a separate fresh read after the click.
+function accountDrawerCancelConfirmInPage(payload) {
+  const accountId = String((payload && payload.accountId) || '');
+  const mode = (payload && payload.mode) || 'snapshot';
+  const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
+  const txt = e => (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
+  const aavid = new URLSearchParams(String(location.search || '')).getAll('aavid');
+  const originOk = location.origin === 'https://qianchuan.jinritemai.com';
+  const pathOk = /^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(location.pathname);
+  if (!originOk || !pathOk || aavid.length !== 1 || aavid[0] !== accountId) {
+    throw new Error('cancel-confirm-page-not-authorized[origin=' + String(location.origin) + ',pathOk=' + pathOk + ',aavidCount=' + aavid.length + ',aavidMatch=' + (aavid.length === 1 && aavid[0] === accountId) + ']');
+  }
+  const sel = '[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="modal"],[class*="Modal"]';
+  const all = [...document.querySelectorAll(sel)].filter(visible);
+  const roots = all.filter(el => !all.some(o => o !== el && o.contains(el)));
+  const drawerRoots = roots.filter(e => /为商品添加抖音号/.test(txt(e)));
+  const confirmRoots = roots.filter(e => /确定要取消选择抖音号/.test(txt(e)) || /再想想/.test(txt(e)) && /取消选择抖音号/.test(txt(e)));
+  if (mode === 'snapshot') {
+    const known = confirmRoots.length === 1 && /确定要取消选择抖音号/.test(txt(confirmRoots[0])) && /再想想/.test(txt(confirmRoots[0])) && /确定取消吗/.test(txt(confirmRoots[0]));
+    return { present: confirmRoots.length > 0, known: known === true, count: confirmRoots.length, drawerPresent: drawerRoots.length === 1 };
+  }
+  if (confirmRoots.length !== 1) throw new Error('cancel-confirm-not-unique');
+  const root = confirmRoots[0];
+  const body = txt(root);
+  if (!/确定要取消选择抖音号/.test(body) || !/再想想/.test(body) || !/确定取消吗/.test(body)) throw new Error('cancel-confirm-copy-drift');
+  const buttons = [...root.querySelectorAll('button,[role="button"]')].filter(visible).filter(b => txt(b) === '确定');
+  if (buttons.length !== 1) throw new Error('cancel-confirm-button-not-unique');
+  const button = buttons[0];
+  if (button.disabled === true || button.getAttribute('aria-disabled') === 'true' || button.closest('[aria-disabled="true"],[disabled]')) throw new Error('cancel-confirm-button-not-enabled');
+  button.click();
+  return { clicked: true, via: 'known-cancel-confirm' };
+}
+
+// Known management-page obstructions (NOT business controls): the balance notice's
+// 我知道了 and the marketing popup's aria-label/title 关闭. Scope is the exact
+// management route + exact account, and the main business actions (投放乘方 / 开启货款
+// 直投 / 发布计划 / 下一步) are hard-forbidden as click targets. Any visible dialog that
+// exposes a close/知道了 control but does not match the known copy is UNKNOWN and stops
+// with zero clicks; a benign container without such controls is ignored.
+function managementObstructionActionInPage(payload) {
+  const accountId = String((payload && payload.accountId) || '');
+  const mode = (payload && payload.mode) || 'snapshot';
+  const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
+  const txt = e => (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
+  const aavid = new URLSearchParams(String(location.search || '')).getAll('aavid');
+  const originOk = location.origin === 'https://qianchuan.jinritemai.com';
+  const pathOk = /^\/(uni-prom\/overall|overall-prom)(\/|$)/.test(location.pathname);
+  if (!originOk || !pathOk || aavid.length !== 1 || aavid[0] !== accountId) {
+    throw new Error('management-obstruction-page-not-authorized[origin=' + String(location.origin) + ',pathOk=' + pathOk + ',aavidCount=' + aavid.length + ',aavidMatch=' + (aavid.length === 1 && aavid[0] === accountId) + ']');
+  }
+  const FORBIDDEN = ['投放乘方', '开启货款直投', '发布计划', '下一步'];
+  const sel = '[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="modal"],[class*="Modal"],[class*="popup"],[class*="Popup"]';
+  const all = [...document.querySelectorAll(sel)].filter(visible);
+  const roots = all.filter(el => !all.some(o => o !== el && o.contains(el)));
+  const found = [];
+  const unknown = [];
+  for (const root of roots) {
+    const body = txt(root);
+    const closeNodes = [...root.querySelectorAll('[aria-label],[title],button,[role="button"]')].filter(visible)
+      .filter(el => /^(关闭|close)$/i.test(String(el.getAttribute('aria-label') || el.getAttribute('title') || '')));
+    const ackButtons = [...root.querySelectorAll('button,[role="button"]')].filter(visible).filter(b => txt(b) === '我知道了');
+    const hasMain = FORBIDDEN.some(m => body.includes(m));
+    if (/余额|账户余额/.test(body) && ackButtons.length === 1 && !hasMain && closeNodes.length === 0) {
+      found.push({ kind: 'balance', content: body.slice(0, 120), control: ackButtons[0], label: '我知道了' });
+      continue;
+    }
+    if (/营销|广告/.test(body) && closeNodes.length === 1 && !hasMain && ackButtons.length === 0) {
+      found.push({ kind: 'marketing', content: body.slice(0, 120), control: closeNodes[0], label: '关闭' });
+      continue;
+    }
+    if (closeNodes.length > 0 || ackButtons.length > 0) unknown.push(body.slice(0, 120));
+    else if (hasMain) continue; // business surface, not an obstruction
+  }
+  if (unknown.length) {
+    if (mode === 'step') throw new Error('management-obstruction-unknown');
+    return { present: true, unknown: 'management-obstruction-unknown', known: 0, roots: [] };
+  }
+  if (mode === 'snapshot') return { present: found.length > 0, unknown: null, known: found.length, kinds: found.map(f => f.kind) };
+  if (found.length !== 1) throw new Error(found.length === 0 ? 'management-obstruction-absent' : 'management-obstruction-not-unique');
+  const target = found[0];
+  target.control.click();
+  return { clicked: true, kind: target.kind, label: target.label };
+}
+
 // Normal-draft navigation ONLY: switch the account drawer's active product by clicking the
 // single .panel whose id equals productId. It never touches a checkbox/input, never edits
 // disabled/props, and never fires a business API — it is the same click a human makes to move
@@ -2464,7 +2899,7 @@ function isAllowedGuidanceKey(key, accountId) {
 function guidanceActionInPage(payload) {
   const accountId = String((payload && payload.accountId) || '');
   const mode = (payload && payload.mode) || 'snapshot';
-  const ALLOWED = ['下一步', '我知道了', '知道了', '完成'];
+  const ALLOWED = ['下一步', '我知道了', '知道了', '完成', '跳过'];
   const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
   const txt = e => (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
   // Strict parameter semantics: exactly one aavid and it equals the verified
@@ -2504,13 +2939,29 @@ function guidanceActionInPage(payload) {
   const buttons = [];
   const scopes = [];
   const unknown = [];
+  // 跳过/下一步 may coexist in one real guide. A dismiss/close control has explicit
+  // priority (`跳过` → `我知道了` → `知道了` → `完成`); only when no unique dismiss label
+  // exists does a single `下一步` win. Two same-priority dismiss labels, or multiple
+  // 下一步 buttons, stay ambiguous and are reported unknown (zero click).
+  const DISMISS_PRIORITY = ['跳过', '我知道了', '知道了', '完成'];
+  const pickGuidanceButton = candidates => {
+    const known = candidates.filter(b => ALLOWED.indexOf(txt(b)) !== -1);
+    if (known.length === 1) return known[0];
+    if (known.length === 0) return null;
+    for (const label of DISMISS_PRIORITY) {
+      const same = known.filter(b => txt(b) === label);
+      if (same.length === 1) return same[0];
+      if (same.length > 1) return null;
+    }
+    return null;
+  };
   const masks = [...document.querySelectorAll('[class*="c-lib-guide-mask"]')].filter(visible);
   const maskRoots = masks.filter(el => !masks.some(o => o !== el && o.contains(el)));
   if (maskRoots.length > 1) unknown.push('guidance-root-duplicate');
   for (const mask of maskRoots.length === 1 ? maskRoots : []) {
     const candidates = [...mask.querySelectorAll('[class*="c-lib-guide-button"]')].filter(visible);
-    if (candidates.length !== 1) { unknown.push('guidance-unknown-root-shape'); continue; }
-    const button = candidates[0];
+    const button = pickGuidanceButton(candidates);
+    if (!button) { unknown.push('guidance-unknown-root-shape'); continue; }
     const label = txt(button);
     if (ALLOWED.indexOf(label) === -1) { unknown.push('guidance-unknown-root-shape'); continue; }
     roots.push({ order: roots.length, kind: 'clib', content: txt(mask), label, disabled: disabledWithin(mask, null, button) });
@@ -2539,8 +2990,8 @@ function guidanceActionInPage(payload) {
   }
   if (fireflyMatches.length > 1) unknown.push('guidance-root-duplicate');
   for (const match of fireflyMatches.length === 1 ? fireflyMatches : []) {
-    if (match.candidates.length !== 1) { unknown.push('guidance-unknown-root-shape'); continue; }
-    const button = match.candidates[0];
+    const button = pickGuidanceButton(match.candidates);
+    if (!button) { unknown.push('guidance-unknown-root-shape'); continue; }
     const label = txt(button);
     if (ALLOWED.indexOf(label) === -1) { unknown.push('guidance-unknown-root-shape'); continue; }
     roots.push({ order: roots.length, kind: 'firefly', content: txt(match.popper), label, disabled: disabledWithin(match.popper, match.host, button) });
@@ -2688,7 +3139,7 @@ async function runGuidanceOnPage(page, accountId, maxSteps = 8) {
     if (snap.unknown) throw new Error(String(snap.unknown));
     if (!snap.present) return { handled };
     if (handled.length >= maxSteps) throw new Error('guidance-step-limit-exceeded');
-    const root = snap.roots[0];
+    const root = snap.roots.find(r => ['跳过', '我知道了', '知道了', '完成'].includes(r.label)) || snap.roots[0];
     await page.evaluate(guidanceActionInPage, { mode: 'step', accountId, order: root.order, kind: root.kind, content: root.content, label: root.label });
     handled.push({ kind: root.kind, label: root.label });
     await until(
@@ -2922,6 +3373,20 @@ function createCatalogTransport(getPage, accountId) {
 
 function createRealDrivers(ctx) {
   let page = ctx.page || null;
+  // Last positively-read main table inside bindAccountsToAll. A failed bind must never
+  // swallow explicit per-product evidence: the wrapper below returns these rows plus the
+  // exact failedIds the platform already proved (no extra read, no guessed id).
+  let lastBindMainRows = null;
+  // Per-product panel evidence seen while binding (spinner state + row/tooltip text).
+  // A failed bind returns it so explicit 商品与该抖音号已存在商品投放计划 / 审核不通过 copy is
+  // never swallowed; a gray checkbox alone is still NOT duplicate evidence.
+  const lastBindPanelEvidence = new Map();
+  // Evidence lifecycle: every bindAccountsToAll call is one epoch for one account + one
+  // exact 30-id batch. Tooltip/panel evidence recorded in an earlier epoch (a previous
+  // batch, a previous authorization, a re-navigation) can never be merged into a later
+  // one, so a stale proof cannot outlive the batch that observed it.
+  let bindEvidenceEpoch = 0;
+  let bindEvidenceScope = null;
   const { managerPage, context, dayState, persist, publishedIds, attemptedSet, hints, accountId, opened, projectRoot, planNumber, runId } = ctx;
   // Per-shop business facts threaded into every serialized in-page helper. When a
   // caller (the legacy main / old tests) provides nothing, these fall back to the
@@ -2997,6 +3462,7 @@ function createRealDrivers(ctx) {
   const managementHydrateTimeoutMs = Number.isInteger(ctx.managementHydrateTimeoutMs) && ctx.managementHydrateTimeoutMs > 0 ? ctx.managementHydrateTimeoutMs : MANAGEMENT_HYDRATE_TIMEOUT_MS;
   const managementTabSettleTimeoutMs = Number.isInteger(ctx.managementTabSettleTimeoutMs) && ctx.managementTabSettleTimeoutMs > 0 ? ctx.managementTabSettleTimeoutMs : MANAGEMENT_TAB_SETTLE_TIMEOUT_MS;
   const successManagementReadTimeoutMs = Number.isInteger(ctx.successManagementReadTimeoutMs) && ctx.successManagementReadTimeoutMs > 0 ? ctx.successManagementReadTimeoutMs : SUCCESS_MANAGEMENT_READ_TIMEOUT_MS;
+  const managementRowCompleteTimeoutMs = Number.isInteger(ctx.managementRowCompleteTimeoutMs) && ctx.managementRowCompleteTimeoutMs > 0 ? ctx.managementRowCompleteTimeoutMs : 120000;
   // The completeness predicate is SHARED by the fallback cold-goto read and the R40
   // redirected-page direct read: a row is complete only when the name matches uniquely
   // (or >1 rows) with a legal new plan id and every required field actually present.
@@ -3022,6 +3488,29 @@ function createRealDrivers(ctx) {
       const msg = String((error && error.message) || '');
       return { ok: false, reason: /management-identity-hydrate-timeout/.test(msg) ? 'management-identity-hydrate-timeout' : 'management-identity-hydrate-failed' };
     }
+  }
+  // Bounded, read-then-one-click dismissal of the KNOWN management obstructions only
+  // (balance 我知道了 / marketing aria-label 关闭). The business page never becomes a
+  // tutorial button: unknown dialogs and every main action (投放乘方 / 开启货款直投 /
+  // 发布计划 / 下一步) stop with zero clicks. Max 3 known overlays, no timers, no retry
+  // services. Off unless the production wiring enables it.
+  async function dismissKnownManagementObstructions(expectedId) {
+    if (ctx.dismissObstructions !== true) return { dismissed: 0, enabled: false };
+    const dismissed = [];
+    for (let i = 0; i < 3; i++) {
+      let snap;
+      try { snap = await managerPage.evaluate(managementObstructionActionInPage, { mode: 'snapshot', accountId: String(expectedId) }); }
+      catch (error) { return { dismissed: dismissed.length, reason: String((error && error.message) || 'management-obstruction-read-failed') }; }
+      if (!snap) return { dismissed: dismissed.length, reason: 'management-obstruction-read-unsupported' };
+      if (snap.unknown) return { dismissed: dismissed.length, reason: String(snap.unknown) };
+      if (snap.present !== true) return { dismissed: dismissed.length };
+      let step;
+      try { step = await managerPage.evaluate(managementObstructionActionInPage, { mode: 'step', accountId: String(expectedId) }); }
+      catch (error) { return { dismissed: dismissed.length, reason: String((error && error.message) || 'management-obstruction-step-failed') }; }
+      if (!step || step.clicked !== true) return { dismissed: dismissed.length, reason: 'management-obstruction-not-dismissed' };
+      dismissed.push(step.kind);
+    }
+    return { dismissed: dismissed.length, reason: 'management-obstruction-bound-exceeded' };
   }
   // ── R36: bounded SPA list-stability settle (read-only, never a fixed sleep) ────
   // A fresh goto / sub-tab switch shows the previous tab's cached total (e.g. 1)
@@ -3803,17 +4292,38 @@ function createRealDrivers(ctx) {
       // seenProductIds/attempted/published, so no numeric restore is attempted.
       while(pageNo<dayState.cursor.page){const restored=await changePage({cat,native:isNativeScrollCategory(cat),selectedIds,baseSelectedCount,expectedCapacity});if(!restored.confirmed||restored.observedPage!==pageNo+1)throw new Error('cursor-restore-page-unconfirmed');pageNo=restored.observedPage;}
     }
+    // A repair round must really BROWSE FROM THE NEXT PAGE, not just carry a flag: when the
+    // caller requires forward progress on the SAME numeric category, the first page this run
+    // is allowed to SCAN is cursor.page+1. It is reached with the ordinary observed page
+    // step; a pagination boundary simply ends this category (the following category switch
+    // is itself the forward proof). The flag is therefore wired into the actual browse, not
+    // only into a final post-hoc check.
+    const requireForward=input.requireNextPage===true;
+    const cursorCategoryAtStart=String((dayState.cursor&&dayState.cursor.category)||'');
+    let forwardFloor=(requireForward&&!isNativeScrollCategory(cat)&&dayState.cursor&&Number.isInteger(dayState.cursor.page)&&dayState.cursor.page>=1)?dayState.cursor.page+1:1;
     for(;categoryIndex<ordered.length;categoryIndex++) {
       cat=ordered[categoryIndex];
       const native=isNativeScrollCategory(cat);
       const tab=native?catalogTabForCategory(cat):null;
       if(native&&!tab)throw new Error('native-category-tab-unknown:'+cat);
       let nativeAdvances=0;
+      // The next-page floor belongs ONLY to the category the cursor was left on; a
+      // different category starts at its own page 1 by definition.
+      if(String(cat)!==cursorCategoryAtStart)forwardFloor=1;
       if(categoryIndex!==Math.max(0,ordered.indexOf(dayState.cursor&&dayState.cursor.category))) { snap=await switchCategory(cat);pageNo=1; }
       else {
         if(!categoryIsActive(snap,cat))snap=await switchCategory(cat);
       }
       for(;;) {
+        // Execute the forward requirement as real browsing: step over the already-exhausted
+        // page(s) before scanning. A boundary here is an honest end of this category.
+        if(!native&&pageNo<forwardFloor){
+          const advanced=await changePage({cat,native,selectedIds,baseSelectedCount,expectedCapacity});
+          if(advanced&&advanced.boundary===true){forwardFloor=1;break;}
+          if(!advanced.confirmed||advanced.observedPage!==pageNo+1)throw new Error('repair-forward-page-unconfirmed');
+          pageNo=advanced.observedPage;
+          continue;
+        }
         // Bounded read-only settle first: a transient empty/duplicate DOM right after an open,
         // category switch or page advance must be given a chance to become a real complete unique
         // valid list before we act; genuine identity drift stops immediately. No tab re-click, no
@@ -3827,7 +4337,27 @@ function createRealDrivers(ctx) {
           // is never claimed for a native scroll category.
           dayState.category=cat;dayState.page=1;dayState.cursor={category:cat,page:1,seenProductIds:[...new Set([...(dayState.cursor.seenProductIds||[]),...cardIds])]};await persist(dayState);
         } else {
-          dayState.category=cat;dayState.page=pageNo;dayState.cursor={category:cat,page:pageNo,seenProductIds:[...new Set([...(dayState.cursor.seenProductIds||[]),...cardIds])]};await persist(dayState);
+          // Numeric pagination and native scroll stay separate. A numeric cursor may ONLY
+          // move on the platform's own observed page: a real category switch resets to
+          // page 1, an unchanged page is an id-only update, and any advance must be exactly
+          // previous+1 (advanceCatalogCursor). A skipped/rewound/unknown page throws BEFORE
+          // the durable cursor is written, so a later resume can never fabricate a page.
+          const seenIds=[...new Set([...(dayState.cursor.seenProductIds||[]),...cardIds])];
+          const prevCursor={category:dayState.cursor.category,page:dayState.cursor.page,nativeEof:dayState.cursor.nativeEof};
+          const prevPage=Number.isInteger(prevCursor.page)?prevCursor.page:1;
+          let nextCursor;
+          if(String(prevCursor.category)!==String(cat)){
+            const sw=wf.advanceCatalogCursor(prevCursor,{kind:'switch',category:cat});
+            if(!sw.ok)throw new Error('catalog-cursor-'+sw.reason);
+            nextCursor={...sw.cursor,page:pageNo,seenProductIds:seenIds};
+          } else if(pageNo===prevPage){
+            nextCursor={...prevCursor,category:cat,page:pageNo,seenProductIds:seenIds,nativeEof:false};
+          } else {
+            const adv=wf.advanceCatalogCursor(prevCursor,{kind:'numeric',observedPage:pageNo,expectedPage:prevPage});
+            if(!adv.ok)throw new Error('catalog-cursor-'+adv.reason);
+            nextCursor={...adv.cursor,seenProductIds:seenIds};
+          }
+          dayState.category=cat;dayState.page=pageNo;dayState.cursor=nextCursor;await persist(dayState);
         }
         const chosen=[];
         // S21/S23 position proof for this exact settled page: settleProductPage above has just
@@ -3944,10 +4474,44 @@ function createRealDrivers(ctx) {
   async function readMainTable() {
     const r=await page.evaluate(readMainTableInPage);if(!r.ok)throw new Error(r.reason);return r.rows;
   }
-  async function bindAccountsToAll({productIds}) {
+  // Bounded, PASSIVE stability read of the CURRENT 30 rows. The platform can raise a
+  // per-row 广告审核不通过 (or a duplicate marker) seconds after the first ready read;
+  // only two CONSECUTIVE identical row signatures held for the stability window count
+  // as settled. It performs zero clicks/scrolls/writes and never turns a timeout into
+  // "no review failure": an unstable window returns stable:false with the last rows so
+  // the caller's existing readiness gate stops honestly.
+  async function awaitMainTableStable({capacity}={}) {
+    const cap = Number.isInteger(capacity) ? capacity : 30;
+    const windowMs = Number.isInteger(ctx.reviewStableMs) && ctx.reviewStableMs > 0 ? ctx.reviewStableMs : 2500;
+    const sigOf = rows => rows.map(r => [r.productId, r.manualAccounts, r.manualEvidence === true ? 1 : r.manualEvidence === false ? 0 : 'u', r.autoPullOnly === true ? 1 : 0, r.reviewFailed === true ? 1 : 0, r.alreadyPlanned === true ? 1 : 0].join(':')).join('|');
+    const deadline = Date.now() + windowMs + 6000;
+    let lastRows = [];
+    let prevSig = null;
+    let reads = 0;
+    let sigSince = null;
+    while (Date.now() < deadline) {
+      const rows = await readMainTable();
+      reads++;
+      lastRows = rows;
+      const sig = sigOf(rows);
+      if (sig !== prevSig) { prevSig = sig; sigSince = Date.now(); }
+      if (sig === prevSig && sigSince !== null && Date.now() - sigSince >= windowMs && rows.length === cap) {
+        return { ok: true, rows, stableReads: reads, stable: true };
+      }
+      await sleep(500);
+    }
+    return { ok: false, rows: lastRows, stableReads: reads, stable: false, reason: 'main-table-not-stable' };
+  }
+  async function bindAccountsToAllInner({productIds}) {
     const ids=(productIds||[]).map(String);
     if(ids.length!==30||new Set(ids).size!==30) return {ok:false,reason:'product-ids-not-exactly-30'};
+    // Start a NEW evidence epoch for this exact account/batch: any previous panel proof is
+    // dropped before a single new read, so nothing from an older batch/authorization leaks.
+    bindEvidenceEpoch+=1;
+    bindEvidenceScope={epoch:bindEvidenceEpoch,accountId:String(accountId),ids:[...ids]};
+    lastBindPanelEvidence.clear();
     const rows=await readMainTable();
+    lastBindMainRows=rows;
     if(rows.length!==30||new Set(rows.map(r=>String(r.productId))).size!==30||rows.some(r=>!ids.includes(r.productId))||ids.some(id=>!rows.some(r=>String(r.productId)===id)))return {ok:false,reason:'main-table-does-not-match-selected-ids'};
     // R32 min-1: an anchor is any product whose main-table row shows at least 1 manual
     // account bound (1 or 2); the anchor's drawer may confirm 1 or 2 target accounts.
@@ -3982,6 +4546,7 @@ function createRealDrivers(ctx) {
     // (k=1 or 2), or checked-plus-disabled-unchecked at checked-count/30.
     const provePanelSet=s=>{
       if(!s||s.ok!==true) return null;
+      if(s.spinnerCount) return null;
       const pidList=Array.isArray(s.panelProductIds)?s.panelProductIds.map(String):[];
       const uniq=[...new Set(pidList)];
       if(pidList.length!==ids.length||uniq.length!==ids.length||!ids.every(id=>uniq.includes(id))) return null;
@@ -3996,7 +4561,7 @@ function createRealDrivers(ctx) {
       return pidList.length===ids.length&&uniq.length===ids.length&&ids.every(id=>uniq.includes(id));
     };
     const consistentSelectionState=s=>{
-      if(!s||s.ok!==true||!Array.isArray(s.rows)||s.rows.length<1||s.rows.length>2) return false;
+      if(!s||s.ok!==true||s.spinnerCount||!Array.isArray(s.rows)||s.rows.length<1||s.rows.length>2) return false;
       // R33: every displayed row must read a DEFINITE checkbox state (an unknown
       // checkbox — checked neither true nor false — is a hard reject, never treated
       // as unchecked). A settled selection is then any known checked subset 1..2 (the
@@ -4027,6 +4592,61 @@ function createRealDrivers(ctx) {
     // lets a drawer whose active is already a second legitimately-bound product be reused
     // directly.
     const isBoundManual2InBatch=pid=>rows.some(r=>String(r.productId)===String(pid)&&Number.isInteger(r.manualAccounts)&&r.manualAccounts>=1);
+    // Record only SETTLED per-product panel evidence (spinner gone). The copy is kept for
+    // the failure contract; a spinner/stale panel is never recorded as evidence.
+    const notePanelEvidence=s=>{
+      if(!s||s.ok!==true)return;
+      if(!Array.isArray(s.activeProductIds)||s.activeProductIds.length!==1)return;
+      if(s.spinnerCount)return;
+      const pid=String(s.activeProductIds[0]);
+      const text=(s.rows||[]).map(r=>String(r&&r.text||'')).join(' ').slice(0,400);
+      if(text)lastBindPanelEvidence.set(pid,{text,settled:true,epoch:bindEvidenceEpoch,accountId:String(accountId)});
+    };
+    const tooltipRowSig=s=>JSON.stringify((s&&Array.isArray(s.rows)?s.rows:[]).map(r=>[r&&r.ids,r&&r.checked,r&&r.labelDisabled]));
+    // A product is proven DUPLICATE only when EVERY one of its account rows is a disabled
+    // label AND that row's own post-hover tooltip carries the exact platform copy. Any
+    // enabled row (>=1 usable account) is normal binding, never a duplicate. The identity
+    // (unique active panel, exact 30-panel set, spinner gone, rows/footer/account ids) is
+    // re-proven before AND after each hover, so a stale panel, a residual tooltip, another
+    // product's popup or an unknown hover copy can never be recorded as proof.
+    async function proveDisabledActivePanelDuplicate(pid){
+      // Authorization scope of the hover proof: when the page exposes an absolute URL it
+      // must still be THIS account's creation route; a drifted tab can never donate proof.
+      try{
+        const u=new URL(page.url());
+        const aavid=new URLSearchParams(u.search||'').getAll('aavid');
+        if(u.origin!=='https://qianchuan.jinritemai.com'||!/^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(u.pathname)||aavid.length!==1||aavid[0]!==String(accountId))return {proven:false,reason:'tooltip-page-not-authorized'};
+      }catch(_){/* a non-absolute harness URL is not a drift proof */}
+      const base=await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null);
+      if(!base||base.ok!==true||base.spinnerCount!==0||!panelSetEqualsIds(base)||provePanelSet(base)!==String(pid))return {proven:false,reason:'tooltip-panel-identity-unverified'};
+      const prow=Array.isArray(base.rows)?base.rows:[];
+      if(prow.length<1||prow.length>2)return {proven:false,reason:'tooltip-row-set-unexpected'};
+      if(prow.some(r=>!Array.isArray(r.ids)||r.ids.length!==1))return {proven:false,reason:'tooltip-row-account-unknown'};
+      if(!prow.every(r=>r.labelDisabled===true))return {proven:false,reason:'tooltip-account-usable'};
+      if(base.totalCount!==30||base.selectedCount!==0)return {proven:false,reason:'tooltip-footer-unsettled'};
+      const sig0=tooltipRowSig(base),texts=[];
+      for(const r of prow){
+        const aid=String(r.ids[0]);
+        const pre=await page.evaluate(bindingRowTooltipInPage,{mode:'snapshot',productId:String(pid),accountId:aid}).catch(()=>null);
+        if(!pre||pre.ok!==true||pre.disabled!==true||pre.tooltipCount!==0)return {proven:false,reason:'tooltip-residual-or-unattributable'};
+        const hovered=await page.evaluate(bindingRowTooltipInPage,{mode:'hover',productId:String(pid),accountId:aid}).catch(()=>null);
+        if(!hovered||hovered.hovered!==true)return {proven:false,reason:'tooltip-hover-not-confirmed'};
+        let read=null;
+        try{ read=await until(()=>page.evaluate(bindingRowTooltipInPage,{mode:'read',productId:String(pid),accountId:aid}),x=>!!x&&x.ok===true&&x.present===true&&x.count===1,nativeTimeoutMs,'binding-row-tooltip-visible'); }
+        catch(_){ read=null; }
+        if(!read||read.present!==true||read.count!==1)return {proven:false,reason:'tooltip-not-uniquely-visible'};
+        const text=String((read.texts||[]).join(' ')).trim();
+        if(!text||!text.includes(wf.ALREADY_PLANNED_MARK))return {proven:false,reason:'tooltip-copy-not-duplicate'};
+        const post=await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null);
+        if(!post||post.ok!==true||post.spinnerCount!==0||!panelSetEqualsIds(post)||provePanelSet(post)!==String(pid)||tooltipRowSig(post)!==sig0||post.selectedCount!==0||post.totalCount!==30)return {proven:false,reason:'tooltip-identity-drift'};
+        texts.push(text);
+        await page.evaluate(bindingRowTooltipInPage,{mode:'leave',productId:String(pid),accountId:aid}).catch(()=>null);
+        const gone=await page.evaluate(bindingRowTooltipInPage,{mode:'snapshot',productId:String(pid),accountId:aid}).catch(()=>null);
+        if(!gone||gone.tooltipCount!==0)return {proven:false,reason:'tooltip-residual-after-leave'};
+      }
+      lastBindPanelEvidence.set(String(pid),{text:texts.join(' ').slice(0,300),settled:true,duplicate:true,accountIds:prow.map(r=>String(r.ids[0])),accountId:String(accountId),epoch:bindEvidenceEpoch});
+      return {proven:true,text:texts.join(' ').slice(0,300)};
+    }
     async function readDrawer() {
       // R63 bounded PASSIVE settle of the auto-opened drawer (read-only, zero clicks): wait
       // for ok+exactTwo PLUS a consistent selection state before returning a usable snapshot,
@@ -4053,8 +4673,17 @@ function createRealDrivers(ctx) {
         return true;
       };
       const fresh=()=>page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null);
-      const usable=s=>!!s&&s.ok===true&&exactTwo(s)&&consistentSelectionState(s);
-      try { return await until(fresh,x=>noteIdentity(x)&&usable(x),Math.min(nativeTimeoutMs,10000),'account-drawer-settled'); }
+      // A switched panel keeps the PREVIOUS panel's cached rows/disabled state until its own
+      // request lands. Availability may only be judged after the spinner is gone; production
+      // additionally requires two CONSECUTIVE identical snapshots (rows checked/disabled state,
+      // footer counts, active, spinner) so a stale-cache read can never be taken as settled.
+      // The stability gate is opt-in so legacy offline drivers keep their exact cadence.
+      const requireStability=ctx.requireDrawerStability===true;
+      let prevSig=null;
+      const signature=s=>JSON.stringify([s&&s.spinnerCount,s&&s.selectedCount,s&&s.totalCount,s&&s.activeProductIds,(s&&s.rows||[]).map(r=>[r&&r.ids,r&&r.checked,r&&r.labelDisabled]),s&&s.rowSignature]);
+      const stable=s=>{ if(!requireStability)return true; const sig=signature(s); const ok=prevSig!==null&&prevSig===sig; prevSig=sig; return ok; };
+      const usable=s=>!!s&&s.ok===true&&!s.spinnerCount&&exactTwo(s)&&consistentSelectionState(s);
+      try { return await until(fresh,x=>noteIdentity(x)&&usable(x)&&stable(x),Math.min(nativeTimeoutMs,10000),'account-drawer-settled'); }
       catch(_) { const fin=await fresh(); if(!trustedIdentity(fin))return fin; return noteIdentity(fin)?fin:null; }
     }
     async function reopenBoundAnchor() {
@@ -4062,9 +4691,35 @@ function createRealDrivers(ctx) {
       // Cancel the auto-opened unsaved drawer and require POSITIVE closed evidence before
       // opening the anchor management button — never click behind a lingering/unknown overlay.
       await page.evaluate(cancelAutoOpenedDrawerInPage).catch(()=>null);
+      // The platform's KNOWN cancel-confirm ("确定要取消选择抖音号吗？ … 再想想 确定") is
+      // handled here, after the ordinary 取消: exactly one visible enabled 确定 inside the
+      // unique known copy scope, one click, then a separate fresh close proof. An unknown
+      // confirm/copy drift aborts with zero further clicks (no force, no disabled edits).
+      let cancelConfirmed=false;
+      if(ctx.cancelConfirmHandling===true){
+        let seen=null;
+        try {
+          seen=await until(()=>page.evaluate(accountDrawerCancelConfirmInPage,{mode:'snapshot',accountId}),x=>!!x&&x.present===true,1500,'cancel-confirm-settle');
+        } catch(_) { seen=null; }
+        if(seen&&seen.present===true){
+          if(seen.known!==true||seen.count!==1)return null;
+          const step=await page.evaluate(accountDrawerCancelConfirmInPage,{mode:'step',accountId}).catch(()=>null);
+          if(!step||step.clicked!==true)return null;
+          cancelConfirmed=true;
+        }
+      }
+      const closed=async()=>{
+        const s=await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null);
+        if(!s||s.ok!==false||s.count!==0)return false;
+        if(ctx.cancelConfirmHandling===true){
+          const c=await page.evaluate(accountDrawerCancelConfirmInPage,{mode:'snapshot',accountId}).catch(()=>null);
+          if(!c||c.present!==false)return false;
+        }
+        return true;
+      };
       let closedEvid=false;
       try {
-        await until(()=>page.evaluate(bindingDrawerSnapshotInPage),x=>!!x&&x.ok===false&&x.count===0,6000,'auto-drawer-closed');
+        await until(closed,x=>x===true,6000,'auto-drawer-closed');
         closedEvid=true;
       } catch(_) { closedEvid=false; }
       // Timeout / null / unknown / multiple / still-open drawer => zero anchor-open, zero batch.
@@ -4150,6 +4805,7 @@ function createRealDrivers(ctx) {
     // drawer FIRST — never force a management-button click while a usable drawer is open,
     // and never click behind an overlay.
     let snap=await readDrawer();
+    notePanelEvidence(snap);
     // STEP 2 (supplement): with no usable auto drawer but a proven manual2 anchor, cancel the
     // auto-opened unsaved drawer, then uniquely open the anchor's management button.
     let reopenedInStep2=false;
@@ -4224,6 +4880,15 @@ function createRealDrivers(ctx) {
       const initialActive=batchAnchorId;
       const usableFor=(s,pid)=>s&&s.ok===true&&Array.isArray(s.activeProductIds)&&s.activeProductIds.length===1&&String(s.activeProductIds[0])===pid&&exactTwo(s)&&s.headerLabelDisabled===false&&Array.isArray(s.rows)&&s.rows.length>=1&&s.rows.length<=2&&s.rows.every(r=>r.ids.length===1&&r.checked===false)&&s.rows.some(r=>r.labelDisabled===false)&&s.selectedCount===0&&s.totalCount===30;
       let found=false;
+      // The initial panel is not re-clicked, but it still has to be judged: a fully
+      // disabled panel there can be a real duplicate product (its copy only exists in
+      // the hover tooltip), and only a per-account hover proof may record it.
+      const provenDuplicates=new Map();
+      const initialFullyDisabled=settledChecked(snap)===false&&Array.isArray(snap.rows)&&snap.rows.length>=1&&snap.rows.every(r=>r.labelDisabled===true);
+      if(initialFullyDisabled){
+        const dup=await proveDisabledActivePanelDuplicate(String(initialActive));
+        if(dup.proven===true) provenDuplicates.set(String(initialActive),dup.text);
+      }
       for(const pid of panelIds){
         if(pid===String(initialActive)) continue;
         let clk=null;
@@ -4233,6 +4898,7 @@ function createRealDrivers(ctx) {
         try {
           fresh=await until(()=>page.evaluate(bindingDrawerSnapshotInPage), s=>usableFor(s,pid), nativeTimeoutMs,'account-anchor-panel-usable');
         } catch(_) { fresh=await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null); }
+        notePanelEvidence(fresh);
         if(!fresh||fresh.ok!==true) return {ok:false,reason:'account-anchor-panel-readback-unknown'};
         // S26/S27：既有 consistentSelectionState(3338-3341) 与 3554 把页脚 selectedCount 视为当前唯一
         // active 商品"已勾选账号行数"的回读（全选→selectedCount=行数、全未选→0）；本页脚正则只捕获
@@ -4255,10 +4921,34 @@ function createRealDrivers(ctx) {
         if(!exactTwo(fresh)) return {ok:false,reason:'account-anchor-account-identity-drift'};
         const checkedCount=fresh.rows.filter(r=>r.checked===true).length;
         if(checkedCount>0&&!settledChecked(fresh)) return {ok:false,reason:'account-anchor-partial-selection'};
-        if(fresh.headerLabelDisabled===true||fresh.rows.every(r=>r.labelDisabled===true)) continue; // nothing selectable => next known candidate, never click a disabled checkbox
+        if(fresh.headerLabelDisabled===true||fresh.rows.every(r=>r.labelDisabled===true)){
+          // No account of this product is usable. That is a candidate for the REAL
+          // "already planned for this account" duplicate, but only the bounded hover
+          // proof above may say so; an unknown/gray panel is skipped with no proof.
+          const dup=await proveDisabledActivePanelDuplicate(pid);
+          if(dup.proven===true) provenDuplicates.set(pid,dup.text);
+          continue; // nothing selectable => next known candidate, never click a disabled checkbox
+        }
         snap=fresh; state=fresh.rows.map(r=>r.checked); fullyChecked=settledChecked(fresh); batchAnchorId=pid; found=true; break;
       }
-      if(!found) return {ok:false,reason:'account-anchor-no-usable-product'};
+      if(!found){
+        // Whole-batch duplicate: every one of the 30 products had EVERY account row
+        // individually hover-proven with the exact platform copy. Only then does the
+        // batch carry explicit per-product evidence for a whole-batch draft repair;
+        // 29/30 or an unknown/gray panel stays the original zero-removal stop.
+        const allDuplicated=panelIds.length===ids.length&&ids.every(id=>provenDuplicates.has(String(id)));
+        if(allDuplicated){
+          const evidenceRows=ids.map(id=>{
+            const baseRow=(rows||[]).find(r=>String(r.productId)===String(id));
+            const proof=provenDuplicates.get(String(id))||'';
+            const text=(String((baseRow&&baseRow.text)||'')+' '+proof).replace(/\s+/g,' ').trim().slice(0,600);
+            return {...(baseRow||{productId:String(id)}),text,alreadyPlanned:true,duplicateEvidence:'hover-tooltip'};
+          });
+          lastBindMainRows=evidenceRows;
+          return {ok:false,reason:'account-anchor-no-usable-product',rows:evidenceRows,failedIds:ids.slice(),duplicateProven:true};
+        }
+        return {ok:false,reason:'account-anchor-no-usable-product'};
+      }
     }
     // (no anchor + a usable unblocked 0/30, or an already-reopened STEP2 anchor still reading 0/30
     //  and unblocked) falls through to the single header select-all below.
@@ -4386,14 +5076,152 @@ function createRealDrivers(ctx) {
     try {
       final=await until(readMainTable,rs=>rs.length===30&&new Set(rs.map(r=>String(r.productId))).size===30&&ids.every(id=>rs.some(r=>String(r.productId)===id))&&rs.every(r=>(Number.isInteger(r.manualAccounts)&&r.manualAccounts>=1)||failedSet.has(String(r.productId))),15000,'manual-account-bind-readback');
     } catch(_) { return {ok:false,reason:'manual-account-bind-readback-does-not-match-recorded-outcome'}; }
+    lastBindMainRows=final;
     await guidancePhase();
     return {ok:true,accountIds:resolvedTargets.slice(),productCount:final.length,rows:final,partial:knownFailures,batchApplied:true,failedIds};
   }
-  async function repairDraft({removeIds,backfillCount,onProgress}) {
+  // Real bind driver contract: a failure is never returned as a bare "no usable anchor".
+  // The rows actually read for this batch are returned together with the exact ids whose
+  // CURRENT row carries explicit evidence (already planned / review failed / a definite
+  // zero manual count), so preparePlan can decide a whole-batch repair from real evidence
+  // instead of trusting a mock. An unknown/gray row is never added to failedIds.
+  async function bindAccountsToAll(input) {
+    const res = await bindAccountsToAllInner(input);
+    if (res && res.ok === true) return res;
+    const baseRows = Array.isArray(res && res.rows) && res.rows.length ? res.rows : (lastBindMainRows || []);
+    // Merge SETTLED panel evidence for the exact product. The mark must appear verbatim;
+    // labelDisabled/spinner alone never becomes alreadyPlanned.
+    const rows = (baseRows || []).map(r => {
+      const ev = r && r.productId ? lastBindPanelEvidence.get(String(r.productId)) : null;
+      // Only THIS batch's epoch/account evidence may be merged: a proof recorded for an
+      // earlier batch or a different authorization can never make a row removable.
+      if (!ev || ev.settled !== true || ev.epoch !== bindEvidenceEpoch || ev.accountId !== String(accountId)) return r;
+      const text = String(r.text || '') + ' ' + ev.text;
+      return {
+        ...r,
+        text,
+        alreadyPlanned: r.alreadyPlanned === true || text.includes(wf.ALREADY_PLANNED_MARK),
+        reviewFailed: r.reviewFailed === true || text.includes(wf.REVIEW_FAILED_MARK),
+        autoPullOnly: r.autoPullOnly === true,
+      };
+    });
+    const failedIds = [...new Set((rows || []).filter(r => r && r.productId
+      && (r.alreadyPlanned === true || r.reviewFailed === true || r.autoPullOnly === true
+        || (r.manualEvidence === true && Number.isInteger(r.manualAccounts) && r.manualAccounts < 1)))
+      .map(r => String(r.productId)))];
+    const readiness = rows && rows.length ? wf.evaluateReadiness(rows, productsPerPlan) : null;
+    return {
+      ...(res || {}),
+      ok: false,
+      reason: (res && res.reason) || 'native-binding-not-confirmed',
+      rows: rows || [],
+      failedIds,
+      bindingEvidence: {
+        proven: !!(readiness && readiness.uniqueCount === productsPerPlan
+          && readiness.unknownManualIds.length === 0 && failedIds.length === productsPerPlan
+          && rows.every(r => r.alreadyPlanned === true || r.reviewFailed === true || r.autoPullOnly === true)),
+        rowCount: rows ? rows.length : 0,
+        removable: failedIds.length,
+        unknown: readiness ? readiness.unknownManualIds.length : null,
+      },
+    };
+  }
+  // Before ANY draft product may be removed, the REAL account drawer that the failed batch
+  // left open has to be closed with POSITIVE proof. The drawer sits above the creation table,
+  // so removing "behind" it is exactly the incident's wrong-order failure. This reuses the
+  // SAME close contract as reopenBoundAnchor: one ordinary 取消, then the KNOWN copy-bound
+  // cancel-confirm (exactly one visible enabled 确定 inside the unique exact-copy root), then
+  // a fresh read proving BOTH the drawer and the confirm layer are gone and no other blocking
+  // overlay is left. Anything unknown / not unique / not enabled returns {ok:false} and the
+  // caller performs zero removals. When the page exposes no drawer at all, the same fresh
+  // reads still have to prove "0 drawer + 0 overlay" before proceeding.
+  async function closeAccountDrawerBeforeDraftRemoval() {
+    // Production scheduled runs set BOTH flags; legacy/unit fakes may set only one (or none).
+    // The legacy "no census => pre-R125 path" allowance exists ONLY for those fakes. When the
+    // production drawer contract is present, an unreadable census / unknown authorization URL
+    // is NOT a fake: it must fail closed with zero removals (Root S126 case 3).
+    const productionDrawerContract=ctx.cancelConfirmHandling===true&&ctx.requireDrawerStability===true;
+    const authorized=()=>{
+      let u=null;
+      try{ u=new URL(page.url()); }catch(_){ return null; }
+      const aavid=new URLSearchParams(u.search||'').getAll('aavid');
+      return u.origin==='https://qianchuan.jinritemai.com'
+        &&/^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(u.pathname)
+        &&aavid.length===1&&aavid[0]===String(accountId);
+    };
+    const auth=authorized();
+    if(auth!==true&&(auth===false||productionDrawerContract))return {ok:false,supported:true,reason:'draft-removal-page-not-authorized'};
+    let snap=null,supported=true;
+    try{ snap=await page.evaluate(bindingDrawerSnapshotInPage); }catch(_){ supported=false; }
+    // A harness/page that cannot even expose the drawer census keeps the pre-R125 path
+    // (no unconditional unknown evaluate is forced onto legacy fakes). Real pages always
+    // expose it, and any real read failure below fails closed.
+    if(supported!==true){
+      if(productionDrawerContract)return {ok:false,supported:true,reason:'account-drawer-census-unreadable-before-draft-removal'};
+      return {ok:true,supported:false};
+    }
+    if(snap&&snap.ok===false&&Number(snap.count)>0)return {ok:false,supported:true,reason:'account-drawer-not-unique-before-draft-removal'};
+    const drawerOpen=!!(snap&&(snap.ok===true||Number(snap.count)>0));
+    if(drawerOpen){
+      const cancelled=await page.evaluate(cancelAutoOpenedDrawerInPage).catch(()=>null);
+      if(!cancelled||cancelled.cancelled!==true){
+        // No unique enabled 取消 => cannot close => no removal at all.
+        return {ok:false,supported:true,reason:'account-drawer-not-cancellable-before-draft-removal'};
+      }
+      if(ctx.cancelConfirmHandling===true){
+        let seen=null;
+        try{ seen=await until(()=>page.evaluate(accountDrawerCancelConfirmInPage,{mode:'snapshot',accountId}),x=>!!x&&x.present===true,1500,'draft-removal-cancel-confirm-settle'); }
+        catch(_){ seen=null; }
+        if(seen&&seen.present===true){
+          if(seen.known!==true||seen.count!==1)return {ok:false,supported:true,reason:'draft-removal-cancel-confirm-unknown'};
+          const step=await page.evaluate(accountDrawerCancelConfirmInPage,{mode:'step',accountId}).catch(()=>null);
+          if(!step||step.clicked!==true)return {ok:false,supported:true,reason:'draft-removal-cancel-confirm-not-clicked'};
+        }
+      }
+    }
+    const closed=async()=>{
+      const s=await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null);
+      if(!s||s.ok!==false||Number(s.count)!==0)return false;
+      if(ctx.cancelConfirmHandling===true){
+        const c=await page.evaluate(accountDrawerCancelConfirmInPage,{mode:'snapshot',accountId}).catch(()=>null);
+        if(!c||c.present!==false)return false;
+      }
+      const ov=await page.evaluate(bindingOverlaySnapshotInPage).catch(()=>null);
+      if(!ov||ov.accountDrawerCount!==0||ov.blockingOverlayPresent!==false)return false;
+      const a=authorized();
+      return productionDrawerContract?a===true:a!==false;
+    };
+    try{ await until(closed,x=>x===true,6000,'draft-removal-drawer-closed'); }
+    catch(_){ return {ok:false,supported:true,reason:'account-drawer-not-proven-closed-before-draft-removal'}; }
+    return {ok:true,supported:true,drawerWasOpen:drawerOpen,closed:true};
+  }
+  async function repairDraft({removeIds,backfillCount,onProgress,failedIds,bindingRows,repairMode,requireNextPage,provenDuplicateIds}) {
+    // Proven bind failures and the ACTUAL main rows are provenance only: every removal
+    // below still requires explicit current-row evidence, so an unknown binding result
+    // (unauthorized account / unknown load / gray checkbox) can never delete a product.
+    if(repairMode==='whole-batch-removal'&&removeIds.length!==30)return {ok:false,reason:'whole-batch-removal-size-mismatch'};
+    if(repairMode==='partial-removal'&&removeIds.length>=30)return {ok:false,reason:'partial-removal-size-mismatch'};
+    const cursorBefore=dayState.cursor?{...dayState.cursor,seenProductIds:[...(dayState.cursor.seenProductIds||[])]}:null;
+    // A hover-tooltip duplicate proof belongs to THIS batch's exact product/account set; it
+    // is only accepted for an id that is still present in the fresh main table below.
+    const provenDuplicates=new Set((Array.isArray(provenDuplicateIds)?provenDuplicateIds:[]).map(String));
     const before=await readMainTable();
+    // Ordering is part of the safety contract: close the real drawer (positive proof) BEFORE
+    // the first product removal, never remove behind a modal. Zero drawer => the same fresh
+    // proof is still required; any unknown/not-unique/still-open state => zero removals.
+    if(removeIds.length){
+      const gate=await closeAccountDrawerBeforeDraftRemoval();
+      if(gate.ok!==true)return {ok:false,reason:gate.reason||'account-drawer-not-proven-closed-before-draft-removal'};
+    }
     for(const id of removeIds) {
       const row=before.find(r=>r.productId===String(id));
-      if(!row||!(row.autoPullOnly===true||row.manualEvidence===true&&Number.isInteger(row.manualAccounts)&&row.manualAccounts<1||row.reviewFailed))return {ok:false,reason:'removal-lacks-explicit-current-row-evidence:'+id};
+      if(!row)return {ok:false,reason:'removal-lacks-explicit-current-row-evidence:'+id};
+      const rowProven=row.autoPullOnly===true
+        ||(row.manualEvidence===true&&Number.isInteger(row.manualAccounts)&&row.manualAccounts<1)
+        ||row.reviewFailed===true
+        ||row.alreadyPlanned===true
+        ||provenDuplicates.has(String(id));
+      if(!rowProven)return {ok:false,reason:'removal-lacks-explicit-current-row-evidence:'+id};
       const removed=await page.evaluate(removeNativeCardInPage,{productId:String(id),accountId});
       await sleep(350);
       // 草稿删除后的引导浮窗只走**既有严格 guidance 身份/允许按钮**通道（未知一律不操作）；
@@ -4422,13 +5250,34 @@ function createRealDrivers(ctx) {
     const snap=await openPicker();
     const selected=dayState.lastSelected.map(String);
     if(selected.length!==30-removeIds.length||snap.selectedCount!==0||snap.remainingCapacity!==30-selected.length)throw new Error('post-removal-picker-selected-count-mismatch');
-    const result=await browseProducts({selectedIds:selected,needed:30-selected.length,hints,publishedSet:new Set(publishedIds),attemptedSet,cursor:dayState.cursor,categories:wf.CATEGORY_TAB_ORDER,onProgress});
+    const result=await browseProducts({selectedIds:selected,needed:30-selected.length,hints,publishedSet:new Set(publishedIds),attemptedSet,cursor:dayState.cursor,categories:wf.CATEGORY_TAB_ORDER,onProgress,requireNextPage:requireNextPage===true});
     if(!result.ok)return {ok:false,reason:result.reason,selectedCount:result.selectedIds.length,progress:result.selectedIds.length>selected.length};
     const newIds=result.selectedIds;
+    // requireNextPage is really executed, never a pass-through flag: a repair round may not
+    // reload the exact exhausted batch. The durable shop cursor may never rewind, and a
+    // WHOLE-BATCH round must additionally prove forward progress (numeric page advanced,
+    // category switched, or the native seen-set grew). The removed ids can never come back
+    // in the same round; attempted ids are persisted as a per-day set, never a re-pick.
+    if(requireNextPage===true){
+      const afterCursor=dayState.cursor||{};
+      const beforePage=Number.isInteger(cursorBefore&&cursorBefore.page)?cursorBefore.page:1;
+      const afterPage=Number.isInteger(afterCursor.page)?afterCursor.page:1;
+      const catChanged=!!cursorBefore&&String(afterCursor.category)!==String(cursorBefore.category);
+      const seenGrew=!!cursorBefore&&(afterCursor.seenProductIds||[]).length>(cursorBefore.seenProductIds||[]).length;
+      const removed=new Set(removeIds.map(String));
+      if(newIds.some(id=>removed.has(String(id))))return {ok:false,reason:'repair-reused-removed-ids'};
+      // A page number only means "rewound" INSIDE the same category. A legitimate category
+      // switch back to page 1 (from 全部 page 26 to 店铺新品 page 1) is forward browsing, not
+      // a rewind, and must not be rejected; the durable-cursor gate above already proved the
+      // switch itself was legal.
+      if(!catChanged&&afterPage<beforePage)return {ok:false,reason:'repair-cursor-rewound'};
+      if(repairMode==='whole-batch-removal'&&!catChanged&&!seenGrew&&afterPage<=beforePage)return {ok:false,reason:'repair-next-page-not-proven'};
+    }
+    dayState.lastSelected=newIds;dayState.hints=hints;dayState.attempted=[...attemptedSet];await persist(dayState);
     const rows=await readMainTable();
     if(rows.length!==30||new Set(rows.map(r=>String(r.productId))).size!==30||rows.some(r=>!newIds.includes(r.productId))||newIds.some(id=>!rows.some(r=>String(r.productId)===id)))return {ok:false,reason:'repair-final-rows-do-not-match-final-picker'};
     dayState.lastSelected=newIds;dayState.hints=hints;await persist(dayState);
-    return {ok:true,mainRows:rows,selectedCount:newIds.length,progress:true};
+    return {ok:true,mainRows:rows,selectedCount:newIds.length,progress:true,mode:repairMode||null,bindFailedIds:(failedIds||[]).map(String),backfillCount:Number.isInteger(backfillCount)?backfillCount:null};
   }
   async function configurePlan({businessDate}) {
     const obs=await observe();if(!obs.creation||obs.creation.accountId!==accountId||!obs.creation.mainTableUnique)return {ok:false,reason:'creation-settings-observation-incomplete'};
@@ -4559,17 +5408,41 @@ function createRealDrivers(ctx) {
     if(String(expectedAccountId||accountId)!==String(accountId))return {found:false,reason:'management-account-identity-unknown'};
     const settled=await settleManagementIdentity(accountId);
     if(!settled.ok)return {found:false,reason:settled.reason};
+    const obstruction=await dismissKnownManagementObstructions(accountId);
+    if(obstruction&&obstruction.reason&&obstruction.reason!=='management-obstruction-read-unsupported')return {found:false,reason:'management-obstruction-unknown'};
     const clicked=await managerPage.evaluate(ctx.clickSubTab('商品自选'));
     if(!clicked||clicked.clicked!==true)return {found:false,reason:'management-product-self-tab-not-found'};
-    let result;
-    try { result=await until(()=>managerPage.evaluate(readManagementRowsInPage,planName),managementRowComplete(accountId),120000,'management-row-complete'); }
-    catch(error) {
-      if(/management-row-complete-timeout/.test(String(error&&error.message||'')))return {found:false,reason:'management-row-or-required-fields-timeout'};
-      return {found:false,reason:'management-row-read-failed'};
+    const readOnce=async()=>{
+      try { return {result:await until(()=>managerPage.evaluate(readManagementRowsInPage,planName),managementRowComplete(accountId),managementRowCompleteTimeoutMs,'management-row-complete')}; }
+      catch(error) {
+        if(/management-row-complete-timeout/.test(String(error&&error.message||'')))return {reason:'management-row-or-required-fields-timeout'};
+        return {reason:'management-row-read-failed'};
+      }
+    };
+    let read=await readOnce();
+    // The SPA management list can keep serving its OLD cached rows (real evidence: 46
+    // rows with no same-name/new-id row right after a successful publish). ONE bounded,
+    // READ-ONLY reload of the SAME correct management page is allowed, followed by a
+    // full identity + tab + row re-read. It never re-publishes, re-finalizes, reopens,
+    // enables/stops or deletes, and it never accepts a row from another shop, an old
+    // plan or a fuzzy name: every gate below is the SAME exact-name/new-id contract.
+    let reloaded=false;
+    if(!read.result&&read.reason==='management-row-or-required-fields-timeout'&&typeof managerPage.reload==='function'){
+      try { await managerPage.reload({waitUntil:'domcontentloaded',timeout:60000}); } catch(_) { return {found:false,reason:'management-row-or-required-fields-timeout'}; }
+      const resettled=await settleManagementIdentity(accountId);
+      if(!resettled.ok)return {found:false,reason:resettled.reason};
+      const again=await dismissKnownManagementObstructions(accountId);
+      if(again&&again.reason&&again.reason!=='management-obstruction-read-unsupported')return {found:false,reason:'management-obstruction-unknown'};
+      const reclicked=await managerPage.evaluate(ctx.clickSubTab('商品自选'));
+      if(!reclicked||reclicked.clicked!==true)return {found:false,reason:'management-product-self-tab-not-found'};
+      read=await readOnce();
+      reloaded=!!read.result;
     }
+    if(!read.result)return {found:false,reason:read.reason||'management-row-read-failed'};
+    const result=read.result;
     if(result.accountId!==accountId)return {found:false,reason:'management-account-identity-drift'};
     if(result.rowCount!==1)return {found:true,uniqueRow:false,accountId,reason:'management-plan-name-not-unique'};
-    return {found:true,uniqueRow:true,accountId,...result.rows[0]};
+    return {found:true,uniqueRow:true,accountId,refreshed:reloaded,...result.rows[0]};
   }
   async function readCurrentShopEnableState() {
     try {
@@ -4655,6 +5528,8 @@ function createRealDrivers(ctx) {
       await managerPage.goto(managementUrl,{waitUntil:'domcontentloaded',timeout:60000});
       const settled=await settleManagementIdentity(accountId);
       if(!settled.ok)return {absenceConfirmed:false,absent:false,present:false,reason:settled.reason};
+      const obstruction=await dismissKnownManagementObstructions(accountId);
+      if(obstruction&&obstruction.reason&&obstruction.reason!=='management-obstruction-read-unsupported')return {absenceConfirmed:false,absent:false,present:false,reason:'management-obstruction-unknown'};
       const tab=await managerPage.evaluate(ctx.clickSubTab('商品自选'));
       if(!tab||tab.clicked!==true)return {absenceConfirmed:false,absent:false,present:false,reason:'absence-tab-not-confirmed'};
       if(typeof ctx.readShopRowsInPage!=='function'||typeof ctx.readShopPaginationInPage!=='function'||typeof ctx.goFirstShopPageInPage!=='function'||typeof ctx.goNextShopPageInPage!=='function')return {absenceConfirmed:false,absent:false,present:false,reason:'absence-read-contract-missing'};
@@ -4754,7 +5629,7 @@ function createRealDrivers(ctx) {
     if(obs.creation.commissionChecked!==true) await page.evaluate(ensureCommissionInPage);
     const fresh=await observe();
     return {header:{originOk:/^https:\/\/qianchuan\.jinritemai\.com$/.test(new URL(fresh.url).origin),accountId:fresh.creation.accountId,commissionOptionPresent:fresh.creation.commissionChecked===true},guidance:{handled:guidance.handled,flagsSaved:guidance.flagsSaved===true}};
-  },browseProducts,bindAccountsToAll,readMainTable,repairDraft,configurePlan,readFinalDialog,readModalLandscape,clickNativePublishPlan,awaitFinalDialog,readManagementRow,readManagementAbsence,readCurrentShopEnableState,readExistingPlanIds,saveCookies,commitPicker,observe,clickFinalConfirm:async({expectedText})=>page.evaluate(clickFinalConfirmInPage,expectedText),evaluate:(fn,arg)=>page.evaluate(fn,arg),get page(){return page;},get managerPage(){return managerPage;},get resolvedBoundAccounts(){return resolvedTargets?resolvedTargets.slice():null;},get guidancePrivateDir(){return ctx.guidancePrivateDir||null;}};
+  },browseProducts,bindAccountsToAll,readMainTable,awaitMainTableStable,repairDraft,configurePlan,readFinalDialog,readModalLandscape,clickNativePublishPlan,awaitFinalDialog,readManagementRow,readManagementAbsence,readCurrentShopEnableState,readExistingPlanIds,saveCookies,commitPicker,observe,clickFinalConfirm:async({expectedText})=>page.evaluate(clickFinalConfirmInPage,expectedText),evaluate:(fn,arg)=>page.evaluate(fn,arg),get page(){return page;},get managerPage(){return managerPage;},get resolvedBoundAccounts(){return resolvedTargets?resolvedTargets.slice():null;},get guidancePrivateDir(){return ctx.guidancePrivateDir||null;}};
 }
 
 function shanghaiPlanName(date, planNumber, nowMs) {
@@ -5527,14 +6402,14 @@ async function main() {
       if(wf.hasUnresolvedPlan(activeState))throw new Error('day-state-pending-or-unknown-read-only-recovery-required');
       dayState={...activeState,runId,businessDate:date,active:null,lastSelected:[]};
       const attemptedSet=new Set(dayState.attempted||[]);const hints={...(dayState.hints||{})};
-      const drivers=createRealDrivers({page:null,managerPage,context,dayState,persist,publishedIds,attemptedSet,hints,accountId:business.accountId,business,boundAccounts:business.boundAccounts||null,productsPerPlan:business.productsPerPlan,creationUrl:business.creationUrl,managementUrl:shopProfile.managementUrlFor(business),legacyBusiness:legacyDefault,guidancePrivateDir:guidanceScope.privateDir,opened,projectRoot:root,planNumber,runId,readAccountInPage:readChengfangAccountInPage,clickSubTab:clickChengfangSubTab,readShopRowsInPage:collectChengfangRowsInPage,readShopPaginationInPage:collectChengfangPaginationInPage,goFirstShopPageInPage:clickChengfangFirstPageInPage,goNextShopPageInPage:clickChengfangNextPageInPage});
+      const drivers=createRealDrivers({page:null,managerPage,context,dayState,persist,publishedIds,attemptedSet,hints,accountId:business.accountId,business,boundAccounts:business.boundAccounts||null,productsPerPlan:business.productsPerPlan,creationUrl:business.creationUrl,managementUrl:shopProfile.managementUrlFor(business),legacyBusiness:legacyDefault,guidancePrivateDir:guidanceScope.privateDir,opened,projectRoot:root,planNumber,runId,dismissObstructions:true,cancelConfirmHandling:true,requireDrawerStability:true,readAccountInPage:readChengfangAccountInPage,clickSubTab:clickChengfangSubTab,readShopRowsInPage:collectChengfangRowsInPage,readShopPaginationInPage:collectChengfangPaginationInPage,goFirstShopPageInPage:clickChengfangFirstPageInPage,goNextShopPageInPage:clickChengfangNextPageInPage});
       // The manager page/context and drivers are held for the complete run. Each
       // preparation creates its own fresh creation page and never carries an old
       // selected list or confirmation into the next plan.
       const prep=await wf.preparePlan({
         planNumber,runId,businessDate:date,dayState,business,publishedIds:[...publishedIds],publishedSet:publishedIds,
         requireRealDrivers:true,openCreationPage:drivers.openCreationPage,browseProducts:drivers.browseProducts,
-        bindAccountsToAll:drivers.bindAccountsToAll,readMainTable:drivers.readMainTable,repairDraft:drivers.repairDraft,
+        bindAccountsToAll:drivers.bindAccountsToAll,readMainTable:drivers.readMainTable,awaitMainTableStable:drivers.awaitMainTableStable,repairDraft:drivers.repairDraft,
         configurePlan:drivers.configurePlan,persistState:persist,hints,nowMs:Date.now(),
       });
       if(prep.status!=='ready-awaiting-confirmation') {
@@ -6049,6 +6924,7 @@ async function runScheduledPlan(businessInput, opts) {
       managementUrl: shopProfile.managementUrlFor(business), legacyBusiness: legacyDefault,
       guidancePrivateDir: guidanceScope.privateDir, opened, projectRoot: adapterRoot, planNumber, runId,
       readAccountInPage: readAccountFn, clickSubTab: clickSubTabFn,
+      dismissObstructions: true, cancelConfirmHandling: true, requireDrawerStability: true,
       readShopRowsInPage: readers.collectChengfangRowsInPage, readShopPaginationInPage: readers.collectChengfangPaginationInPage,
       goFirstShopPageInPage: readers.clickChengfangFirstPageInPage, goNextShopPageInPage: readers.clickChengfangNextPageInPage,
       awaitFinalDialogTimeoutMs: Number.isInteger(o.awaitFinalDialogTimeoutMs) ? o.awaitFinalDialogTimeoutMs : undefined,
@@ -6056,7 +6932,7 @@ async function runScheduledPlan(businessInput, opts) {
     const prep = await wf.preparePlan({
       planNumber, runId, businessDate, dayState, business, publishedIds: [...publishedIds], publishedSet: publishedIds,
       requireRealDrivers: true, openCreationPage: drivers.openCreationPage, browseProducts: drivers.browseProducts,
-      bindAccountsToAll: drivers.bindAccountsToAll, readMainTable: drivers.readMainTable, repairDraft: drivers.repairDraft,
+      bindAccountsToAll: drivers.bindAccountsToAll, readMainTable: drivers.readMainTable, awaitMainTableStable: drivers.awaitMainTableStable, repairDraft: drivers.repairDraft,
       configurePlan: drivers.configurePlan, persistState: persist, hints, nowMs: nowOf(),
       onPreparationDiagnostic: typeof o.onPreparationDiagnostic === 'function' ? o.onPreparationDiagnostic : (summary => { try { log('info', 'scheduled-readiness-summary ' + JSON.stringify(summary)); } catch (_) {} }),
     });
@@ -6125,15 +7001,29 @@ async function runScheduledPlan(businessInput, opts) {
     // 初始消费/点击前最后一道新鲜授权：任何漂移都在**任何点击与任何消费之前**停止。
     const driftBeforeInitial = policyDriftReason();
     if (driftBeforeInitial) {
-      preserveOwnedBrowser = true;
-      // 未发生任何消费/点击，因此这不是"未决发布"：把 ready-awaiting-confirmation 收口为
-      // preparation-stopped，用户重新启用后本日仍可继续，不会被只读恢复永久卡住。
+      const driftReason = 'scheduled-policy-drift-before-initial:' + driftBeforeInitial;
+      // 未发生任何消费/点击。R126: prove it from the ORIGINAL ready/frozen state + independent
+      // attempts store, then write the durable preparation closure (existing mapper contract:
+      // preparationClosure fact → scheduler in-lock close → unsubmitted/backoff). The frozen
+      // nonce/CID are preserved only as an audit disposition; they are never replayed and no
+      // consumption is fabricated. If the proof does not hold, stop and leave active untouched —
+      // never clear frozen first and then claim "no frozen".
+      let closure = null;
       try {
-        const latest = wf.loadDayState(STATE_FILE, businessDate);
-        latest.active = { status: 'preparation-stopped', planNumber, reason: 'scheduled-policy-drift-before-initial:' + driftBeforeInitial, at: new Date(nowOf()).toISOString() };
-        wf.persistDayState(STATE_FILE, latest); dayState = latest;
-      } catch (_) { /* 状态写失败不改变"零点击、零消费"的事实 */ }
-      return result('blocked', 'scheduled-policy-drift-before-initial:' + driftBeforeInitial, { planNumber, manifestHash: frozen.manifestHash, noAction: true, noReplay: true });
+        closure = applyProvenPreInitialPolicyCancelClose(STATE_FILE, ATTEMPTS_FILE, businessDate, {
+          reason: driftReason, source: 'scheduled-policy-cancel-before-initial',
+          shop: business && business.shop, accountId: business && business.accountId,
+        }, { nowMs: nowOf });
+      } catch (_) { closure = null; }
+      if (closure && closure.closed === true) {
+        log('warn', 'scheduled-policy-cancel-closed ' + closure.fact.planNumber + ' ' + closure.fact.runId + ' ' + driftReason);
+        return result('preparation-stopped', driftReason, {
+          planNumber: closure.fact.planNumber, businessDate, runId: closure.fact.runId,
+          preparationClosure: closure.fact, noAction: true, noReplay: true,
+        });
+      }
+      preserveOwnedBrowser = true;
+      return result('blocked', driftReason, { planNumber, manifestHash: frozen.manifestHash, noAction: true, noReplay: true });
     }
     const innerGate = typeof o.runPublishGate === 'function' ? o.runPublishGate : guard.runPublishPlan;
     let res;
@@ -7334,6 +8224,6 @@ async function closeExpiredScheduledKnownFinalUnsubmitted(deps) {
   }
 }
 
-module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,buildScheduledPreparationDiagnostic,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,resumeScheduledKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,closeExpiredScheduledKnownFinalUnsubmitted,main};
+module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,bindingPanelSettled,accountDrawerCancelConfirmInPage,managementObstructionActionInPage,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,provePreInitialPolicyCancelState,applyProvenPreInitialPolicyCancelClose,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,bindingRowTooltipInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,buildScheduledPreparationDiagnostic,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,resumeScheduledKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,closeExpiredScheduledKnownFinalUnsubmitted,main};
 
 if(require.main===module)main();

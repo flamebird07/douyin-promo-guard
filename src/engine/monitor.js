@@ -34,7 +34,7 @@ const { ChengfangRunner, defaultChengfangOpener } = require('./chengfang-runner'
 const { readQianchuanBalanceInPage, balanceCentsFromPageResult } = require('../adapters/chengfang-reader');
 const { resolvePollingConfig } = require('../lib/bounded-poll');
 const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed } = require('./chengfang-gate');
-const { perOrderDisplayText } = require('./rules');
+const { perOrderDisplayText, SPEND_FLOOR_CENTS } = require('./rules');
 const { decideAdSwitchAction, DECISION } = require('./ad-switch-decision');
 const { AdSwitchOrchestrator, createSwitchSerialGate } = require('./ad-switch-orchestrator');
 const { mapAdStateFromAdList, mapAdStateFromSwitchRows, normalizeAdState } = require('./ad-switch-state');
@@ -1175,6 +1175,14 @@ class Monitor {
     const orders = data && data.orders ? data.orders.valueCount : null;
     const rule = (this.config.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
     const thresholdCents = this._thresholdCents(shopCfg);
+    const evaluation = (data && data.evaluation) || null;
+    // 100 元保护/ROI 提示均由规则/决策投影，消费方（日志/页面）不重算金额。
+    const spendProtected = decision ? decision.spendProtected === true
+      : (evaluation ? evaluation.spendProtected === true : null);
+    const pauseEligible = decision ? decision.pauseEligible === true
+      : (evaluation ? evaluation.pauseEligible === true : false);
+    const roiTooLow = decision ? decision.roiTooLow === true
+      : (evaluation && status !== 'blocked' ? evaluation.roiTooLow === true : false);
     const rec = {
       cycleNo,
       trigger: this._currentCycle ? this._currentCycle.trigger : null,
@@ -1188,6 +1196,11 @@ class Monitor {
       overKnown: over !== null && over !== undefined,
       status,
       reason: reason || null,
+      // 100 元门槛投影：spendProtected=保护中；pauseEligible=>100 且严格超标；roiTooLow=仅提示不自动改 ROI
+      spendFloorCents: SPEND_FLOOR_CENTS,
+      spendProtected,
+      pauseEligible,
+      roiTooLow,
       // 决策层标签（metric/decision 分离；currentAdState 只来自本轮回读）
       currentAdState: currentAdState || null,
       metric: (decision && decision.metric) || null,
@@ -1455,6 +1468,12 @@ class Monitor {
       rt.lastError = null;
       rt.lastData = this._summarizeData(data);
       rt.lastDataAt = new Date(this.nowFn()).toISOString();
+      if (data.ok !== false && data.evaluation) {
+        rt.lastData.spendFloorCents = SPEND_FLOOR_CENTS;
+        rt.lastData.spendProtected = data.evaluation.spendProtected === true;
+        rt.lastData.pauseEligible = data.evaluation.pauseEligible === true;
+        rt.lastData.roiTooLow = data.evaluation.roiTooLow === true;
+      }
       // 只读回读广告状态（on/off/mixed/unknown）；失败 → unknown + blocked 说明
       const stateRead = await this._readCurrentAdState(shopCfg);
       this._applyBalanceToLastData(rt, stateRead);
@@ -1464,6 +1483,8 @@ class Monitor {
         : '只读清单/页面回读');
       if (stateRead.error) {
         rt.lastData.blockedReason = stateRead.error.reason;
+        rt.lastData.roiTooLow = false;
+        rt.lastData.pauseEligible = false;
         return {
           ok: true,
           readOnly: true,
@@ -2440,6 +2461,14 @@ class Monitor {
       rt.lastError = null;
       rt.lastData = this._summarizeData(data);
 
+      // 有效同日费用/订单的规则评估先投影 100 元门槛；后续决策以同值覆盖。
+      if (data.ok !== false && data.evaluation) {
+        rt.lastData.spendFloorCents = SPEND_FLOOR_CENTS;
+        rt.lastData.spendProtected = data.evaluation.spendProtected === true;
+        rt.lastData.pauseEligible = data.evaluation.pauseEligible === true;
+        rt.lastData.roiTooLow = data.evaluation.roiTooLow === true;
+      }
+
       if (data.ok === false) {
         rt.lastData.blockedReason = data.reason;
         this._emitJudgement(shopCfg, { data, over: null, status: 'blocked', reason: data.reason });
@@ -2456,8 +2485,8 @@ class Monitor {
         return { status: 'blocked', reason: scopeBlockedReason };
       }
 
-      // 4) 执行时间窗口（超标=暂停意图）：窗口外不打开执行会话，直接 window_blocked
-      if (data.evaluation.over === true && !isAfterDailyStart(this.nowFn(), this.config.schedule.dailyStartHour)) {
+      // 4) 执行时间窗口（暂停资格=暂停意图；100 元保护区内不构成意图）：窗口外不打开执行会话，直接 window_blocked
+      if (data.evaluation.pauseEligible === true && !isAfterDailyStart(this.nowFn(), this.config.schedule.dailyStartHour)) {
         const hh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
         const reason = `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：已读取并记录，未执行真实关闭（手动检查不绕过时间限制）`;
         this.schedule.lastWindowBlockReason = reason;
@@ -2476,6 +2505,9 @@ class Monitor {
       if (stateRead.error) {
         const err = stateRead.error;
         rt.lastData.blockedReason = err.reason;
+        // 本轮没有可信决策 → 不保留上一轮的 ROI 提示（避免陈旧警告）
+        rt.lastData.roiTooLow = false;
+        rt.lastData.pauseEligible = false;
         // 失败/unknown：只读观测，不得伪称动作确认；旧确认时间随观测失效
         this._applyObservedAdState(shopCfg.id, 'unknown', `只读回读失败：${err.reason || 'unknown'}`);
         this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: err.reason }, undefined, 'error');
@@ -2502,6 +2534,11 @@ class Monitor {
         currentAdState,
         identityOk: true,
       });
+      // 同店同日有效判定 → 页面/日志的 100 元保护与 ROI 提示投影（不由 UI 重算）
+      rt.lastData.spendFloorCents = SPEND_FLOOR_CENTS;
+      rt.lastData.spendProtected = decision.spendProtected === true;
+      rt.lastData.pauseEligible = decision.pauseEligible === true;
+      rt.lastData.roiTooLow = decision.roiTooLow === true;
 
       // 每周期一条判断
       this._emitJudgement(shopCfg, {
@@ -2540,6 +2577,9 @@ class Monitor {
         decision: decision.decision,
         metric: decision.metric,
         currentAdState,
+        spendProtected: decision.spendProtected === true,
+        pauseEligible: decision.pauseEligible === true,
+        roiTooLow: decision.roiTooLow === true,
         reason: decision.reason,
       };
     } catch (e) {
@@ -3203,6 +3243,9 @@ class Monitor {
       const dateRec = (this.batches[s.id] && this.batches[s.id][today]) || null;
       const enableRec = this.getEnablePhaseRecord(s.id, today);
       const thresholdCents = this._thresholdCents(s);
+      // 同店同日有效投影：跨日/上一日数据不得把 ROI 提示带进今天。
+      const todayData = rt.lastData || null;
+      const todaySameDay = !!(todayData && todayData.businessDate === today);
       return {
         id: s.id,
         name: s.name || null,
@@ -3220,6 +3263,11 @@ class Monitor {
         lastError: rt.lastError || null,
         today: rt.lastData || null,
         lastDataAt: rt.lastDataAt || (rt.lastData && rt.lastData.fetchedAt) || null,
+        // 100 元门槛：只展示同店同日有效投影，不把 null 当 0 重算
+        spendFloorCents: SPEND_FLOOR_CENTS,
+        spendProtected: todaySameDay ? todayData.spendProtected === true : null,
+        pauseEligible: todaySameDay ? todayData.pauseEligible === true : false,
+        roiTooLow: !!(todaySameDay && todayData.roiTooLow === true),
         lastAdState: rt.lastAdState || null,
         // 证据时间语义分离：动作确认 vs 只读观测；互斥（观测覆盖后旧确认失效）
         adStateConfirmedAt: rt.adStateConfirmedAt || null,
@@ -3301,6 +3349,11 @@ class Monitor {
           balanceAt: t && t.balanceAt ? t.balanceAt : null,
           thresholdCents: this._thresholdCents(s),
           over: t ? t.over === true : null,
+          // 同店同日 100 元保护/ROI 提示投影（t.businessDate 必须等于今日）
+          spendFloorCents: SPEND_FLOOR_CENTS,
+          spendProtected: (t && t.businessDate === today) ? t.spendProtected === true : null,
+          pauseEligible: (t && t.businessDate === today) ? t.pauseEligible === true : false,
+          roiTooLow: !!(t && t.businessDate === today && t.roiTooLow === true),
           lastError: rt.lastError || (t && t.blockedReason) || null,
           // 状态供界面兼容；正常配置店铺不显示待核验标记。
           identityPending: this._shopIdentityState(s).pending,

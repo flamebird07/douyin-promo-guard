@@ -341,6 +341,12 @@ class ChengfangRunner {
       this.audit({ ...base, step: 'pre-batch-revalidate', ok: false, blocked: fresh.blocked, reason: fresh.reason });
       return { outcome: 'blocked', reason: `操作前重新核实被阻止：${fresh.reason}`, counts, pre, batchDate };
     }
+    if (fresh.evaluation.spendProtected === true) {
+      const reason = `操作前重新核实：当天消耗 ${fresh.cost.valueCents} 分 ≤ 10000 分（100 元），按 100 元保护取消暂停（零请求）。${fresh.evaluation.reason}`;
+      this.audit({ ...base, step: 'pre-batch-revalidate', ok: true, cancelled: true, spendProtected: true, reason });
+      counts.cancelled = 1;
+      return { outcome: 'cancelled', reason, counts, pre, batchDate };
+    }
     if (!fresh.evaluation.over) {
       const reason = `操作前重新核实：已不超标，取消暂停。${fresh.evaluation.reason}`;
       this.audit({ ...base, step: 'pre-batch-revalidate', ok: true, cancelled: true, reason });

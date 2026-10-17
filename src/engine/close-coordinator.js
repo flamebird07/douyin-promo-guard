@@ -216,8 +216,10 @@ class WholeShopCloseCoordinator {
       this.audit({ ...base, step: 'pre-batch-revalidate', ok: false, blocked: fresh.blocked, reason: fresh.reason });
       return { outcome: 'blocked', reason: `操作前重新核实被阻止：${fresh.reason}`, counts, pre };
     }
-    if (!fresh.evaluation.over) {
-      const reason = `操作前重新核实：已不超标，取消关闭。${fresh.evaluation.reason}`;
+    if (!fresh.evaluation.pauseEligible) {
+      const reason = fresh.evaluation.spendProtected === true
+        ? `操作前重新核实：当天消耗 ${fresh.cost.valueCents} 分 ≤ 10000 分（100 元），按 100 元保护取消暂停（旧决策作废，零暂停）。${fresh.evaluation.reason}`
+        : `操作前重新核实：已不超标，取消关闭。${fresh.evaluation.reason}`;
       this.audit({ ...base, step: 'pre-batch-revalidate', ok: true, cancelled: true, reason });
       counts.cancelled = 1;
       return { outcome: 'cancelled', reason, counts, pre };

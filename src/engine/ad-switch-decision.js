@@ -23,10 +23,16 @@
  *   - equal + mixed → equal_no_action
  * identityOk 必须严格 === true 才通过；缺失/null/字符串一律 data_blocked。
  * unknown / 数据异常 / 身份不匹配 / 零订单 / 乘法溢出 → fail-closed，零点击。
+ *
+ * 100 元保护（客户 2026-10-17）：
+ * - spendProtected = costCents <= 10000（100.00 元）→ 任何方向都不得自动暂停；
+ * - pauseEligible / roiTooLow = costCents > 10000 且 metric 严格 above；
+ * - 保护区内原本会暂停的 on/mixed 一律零动作（spend_protected），且不强制重开原 off；
+ * - 低于阈值仍按原语义 should_enable；等于阈值 on/off/mixed 仍 equal_no_action（公共库既有语义保留）。
  */
 
 const { DataGuardError } = require('../lib/errors');
-const { evaluateWholeShopCostPerOrder } = require('./rules');
+const { evaluateWholeShopCostPerOrder, SPEND_FLOOR_CENTS } = require('./rules');
 
 const AD_STATES = new Set(['on', 'off', 'mixed', 'unknown']);
 
@@ -44,6 +50,7 @@ const DECISION = Object.freeze({
   ALREADY_ON: 'already_on',
   ALREADY_OFF: 'already_off',
   EQUAL_NO_ACTION: 'equal_no_action',
+  SPEND_PROTECTED: 'spend_protected',
   UNKNOWN_BLOCKED: 'unknown_blocked',
   DATA_BLOCKED: 'data_blocked',
 });
@@ -59,6 +66,7 @@ const DECISIONS = Object.freeze({
   ALREADY_OFF: DECISION.ALREADY_OFF,
   SHOULD_ENABLE: DECISION.SHOULD_ENABLE,
   SHOULD_PAUSE: DECISION.SHOULD_PAUSE,
+  SPEND_PROTECTED: DECISION.SPEND_PROTECTED,
   UNKNOWN_BLOCKED: DECISION.UNKNOWN_BLOCKED,
   DATA_BLOCKED: DECISION.DATA_BLOCKED,
 });
@@ -97,6 +105,10 @@ function decideAdSwitchAction({
     thresholdCents: Number.isSafeInteger(thresholdCents) ? thresholdCents : null,
     expectedCents: null,
     adStateSource,
+    spendFloorCents: SPEND_FLOOR_CENTS,
+    spendProtected: null,
+    pauseEligible: false,
+    roiTooLow: false,
   };
 
   // 1) 身份：必须严格 === true
@@ -175,12 +187,21 @@ function decideAdSwitchAction({
   else metric = METRIC.ABOVE;
   base.metric = metric;
 
+  // 100 元门槛：保护区内一律无暂停资格；严格超标且 >100 元才允许暂停/提示 ROI 过低。
+  const spendProtected = costCents <= SPEND_FLOOR_CENTS;
+  base.spendProtected = spendProtected;
+  base.pauseEligible = metric === METRIC.ABOVE && !spendProtected;
+  base.roiTooLow = base.pauseEligible;
+
   // 6) 当前状态 unknown → 阻止（不因超标绕过）
   if (!AD_STATES.has(currentAdState) || currentAdState === 'unknown') {
     return {
       ...base,
       decision: DECISION.UNKNOWN_BLOCKED,
       blocked: 'unknown_ad_state',
+      // 状态未知不是有效决策：不把 ROI 提示当作已确认事实
+      roiTooLow: false,
+      pauseEligible: false,
       reason: '当前广告状态为 unknown（或未提供）：fail-closed，零点击；历史 adBelief 不得代替当前状态',
     };
   }
@@ -219,6 +240,18 @@ function decideAdSwitchAction({
       reason: currentAdState === 'mixed'
         ? `低于阈值且当前 mixed：仅开启 off 项（should_enable）（${evalR.reason}）`
         : `低于阈值且当前为 off：需要开启（should_enable）（${evalR.reason}）`,
+    };
+  }
+
+  // 8b) 高于阈值但仍在 100 元保护区内：零暂停、零强制开关，如实标记 spend_protected。
+  if (spendProtected) {
+    return {
+      ...base,
+      decision: DECISION.SPEND_PROTECTED,
+      targetState: currentAdState,
+      action: null,
+      zeroClick: true,
+      reason: `高于费比阈值（${evalR.reason}）；但当天消耗 ${costCents} 分 ≤ ${SPEND_FLOOR_CENTS} 分（100 元）：100 元保护生效，本轮不暂停（当前 ${currentAdState} 保持，不强制重开/关闭）`,
     };
   }
 

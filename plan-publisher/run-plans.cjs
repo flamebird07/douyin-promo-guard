@@ -694,6 +694,12 @@ function provePreInitialPolicyCancelState(stateFile, attemptsFile, businessDate,
   const RECOGNIZED = new Set(['pending', 'dispatched', 'unknown', 'success', 'failed']);
   for (const mapName of ['consumed', 'finalConsumed', 'reopenConsumed']) {
     const m = attempts[mapName];
+    // S127: `consumed` is the guard store's REQUIRED map; `finalConsumed` / `reopenConsumed` are
+    // optional and a legitimate legacy store simply omits the ones it never used (guard's own
+    // loader treats an absent optional map as an empty store). Only an ABSENT optional map is
+    // read as empty here; null / array / scalar stays malformed, and `consumed` staying absent
+    // stays malformed. This is a read-only proof: nothing is ever written back to the source.
+    if (m === undefined && mapName !== 'consumed') continue;
     if (!m || typeof m !== 'object' || Array.isArray(m)) return { ok: false, reason: 'policy-cancel-attempts-malformed' };
     for (const rec of Object.values(m)) {
       if (!rec || typeof rec !== 'object' || Array.isArray(rec)

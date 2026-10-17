@@ -99,6 +99,25 @@
   ready/frozen → 零消费收口、无 runId legacy 不编造、已消费/已清 frozen/manifest 被改
   拒绝且源字节零改动、release 后 tick 只补 3 份缺额且旧 nonce 不进入账本。
 
+## R127 可选 attempts 表的合法缺省
+
+- **背景**：S126 已验收；新后台正式恢复仍被
+  `release-proof-not-established:policy-cancel-attempts-malformed` 拒绝，零广告动作、
+  零账本修改。实际店铺 attempts 文件 schema 为 `consumed`（19 条历史）+
+  `finalConsumed`（19 条历史），`reopenConsumed` 从未使用因此键不存在（undefined），
+  不是损坏；guard `loadAttemptsStore` 本身也把 `finalConsumed` / `reopenConsumed`
+  视为可选，只在**存在**时要求非 null、非数组的对象。
+- **补丁**：仅 `provePreInitialPolicyCancelState` 的 attempts 结构检查与 guard 语义对齐：
+  `consumed` 仍是必需合法对象；`finalConsumed` / `reopenConsumed` **键缺失**时按空表
+  做只读零消费证明。null / array / scalar 仍 malformed；缺失/undefined 的 `consumed`
+  仍 malformed；当日记录、非空历史、record 字段校验、同日消费/未决/跨店/源码 hash/
+  nonce/CID/锁/配置等门禁全部不变。证明只读，绝不把空表写回源文件制造“合法”，
+  也不清账本、nonce 或状态。
+- **离线验证**：`flow-hardening-r123.test.cjs` 追加两例（原 29 例保留）：19+19 历史且
+  `reopenConsumed` 缺失、双可选表缺失、三表皆空均证明 ok 且源字节不变；optional
+  null/array/scalar/number、required 缺失/null/array/scalar、当日记录、坏历史记录
+  均被拒绝且源字节不变。
+
 ## 入口接线（R124）
 
 日常 `runScheduledPlan` 与手动 `main` 都向 `preparePlan` 传

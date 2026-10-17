@@ -793,3 +793,102 @@ test('R126 a production unknown authorization URL never defaults to allow', asyn
   assert.equal(res.reason, 'draft-removal-page-not-authorized');
   assert.deepEqual(h.calls, [], 'an unknown production URL performs zero removals');
 });
+
+// ── 15. S127: legacy attempts stores that legitimately omit unused optional maps ─
+// The guard store requires `consumed`; `finalConsumed` / `reopenConsumed` are optional and an
+// existing legacy file may simply not contain them. The pre-initial policy-cancel proof must
+// read an ABSENT optional map as empty (never rewrite it into the source), while null / array /
+// scalar optional values and a missing required `consumed` stay malformed.
+const S127fs = require('node:fs');
+const S127os = require('node:os');
+const S127path = require('node:path');
+const S127_CANCEL = 'scheduled-policy-drift-before-initial:policy-disabled-or-not-autoconfirmed';
+const S127_SHOP = '敏敏高定私服';
+const S127_ACCOUNT = '1696626252631053';
+const S127_DATE = '2026-10-17';
+
+function s127HistoryRecord(planNumber, status) {
+  return { status: status || 'success', businessDate: '2026-10-16', planNumber,
+    runId: 'plan-scheduler-2026-10-16-0123456789abcdef', manifestHash: 'ab'.repeat(32) };
+}
+function s127Store() {
+  const store = { consumed: {}, finalConsumed: {} };
+  for (let i = 1; i <= 19; i += 1) {
+    store.consumed['closed-' + i] = s127HistoryRecord(i);
+    store.finalConsumed['closed-' + i] = s127HistoryRecord(i);
+  }
+  return store;
+}
+function s127State() {
+  const state = wf.newDayState(S127_DATE);
+  state.active = { status: 'preparation-stopped', planNumber: 1, reason: S127_CANCEL,
+    businessDate: S127_DATE, shop: S127_SHOP, accountId: S127_ACCOUNT };
+  return state;
+}
+function s127WithFiles(mutateStore, fn) {
+  const dir = S127fs.mkdtempSync(S127path.join(S127os.tmpdir(), 'r127-legacy-'));
+  const stateFile = S127path.join(dir, 'plan-publisher-state.json');
+  const attemptsFile = S127path.join(dir, 'plan-publication-attempts.json');
+  const store = s127Store();
+  mutateStore(store);
+  S127fs.writeFileSync(stateFile, JSON.stringify(s127State(), null, 2));
+  S127fs.writeFileSync(attemptsFile, JSON.stringify(store, null, 2));
+  try { return fn(stateFile, attemptsFile); } finally { S127fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+test('R127 absent optional attempts maps prove zero reuse read-only; historical records and source bytes stay intact', () => {
+  for (const mode of ['reopen-omitted-with-history', 'both-optional-omitted', 'all-three-empty-maps']) {
+    s127WithFiles((store) => {
+      if (mode !== 'all-three-empty-maps') delete store.reopenConsumed;
+      if (mode === 'both-optional-omitted') delete store.finalConsumed;
+      if (mode === 'all-three-empty-maps') { store.consumed = {}; store.finalConsumed = {}; store.reopenConsumed = {}; }
+    }, (stateFile, attemptsFile) => {
+      const before = S127fs.readFileSync(attemptsFile, 'utf8');
+      const res = rp.provePreInitialPolicyCancelState(stateFile, attemptsFile, S127_DATE,
+        { planNumber: 1, shop: S127_SHOP, accountId: S127_ACCOUNT });
+      assert.equal(res.ok, true, mode + ': ' + JSON.stringify(res));
+      assert.equal(res.proof.method, 'pre-initial-policy-cancel');
+      assert.deepEqual(res.proof.zeroConsumptionProof, {
+        initialConsumptions: 0, finalConsumptions: 0, reopenConsumptions: 0,
+        manualUnresolved: 0, plansContainsNumber: false, confirmationConsumptionsRecorded: false,
+      });
+      assert.equal(res.proof.sourceHash, rp.preOpenSourceHash(S127fs.readFileSync(stateFile, 'utf8'), before));
+      assert.equal(Object.prototype.hasOwnProperty.call(JSON.parse(before), 'reopenConsumed'),
+        mode === 'both-optional-omitted' ? false : mode === 'all-three-empty-maps', mode + ': absent stays absent');
+      assert.equal(S127fs.readFileSync(attemptsFile, 'utf8'), before, mode + ': proof never rewrites the attempts source');
+      if (mode === 'reopen-omitted-with-history') {
+        assert.equal(Object.keys(JSON.parse(before).consumed).length, 19);
+        assert.equal(Object.keys(JSON.parse(before).finalConsumed).length, 19);
+      }
+    });
+  }
+});
+
+test('R127 null/array/scalar optional maps and missing/invalid required consumed stay malformed', () => {
+  const bad = [
+    ['reopen null', s => { s.reopenConsumed = null; }],
+    ['reopen array', s => { s.reopenConsumed = []; }],
+    ['reopen scalar', s => { s.reopenConsumed = 'bad'; }],
+    ['reopen number', s => { s.reopenConsumed = 7; }],
+    ['final null', s => { s.finalConsumed = null; }],
+    ['final array', s => { s.finalConsumed = []; }],
+    ['final scalar', s => { s.finalConsumed = 'bad'; }],
+    ['consumed missing', s => { delete s.consumed; }],
+    ['consumed null', s => { s.consumed = null; }],
+    ['consumed array', s => { s.consumed = []; }],
+    ['consumed scalar', s => { s.consumed = 'bad'; }],
+    ['today record in consumed', s => { s.consumed.today = { status: 'unknown', businessDate: S127_DATE, planNumber: 1 }; }],
+    ['today record in finalConsumed', s => { s.finalConsumed.today = { status: 'pending', businessDate: S127_DATE, planNumber: 1 }; }],
+    ['malformed historical record', s => { s.consumed.broken = { status: 'nope', businessDate: '2026-10-16', planNumber: 1 }; }],
+  ];
+  for (const [name, mutate] of bad) {
+    s127WithFiles(mutate, (stateFile, attemptsFile) => {
+      const before = S127fs.readFileSync(attemptsFile, 'utf8');
+      const res = rp.provePreInitialPolicyCancelState(stateFile, attemptsFile, S127_DATE,
+        { planNumber: 1, shop: S127_SHOP, accountId: S127_ACCOUNT });
+      assert.equal(res.ok, false, name + ': ' + JSON.stringify(res));
+      assert.match(String(res.reason), /^(policy-cancel-attempts-malformed|policy-cancel-attempt-record-(malformed|for-date))$/, name);
+      assert.equal(S127fs.readFileSync(attemptsFile, 'utf8'), before, name + ': rejected proof never rewrites the source');
+    });
+  }
+});

@@ -892,3 +892,194 @@ test('R127 null/array/scalar optional maps and missing/invalid required consumed
     });
   }
 });
+
+// ── 15. R128 panel-navigation target-stop diagnostic ───────────────────────
+// The real failure exit `batch-result-panel-target-not-verified` used to return only a reason.
+// These cases drive the ACTUAL createRealDrivers().bindAccountsToAll through both entry modes
+// (known-partial notice + no-result-modal all-success) and assert the attached diag is the one
+// from the LAST fresh read (numeric only, null when no snapshot could be read) while the stop,
+// zero drawer commit and zero publish are unchanged.
+const R128_IDS = IDS30.slice();
+const R128_ANCHOR = R128_IDS[0];
+const R128_FAIL = R128_IDS[1];
+const R128_DIAG_UNKNOWN = {
+  phase: 'panel-navigation', rowCount: 2, knownCheckedCount: 1,
+  unknownStateCount: 1, selectedCount: 5, totalCount: 30,
+};
+function r128Page(mode, shape) {
+  let active = R128_ANCHOR;
+  const calls = { commit: 0, warning: 0, header: 0 };
+  const rows = R128_IDS.map((productId, i) => ({
+    productId, text: 'ID：' + productId, manualAccounts: i === 0 ? 1 : 0,
+    manualEvidence: true, manualCountKnown: true, autoPullOnly: false,
+    reviewFailed: false, alreadyPlanned: false,
+  }));
+  const proven = pid => ({
+    ok: true, spinnerCount: 0, headerLabelDisabled: false,
+    rows: [{ ids: [A1], checked: true, labelDisabled: false }],
+    panelProductIds: R128_IDS.slice(), activeProductIds: [pid], selectedCount: 1, totalCount: 30,
+  });
+  // A "previous" panel stays fully proven; only the panel the batch navigated TO is broken.
+  const failing = () => {
+    if (shape === 'missing') return null;
+    if (shape === 'zero') return {
+      ok: true, spinnerCount: 0, headerLabelDisabled: false,
+      rows: [{ ids: [A1], checked: false, labelDisabled: false }],
+      panelProductIds: R128_IDS.slice(), activeProductIds: [active], selectedCount: 0, totalCount: 30,
+    };
+    // unknown row state + a footer that disagrees with the known checked count
+    return {
+      ok: true, spinnerCount: 0, headerLabelDisabled: false,
+      rows: [{ ids: [A1], checked: true, labelDisabled: false }, { ids: [A2], checked: undefined, labelDisabled: false }],
+      panelProductIds: R128_IDS.slice(), activeProductIds: [active], selectedCount: 5, totalCount: 30,
+    };
+  };
+  const page = {
+    url: () => 'https://qianchuan.jinritemai.com/uni-creation/overall-product-multi?aavid=' + wf.BUSINESS.accountId,
+    evaluate: async (fn, arg) => {
+      if (fn === rp.readMainTableInPage) return { ok: true, rows };
+      if (fn === rp.bindingDrawerSnapshotInPage) return active === R128_FAIL ? failing() : proven(active);
+      if (fn === rp.selectBindingDrawerPanelInPage) { active = String(arg); return { clicked: true, id: String(arg) }; }
+      if (fn === rp.selectAllAccountsInPage) { calls.header++; return { clicked: true }; }
+      if (fn === rp.applyBatchAccountsInPage) return { clicked: true };
+      if (fn === rp.batchAddAllModalSnapshotInPage) return { modalCount: 1, productCount: 29, accountCount: 1, drawerSettled: true };
+      if (fn === rp.confirmBatchAddAllModalInPage) return { clicked: true };
+      if (fn === rp.batchResultSnapshotInPage) return mode === 'partial'
+        ? { present: true, known: true, settled: false }
+        : { present: false, known: false, settled: false };
+      if (fn === rp.closeKnownPartialResultInPage) return { closed: true };
+      if (fn === rp.bindingOverlaySnapshotInPage) return { accountDrawerCount: 1, blockingOverlayPresent: false };
+      if (fn === rp.confirmBatchAccountsApplyInPage) { calls.commit++; return { clicked: true }; } // drawer 确定
+      if (fn === rp.acceptPartialDraftWarningInPage) { calls.warning++; return { accepted: true }; }
+      if (fn === rp.guidanceActionInPage) return { present: false, unknown: null, roots: [] };
+      throw new Error('R128 unexpected ' + (fn && fn.name));
+    },
+  };
+  const driver = () => rp.createRealDrivers({
+    page, managerPage: {}, context: {}, dayState: { lastSelected: [], cursor: { seenProductIds: [] } }, persist: async () => {},
+    publishedIds: new Set(), attemptedSet: new Set(), hints: {}, accountId: wf.BUSINESS.accountId, opened: {}, projectRoot: __dirname,
+    planNumber: 1, runId: 'offline-r128', nativeScrollTimeoutMs: 60, cancelConfirmHandling: true,
+  });
+  return { driver, calls, rows };
+}
+test('R128 the real bind target stop carries the LAST fresh numeric diag (partial + no-modal full), zero drawer commit', async () => {
+  const cases = [
+    ['partial unknown-row', 'partial', 'unknown', R128_DIAG_UNKNOWN],
+    ['no-modal full unknown-row', 'full', 'unknown', R128_DIAG_UNKNOWN],
+    ['no-modal full definite-zero', 'full', 'zero',
+      { phase: 'panel-navigation', rowCount: 1, knownCheckedCount: 0, unknownStateCount: 0, selectedCount: 0, totalCount: 30 }],
+    ['no-modal full unreadable snapshot', 'full', 'missing',
+      { phase: 'panel-navigation', rowCount: null, knownCheckedCount: null, unknownStateCount: null, selectedCount: null, totalCount: null }],
+  ];
+  for (const [name, mode, shape, expected] of cases) {
+    const fx = r128Page(mode, shape);
+    const res = await fx.driver().bindAccountsToAll({ productIds: R128_IDS.slice() });
+    assert.equal(res.ok, false, name + ': ' + JSON.stringify(res.reason));
+    assert.equal(res.reason, 'batch-result-panel-target-not-verified', name + ': same fail-closed stop');
+    assert.deepEqual(res.diag, expected, name + ': diag must be the LAST fresh read, never an earlier proven panel');
+    assert.equal(Object.prototype.hasOwnProperty.call(res, 'duplicateProven'), false, name + ': a failed probe never becomes duplicate proof');
+    assert.equal(res.rows.length, 30, name + ': the real rows still reach repair');
+    assert.equal(fx.calls.commit, 0, name + ': zero drawer 确定 (no real publish path entered)');
+    assert.equal(fx.calls.warning, 0, name + ': zero partial-warning accept');
+    const raw = JSON.stringify(res.diag);
+    assert.deepEqual(Object.keys(res.diag).sort(),
+      ['knownCheckedCount', 'phase', 'rowCount', 'selectedCount', 'totalCount', 'unknownStateCount'], name + ': closed numeric whitelist only');
+    assert.equal(raw.includes(A1), false, name + ': no account id');
+    assert.equal(raw.includes(A2), false, name + ': no account id');
+    assert.equal(raw.includes('ID：'), false, name + ': no row text');
+    assert.equal(/https?:|\//.test(raw), false, name + ': no URL/path');
+  }
+});
+test('R128 that panel-navigation diag survives the real preparePlan stop and the scheduler packet verbatim', async () => {
+  const fx = r128Page('full', 'unknown');
+  const drv = fx.driver();
+  let repairs = 0, configured = 0;
+  const prep = await wf.preparePlan({
+    requireRealDrivers: true, businessDate: '2026-10-17', planNumber: 1, runId: 'r128-prep', persistState: async () => {},
+    dayState: wf.newDayState('2026-10-17'), catalogRemainingIds: [],
+    openCreationPage: async () => ({ header: { originOk: true, accountId: wf.BUSINESS.accountId, commissionOptionPresent: true } }),
+    browseProducts: async () => ({ ok: true, selectedIds: R128_IDS.slice(), attempted: [], cursor: { category: '全部', page: 26 } }),
+    bindAccountsToAll: drv.bindAccountsToAll,
+    readMainTable: drv.readMainTable,
+    awaitMainTableStable: async () => ({ ok: true, rows: fx.rows, stableReads: 3 }),
+    repairDraft: async () => { repairs++; return { ok: false, reason: 'offline-stop-after-diagnostic' }; },
+    configurePlan: async () => { configured++; return { ok: true, planName: 'r128' }; },
+  });
+  assert.equal(prep.status, 'stopped', JSON.stringify(prep.reason));
+  assert.equal(prep.stage, 'account-binding', 'the precise failing stage survives');
+  assert.equal(prep.reason, 'batch-result-panel-target-not-verified', 'the original reason is not swallowed');
+  assert.deepEqual(prep.bindingDiag, R128_DIAG_UNKNOWN, 'sanitizeBindingDiagnostic keeps exactly the numeric fields');
+  assert.equal(repairs, 0, 'an unproven batch is never handed to repair');
+  assert.equal(configured, 0, 'no configuration after a failed bind');
+  const packet = rp.buildScheduledPreparationDiagnostic(prep);
+  assert.equal(packet.stage, 'account-binding');
+  assert.equal(packet.reason, 'batch-result-panel-target-not-verified', 'the scheduler packet keeps the exact fixed reason literal');
+  assert.deepEqual(packet.binding, R128_DIAG_UNKNOWN);
+  const serialized = JSON.stringify(packet);
+  assert.equal(serialized.includes(A1), false);
+  assert.equal(serialized.includes(A2), false);
+  assert.equal(serialized.includes('ID：'), false);
+  assert.equal(/https?:/.test(serialized), false);
+  // The closed reason enum stays closed: only exact known literals pass, free text never does.
+  assert.equal(rp.buildScheduledPreparationDiagnostic({ stage: 'account-binding', reason: 'sessionid=FAKE_SECRET' }).reason, 'other-preparation-stop');
+  assert.equal(rp.buildScheduledPreparationDiagnostic({ stage: 'account-binding', reason: 'batch-result-panel-target-not-verified/../x' }).reason, 'other-preparation-stop');
+
+  // scheduler pass-through: the same failure through the REAL scheduled entry logs the packet
+  const r128fs = require('node:fs'), r128os = require('node:os'), r128path = require('node:path');
+  const dir = r128fs.mkdtempSync(r128path.join(r128os.tmpdir(), 'r128-sched-'));
+  const accountId = '1888123400000001', shopName = 'R128离线诊断透传店';
+  const shopRow = { name: shopName, accountId, targetRoi: 17, dailyBudget: 300, enabled: true };
+  const readAccountStub = () => {};
+  const fakeOpened = {
+    target: { evaluate: async fn => (fn === readAccountStub ? { accountId } : { clicked: true }) },
+    context: { addInitScript: async () => {} }, browser: {},
+  };
+  const logs = [];
+  const fx2 = r128Page('full', 'unknown');
+  const drv2 = fx2.driver();
+  const schedDriver = {
+    openCreationPage: async () => ({ header: { originOk: true, accountId, commissionOptionPresent: true } }),
+    browseProducts: async () => ({ ok: true, selectedIds: R128_IDS.slice(), attempted: [], cursor: { category: '全部', page: 26 } }),
+    bindAccountsToAll: drv2.bindAccountsToAll,
+    readMainTable: drv2.readMainTable,
+    awaitMainTableStable: async () => ({ ok: true, rows: fx2.rows, stableReads: 3 }),
+    repairDraft: async () => ({ ok: false, reason: 'offline-scheduler-stop' }),
+    configurePlan: async () => ({ ok: true, planName: 'r128-scheduler' }),
+    saveCookies: async () => ({ status: 'skipped' }),
+  };
+  let scheduled;
+  try {
+    scheduled = await rp.runScheduledPlan(
+      { shop: shopName, accountId, boundAccounts: [A1], roi: 17, dailyBudget: 300 },
+      {
+        projectRoot: dir, stateRoot: dir, businessDate: '2026-10-17',
+        nowMs: () => Date.parse('2026-10-17T06:00:00Z'),
+        planNumber: 1, plansPerShopPerDay: 3, dailyBudget: 300, roi: 17, autoConfirm: true,
+        policy: { enabled: true, autoConfirm: true, plansPerShopPerDay: 3, dailyBudget: 300 },
+        loadConfig: () => ({ ready: true, config: { login: {}, shops: [shopRow] } }),
+        onLog: (level, msg) => logs.push(level + ' ' + msg),
+        readers: {
+          openChengfangShop: async () => fakeOpened, readChengfangAccountInPage: readAccountStub,
+          clickChengfangSubTab: () => () => ({ clicked: true }), closeBrowser: async () => {},
+        },
+        driversFactory: () => schedDriver,
+      },
+    );
+  } finally {
+    r128fs.rmSync(dir, { recursive: true, force: true });
+  }
+  assert.ok(scheduled && typeof scheduled === 'object', 'scheduled entry returned nothing');
+  assert.equal(scheduled.reason, 'prepare-stopped:batch-result-panel-target-not-verified', 'the durable/result reason keeps the original literal: ' + JSON.stringify(scheduled.reason));
+  assert.equal(scheduled.noAction, true);
+  const diagLines = logs.filter(line => line.includes('scheduled-preparation-diagnostic '));
+  assert.equal(diagLines.length, 1, 'exactly one sanitized packet is logged: ' + JSON.stringify(logs));
+  const logged = JSON.parse(diagLines[0].slice(diagLines[0].indexOf('scheduled-preparation-diagnostic ') + 'scheduled-preparation-diagnostic '.length));
+  assert.equal(logged.stage, 'account-binding');
+  assert.equal(logged.reason, 'batch-result-panel-target-not-verified');
+  assert.deepEqual(logged.binding, R128_DIAG_UNKNOWN);
+  const all = logs.join('\n');
+  assert.equal(all.includes(A1), false);
+  assert.equal(all.includes(A2), false);
+  assert.equal(all.includes('ID：'), false);
+  assert.equal(fx2.calls.commit, 0, 'scheduler failure still performs zero drawer 确定');
+});

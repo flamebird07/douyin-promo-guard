@@ -4789,7 +4789,10 @@ function createRealDrivers(ctx) {
         let fresh=null;
         try { fresh=await until(()=>page.evaluate(bindingDrawerSnapshotInPage), s=>proves(s,pid), nativeTimeoutMs,'batch-result-panel-verified'); }
         catch(_) { fresh=await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null); }
-        if(!proves(fresh,pid)) return {ok:false,reason:'batch-result-panel-target-not-verified'};
+        // R128: a target that cannot be positively proven is still the SAME fail-closed stop; only
+        // the sanitized numeric footer/row-state of THIS LAST fresh read is attached (never row
+        // text, ids, URLs or cookies), so a real run's stop can be told apart from a stale cache.
+        if(!proves(fresh,pid)) return {ok:false,reason:'batch-result-panel-target-not-verified',diag:footerStateDiag(fresh,'panel-navigation')};
         if(!(await noBlocking())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
         if(partial){ (provesTarget(fresh,pid)?boundIds:zeroIds).push(String(pid)); }
         prev=pid;
@@ -6700,7 +6703,7 @@ function recoveryReadbackDrivers(o, opened, business, adapterRoot, readAccountFn
 // token, URL or path material is never screened by length) becomes 'other-preparation-stop'.
 // Only the diagnostic packet is hardened; prep itself is never mutated.
 const PREP_DIAG_STAGES = new Set(['driver-contract','state-recovery','creation-header','selection','selection-incomplete','account-binding','account-rebinding','readiness','readiness-after-repair','plan-settings']);
-const PREP_DIAG_REASONS = new Set(['plan-settings-readback-mismatch','account-drawer-footer-row-state-conflict']);
+const PREP_DIAG_REASONS = new Set(['plan-settings-readback-mismatch','account-drawer-footer-row-state-conflict','batch-result-panel-target-not-verified']);
 function buildScheduledPreparationDiagnostic(prep) {
   if (!prep || typeof prep !== 'object') return null;
   const numStr = v => (typeof v === 'string' && /^\d+(?:\.\d{1,4})?$/.test(v) && v.length <= 16) ? v : null;

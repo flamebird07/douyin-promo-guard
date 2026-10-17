@@ -118,6 +118,29 @@
   null/array/scalar/number、required 缺失/null/array/scalar、当日记录、坏历史记录
   均被拒绝且源字节不变。
 
+## R128 panel-navigation 失败出口的数字诊断
+
+- **背景**：S127 已安装；敏敏当日第 1 份成功，第 2 份在连续准备阶段返回
+  `batch-result-panel-target-not-verified` 且未发布。该出口此前只带 reason，没有可区分
+  “未知行 / 明确 0 / 读不回 / 上次缓存”的安全数字，真实快照不足时无法判断原因。
+- **补丁（仅诊断出口）**：`proveAllSuccessByPanelNavigation` 的 target 验证失败返回仍保持
+  **同一** fail-closed 语义与 reason，只附带 `footerStateDiag(fresh,'panel-navigation')`。
+  诊断来自**最后一次 fresh 读取**；读取不到快照时各计数为 `null`，绝不伪造 0。字段仍只用
+  既有白名单：`phase/rowCount/knownCheckedCount/unknownStateCount/selectedCount/totalCount`，
+  不含行文本、商品 id、账号 id、URL、Cookie。`provesZero` / `provesTarget` / 准备与提交
+  顺序、零 drawer 确定、零发布全部未改。
+- **传播**：`bindAccountsToAll` 的失败包装本就展开原失败对象，`diag` 原样到达
+  `preparePlan`；既有 `sanitizeBindingDiagnostic` 已允许 `panel-navigation`，并写入
+  `prep.bindingDiag`。`buildScheduledPreparationDiagnostic` 的 reason 仍为闭集，本次只把
+  **固定字面量** `batch-result-panel-target-not-verified` 加入已知码（精确等值匹配，任意
+  自由文本/`.../../x` 仍映射为 `other-preparation-stop`），数字 binding 白名单未扩。
+- **离线验证**：`flow-hardening-r123.test.cjs` 追加两例（31→33）：首个用例经真实
+  `createRealDrivers().bindAccountsToAll` 走 known-partial 与无弹窗 all-success 两条入口，
+  覆盖未知行、明确 0、读不回快照，断言同一 reason、diag 来自最后 fresh、缺失快照仅 null、
+  零 drawer 确定 / 零部分提交接受；第二个用例断言同一失败经 `preparePlan` 保留原 reason 与
+  数字 diag，并经真实 `runScheduledPlan` 日志输出一次
+  `scheduled-preparation-diagnostic`。移除补丁后两例均失败（诊断缺失），加回后 33/33。
+
 ## 入口接线（R124）
 
 日常 `runScheduledPlan` 与手动 `main` 都向 `preparePlan` 传

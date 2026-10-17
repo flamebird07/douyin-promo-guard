@@ -241,6 +241,188 @@ function provePreparationZeroConsumption(stateRaw, attempts, businessDate) {
   };
 }
 
+// ── S108：「早于当前业务日且完整已结束」的旧日闭环判定 ─────────────────────────
+// 日期不同本身绝不是零发布证明。旧 store 必须**正面**自证闭环：active 为终态
+// published-success、frozen 自洽（同旧业务日/份号/64hex manifest/confirmationId/nonce/
+// accountId 齐备）、plans 每条都是互不重复的旧日 success 且覆盖 frozen 份号；attempts 侧
+// （见下）再核对旧日 success 消费与 frozen CID 闭环逐一吻合。任何当前日痕迹（plans/确认/
+// 手动/三表消费）、旧日未决（pending/dispatched/unknown）、缺 frozen 计划的成功记录、
+// 日级 unknown/pending 含混旗标、身份/manifest 冲突一律拒绝。只读、绝不改写旧 store，
+// 原成功与全部 nonce/CID 保留。字段要求以现网实际形状（actual-prior-day-shape）为准，
+// 不强求真实结构中不存在的字段（如 plans[].businessDate 可为 null、frozen 无 shop 字段）。
+const PRIOR_DAY_CLOSED_ACTIVE_STATUS = 'published-success';
+const PRIOR_DAY_HEX64_RE = /^[a-f0-9]{64}$/;
+function provePriorDayStateClosure(raw, date, bindAccount, bindShop) {
+  const prior = String(raw.businessDate);
+  if (raw.unknown === true || raw.pending === true) return { ok: false, reason: 'proof-prior-day-ambiguous' };
+  const a = raw.active;
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return { ok: false, reason: 'proof-prior-day-unclosed' };
+  if (String(a.status || '') !== PRIOR_DAY_CLOSED_ACTIVE_STATUS) return { ok: false, reason: 'proof-prior-day-unclosed' };
+  const f = a.frozen;
+  if (!f || typeof f !== 'object' || Array.isArray(f)) return { ok: false, reason: 'proof-prior-day-unclosed' };
+  if (String(f.businessDate || '') !== prior) return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+  const fPlan = Number(f.planNumber);
+  const aPlan = Number(a.planNumber);
+  if (!Number.isInteger(fPlan) || fPlan < 1 || fPlan !== aPlan) return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+  if (typeof f.confirmationId !== 'string' || f.confirmationId.trim() === '') return { ok: false, reason: 'proof-prior-day-unclosed' };
+  if (!PRIOR_DAY_HEX64_RE.test(String(f.manifestHash || '').toLowerCase())) return { ok: false, reason: 'proof-prior-day-unclosed' };
+  if (f.nonce == null || String(f.nonce) === '') return { ok: false, reason: 'proof-prior-day-unclosed' };
+  if (!/^[A-Za-z0-9._:-]{1,160}$/.test(String(f.runId || ''))) return { ok: false, reason: 'proof-prior-day-unclosed' };
+  if (f.accountId == null || String(f.accountId) === '') return { ok: false, reason: 'proof-prior-day-unclosed' };
+  if (bindAccount != null && String(f.accountId) !== String(bindAccount)) return { ok: false, reason: 'proof-prior-day-account-mismatch' };
+  // 真实结构的 frozen 没有 shop 字段：绝不能虚构一个强制 shop。只有 frozen **显式**带 shop
+  // 且与本次 scope 店不同，才按跨店身份拒绝（也不借另一店的闭环）。
+  if (f.shop != null && String(f.shop).trim() !== '' && bindShop != null
+    && String(f.shop).trim() !== String(bindShop).trim()) {
+    return { ok: false, reason: 'proof-prior-day-shop-mismatch' };
+  }
+  // frozen 必须自洽：manifestHash 不是"看起来像 64hex"就够，还要等于用同一 frozen 字段
+  // 重算出的 manifest（与 publisher 自己的 freezePlan 同一算法），杜绝伪造/被改的冻结体。
+  let frozenManifestOk = false;
+  try { frozenManifestOk = String(wf.manifestHash(f)).toLowerCase() === String(f.manifestHash).toLowerCase(); }
+  catch (_) { frozenManifestOk = false; }
+  if (!frozenManifestOk) return { ok: false, reason: 'proof-prior-day-manifest-conflict' };
+  const planNumbers = [];
+  const planManifestByNumber = new Map();
+  for (const p of raw.plans) {
+    if (String(p.status) !== 'success') return { ok: false, reason: 'proof-prior-day-unclosed' };
+    const n = Number(p.planNumber);
+    if (!Number.isInteger(n) || n < 1 || planNumbers.includes(n)) return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+    planNumbers.push(n);
+    const pb = p.businessDate == null ? '' : String(p.businessDate);
+    if (pb !== '') {
+      if (pb === date) return { ok: false, reason: 'proof-consumption-artifacts-present' };
+      if (pb !== prior) return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+    }
+    if (p.manifestHash != null && String(p.manifestHash) !== '') {
+      const mh = String(p.manifestHash).toLowerCase();
+      if (!/^[a-f0-9]{64}$/.test(mh)) return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+      planManifestByNumber.set(n, mh);
+    }
+  }
+  if (!planNumbers.includes(fPlan)) return { ok: false, reason: 'proof-prior-day-unclosed' };
+  if (planManifestByNumber.has(fPlan) && planManifestByNumber.get(fPlan) !== String(f.manifestHash).toLowerCase()) {
+    return { ok: false, reason: 'proof-prior-day-manifest-conflict' };
+  }
+  const cc = Array.isArray(raw.confirmationConsumptions) ? raw.confirmationConsumptions : [];
+  if (cc.some((r) => r && String(r.businessDate || '') === date)) return { ok: false, reason: 'proof-consumption-artifacts-present' };
+  const mu = Array.isArray(raw.manualUiPublicationFacts) ? raw.manualUiPublicationFacts : [];
+  if (mu.some((r) => r && String(r.businessDate || '') === date)) return { ok: false, reason: 'proof-consumption-artifacts-present' };
+  return {
+    ok: true,
+    closure: {
+      sourceBusinessDate: prior, planNumbers, planManifestByNumber,
+      frozenPlanNumber: fPlan, confirmationId: f.confirmationId,
+      manifestHash: String(f.manifestHash).toLowerCase(),
+      runId: String(f.runId),
+    },
+  };
+}
+// attempts 侧的旧日闭环复核：当前日任何痕迹拒绝；任何 pending/dispatched/unknown 未决拒绝；
+// frozen CID 必须在 consumed **和 finalConsumed** 中都以 success 闭环（旧日/份号/runId/manifest
+// 逐字一致）；旧日每个被信任的 success 消费都必须有同一 CID 的 final success 闭环且逐字段一致；
+// 旧日出现过的每个份号与 plans 声明的每个份号都必须有 success 消费；reopen 若出现也不得引入
+// 身份/份号/manifest 冲突。历史其它日的终态 success/failed（含带已知 resolution 的 failed）
+// 只作旧事实保留，绝不改写、也不整体误拒。
+function provePriorDayAttemptsClosure(rawAttempts, closure, date) {
+  const prior = closure.sourceBusinessDate;
+  const consumed = (rawAttempts && rawAttempts.consumed) || {};
+  const finalConsumed = (rawAttempts && rawAttempts.finalConsumed) || {};
+  const reopenConsumed = (rawAttempts && rawAttempts.reopenConsumed) || {};
+  const successByPlan = new Set();
+  const seenPriorPlans = new Set();
+  const priorSuccessCids = [];
+  const sameHash = (a, b) => typeof a === 'string' && PRIOR_DAY_HEX64_RE.test(a.toLowerCase())
+    && PRIOR_DAY_HEX64_RE.test(String(b || '').toLowerCase()) && a.toLowerCase() === String(b).toLowerCase();
+  for (const [mapName, map] of [['consumed', consumed], ['finalConsumed', finalConsumed], ['reopenConsumed', reopenConsumed]]) {
+    for (const [cid, rec] of Object.entries(map)) {
+      if (!rec || typeof rec !== 'object' || Array.isArray(rec)) continue;
+      if (String(rec.businessDate || '') === date) return { ok: false, reason: 'proof-consumption-artifacts-present' };
+      const st = String(rec.status || '');
+      if (st === 'pending' || st === 'dispatched' || st === 'unknown') return { ok: false, reason: 'proof-prior-day-unresolved' };
+      if (String(rec.businessDate || '') !== prior) continue; // 其它历史日：只保留终态事实
+      const n = Number(rec.planNumber);
+      if (mapName === 'consumed') {
+        if (!Number.isInteger(n) || n < 1) return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+        seenPriorPlans.add(n);
+        if (st !== 'success') continue;
+        successByPlan.add(n);
+        if (!PRIOR_DAY_HEX64_RE.test(String(rec.manifestHash || '').toLowerCase())) {
+          return { ok: false, reason: 'proof-prior-day-manifest-conflict' };
+        }
+        if (closure.planManifestByNumber.has(n)
+          && String(rec.manifestHash).toLowerCase() !== closure.planManifestByNumber.get(n)) {
+          return { ok: false, reason: 'proof-prior-day-manifest-conflict' };
+        }
+        priorSuccessCids.push(cid);
+      } else if (mapName === 'finalConsumed' && st === 'success') {
+        // 旧日 final success 必须落在已闭合的计划上且与 plans manifest 一致；同 CID 的
+        // initial success 匹配在下面逐 CID 复核。
+        if (!Number.isInteger(n) || n < 1 || !closure.planNumbers.includes(n)) {
+          return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+        }
+        if (!PRIOR_DAY_HEX64_RE.test(String(rec.manifestHash || '').toLowerCase())) {
+          return { ok: false, reason: 'proof-prior-day-manifest-conflict' };
+        }
+        if (closure.planManifestByNumber.has(n)
+          && String(rec.manifestHash).toLowerCase() !== closure.planManifestByNumber.get(n)) {
+          return { ok: false, reason: 'proof-prior-day-manifest-conflict' };
+        }
+      } else if (mapName === 'reopenConsumed') {
+        if (!Number.isInteger(n) || n < 1) return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+        if (st === 'success' && !closure.planNumbers.includes(n)) {
+          return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+        }
+        if (rec.manifestHash != null && String(rec.manifestHash) !== '') {
+          if (!PRIOR_DAY_HEX64_RE.test(String(rec.manifestHash).toLowerCase())) {
+            return { ok: false, reason: 'proof-prior-day-manifest-conflict' };
+          }
+          if (closure.planManifestByNumber.has(n)
+            && String(rec.manifestHash).toLowerCase() !== closure.planManifestByNumber.get(n)) {
+            return { ok: false, reason: 'proof-prior-day-manifest-conflict' };
+          }
+        }
+      }
+    }
+  }
+  // frozen CID 的 initial 消费：必须 success 且业务日/份号/manifest/runId 与 frozen 全部一致。
+  const cidRec = consumed[closure.confirmationId];
+  if (!cidRec || typeof cidRec !== 'object' || String(cidRec.status) !== 'success') return { ok: false, reason: 'proof-prior-day-cid-unclosed' };
+  if (String(cidRec.businessDate || '') !== prior || Number(cidRec.planNumber) !== closure.frozenPlanNumber) {
+    return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+  }
+  if (!sameHash(cidRec.manifestHash, closure.manifestHash)) return { ok: false, reason: 'proof-prior-day-manifest-conflict' };
+  if (String(cidRec.runId || '') === '' || String(cidRec.runId) !== closure.runId) {
+    return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+  }
+  // frozen CID 的 final 闭环：缺失、failed、业务日/份号/runId/manifest 任一不一致都拒绝。
+  const cidFinal = finalConsumed[closure.confirmationId];
+  if (!cidFinal || typeof cidFinal !== 'object' || String(cidFinal.status) !== 'success'
+    || String(cidFinal.businessDate || '') !== prior || Number(cidFinal.planNumber) !== closure.frozenPlanNumber) {
+    return { ok: false, reason: 'proof-prior-day-final-unclosed' };
+  }
+  if (!sameHash(cidFinal.manifestHash, closure.manifestHash)) return { ok: false, reason: 'proof-prior-day-manifest-conflict' };
+  if (String(cidFinal.runId || '') === '' || String(cidFinal.runId) !== closure.runId) {
+    return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+  }
+  // 每个被信任的旧日 success 消费都必须与其相同 CID 的 final 闭环逐字段一致。
+  for (const cid of priorSuccessCids) {
+    const ini = consumed[cid];
+    const fin = finalConsumed[cid];
+    if (!fin || typeof fin !== 'object' || String(fin.status) !== 'success'
+      || String(fin.businessDate || '') !== prior || Number(fin.planNumber) !== Number(ini.planNumber)) {
+      return { ok: false, reason: 'proof-prior-day-final-unclosed' };
+    }
+    if (!sameHash(fin.manifestHash, ini.manifestHash)) return { ok: false, reason: 'proof-prior-day-manifest-conflict' };
+    if (String(fin.runId || '') === '' || String(fin.runId) !== String(ini.runId || '')) {
+      return { ok: false, reason: 'proof-prior-day-identity-mismatch' };
+    }
+  }
+  for (const n of seenPriorPlans) if (!successByPlan.has(n)) return { ok: false, reason: 'proof-prior-day-unclosed' };
+  for (const n of closure.planNumbers) if (!successByPlan.has(n)) return { ok: false, reason: 'proof-prior-day-unclosed' };
+  return { ok: true };
+}
+
 // ── 预导航打开失败的"从未发布"证明（R43/S43）─────────────────────────────────
 // 正式排程 run 在 openShop 抛错（尚未取得任何活动页，结构上不可能有发布/消费）时，只有对当日
 // day-state 与 attempts store **新鲜回读**、正面证明"无任何发布/消费记录"才可返回可安全重试的
@@ -269,6 +451,7 @@ function proveNoPublicationPreOpen(stateFile, attemptsFile, businessDate, scope)
   // Raw bytes actually read this run; fed into a deterministic sourceHash so a later mutation
   // can re-verify the SAME store contents (changed / deleted bytes => a different hash => refuse).
   let stateText = null, attemptsText = null;
+  let priorClosure = null;
   if (fs.existsSync(stateFile)) {
     let text;
     try { text = fs.readFileSync(stateFile, 'utf8'); }
@@ -285,7 +468,24 @@ function proveNoPublicationPreOpen(stateFile, attemptsFile, businessDate, scope)
     // REAL plans array with well-formed entries. The mere ABSENCE of a known consumption key is
     // never treated as "no consumption" (an unrelated object like {lostState:1} must refuse).
     if (!/^\d{4}-\d{2}-\d{2}$/.test(String(raw.businessDate || ''))) return { ok: false, reason: 'proof-state-malformed' };
-    if (String(raw.businessDate) !== date) return { ok: false, reason: 'proof-state-date-mismatch' };
+    if (String(raw.businessDate) !== date) {
+      // S108: a different date is by itself NEVER sufficient proof. A strictly-earlier, fully
+      // closed day-state may INDEPENDENTLY prove the CURRENT day's zero publication only after
+      // positive structural closure verification (state side now, attempts side below). A
+      // future day keeps the original refusal; an unclosed / ambiguous / conflicting old day
+      // refuses exactly like the same-day path never releasing on stale labels.
+      if (String(raw.businessDate) > date) return { ok: false, reason: 'proof-state-date-mismatch' };
+      if (!Array.isArray(raw.plans)) return { ok: false, reason: 'proof-state-malformed' };
+      if (raw.plans.some(p => !p || typeof p !== 'object' || Array.isArray(p) || !Number.isInteger(Number(p.planNumber)) || Number(p.planNumber) < 1)) {
+        return { ok: false, reason: 'proof-state-malformed' };
+      }
+      if (raw.confirmationConsumptions !== undefined && !Array.isArray(raw.confirmationConsumptions)) return { ok: false, reason: 'proof-state-malformed' };
+      if (raw.manualUiPublicationFacts !== undefined && !Array.isArray(raw.manualUiPublicationFacts)) return { ok: false, reason: 'proof-state-malformed' };
+      const pc = provePriorDayStateClosure(raw, date, bindAccount, bindShop);
+      if (!pc.ok) return pc;
+      priorClosure = pc.closure;
+    }
+    if (!priorClosure) {
     if (!Array.isArray(raw.plans)) return { ok: false, reason: 'proof-state-malformed' };
     if (raw.plans.some(p => !p || typeof p !== 'object' || Array.isArray(p) || !Number.isInteger(Number(p.planNumber)) || Number(p.planNumber) < 1)) {
       return { ok: false, reason: 'proof-state-malformed' };
@@ -338,6 +538,7 @@ function proveNoPublicationPreOpen(stateFile, attemptsFile, businessDate, scope)
     if (mu.some(r => r && String(r.businessDate || '') === date && (scopedPlan == null || r.planNumber == null || Number(r.planNumber) === scopedPlan))) {
       return { ok: false, reason: 'proof-manual-publication-recorded' };
     }
+    } // end same-day (unwrapped prior) checks — identical to the shipped R43/S43 logic
   }
   if (fs.existsSync(attemptsFile)) {
     // Validate the RAW store shape BEFORE trusting guard.loadAttemptsStore (whose ENOENT path
@@ -370,8 +571,16 @@ function proveNoPublicationPreOpen(stateFile, attemptsFile, businessDate, scope)
         return { ok: false, reason: 'proof-attempt-record-for-date' };
       }
     }
+    if (priorClosure) {
+      // S108: the prior-day closure must ALSO close on the attempts side: no current-day trace,
+      // no unresolved pending/dispatched/unknown anywhere, the frozen CID success-bound, and
+      // every prior-day plan number backed by a success consumption with matching manifest.
+      const pa = provePriorDayAttemptsClosure(rawAttempts, priorClosure, date);
+      if (!pa.ok) return pa;
+    }
   }
-  return {
+  if (priorClosure && attemptsText == null) return { ok: false, reason: 'proof-prior-day-attempts-missing' };
+  const proofOut = {
     ok: true,
     proof: {
       method: 'pre-navigation-open-failed', businessDate: date,
@@ -380,6 +589,15 @@ function proveNoPublicationPreOpen(stateFile, attemptsFile, businessDate, scope)
       sourceHash: preOpenSourceHash(stateText, attemptsText),
     },
   };
+  // Read-back annotation only — the closure facts stay in the ORIGINAL store (untouched, with
+  // every nonce/CID preserved); this never becomes a second state system.
+  if (priorClosure) {
+    proofOut.proof.priorDayClosure = {
+      sourceBusinessDate: priorClosure.sourceBusinessDate,
+      planNumbers: priorClosure.planNumbers.slice(),
+    };
+  }
+  return proofOut;
 }
 
 // Deterministic content hash of the two stores a zero-publication proof actually read. An absent

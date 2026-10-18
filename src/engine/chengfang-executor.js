@@ -58,6 +58,8 @@ const V_ENABLED = 'enabled';                 // 目标全部确认开启（开�
  * @param {()=>number} [p.now]
  * @param {(e:object)=>void} [p.audit]
  * @param {()=>boolean} [p.stopRequested]
+ * @param {object} [p.landingTiming] 仅供离线测试注入落地尾段预算（tailBaseMs/tailMarginMs/tailCapMs）；
+ *                                  缺省 = 生产默认（真实时间），不改变任何生产语义。
  * @returns {Promise<object>} 结果（含 views/targets/allPausedConfirmed/confirmReason/finalVerify）
  */
 async function executeChengfangPause(p) {
@@ -65,6 +67,7 @@ async function executeChengfangPause(p) {
   const now = p.now || Date.now;
   const audit = p.audit || (() => {});
   const stopRequested = p.stopRequested || (() => false);
+  const landingTiming = p.landingTiming;
 
   // 集中门槛：dryRun 由配置决定，显式 dryRun:false 不能越过配置门槛；
   // 但显式 dryRun:true（如演练入口强制）无条件进入演练，无视当前配置许可。
@@ -153,11 +156,11 @@ async function executeChengfangPause(p) {
     }
 
     // ── 1. 全店托管 ──────────────────────────────────────────────
-    const tuoguanOk = await pauseTuoguan({ controller, page, result, dryRun, requestGate, fail, audit, config, now, stopRequested });
+    const tuoguanOk = await pauseTuoguan({ controller, page, result, dryRun, requestGate, fail, audit, config, now, stopRequested, timing: landingTiming });
     if (!tuoguanOk) return result;
 
     // ── 2. 商品自选 ──────────────────────────────────────────────
-    const zixuanOk = await pauseZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit, config, now, stopRequested });
+    const zixuanOk = await pauseZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit, config, now, stopRequested, timing: landingTiming });
     if (!zixuanOk) return result;
     if (dryRun) {
       result.confirmReason = '演练模式：仅记录将执行的动作，未点击任何开关/暂停，不得宣称已暂停';
@@ -193,7 +196,7 @@ function markTargetConfirmed(result, view, planId) {
 
 // ── 全店托管：读取开关状态；已关闭跳过；开启才关闭 ──────────────────
 
-async function pauseTuoguan({ controller, page, result, dryRun, requestGate, fail, audit, config, now = Date.now, stopRequested = () => false }) {
+async function pauseTuoguan({ controller, page, result, dryRun, requestGate, fail, audit, config, now = Date.now, stopRequested = () => false, timing }) {
   await controller.switchView({ page, tab: '全店托管' });
   const view = await readViewFor(controller, page, '全店托管');
   if (!view) {
@@ -265,7 +268,7 @@ async function pauseTuoguan({ controller, page, result, dryRun, requestGate, fai
     // 托管开关是**切换**动作：超时/状态未知一律只回读，绝不重复点击（避免反向开启）。
     const landing = await confirmLanding({
       controller, page, view: '全店托管', targetIds: [r.id], wantChecked: false,
-      config, stopRequested, audit, eventKind: 'chengfang',
+      config, stopRequested, audit, eventKind: 'chengfang', timing,
     });
     result.polling['全店托管'] = pollingSummary(landing.polling, landing.poll, { targetCount: 1 });
     if (!landing.rows) {
@@ -301,7 +304,7 @@ async function pauseTuoguan({ controller, page, result, dryRun, requestGate, fai
 
 // ── 商品自选：100条/页 → 全选（实测范围）→ 批量暂停 → 稳定ID去重翻页 ──
 
-async function pauseZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit, config, now = Date.now, stopRequested = () => false }) {
+async function pauseZixuan({ controller, page, shopCfg, result, dryRun, requestGate, fail, audit, config, now = Date.now, stopRequested = () => false, timing }) {
   await controller.switchView({ page, tab: '商品自选' });
   const firstView = await readViewFor(controller, page, '商品自选');
   if (!firstView) {
@@ -375,7 +378,7 @@ async function pauseZixuan({ controller, page, shopCfg, result, dryRun, requestG
       continue;
     }
 
-    const pageOk = await pausePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, config, now, stopRequested });
+    const pageOk = await pausePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, config, now, stopRequested, timing });
     if (!pageOk) return false;
     // 处理完成继续循环：列表可能收缩/前移，重新扫描当前页
   }
@@ -444,23 +447,57 @@ function classifyLanding(rows, targetIds, wantChecked) {
 }
 
 /**
+ * 轮询结束后的"尾段"预算：只等**那一次已发出的在途读取**落定，不新发读取。
+ *
+ * 2026-10-18 定点修复（AD-PAUSE-LANDING-RECOVERY-20261018-F1-R1）：
+ * 旧实现固定 `min(max(interval*4,5000),15000)`（生产 12s）。真实现场（reference/diagnosis.json
+ * 08:11:58–08:13:28）单次回读含页面刷新约 20–23s，120s 预算在第 6 次读取中途到期，
+ * 12s 尾段必然不够 → 判"在途未落定" → 49 条全部未知 → 连带挡死"只对仍开启目标同会话重试一次"。
+ * 现按**本次已观测到的单次读取耗时 + margin** 延长，旧公式保留为下限，30s 为严格上限：
+ *  - 读取慢 → 尾段相应变长，但绝不无限（上限 capMs）；
+ *  - 读取快 → 仍用旧下限，不改变原有节奏；
+ *  - 只延长"等待已在途的那一次读取"，不放大全局 120s 轮询预算，也不新开并发读取。
+ * @param {{intervalMs?:number, observedMaxReadMs?:number, baseMs?:number, marginMs?:number, capMs?:number}} o
+ * @returns {number} 毫秒（0 ≤ 结果 ≤ capMs）
+ */
+const LANDING_TAIL = { intervalFactor: 4, minBaseMs: 5000, maxBaseMs: 15000, marginMs: 2000, capMs: 30000 };
+
+function computeLandingTailMs(o) {
+  const src = o || {};
+  const intervalMs = Number.isFinite(src.intervalMs) && src.intervalMs >= 0 ? src.intervalMs : 3000;
+  const observedMaxReadMs = Number.isFinite(src.observedMaxReadMs) && src.observedMaxReadMs > 0 ? src.observedMaxReadMs : 0;
+  const marginMs = Number.isFinite(src.marginMs) && src.marginMs >= 0 ? src.marginMs : LANDING_TAIL.marginMs;
+  const capMs = Number.isFinite(src.capMs) && src.capMs > 0 ? src.capMs : LANDING_TAIL.capMs;
+  const baseMs = Number.isFinite(src.baseMs) && src.baseMs >= 0
+    ? src.baseMs
+    : Math.min(Math.max(intervalMs * LANDING_TAIL.intervalFactor, LANDING_TAIL.minBaseMs), LANDING_TAIL.maxBaseMs);
+  const needMs = observedMaxReadMs > 0 ? observedMaxReadMs + marginMs : 0;
+  return Math.max(0, Math.min(Math.max(baseMs, needMs), capMs));
+}
+
+/**
  * 点击已派发后的落地确认（有界轮询）。
  *
  * 时钟说明（2026-09-16 定点修复）：轮询预算必须按**真实经过的时间**计算，因此这里
  * 一律使用单调推进的真实时钟（`Date.now`），**绝不使用调用方的业务时钟 `now`**——
  * 业务时钟在调用方是"当次检查时刻"的固定快照（用于上海时段/跨日判断），把它当轮询时钟
  * 会让 deadline 永不耗尽（预算恒为正剩余），轮询退化为死循环。
- * @param {object} o { controller, page, view, targetIds, wantChecked, config, stopRequested, audit, eventKind }
+ * @param {object} o { controller, page, view, targetIds, wantChecked, config, stopRequested, audit, eventKind, timing }
+ *        timing 仅供离线测试注入尾段预算（tailBaseMs/tailMarginMs/tailCapMs），缺省 = 生产默认。
  * @returns {Promise<{polling:object, poll:object, rows:Array|null, confirmed:string[], failed:string[], notFound:string[]}>}
  *          rows === null 表示整个轮询期间没有一次成功读取（结果未知，绝不当作成功）。
  */
 async function confirmLanding(o) {
   const { controller, page, view, targetIds, wantChecked, config, stopRequested, audit, eventKind } = o;
+  const timing = (o.timing && typeof o.timing === 'object') ? o.timing : {};
   const polling = resolvePollingConfig(config && config.execution);
   // 在途读取句柄：轮询超时是"截止时间到了就返回"，被放弃的读取其实仍在跑。
   // 记下它，超时后**有界等待它落定**（而不是再起一个并发读取——并发峰值必须 ≤1）。
   let pendingRead = null;
+  // 本次已完成的单次读取最大耗时（含页面刷新）：尾段预算据此延长（见 computeLandingTailMs）。
+  let observedMaxReadMs = 0;
   const readOnce = async () => {
+    const readStartedAt = Date.now();
     const p = (async () => {
       // 2026-09-21：新 UI 列表为 URL 快照，同页重复读取不会更新 → 回读前强制刷新
       // （旧 UI/无该方法时为空操作，语义不变）。
@@ -479,6 +516,8 @@ async function confirmLanding(o) {
     try {
       return await p;
     } finally {
+      const cost = Date.now() - readStartedAt;
+      if (cost > observedMaxReadMs) observedMaxReadMs = cost;
       if (pendingRead === p) pendingRead = null;
     }
   };
@@ -502,26 +541,67 @@ async function confirmLanding(o) {
   const trust0 = landingStateTrustworthy(poll);
   let finalRead = null;
   if ((!poll.value || !trust0.trustworthy) && !poll.stopped && pendingRead) {
-    const settleWaitMs = Math.min(Math.max(polling.intervalMs * 4, 5000), 15000);
-    const settled = await Promise.race([
-      pendingRead.then((v) => ({ ok: true, v })).catch((e) => ({ ok: false, reason: String(e.reason || e.message) })),
-      new Promise((r) => setTimeout(() => r({ ok: false, timeout: true }), settleWaitMs)),
-    ]);
-    if (settled.ok) {
+    // 尾段预算：旧公式 12s 在"单次读取 20–23s"的真实页面上必然抢跑（09-21/10-18 实录），
+    // 现按本次观测到的单次读取耗时延长，且严格封顶（默认 30s）。只等这一次已发出的读取。
+    const tailBasisMaxReadMs = observedMaxReadMs;   // 计算尾段时的观测依据（在途那次尚未落定，不计入）
+    const settleWaitMs = computeLandingTailMs({
+      intervalMs: polling.intervalMs,
+      observedMaxReadMs: tailBasisMaxReadMs,
+      baseMs: timing.tailBaseMs,
+      marginMs: timing.tailMarginMs,
+      capMs: timing.tailCapMs,
+    });
+    // 有界等待：timer 必须清理；被放弃的读取即使迟到失败也已被 catch 挂接（不产生未处理拒绝）。
+    let tailTimer = null;
+    const tailTimeout = new Promise((resolve) => {
+      tailTimer = setTimeout(() => resolve({ ok: false, timeout: true }), settleWaitMs);
+    });
+    let settled;
+    try {
+      settled = await Promise.race([
+        pendingRead
+          .then((v) => ({ ok: true, v }))
+          .catch((e) => ({ ok: false, reason: String((e && (e.reason || e.message)) || e) })),
+        tailTimeout,
+      ]);
+    } finally {
+      if (tailTimer) clearTimeout(tailTimer);
+    }
+    const snapshotComplete = !!(settled.ok && settled.v && Array.isArray(settled.v.rows));
+    if (snapshotComplete) {
+      // 成功落定且记录完整 → 用这次**最新完整快照**交回调用方（才允许走既有的一次重试）
       poll.value = settled.v;
       poll.inFlight = false;
       poll.lastReadFailed = false;
       poll.valueStale = false;
+      poll.tailSettled = true;
       finalRead = { ok: true, mode: 'awaited-inflight' };
     } else {
-      finalRead = { ok: false, reason: settled.timeout ? `在途读取未在 ${settleWaitMs}ms 内落定` : settled.reason };
-      if (!settled.timeout) poll.inFlight = false; // 读取确实以失败告终 → 如实登记
+      // 失败 / 记录不全 → 如实登记为"最后一次读取失败"，绝不用旧快照重发
+      poll.inFlight = false;
+      poll.lastReadFailed = true;
+      poll.valueStale = true;
+      finalRead = {
+        ok: false,
+        reason: settled.ok
+          ? '尾段读取返回的记录不完整（缺少行清单），不据旧快照重发'
+          : (settled.timeout ? `在途读取未在 ${settleWaitMs}ms 内落定` : settled.reason),
+      };
+      if (settled.timeout) {
+        // 超时 ≠ 读取结束：底层读取仍在跑（不可取消），必须保留在途登记与 stale 标记
+        poll.inFlight = true;
+        poll.valueStale = true;
+      }
     }
+    // 尾段等待期间到达的停止信号同样必须生效：禁止重试/新请求（调用方据 poll.stopped 拦截）
+    if (stopRequested && stopRequested()) poll.stopped = true;
+    poll.observedMaxReadMs = tailBasisMaxReadMs;
     audit({
       kind: eventKind, event: 'landing-final-read', view,
       ok: !!(finalRead && finalRead.ok), reason: (finalRead && finalRead.reason) || null,
-      settleWaitMs, mode: (finalRead && finalRead.mode) || null,
-      note: '轮询结束后有界等待在途读取落定（不新增并发读取），以最新完成快照判定是否可重试',
+      settleWaitMs, observedMaxReadMs: tailBasisMaxReadMs, mode: (finalRead && finalRead.mode) || null,
+      attempts: poll.attempts,
+      note: '轮询结束后有界等待在途读取落定（尾段按本次观测读取耗时延长并封顶，不新增并发读取），以最新完整快照判定是否可重试',
     });
   }
   const rows = poll.value ? (poll.value.rows || []) : null;
@@ -547,6 +627,9 @@ function pollingSummary(polling, poll, extra = {}) {
     inFlight: poll.inFlight,
     lastReadFailed: poll.lastReadFailed,
     valueStale: poll.valueStale,
+    // 2026-10-18：尾段是否用最新完整快照落定（false/缺省 = 未落定，调用方禁止重试）
+    tailSettled: poll.tailSettled === true,
+    observedMaxReadMs: poll.observedMaxReadMs === undefined ? null : poll.observedMaxReadMs,
     ...extra,
   };
 }
@@ -581,7 +664,7 @@ function landingStateTrustworthy(poll) {
  * 请求级门槛 → 危险检测 → 暂停 → 强制新扫描回读。
  * 返回 true 继续；false 表示已 fail（调用方停止）。
  */
-async function pausePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, config, now = Date.now, stopRequested = () => false, retryAttempt = 0 }) {
+async function pausePageTargets({ controller, page, shopCfg, targets, rows, result, dryRun, processed, drySeen, requestGate, fail, audit, config, now = Date.now, stopRequested = () => false, retryAttempt = 0, timing }) {
   const targetIds = targets.map((t) => t.id);
   for (const id of targetIds) {
     if (retryAttempt === 0) {
@@ -725,7 +808,7 @@ async function pausePageTargets({ controller, page, shopCfg, targets, rows, resu
   // 但已派发请求继续在有限期限内只读确认。
   const landing = await confirmLanding({
     controller, page, view: '商品自选', targetIds, wantChecked: false,
-    config, stopRequested, audit, eventKind: 'chengfang',
+    config, stopRequested, audit, eventKind: 'chengfang', timing,
   });
   result.polling['商品自选'] = pollingSummary(landing.polling, landing.poll, { targetCount: targetIds.length });
   if (!landing.rows) {
@@ -798,7 +881,7 @@ async function pausePageTargets({ controller, page, shopCfg, targets, rows, resu
       });
       return pausePageTargets({
         controller, page, shopCfg, targets: retryTargets, rows: postRows, result, dryRun,
-        processed, drySeen, requestGate, fail, audit, config, now, stopRequested, retryAttempt: 1,
+        processed, drySeen, requestGate, fail, audit, config, now, stopRequested, retryAttempt: 1, timing,
       });
     }
     fail('zixuan', V_PARTIAL_FAILED, `暂停未生效（开关仍开启）：${failed.slice(0, 5).join(',')}...${failed.length > 5 ? `（共 ${failed.length} 个）` : ''}${clickError ? `（点击结果曾未知，以回读为准：${clickError.reason || clickError.message}）` : ''}`);
@@ -1745,6 +1828,7 @@ async function verifyAllEnabled({ controller, page, result }) {
 module.exports = {
   executeChengfangPause,
   executeChengfangEnable,
+  computeLandingTailMs,
   MAX_PAGE_VISITS,
   V_READ_FAILED,
   V_CONFIRMED_EMPTY,

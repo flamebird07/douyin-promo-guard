@@ -24,9 +24,9 @@
  * identityOk 必须严格 === true 才通过；缺失/null/字符串一律 data_blocked。
  * unknown / 数据异常 / 身份不匹配 / 零订单 / 乘法溢出 → fail-closed，零点击。
  *
- * 100 元保护（客户 2026-10-17）：
- * - spendProtected = costCents <= 10000（100.00 元）→ 任何方向都不得自动暂停；
- * - pauseEligible / roiTooLow = costCents > 10000 且 metric 严格 above；
+ * 50 元保护（客户 2026-10-17）：
+ * - spendProtected = costCents <= 5000（50.00 元）→ 任何方向都不得自动暂停；
+ * - pauseEligible / roiTooLow = costCents > 5000 且 metric 严格 above；
  * - 保护区内原本会暂停的 on/mixed 一律零动作（spend_protected），且不强制重开原 off；
  * - 低于阈值仍按原语义 should_enable；等于阈值 on/off/mixed 仍 equal_no_action（公共库既有语义保留）。
  */
@@ -187,7 +187,7 @@ function decideAdSwitchAction({
   else metric = METRIC.ABOVE;
   base.metric = metric;
 
-  // 100 元门槛：保护区内一律无暂停资格；严格超标且 >100 元才允许暂停/提示 ROI 过低。
+  // 50 元门槛：保护区内一律无暂停资格；严格超标且 >50 元才允许暂停/提示 ROI 过低。
   const spendProtected = costCents <= SPEND_FLOOR_CENTS;
   base.spendProtected = spendProtected;
   base.pauseEligible = metric === METRIC.ABOVE && !spendProtected;
@@ -243,7 +243,7 @@ function decideAdSwitchAction({
     };
   }
 
-  // 8b) 高于阈值但仍在 100 元保护区内：零暂停、零强制开关，如实标记 spend_protected。
+  // 8b) 高于阈值但仍在 50 元保护区内：零暂停、零强制开关，如实标记 spend_protected。
   if (spendProtected) {
     return {
       ...base,
@@ -251,7 +251,7 @@ function decideAdSwitchAction({
       targetState: currentAdState,
       action: null,
       zeroClick: true,
-      reason: `高于费比阈值（${evalR.reason}）；但当天消耗 ${costCents} 分 ≤ ${SPEND_FLOOR_CENTS} 分（100 元）：100 元保护生效，本轮不暂停（当前 ${currentAdState} 保持，不强制重开/关闭）`,
+      reason: `高于费比阈值（${evalR.reason}）；但当天消耗 ${costCents} 分 ≤ ${SPEND_FLOOR_CENTS} 分（50 元）：50 元保护生效，本轮不暂停（当前 ${currentAdState} 保持，不强制重开/关闭）`,
     };
   }
 

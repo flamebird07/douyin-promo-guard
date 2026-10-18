@@ -1176,7 +1176,7 @@ class Monitor {
     const rule = (this.config.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
     const thresholdCents = this._thresholdCents(shopCfg);
     const evaluation = (data && data.evaluation) || null;
-    // 100 元保护/ROI 提示均由规则/决策投影，消费方（日志/页面）不重算金额。
+    // 50 元保护/ROI 提示均由规则/决策投影，消费方（日志/页面）不重算金额。
     const spendProtected = decision ? decision.spendProtected === true
       : (evaluation ? evaluation.spendProtected === true : null);
     const pauseEligible = decision ? decision.pauseEligible === true
@@ -1196,7 +1196,7 @@ class Monitor {
       overKnown: over !== null && over !== undefined,
       status,
       reason: reason || null,
-      // 100 元门槛投影：spendProtected=保护中；pauseEligible=>100 且严格超标；roiTooLow=仅提示不自动改 ROI
+      // 50 元门槛投影：spendProtected=保护中；pauseEligible=>50 且严格超标；roiTooLow=仅提示不自动改 ROI
       spendFloorCents: SPEND_FLOOR_CENTS,
       spendProtected,
       pauseEligible,
@@ -2461,7 +2461,7 @@ class Monitor {
       rt.lastError = null;
       rt.lastData = this._summarizeData(data);
 
-      // 有效同日费用/订单的规则评估先投影 100 元门槛；后续决策以同值覆盖。
+      // 有效同日费用/订单的规则评估先投影 50 元门槛；后续决策以同值覆盖。
       if (data.ok !== false && data.evaluation) {
         rt.lastData.spendFloorCents = SPEND_FLOOR_CENTS;
         rt.lastData.spendProtected = data.evaluation.spendProtected === true;
@@ -2485,7 +2485,7 @@ class Monitor {
         return { status: 'blocked', reason: scopeBlockedReason };
       }
 
-      // 4) 执行时间窗口（暂停资格=暂停意图；100 元保护区内不构成意图）：窗口外不打开执行会话，直接 window_blocked
+      // 4) 执行时间窗口（暂停资格=暂停意图；50 元保护区内不构成意图）：窗口外不打开执行会话，直接 window_blocked
       if (data.evaluation.pauseEligible === true && !isAfterDailyStart(this.nowFn(), this.config.schedule.dailyStartHour)) {
         const hh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
         const reason = `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：已读取并记录，未执行真实关闭（手动检查不绕过时间限制）`;
@@ -2534,7 +2534,7 @@ class Monitor {
         currentAdState,
         identityOk: true,
       });
-      // 同店同日有效判定 → 页面/日志的 100 元保护与 ROI 提示投影（不由 UI 重算）
+      // 同店同日有效判定 → 页面/日志的 50 元保护与 ROI 提示投影（不由 UI 重算）
       rt.lastData.spendFloorCents = SPEND_FLOOR_CENTS;
       rt.lastData.spendProtected = decision.spendProtected === true;
       rt.lastData.pauseEligible = decision.pauseEligible === true;
@@ -3263,7 +3263,7 @@ class Monitor {
         lastError: rt.lastError || null,
         today: rt.lastData || null,
         lastDataAt: rt.lastDataAt || (rt.lastData && rt.lastData.fetchedAt) || null,
-        // 100 元门槛：只展示同店同日有效投影，不把 null 当 0 重算
+        // 50 元门槛：只展示同店同日有效投影，不把 null 当 0 重算
         spendFloorCents: SPEND_FLOOR_CENTS,
         spendProtected: todaySameDay ? todayData.spendProtected === true : null,
         pauseEligible: todaySameDay ? todayData.pauseEligible === true : false,
@@ -3349,7 +3349,7 @@ class Monitor {
           balanceAt: t && t.balanceAt ? t.balanceAt : null,
           thresholdCents: this._thresholdCents(s),
           over: t ? t.over === true : null,
-          // 同店同日 100 元保护/ROI 提示投影（t.businessDate 必须等于今日）
+          // 同店同日 50 元保护/ROI 提示投影（t.businessDate 必须等于今日）
           spendFloorCents: SPEND_FLOOR_CENTS,
           spendProtected: (t && t.businessDate === today) ? t.spendProtected === true : null,
           pauseEligible: (t && t.businessDate === today) ? t.pauseEligible === true : false,

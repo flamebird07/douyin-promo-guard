@@ -12,17 +12,17 @@
  *   费用>0 且订单为 0 → 阻止关闭并说明（用户说明 08:00 后订单不应为 0，需重读核实）；
  * - 费用与订单必须同一店铺、同一业务日期（由 guard 校验后传入）。
  *
- * 100 元保护（客户 2026-10-17）：
- * - 当天账户整体消耗 <= 10000 分（100.00 元）时，不因费比超标自动暂停；
- * - 只有消耗 > 10000 分（100.01 元起）且费比严格超标，才具备暂停资格并提示「ROI设置过低」；
+ * 50 元保护（客户 2026-10-17）：
+ * - 当天账户整体消耗 <= 5000 分（50.00 元）时，不因费比超标自动暂停；
+ * - 只有消耗 > 5000 分（50.01 元起）且费比严格超标，才具备暂停资格并提示「ROI设置过低」；
  * - over 保留原始费比语义（cost > orders×threshold），保护门槛另以
  *   spendProtected / pauseEligible / roiTooLow 显式表达，避免把保护误标成数据异常。
  */
 
 const { DataGuardError } = require('../lib/errors');
 
-/** 当天消耗保护线：10000 分 = 100.00 元（<= 保护，> 才允许自动暂停）。 */
-const SPEND_FLOOR_CENTS = 10000;
+/** 当天消耗保护线：5000 分 = 50.00 元（<= 保护，> 才允许自动暂停）。 */
+const SPEND_FLOOR_CENTS = 5000;
 
 /**
  * @param {object} p
@@ -63,8 +63,8 @@ function evaluateWholeShopCostPerOrder({ costCents, orders, thresholdCents }) {
   if (over) {
     reason = `全店触发：当天推广费用 ${costCents} 分 > 订单数 ${orders} × 阈值 ${thresholdCents} 分 = ${expectedCents} 分（严格大于，恰好相等不关闭）`;
     reason += spendProtected
-      ? `；当天消耗 ${costCents} 分 ≤ ${SPEND_FLOOR_CENTS} 分（100 元）：100 元保护生效，本轮不自动暂停`
-      : `；当天消耗 ${costCents} 分 > ${SPEND_FLOOR_CENTS} 分（100 元）：暂停资格成立`;
+      ? `；当天消耗 ${costCents} 分 ≤ ${SPEND_FLOOR_CENTS} 分（50 元）：50 元保护生效，本轮不自动暂停`
+      : `；当天消耗 ${costCents} 分 > ${SPEND_FLOOR_CENTS} 分（50 元）：暂停资格成立`;
   } else {
     reason = `未触发：当天推广费用 ${costCents} 分 ≤ 订单数 ${orders} × 阈值 ${thresholdCents} 分 = ${expectedCents} 分`;
   }

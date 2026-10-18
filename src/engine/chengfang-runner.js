@@ -342,7 +342,7 @@ class ChengfangRunner {
       return { outcome: 'blocked', reason: `操作前重新核实被阻止：${fresh.reason}`, counts, pre, batchDate };
     }
     if (fresh.evaluation.spendProtected === true) {
-      const reason = `操作前重新核实：当天消耗 ${fresh.cost.valueCents} 分 ≤ 10000 分（100 元），按 100 元保护取消暂停（零请求）。${fresh.evaluation.reason}`;
+      const reason = `操作前重新核实：当天消耗 ${fresh.cost.valueCents} 分 ≤ 5000 分（50 元），按 50 元保护取消暂停（零请求）。${fresh.evaluation.reason}`;
       this.audit({ ...base, step: 'pre-batch-revalidate', ok: true, cancelled: true, spendProtected: true, reason });
       counts.cancelled = 1;
       return { outcome: 'cancelled', reason, counts, pre, batchDate };

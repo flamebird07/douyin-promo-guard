@@ -222,6 +222,16 @@ function provePreparationZeroConsumption(stateRaw, attempts, businessDate) {
     || (String(r.businessDate || '') === String(businessDate) && Number(r.planNumber) === planNumber)))) {
     return { ok: false, reason: 'confirmation-consumption-recorded' };
   }
+  // F1：手动 UI 发布事实同样是消费面（本日本份任何记录都禁止收口）。字段存在但不是数组
+  // 属于错型：一律不可知，绝不把"读不出来"当成"没有"。
+  if (stateRaw.manualUiPublicationFacts !== undefined && !Array.isArray(stateRaw.manualUiPublicationFacts)) {
+    return { ok: false, reason: 'manual-publication-facts-unreadable' };
+  }
+  if (Array.isArray(stateRaw.manualUiPublicationFacts)
+    && stateRaw.manualUiPublicationFacts.some(r => r && (String(r.runId || '') === runId
+      || (String(r.businessDate || '') === String(businessDate) && Number(r.planNumber) === planNumber)))) {
+    return { ok: false, reason: 'manual-publication-recorded' };
+  }
   if (!attempts || typeof attempts !== 'object' || !attempts.consumed || typeof attempts.consumed !== 'object') {
     return { ok: false, reason: 'attempts-store-unreadable' };
   }
@@ -239,6 +249,151 @@ function provePreparationZeroConsumption(stateRaw, attempts, businessDate) {
     ok: true, planNumber, runId,
     proof: { initialConsumptions: 0, finalConsumptions: 0, reopenConsumptions: 0, manualUnresolved: 0, plansContainsNumber: false, confirmationConsumptionsRecorded: false },
   };
+}
+
+// ── F1-R2：本地准备恢复专用的**严格**消费面判据（不改变旧证明/loader 语义）────────────
+// 旧 guard.loadAttemptsStore 会把缺失的 finalConsumed/reopenConsumed 默认补成空表——那是
+// "首次尝试"的全局初始化语义，R127 等旧路径依赖它。但"准备阶段零消费"是一个**正面证明**：
+// 三张表必须原始存在且是对象，缺表/错型一律不可知（绝不把读不出来当成零）。因此只在本地
+// 恢复（及其幂等分支）使用下面这个严格 reader，不改全局 loader。
+const LOCAL_ATTEMPTS_TABLES = ['consumed', 'finalConsumed', 'reopenConsumed'];
+function readStrictLocalAttemptsStore(file) {
+  let text;
+  try {
+    if (!fs.existsSync(file)) return { ok: false, reason: 'local-recovery-attempts-file-missing' };
+    text = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    return { ok: false, reason: 'local-recovery-attempts-unreadable:' + scheduledErrorText(error) };
+  }
+  let parsed;
+  try { parsed = JSON.parse(text); }
+  catch (error) { return { ok: false, reason: 'local-recovery-attempts-malformed' }; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, reason: 'local-recovery-attempts-malformed' };
+  }
+  for (const name of LOCAL_ATTEMPTS_TABLES) {
+    if (!Object.prototype.hasOwnProperty.call(parsed, name)) {
+      return { ok: false, reason: 'local-recovery-attempts-table-missing:' + name };
+    }
+    const table = parsed[name];
+    if (!table || typeof table !== 'object' || Array.isArray(table)) {
+      return { ok: false, reason: 'local-recovery-attempts-table-malformed:' + name };
+    }
+  }
+  return { ok: true, attempts: parsed };
+}
+
+// 不要求 active 仍是 preparing（幂等分支 active 已是 preparation-stopped），只核对"本 runId/
+// 同日同份"在全部消费面（plans/confirmationConsumptions/manualUiPublicationFacts/三表/手动未决/
+// 日级 unknown·pending）都没有任何记录。三表仍要求原始存在且为对象。
+function proveLocalPreparationNoConsumption(stateRaw, attempts, businessDate, expected) {
+  const date = String(businessDate || '');
+  const runId = String((expected && expected.runId) || '');
+  const planNumber = Number(expected && expected.planNumber);
+  const origin = SCHEDULED_RUN_ORIGIN_RE.exec(runId);
+  if (!origin || origin[1] !== date) return { ok: false, reason: 'run-origin-not-scheduled' };
+  if (!Number.isInteger(planNumber) || planNumber < 1) return { ok: false, reason: 'active-plan-number-invalid' };
+  if (!stateRaw || typeof stateRaw !== 'object' || Array.isArray(stateRaw)) return { ok: false, reason: 'state-malformed' };
+  if (stateRaw.unknown || stateRaw.pending) return { ok: false, reason: 'day-state-unresolved-flag-present' };
+  if (String(stateRaw.businessDate || '') !== date) return { ok: false, reason: 'state-business-date-mismatch' };
+  if (!Array.isArray(stateRaw.plans)) return { ok: false, reason: 'plans-list-unreadable' };
+  if (stateRaw.plans.some(p => p && Number(p.planNumber) === planNumber)) return { ok: false, reason: 'plan-number-already-in-plans' };
+  if (!Array.isArray(stateRaw.confirmationConsumptions)) return { ok: false, reason: 'confirmation-consumptions-unreadable' };
+  if (stateRaw.confirmationConsumptions.some(r => r && (String(r.runId || '') === runId
+    || (String(r.businessDate || '') === date && Number(r.planNumber) === planNumber)))) {
+    return { ok: false, reason: 'confirmation-consumption-recorded' };
+  }
+  if (!Array.isArray(stateRaw.manualUiPublicationFacts)) return { ok: false, reason: 'manual-publication-facts-unreadable' };
+  if (stateRaw.manualUiPublicationFacts.some(r => r && (String(r.runId || '') === runId
+    || (String(r.businessDate || '') === date && Number(r.planNumber) === planNumber)))) {
+    return { ok: false, reason: 'manual-publication-recorded' };
+  }
+  if (!attempts || typeof attempts !== 'object' || Array.isArray(attempts)) return { ok: false, reason: 'attempts-store-unreadable' };
+  for (const name of LOCAL_ATTEMPTS_TABLES) {
+    if (!attempts[name] || typeof attempts[name] !== 'object' || Array.isArray(attempts[name])) {
+      return { ok: false, reason: 'attempts-table-unreadable:' + name };
+    }
+  }
+  for (const mapName of LOCAL_ATTEMPTS_TABLES) {
+    for (const rec of Object.values(attempts[mapName])) {
+      if (!rec) continue;
+      if (String(rec.runId || '') === runId) return { ok: false, reason: mapName + '-consumption-for-run' };
+      if (String(rec.businessDate || '') === date && Number(rec.planNumber) === planNumber) {
+        return { ok: false, reason: mapName + '-consumption-for-same-day-plan' };
+      }
+    }
+  }
+  if (listManualUnresolved(attempts).length > 0) return { ok: false, reason: 'manual-unresolved-present' };
+  return { ok: true };
+}
+
+// 独立发布事实面：published-products.json 不是 day-state / attempts 的一部分，必须单独读。
+// 生产原生形状是 {seeded,seededFrom,publishedIds:[],plans:[{planId,date}]}（wf.appendPublished
+// 只写 planId/date，没有 businessDate/planNumber/runId）。因此：
+//  * 顶层必须是对象；publishedIds 必须原始存在且为数组（null/缺失/错型一律不可知，绝不把
+//    "读不出来"当零——也不接受 productIds 之类的替代字段）；
+//  * plans 必须是数组，单条必须是对象；日期取原生 date（若同时带 businessDate 且冲突 → 拒绝）；
+//    无日期/非法日期 = 无法归因，不可知；
+//  * 历史日记录原样忽略（旧历史保留，不影响本日恢复）；
+//  * 本日记录：同 runId 或同份号 → 拒绝；其余必须能用**同店 day-state 既有 success 记录**的
+//    planId 逐条证明它属于其它已完成份号，否则拒绝（当前份/不明来源绝不放过）。这样已成功
+//    第 1 份的店仍可恢复第 2/3 份，但任何无法归因的当日发布事实都阻止"零发布"声明。
+function proveLocalPublishedStoreClean(file, businessDate, runId, planNumber, statePlans) {
+  let text;
+  try {
+    if (!fs.existsSync(file)) return { ok: false, reason: 'local-recovery-published-store-missing' };
+    text = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    return { ok: false, reason: 'local-recovery-published-store-unreadable:' + scheduledErrorText(error) };
+  }
+  let parsed;
+  try { parsed = JSON.parse(text); }
+  catch (error) { return { ok: false, reason: 'local-recovery-published-store-corrupt' }; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, reason: 'local-recovery-published-store-malformed' };
+  }
+  // 实际 schema：publishedIds 是必填数组。null/缺失/非数组一律拒绝，绝不默认补成 []。
+  if (!Object.prototype.hasOwnProperty.call(parsed, 'publishedIds') || !Array.isArray(parsed.publishedIds)) {
+    return { ok: false, reason: 'local-recovery-published-ids-unreadable' };
+  }
+  if (!Array.isArray(parsed.plans)) return { ok: false, reason: 'local-recovery-published-plans-unreadable' };
+  const successes = (Array.isArray(statePlans) ? statePlans : []).filter(p => p && typeof p === 'object'
+    && !Array.isArray(p) && String(p.status || '') === 'success'
+    && Number.isInteger(Number(p.planNumber)) && Number(p.planNumber) >= 1
+    && p.planId != null && String(p.planId) !== '');
+  for (const p of parsed.plans) {
+    if (!p || typeof p !== 'object' || Array.isArray(p)) {
+      return { ok: false, reason: 'local-recovery-published-plan-malformed' };
+    }
+    const hasNativeDate = p.date != null && String(p.date) !== '';
+    const hasBusinessDate = p.businessDate != null && String(p.businessDate) !== '';
+    if (hasNativeDate && hasBusinessDate && String(p.date) !== String(p.businessDate)) {
+      return { ok: false, reason: 'local-recovery-published-date-conflict' };
+    }
+    const recordDate = hasNativeDate ? String(p.date) : (hasBusinessDate ? String(p.businessDate) : '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(recordDate)) {
+      return { ok: false, reason: 'local-recovery-published-date-unreadable' };
+    }
+    if (recordDate !== String(businessDate)) continue; // 历史日：原样保留，不影响本日证明
+    if (p.planNumber != null && Number(p.planNumber) === Number(planNumber)) {
+      return { ok: false, reason: 'local-recovery-published-plan-recorded' };
+    }
+    if (runId && String(p.runId || '') === String(runId)) {
+      return { ok: false, reason: 'local-recovery-published-run-recorded' };
+    }
+    // 本日记录必须能被同店 day-state 的既有 success planId 精确归因到**另一**已完成份号。
+    const planId = p.planId == null ? '' : String(p.planId);
+    if (planId === '') return { ok: false, reason: 'local-recovery-published-plan-unattributed' };
+    const owner = successes.find(s => String(s.planId) === planId);
+    if (!owner) return { ok: false, reason: 'local-recovery-published-plan-unattributed' };
+    if (Number(owner.planNumber) === Number(planNumber)) {
+      return { ok: false, reason: 'local-recovery-published-plan-recorded' };
+    }
+    if (p.planNumber != null && Number(p.planNumber) !== Number(owner.planNumber)) {
+      return { ok: false, reason: 'local-recovery-published-plan-unattributed' };
+    }
+  }
+  return { ok: true };
 }
 
 // ── S108：「早于当前业务日且完整已结束」的旧日闭环判定 ─────────────────────────
@@ -617,11 +772,23 @@ function readStoreTextSafe(file) {
 
 // Recompute the proof's sourceHash straight from the CURRENT on-disk stores. A caller that must
 // re-verify at mutation time under its own lock uses this to detect changed/deleted bytes.
-function currentPreOpenSourceHash(stateFile, attemptsFile) {
+// F1-R2：本地准备恢复还要把**独立发布事实面** published-products.json 与（一般店的）
+// shop-identity.json 纳入同一 CAS。额外文件可选：缺省仍是原来两文件哈希（旧路径语义不变）；
+// 传入 extraFiles 时，任一文件不可读 → null（拒绝），缺失用独立哨兵（绝不等同空文件）。
+function currentPreOpenSourceHash(stateFile, attemptsFile, extraFiles) {
   const s = readStoreTextSafe(stateFile);
   const a = readStoreTextSafe(attemptsFile);
   if (s === undefined || a === undefined) return null;
-  return preOpenSourceHash(s, a);
+  const base = preOpenSourceHash(s, a);
+  if (!Array.isArray(extraFiles) || extraFiles.length === 0) return base;
+  const parts = ['BASE:' + base];
+  for (const file of extraFiles) {
+    if (typeof file !== 'string' || file === '') return null;
+    const text = readStoreTextSafe(file);
+    if (text === undefined) return null;
+    parts.push('E:' + (text == null ? PRE_OPEN_ABSENT_SENTINEL : text));
+  }
+  return sha256Hex(parts.join('\u0001'));
 }
 
 // Deterministic sha256 (hex) of an entry's recorded reason — the ONLY quantity used to bind a
@@ -862,10 +1029,32 @@ function applyProvenPreparationClose(stateFile, attemptsFile, businessDate, clos
     return { closed: false, reason: 'preparation-close-attempts-file-missing' };
   }
   let attempts;
-  try { attempts = guard.loadAttemptsStore(attemptsFile); }
-  catch (error) { return { closed: false, reason: 'preparation-close-attempts-unreadable:' + scheduledErrorText(error) }; }
+  if (typeof o.attemptsLoader === 'function') {
+    // F1-R2：本地准备恢复传入严格 reader（三表必须原始存在且为对象）。旧调用方不传，
+    // 仍走 guard.loadAttemptsStore 的既有语义，R127 等路径不受影响。
+    const loaded = o.attemptsLoader(attemptsFile);
+    if (!loaded || loaded.ok !== true) {
+      return { closed: false, reason: String((loaded && loaded.reason) || 'preparation-close-attempts-unreadable') };
+    }
+    attempts = loaded.attempts;
+  } else {
+    try { attempts = guard.loadAttemptsStore(attemptsFile); }
+    catch (error) { return { closed: false, reason: 'preparation-close-attempts-unreadable:' + scheduledErrorText(error) }; }
+  }
   const chk = provePreparationZeroConsumption(raw, attempts, businessDate);
   if (!chk.ok) return { closed: false, reason: 'preparation-close-recheck-failed:' + chk.reason };
+  // F1-R3：本地恢复路径可传入**写前**严格复验（可选）。它在状态真正落盘之前重读全部证明面
+  // （state/attempts/published/identity 字节 + 严格三表 + 发布事实 + 消费面），与已证明快照
+  // 不一致就拒绝——绝不允许"先写 state 再回读哈希"这种伪 CAS。旧调用方不传，默认行为与
+  // R127 等既有语义完全不变。
+  if (typeof o.preWriteCheck === 'function') {
+    let pre;
+    try { pre = o.preWriteCheck(); }
+    catch (error) { return { closed: false, reason: 'preparation-close-pre-write-check-failed:' + scheduledErrorText(error) }; }
+    if (!pre || pre.ok !== true) {
+      return { closed: false, reason: String((pre && pre.reason) || 'preparation-close-pre-write-check-refused') };
+    }
+  }
   const fact = {
     status: 'preparationClosed', phase: 'preparing',
     reason: String(closure.reason || (raw.active && raw.active.reason) || 'preparing-exception'),
@@ -884,6 +1073,296 @@ function applyProvenPreparationClose(stateFile, attemptsFile, businessDate, clos
   };
   atomicWrite(stateFile, raw);
   return { closed: true, fact };
+}
+
+// ── F1：排程遗留 preparing 的**本地**准备恢复（无浏览器、无 Cookie、纯文件）────────────
+// 真实故障（2026-10-18 瑾漂亮）：进程在 preparing 相位被杀，scheduler 侧只留下
+// entries[1].status=in-progress，tick 直接终态 unknown 后再也不派发；而 publisher 侧
+// active 仍是 preparing（runId=plan-scheduler-<date>-<16hex>），既有的
+// recoverShopDayReadback 先 openShop/直播身份，Cookie 失效时永远走不到它的 preparing 收口
+// 分支。本入口不打开浏览器、不读任何 Cookie/账号配置，只做两件事：
+//   1) 复用既有**严格零消费正面证明** provePreparationZeroConsumption（同店同日同份号、
+//      排程 origin、无 frozen/CID/manifest/planId/nonce、plans/confirmationConsumptions 无
+//      本份、attempts 三表无本 runId/同日同份、无手动未决、无日 unknown/pending 旗标）；
+//   2) 复用既有**耐久收口** applyProvenPreparationClose（锁内新鲜重读两文件后再证明一次，
+//      保留 plans/attempts/history 原样，只把 active 翻成 preparation-stopped 并追加
+//      preparationClosureFacts）。
+// 缺失/损坏/错型文件一律不可知（绝不当成"零消费"）；startedAt 很旧或进程消失本身**不是**
+// 证据，绝不据此清状态。身份解析只接受：一般店自己的 shop-identity.json（唯一、同名同账户）；
+// legacy 默认根只由 wf.BUSINESS 现有默认 profile 精确绑定——绝不猜第一个目录、绝不硬编码店名。
+// 公开的 publisherStatePaths 仍是 ROOT-only 两参数权威，本入口只经内部 scheduledStatePaths。
+// 同一店名的隔离目录前缀扫描（只读）。用于两件事：账户未知时的唯一候选定位，以及
+// legacy 默认根绑定前的歧义/冲突检查（同名隔离目录存在即拒绝，绝不猜第一个目录）。
+function scanSameNameShopStateDirs(shop, root) {
+  const base = path.join(root, 'shop-state');
+  let names = [];
+  try { names = fs.existsSync(base) ? fs.readdirSync(base) : []; }
+  catch (error) { return { ok: false, reason: 'local-recovery-state-root-unreadable' }; }
+  const prefix = shopProfile.shopSlug({ shop }).replace(/__pending$/, '') + '__';
+  return { ok: true, names: names.filter(name => name.startsWith(prefix)) };
+}
+
+// legacy 扁平根内的显式身份元数据（若存在）必须与默认 profile 完全一致；冲突即拒绝。
+// 默认 profile 只来自 wf.BUSINESS，不硬编码店名/账户，也不要求用户补 accountId。
+function legacyRootIdentityConflict(root, legacyProfile, shop) {
+  const identityFile = path.join(root, 'shop-identity.json');
+  if (!fs.existsSync(identityFile)) return { ok: true };
+  let identity;
+  try { identity = JSON.parse(fs.readFileSync(identityFile, 'utf8')); }
+  catch (error) { return { ok: false, reason: 'local-recovery-legacy-identity-corrupt' }; }
+  if (!identity || typeof identity !== 'object' || Array.isArray(identity)) {
+    return { ok: false, reason: 'local-recovery-legacy-identity-malformed' };
+  }
+  if (String(identity.shop || '') !== String(shop)) {
+    return { ok: false, reason: 'local-recovery-legacy-identity-shop-conflict' };
+  }
+  if (String(identity.accountId == null ? '' : identity.accountId) !== String(legacyProfile.accountId)) {
+    return { ok: false, reason: 'local-recovery-legacy-identity-account-conflict' };
+  }
+  return { ok: true };
+}
+
+function resolveLocalPreparationState(shop, accountId, stateRoot) {
+  const root = stateRoot || ROOT;
+  let legacyProfile;
+  try { legacyProfile = shopProfile.profileFromBusiness(wf.BUSINESS); }
+  catch (error) { return { ok: false, reason: 'local-recovery-legacy-profile-invalid' }; }
+  const isLegacyShop = String(shop) === String(legacyProfile.shop);
+  const scan = scanSameNameShopStateDirs(shop, root);
+  if (!scan.ok) return scan;
+  if (accountId !== null) {
+    if (isLegacyShop && String(accountId) === String(legacyProfile.accountId)) {
+      // legacy 根只在"没有任何同名隔离目录"时才是唯一权威；存在同名隔离目录即视为歧义，
+      // 因为无法从目录名/店名证明哪一份才是本店当日的真实状态。
+      if (scan.names.length > 0) {
+        return { ok: false, reason: 'local-recovery-legacy-isolated-dir-present:' + scan.names[0] };
+      }
+      const conflict = legacyRootIdentityConflict(root, legacyProfile, shop);
+      if (!conflict.ok) return conflict;
+      return { ok: true, legacy: true, accountId: String(accountId), paths: scheduledStatePaths(legacyProfile, true, root), identityFile: path.join(root, 'shop-identity.json') };
+    }
+    const profile = shopProfile.buildShopProfile({ shop, accountId, creationPath: wf.BUSINESS.creationPath });
+    const paths = scheduledStatePaths(profile, false, root);
+    if (!fs.existsSync(paths.dir)) {
+      return { ok: true, legacy: false, absent: true, accountId, paths, reason: 'local-recovery-state-dir-missing' };
+    }
+    const identityFile = path.join(paths.dir, 'shop-identity.json');
+    if (!fs.existsSync(identityFile)) return { ok: false, reason: 'local-recovery-identity-file-missing' };
+    let identity;
+    try { identity = JSON.parse(fs.readFileSync(identityFile, 'utf8')); }
+    catch (error) { return { ok: false, reason: 'local-recovery-identity-file-corrupt' }; }
+    if (!identity || typeof identity !== 'object' || Array.isArray(identity)) return { ok: false, reason: 'local-recovery-identity-file-malformed' };
+    const identityAccount = identity.accountId == null ? '' : String(identity.accountId);
+    if (!/^\d{6,24}$/.test(identityAccount)) return { ok: false, reason: 'local-recovery-identity-account-invalid' };
+    const same = shopProfile.assertSameShopIdentity({ shop, accountId }, { shop: identity.shop, accountId: identityAccount });
+    if (!same.ok) return { ok: false, reason: 'local-recovery-identity-conflict:' + same.reason };
+    return { ok: true, legacy: false, accountId: identityAccount, paths, identityFile };
+  }
+  // 账户未知（生产 legacy 店配置 accountId=null，用户无需额外补账户）：只有店名与
+  // wf.BUSINESS 默认 profile **精确相等**时才绑定 legacy 扁平根，并使用该 profile 已冻结的
+  // 可信账户作为身份；任何同名隔离目录/根内身份元数据冲突一律拒绝。
+  if (isLegacyShop) {
+    if (scan.names.length > 0) {
+      return { ok: false, reason: 'local-recovery-legacy-isolated-dir-present:' + scan.names[0] };
+    }
+    const conflict = legacyRootIdentityConflict(root, legacyProfile, shop);
+    if (!conflict.ok) return conflict;
+    return { ok: true, legacy: true, accountId: String(legacyProfile.accountId), paths: scheduledStatePaths(legacyProfile, true, root), identityFile: path.join(root, 'shop-identity.json') };
+  }
+  // 一般店账户未知：只按本店 own 的 shop-identity.json（目录名前缀 + 店名精确 + 合法账户）定位。
+  // 前缀命中但 identity 缺失/损坏/店名冲突/账户非法 → 一律不可知；多候选 → 拒绝（绝不猜第一家）。
+  const candidates = [];
+  for (const name of scan.names) {
+    const dir = path.join(root, 'shop-state', name);
+    const identityFile = path.join(dir, 'shop-identity.json');
+    if (!fs.existsSync(identityFile)) return { ok: false, reason: 'local-recovery-identity-file-missing:' + name };
+    let identity;
+    try { identity = JSON.parse(fs.readFileSync(identityFile, 'utf8')); }
+    catch (error) { return { ok: false, reason: 'local-recovery-identity-file-corrupt:' + name }; }
+    if (!identity || typeof identity !== 'object' || Array.isArray(identity)) return { ok: false, reason: 'local-recovery-identity-file-malformed:' + name };
+    if (String(identity.shop || '') !== shop) return { ok: false, reason: 'local-recovery-identity-shop-conflict:' + name };
+    const account = identity.accountId == null ? '' : String(identity.accountId);
+    if (!/^\d{6,24}$/.test(account)) return { ok: false, reason: 'local-recovery-identity-account-invalid:' + name };
+    candidates.push({ dir, account, identityFile });
+  }
+  if (candidates.length > 1) return { ok: false, reason: 'local-recovery-identity-ambiguous:' + candidates.length };
+  if (candidates.length === 0) return { ok: true, legacy: false, absent: true, accountId: null, paths: null, reason: 'local-recovery-no-shop-state' };
+  const only = candidates[0];
+  const profile = shopProfile.buildShopProfile({ shop, accountId: only.account, creationPath: wf.BUSINESS.creationPath });
+  return { ok: true, legacy: false, accountId: only.account, paths: scheduledStatePaths(profile, false, root), identityFile: only.identityFile };
+}
+
+async function recoverLocalPreparationClose(shopLike, businessDate, opts) {
+  const o = opts || {};
+  const nowMs = typeof o.nowMs === 'function' ? o.nowMs : () => Date.now();
+  const shop = String((shopLike && (shopLike.shop || shopLike.name)) || '').trim();
+  const date = String(businessDate || '');
+  if (!shop) return { ok: false, status: 'failed', reason: 'local-recovery-shop-missing', shop, businessDate: date };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { ok: false, status: 'failed', reason: 'local-recovery-business-date-invalid', shop, businessDate: date };
+  const stateRoot = o.stateRoot || ROOT;
+  const cfgAccount = shopLike && shopLike.accountId != null && String(shopLike.accountId) !== '' ? String(shopLike.accountId) : null;
+  let resolved;
+  try { resolved = resolveLocalPreparationState(shop, cfgAccount, stateRoot); }
+  catch (error) { return { ok: false, status: 'failed', reason: 'local-recovery-identity-resolution-failed:' + scheduledErrorText(error), shop, businessDate: date }; }
+  if (!resolved.ok) return { ok: false, status: 'refused', reason: resolved.reason, shop, businessDate: date, accountId: cfgAccount };
+  if (resolved.absent) {
+    return { ok: true, status: 'nothingToRecover', reason: resolved.reason, shop, businessDate: date, accountId: resolved.accountId, legacy: resolved.legacy };
+  }
+  const paths = resolved.paths;
+  const accountId = resolved.accountId;
+  // CAS 覆盖：状态 + attempts + 独立发布事实面 +（一般店的）identity 字节。任何一项在收口后
+  // 被改写/删除，sourceHash 都会变化，账本侧拒绝映射。
+  const extraFiles = [paths.publishedFile];
+  if (resolved.identityFile) extraFiles.push(resolved.identityFile);
+  const bind = (extra) => Object.assign({
+    shop, businessDate: date, accountId, legacy: resolved.legacy,
+    stateFile: paths.stateFile, attemptsFile: paths.attemptsFile, publishedFile: paths.publishedFile,
+    sourceExtraFiles: extraFiles.slice(),
+  }, extra || {});
+  if (!fs.existsSync(paths.stateFile)) return bind({ ok: true, status: 'nothingToRecover', reason: 'local-recovery-state-file-missing' });
+  let releaseLock = null;
+  try { releaseLock = acquireLock(paths.lockFile); }
+  catch (error) {
+    const text = scheduledErrorText(error);
+    const busy = /publisher-lock-owner-active|publisher-lock-recovery-in-progress|publisher-lock-recovery-race|publisher-lock-owner-changed|publisher-lock-owner-unknown|invalid-lock-record/.test(text);
+    // 锁忙=真实 publisher worker 在途：不抢占、不删除、零改写，交给后续 tick。
+    return bind({ ok: false, status: busy ? 'locked' : 'failed', reason: 'local-recovery-publisher-lock-' + (busy ? 'busy:' : 'acquire-failed:') + text });
+  }
+  try {
+    let raw = null;
+    try { raw = JSON.parse(fs.readFileSync(paths.stateFile, 'utf8')); }
+    catch (error) { return bind({ ok: false, status: 'refused', reason: 'local-recovery-state-unreadable:' + scheduledErrorText(error) }); }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return bind({ ok: false, status: 'refused', reason: 'local-recovery-state-malformed' });
+    // 根内显式元数据（若存在）必须与解析出的可信身份一致，冲突即拒绝（绝不借用其它店状态）。
+    if (raw.shop != null && String(raw.shop) !== shop) {
+      return bind({ ok: false, status: 'refused', reason: 'local-recovery-state-shop-conflict' });
+    }
+    if (raw.accountId != null && String(raw.accountId) !== String(accountId)) {
+      return bind({ ok: false, status: 'refused', reason: 'local-recovery-state-account-conflict' });
+    }
+    if (String(raw.businessDate || '') !== date) {
+      return bind({ ok: true, status: 'unknown', reason: 'local-recovery-state-business-date-mismatch:' + String(raw.businessDate || '') });
+    }
+    const a = raw.active;
+    if (!a || typeof a !== 'object' || Array.isArray(a)) return bind({ ok: true, status: 'nothingToRecover', reason: 'local-recovery-no-active' });
+    // 幂等：publisher 已耐久收口（前次本地恢复/正式 catch 写入）。D：不能只凭"最后一条 fact"
+    // 直接复用——必须把 active 的 runId/业务日/份号与**唯一**耐久 fact 精确匹配，并重新核对
+    // 三表/发布/确认/手动/日旗标是否有新增消费；任何新增/损坏/被改都拒绝，零再改写。
+    if (a.status === 'preparation-stopped') {
+      const activeRunId = String(a.runId || '');
+      const activePlan = Number(a.planNumber);
+      const activeOrigin = SCHEDULED_RUN_ORIGIN_RE.exec(activeRunId);
+      if (!activeOrigin || activeOrigin[1] !== date) {
+        return bind({ ok: true, status: 'unknown', reason: 'local-recovery-closed-active-run-invalid' });
+      }
+      if (!Number.isInteger(activePlan) || activePlan < 1) {
+        return bind({ ok: true, status: 'unknown', reason: 'local-recovery-closed-active-plan-invalid' });
+      }
+      if (String(a.businessDate || '') !== date) {
+        return bind({ ok: true, status: 'unknown', reason: 'local-recovery-closed-active-date-mismatch' });
+      }
+      if (o.planNumber != null && String(o.planNumber) !== String(activePlan)) {
+        return bind({ ok: true, status: 'unknown', reason: 'local-recovery-plan-number-mismatch' });
+      }
+      const facts = (Array.isArray(raw.preparationClosureFacts) ? raw.preparationClosureFacts : [])
+        .filter(f => f && f.status === 'preparationClosed' && f.phase === 'preparing'
+          && String(f.businessDate || '') === date
+          && String(f.runId || '') === activeRunId
+          && Number(f.planNumber) === activePlan
+          && String(f.shop || '') === shop
+          && String(f.accountId || '') === String(accountId)
+          && strictZeroConsumptionProof(f.zeroConsumptionProof));
+      if (facts.length === 0) return bind({ ok: true, status: 'unknown', reason: 'local-recovery-closed-without-durable-fact' });
+      if (facts.length !== 1) return bind({ ok: true, status: 'unknown', reason: 'local-recovery-closed-fact-ambiguous:' + facts.length });
+      const fact = facts[0];
+      // 幂等返回也必须基于**同一份新鲜字节**：先取哈希，再重读/复核全部证明面，最后再取一次
+      // 哈希并要求两者相等；任何期间漂移都拒绝，绝不把未复核的新字节包装成新证明。
+      const hashBefore = currentPreOpenSourceHash(paths.stateFile, paths.attemptsFile, extraFiles);
+      if (typeof hashBefore !== 'string') return bind({ ok: true, status: 'unknown', reason: 'local-recovery-source-hash-unavailable' });
+      const attemptsStrict = readStrictLocalAttemptsStore(paths.attemptsFile);
+      if (!attemptsStrict.ok) return bind({ ok: false, status: 'refused', reason: attemptsStrict.reason });
+      const published = proveLocalPublishedStoreClean(paths.publishedFile, date, activeRunId, activePlan, raw.plans);
+      if (!published.ok) return bind({ ok: true, status: 'unknown', reason: 'local-recovery-not-proven:' + published.reason });
+      const recheck = proveLocalPreparationNoConsumption(raw, attemptsStrict.attempts, date, { runId: activeRunId, planNumber: activePlan });
+      if (!recheck.ok) return bind({ ok: true, status: 'unknown', reason: 'local-recovery-not-proven:' + recheck.reason });
+      const hashNow = currentPreOpenSourceHash(paths.stateFile, paths.attemptsFile, extraFiles);
+      if (typeof hashNow !== 'string') return bind({ ok: true, status: 'unknown', reason: 'local-recovery-source-hash-unavailable' });
+      if (hashNow !== hashBefore) return bind({ ok: true, status: 'unknown', reason: 'local-recovery-source-drift' });
+      return bind({
+        ok: true, status: 'preparationClosed', alreadyClosed: true,
+        planNumber: activePlan, runId: activeRunId, closedAt: fact.closedAt || null,
+        reason: String(fact.reason || ''), preparationClosure: fact, zeroConsumptionProof: fact.zeroConsumptionProof,
+        sourceHash: hashNow, sourceStateFile: paths.stateFile, sourceAttemptsFile: paths.attemptsFile,
+      });
+    }
+    if (a.status !== 'preparing') {
+      return bind({ ok: true, status: 'unknown', reason: 'local-recovery-not-preparing-phase:' + String(a.status || '') });
+    }
+    // 手动发布事实也是消费面：缺数组（错型）一律不可知，绝不当成"没有手动发布"。
+    if (!Array.isArray(raw.manualUiPublicationFacts)) return bind({ ok: false, status: 'refused', reason: 'local-recovery-manual-facts-unreadable' });
+    // B：三张表必须原始存在且为对象；缺表/错型 = 不可知，绝不把 guard loader 的默认补表当零。
+    const attemptsStrict = readStrictLocalAttemptsStore(paths.attemptsFile);
+    if (!attemptsStrict.ok) return bind({ ok: false, status: 'refused', reason: attemptsStrict.reason });
+    const chk = provePreparationZeroConsumption(raw, attemptsStrict.attempts, date);
+    if (!chk.ok) return bind({ ok: true, status: 'unknown', reason: 'local-recovery-not-proven:' + chk.reason });
+    if (o.planNumber != null && String(o.planNumber) !== String(chk.planNumber)) {
+      return bind({ ok: true, status: 'unknown', reason: 'local-recovery-plan-number-mismatch' });
+    }
+    // C：独立发布事实面必须单独证明零（同日同份/同 run/无法归因的当日记录一律拒绝）。
+    const published = proveLocalPublishedStoreClean(paths.publishedFile, date, chk.runId, chk.planNumber, raw.plans);
+    if (!published.ok) return bind({ ok: true, status: 'unknown', reason: 'local-recovery-not-proven:' + published.reason });
+    const surface = proveLocalPreparationNoConsumption(raw, attemptsStrict.attempts, date, { runId: chk.runId, planNumber: chk.planNumber });
+    if (!surface.ok) return bind({ ok: true, status: 'unknown', reason: 'local-recovery-not-proven:' + surface.reason });
+    const priorSourceHash = currentPreOpenSourceHash(paths.stateFile, paths.attemptsFile, extraFiles);
+    if (typeof priorSourceHash !== 'string') return bind({ ok: true, status: 'unknown', reason: 'local-recovery-source-hash-unavailable' });
+    // 写前 CAS：真正落盘之前再核验一次全部证明面与字节（state/attempts/published/identity），
+    // 任何漂移 → 零 state 改写（不是先写再回读）。
+    const preWriteCheck = () => {
+      const freshHash = currentPreOpenSourceHash(paths.stateFile, paths.attemptsFile, extraFiles);
+      if (typeof freshHash !== 'string' || freshHash !== priorSourceHash) {
+        return { ok: false, reason: 'local-recovery-source-drift-before-close' };
+      }
+      const freshAttempts = readStrictLocalAttemptsStore(paths.attemptsFile);
+      if (!freshAttempts.ok) return { ok: false, reason: freshAttempts.reason };
+      let freshRaw = null;
+      try { freshRaw = JSON.parse(fs.readFileSync(paths.stateFile, 'utf8')); } catch (_) { freshRaw = null; }
+      if (!freshRaw || typeof freshRaw !== 'object' || Array.isArray(freshRaw)) {
+        return { ok: false, reason: 'local-recovery-state-unreadable-before-close' };
+      }
+      const freshPublished = proveLocalPublishedStoreClean(paths.publishedFile, date, chk.runId, chk.planNumber, freshRaw.plans);
+      if (!freshPublished.ok) return { ok: false, reason: 'local-recovery-not-proven:' + freshPublished.reason };
+      const freshSurface = proveLocalPreparationNoConsumption(freshRaw, freshAttempts.attempts, date, { runId: chk.runId, planNumber: chk.planNumber });
+      if (!freshSurface.ok) return { ok: false, reason: 'local-recovery-not-proven:' + freshSurface.reason };
+      return { ok: true };
+    };
+    const closure = applyProvenPreparationClose(paths.stateFile, paths.attemptsFile, date, {
+      source: 'local-preparation-recovery',
+      reason: String(a.reason || 'preparing-stall-observed-by-local-recovery'),
+      shop, accountId,
+    }, { nowMs, attemptsLoader: readStrictLocalAttemptsStore, preWriteCheck });
+    if (closure.closed !== true) return bind({ ok: true, status: 'unknown', reason: String(closure.reason || 'local-recovery-close-refused') });
+    const fact = closure.fact;
+    const sourceHash = currentPreOpenSourceHash(paths.stateFile, paths.attemptsFile, extraFiles);
+    let after = null;
+    try { after = JSON.parse(fs.readFileSync(paths.stateFile, 'utf8')); } catch (_) { after = null; }
+    const durableFact = !!(after && Array.isArray(after.preparationClosureFacts)
+      && after.preparationClosureFacts.some(f => f && String(f.runId) === String(fact.runId)
+        && String(f.businessDate) === date && strictZeroConsumptionProof(f.zeroConsumptionProof)));
+    if (!after || !after.active || after.active.status !== 'preparation-stopped'
+      || String(after.active.runId || '') !== String(fact.runId)
+      || String(after.active.businessDate || '') !== date || !durableFact) {
+      return bind({ ok: true, status: 'unknown', reason: 'local-recovery-post-close-readback-failed' });
+    }
+    if (typeof sourceHash !== 'string') return bind({ ok: true, status: 'unknown', reason: 'local-recovery-source-hash-unavailable' });
+    return bind({
+      ok: true, status: 'preparationClosed',
+      planNumber: Number(fact.planNumber), runId: String(fact.runId), closedAt: fact.closedAt || null,
+      reason: String(fact.reason || ''), preparationClosure: fact, zeroConsumptionProof: fact.zeroConsumptionProof,
+      sourceHash, priorSourceHash, sourceStateFile: paths.stateFile, sourceAttemptsFile: paths.attemptsFile,
+    });
+  } finally {
+    try { releaseLock(); } catch (_) { /* 释放失败交由既有陈旧锁回收 */ }
+  }
 }
 
 // ── S126: durable pre-initial policy-cancel close for the FUTURE writer ───────
@@ -8233,6 +8712,6 @@ async function closeExpiredScheduledKnownFinalUnsubmitted(deps) {
   }
 }
 
-module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,bindingPanelSettled,accountDrawerCancelConfirmInPage,managementObstructionActionInPage,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,provePreInitialPolicyCancelState,applyProvenPreInitialPolicyCancelClose,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,bindingRowTooltipInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,buildScheduledPreparationDiagnostic,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,resumeScheduledKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,closeExpiredScheduledKnownFinalUnsubmitted,main};
+module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,bindingPanelSettled,accountDrawerCancelConfirmInPage,managementObstructionActionInPage,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,provePreInitialPolicyCancelState,applyProvenPreInitialPolicyCancelClose,recoverLocalPreparationClose,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,bindingRowTooltipInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,buildScheduledPreparationDiagnostic,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,resumeScheduledKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,closeExpiredScheduledKnownFinalUnsubmitted,main};
 
 if(require.main===module)main();

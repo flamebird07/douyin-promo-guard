@@ -31,6 +31,73 @@ const { checkpointQianchuanSessionCookies } = require('../login/session-cookie-c
 // 每店最多保留一个窗口，用户关闭窗口后下一轮才允许再次尝试。
 const manualReviewSessions = new Map();
 
+// ── 本次会话严格关闭证据（2026-10-18 F2-R3）────────────────────────
+// openChengfangShop 的失败路径会在关闭浏览器后，把「本次是否真的已关闭」作为
+// 非枚举、无凭据的纯数据证据挂到原始错误上；Monitor 只有读到 closed===true 才允许
+// 同一周期内重读。closeBrowser 自身会吞掉 browser.close 的拒绝（并承载 Cookie 收尾），
+// 因此它的返回/异常都不能作为成功证明；这里用 browser.isConnected() 的当前事实独立核对，
+// 不可用/抛错/仍连接一律视为未证明。
+const CLEANUP_EVIDENCE_KEY = 'chengfangCleanupEvidence';
+
+function readChengfangCleanupEvidence(err) {
+  if (!err || typeof err !== 'object') return null;
+  const ev = err[CLEANUP_EVIDENCE_KEY];
+  if (!ev || typeof ev !== 'object') return null;
+  return {
+    attempted: ev.attempted === true,
+    closed: ev.closed === true,
+    source: typeof ev.source === 'string' ? ev.source : 'unknown',
+  };
+}
+
+function attachChengfangCleanupEvidence(err, evidence) {
+  if (!err || typeof err !== 'object') return err;
+  try {
+    Object.defineProperty(err, CLEANUP_EVIDENCE_KEY, {
+      value: {
+        attempted: !!(evidence && evidence.attempted === true),
+        closed: !!(evidence && evidence.closed === true),
+        source: (evidence && typeof evidence.source === 'string') ? evidence.source : 'unknown',
+      },
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  } catch (_) { /* 错误对象不可扩展：保留原始错误，缺证明按未知处理 */ }
+  return err;
+}
+
+/** 关闭后核对浏览器连接事实：只有明确 isConnected()===false 才算已关闭。 */
+function proveChengfangBrowserClosed(browser) {
+  if (!browser || typeof browser !== 'object') {
+    return { attempted: false, closed: false, source: 'no-browser' };
+  }
+  if (typeof browser.isConnected !== 'function') {
+    return { attempted: true, closed: false, source: 'isConnected-unavailable' };
+  }
+  try {
+    return { attempted: true, closed: browser.isConnected() === false, source: 'browser.isConnected' };
+  } catch (_) {
+    return { attempted: true, closed: false, source: 'isConnected-threw' };
+  }
+}
+
+// 跨周期收口句柄（2026-10-18 F3-R7）：失败路径已拿到 browser 对象时，绝不能抛掉引用后
+// 让后续周期永远 unknown。browser 引用登记在模块内部 WeakMap（键为原始错误）：非枚举、
+// 不可序列化、绝不进日志；Monitor 凭句柄推进本次真实关闭与连接核验，成功后清门恢复读取。
+const chengfangCleanupHandles = new WeakMap();
+
+function attachChengfangCleanupHandle(err, browser) {
+  if (!err || typeof err !== 'object' || !browser || typeof browser !== 'object') return err;
+  try { chengfangCleanupHandles.set(err, browser); } catch (_) { /* 不可作 WeakMap 键：保持无句柄（Monitor 保守阻断） */ }
+  return err;
+}
+
+function readChengfangCleanupHandle(err) {
+  if (!err || typeof err !== 'object') return null;
+  return chengfangCleanupHandles.get(err) || null;
+}
+
 function isMissingChengfangControl(error) {
   const reason = String((error && (error.reason || error.message)) || error || '');
   return /(?:未找到|无法唯一定位|定位失败|二次定位不一致|控件缺失)/.test(reason)
@@ -1290,7 +1357,8 @@ async function openChengfangShop(p) {
   if (hasChengfangManualReview(p.shopCfg)) {
     throw new DataGuardError('该店千川页面正在等待人工检查；请先查看并关闭保留的可见窗口，本轮不再自动操作');
   }
-  const { browser, context, target, cookieSession } = await openQianchuanHome(p.loginCfg, p.shopCfg, p);
+  const openHome = p.openHome || openQianchuanHome;
+  const { browser, context, target, cookieSession } = await openHome(p.loginCfg, p.shopCfg, p);
   try {
     await target.waitForTimeout(2000);
     try { await target.getByText('我知道了', { exact: true }).first().click({ timeout: 3000 }); } catch (_) {}
@@ -1354,7 +1422,15 @@ async function openChengfangShop(p) {
         context, cookieSession, target, shopCfg: p.shopCfg, audit: p.audit,
       });
     } catch (_) { /* 检查点失败不得影响原始错误的如实传播 */ }
-    await closeBrowser(browser);
+    // 关闭仍走 closeBrowser（保留其 Cookie 收尾语义）；它吞掉 browser.close 的拒绝，
+    // 故关闭是否真实成功必须以独立事实核对后挂到原错误上，供 Monitor 决定能否重读。
+    try {
+      await closeBrowser(browser);
+    } catch (_) { /* 关闭异常同样不得掩盖原始错误；是否关闭由下面的独立核对判定 */ }
+    attachChengfangCleanupEvidence(e, proveChengfangBrowserClosed(browser));
+    // 本次已创建浏览器却未证明关闭时，把 browser 引用交给 Monitor（WeakMap 句柄，不进日志），
+    // 由后续巡查先推进真实关闭；关闭核验成功前该店不得启动新 opener。
+    attachChengfangCleanupHandle(e, browser);
     throw e;
   }
 }
@@ -1838,6 +1914,8 @@ module.exports = {
   openChengfangShop,
   createChengfangController,
   closeBrowser,
+  readChengfangCleanupEvidence,
+  readChengfangCleanupHandle,
   CHENGFANG_URL_MARKER,
   SUB_TAB_OPTIONS,
 };

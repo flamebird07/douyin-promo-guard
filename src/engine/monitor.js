@@ -31,7 +31,7 @@ const { createPromoReaderNotConnected, createMockPromoReader } = require('../ada
 const { createAdControllerNotConnected, createMockAdController } = require('../adapters/ad-controller');
 const { WholeShopCloseCoordinator } = require('./close-coordinator');
 const { ChengfangRunner, defaultChengfangOpener } = require('./chengfang-runner');
-const { readQianchuanBalanceInPage, balanceCentsFromPageResult } = require('../adapters/chengfang-reader');
+const { readQianchuanBalanceInPage, balanceCentsFromPageResult, readChengfangCleanupEvidence, readChengfangCleanupHandle } = require('../adapters/chengfang-reader');
 const { resolvePollingConfig } = require('../lib/bounded-poll');
 const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed } = require('./chengfang-gate');
 const { perOrderDisplayText, SPEND_FLOOR_CENTS } = require('./rules');
@@ -40,13 +40,19 @@ const { AdSwitchOrchestrator, createSwitchSerialGate } = require('./ad-switch-or
 const { mapAdStateFromAdList, mapAdStateFromSwitchRows, normalizeAdState } = require('./ad-switch-state');
 const { discoverShopsFromCookies } = require('./shop-discovery');
 const guard = require('./guard');
-const { NotConnectedError } = require('../lib/errors');
+const { NotConnectedError, AuthError } = require('../lib/errors');
 const { shanghaiDate, shanghaiClockText, shanghaiWall, shanghaiMs, isAfterDailyStart, msUntilDailyStart, msUntilHour, nextIntervalDelayMs } = require('../lib/time');
 const { centsToYuan } = require('../lib/money');
 const log = require('../lib/log');
 
 const DEFAULT_DATA_DIR = path.join(__dirname, '..', '..', 'data');
 const STATE_VERSION = 2;
+// 有限恢复周期（2026-10-18 F4-R8，用户口径）：首次读取不算；连续失败最多重试 10 次，
+// 每 2 次一组，组内可立即，组结束后至少等待 5 分钟再下一组（等待从该组末次完成时算起）。
+// 物理完整回读 = 首次 1 + 重试 10 = 11 次；满 10 后该链停止，不再自行第 11 次。
+const READ_RECOVERY_MAX_RETRIES = 10;
+const READ_RECOVERY_GROUP_SIZE = 2;
+const READ_RECOVERY_GROUP_WAIT_MS = 5 * 60 * 1000; // 300000ms
 
 class Monitor {
   /**
@@ -64,6 +70,12 @@ class Monitor {
     this.nowFn = opts.nowFn || (() => Date.now());
     this.delayFn = opts.delayFn || ((ms) => this._chunkedDelay(ms));
     this._injectedDelayFn = opts.delayFn || null; // 测试可控时钟：开启调度循环复用同一时钟门
+    // 有限恢复链的可注入 timer（测试用 fake clock；生产即全局 setTimeout/clearTimeout）。
+    this._setTimeoutFn = opts.setTimeoutFn || ((fn, ms) => setTimeout(fn, ms));
+    this._clearTimeoutFn = opts.clearTimeoutFn || ((h) => clearTimeout(h));
+    this._readRecoveries = new Map(); // shopId -> 每店独立的活动恢复链（内存态；绝不持久化 timer/句柄）
+    this._readRecoverySeq = 0;
+    this._readAttemptSeq = 0; // 实际发起物理读取的次数（恢复链据此只对真实读取计数）
 
     this.adapters = adapters || null;
     this._injectedReader = (adapters && adapters.reader) || null;
@@ -71,6 +83,10 @@ class Monitor {
     this._coordinators = new Map(); // shopId -> WholeShopCloseCoordinator（跨周期保留在途请求登记）
     this._chengfangRunners = new Map(); // shopId -> ChengfangRunner（乘方主链路）
     this._chengfangOpener = opts.chengfangOpener || null; // 测试注入：本地 DOM fixture 会话开启器
+    // 每店回读收口门（2026-10-18 状态未知修复）：会话未严格关闭时只阻断本店，
+    // 不得让一店的未收口读取阻塞其他店。旧属性 _pendingReadGate 仅保留兼容别名。
+    this._pendingReadGates = new Map();
+    this._pendingReadGate = null;
     // 决策层 + 串行门外层（2026-09-22）：每日 07:00 开启 / 低于阈值开启 / 高于阈值暂停统一入口
     this._readAdState = opts.readAdState || null; // 测试注入：本轮回读 currentAdState
     this._switchOrchestrator = opts.switchOrchestrator || null; // 测试注入
@@ -605,6 +621,8 @@ class Monitor {
     if (this.running) return { ok: true, alreadyRunning: true, activeShopCount };
     this._gen += 1;
     this.running = true;
+    // 代数变化：上一代遗留的恢复等待/迟到结果一律取消，绝不跨代继续打开页面或覆盖新状态。
+    this._cancelAllReadRecoveries('generation-change');
     this.startedAt = new Date(this.nowFn()).toISOString();
     const gen = this._gen;
     this._audit({ kind: 'monitor', event: 'start', mode: this.modeLabel, activeShopCount });
@@ -616,6 +634,8 @@ class Monitor {
   stop() {
     this._gen += 1;          // 使旧循环退出、旧 delay 中断（仅暂停巡查循环）
     this.running = false;
+    // 停止值守：取消本店恢复链的等待 timer；在途读取的迟到结果由代数/取消标记丢弃，不再打开页面。
+    this._cancelAllReadRecoveries('monitor-stop');
     // 停止在途**暂停巡查**周期：周期内不再发起新的关闭请求（已发出的继续回读确认）。
     // 按动作区分令牌：每日开启（kind:'enable'）不受"停止值守"影响——它是独立任务。
     for (const t of this._activeTokens) if (t.kind !== 'enable') t.aborted = true;
@@ -1452,6 +1472,19 @@ class Monitor {
     if (this.pending.length > 0) {
       return { ok: false, reason: `存在待配置/非法配置项，不允许更新: ${this.pending.join('；')}` };
     }
+    // 同店互斥：恢复链正在执行物理读取时，手动刷新不得叠加另一路读取（返回真实进度，稍后可再试）。
+    const activeRec = this._readRecoveryFor(shopId);
+    if (activeRec && activeRec.phase === 'running') {
+      const view = this._readRecoveryView(shopId);
+      return {
+        ok: true, readOnly: true, shopId, adState: 'unknown',
+        blocked: 'recovery_inflight',
+        reason: `本店有限恢复执行中（${view.attempts}/${view.maxRetries}），本次手动更新未叠加新读取`,
+        readRecovery: view, zeroClick: true,
+      };
+    }
+    // 用户手动更新可重置恢复事件：先取消旧链的等待 timer，再按本次真实读取重新开始。
+    this._clearReadRecovery(shopId, 'manual-refresh');
     const rt = this._runtime(shopId);
     try {
       const coord = this._getCoordinator(shopCfg);
@@ -1477,25 +1510,32 @@ class Monitor {
       // 只读回读广告状态（on/off/mixed/unknown）；失败 → unknown + blocked 说明
       const stateRead = await this._readCurrentAdState(shopCfg);
       this._applyBalanceToLastData(rt, stateRead);
-      // 只读观测更新状态；失败/unknown 也不得保留旧动作确认时间去配对新状态
-      this._applyObservedAdState(shopCfg.id, stateRead.state || 'unknown', stateRead.error
-        ? `只读回读失败：${stateRead.error.reason || 'unknown'}`
-        : '只读清单/页面回读');
       if (stateRead.error) {
-        rt.lastData.blockedReason = stateRead.error.reason;
+        // 新错误覆盖旧因；Auth 失败同时撤销旧 on 证据；未知保持零广告开关。
+        this._applyReadFailure(shopCfg.id, stateRead.error);
         rt.lastData.roiTooLow = false;
         rt.lastData.pauseEligible = false;
+        // 返回的 blocked 与 lastReadError.kind 同源（F5-R9）：注入/适配器给出的通用
+        // blocked=auth 若被具体原因推翻（Cookie/身份/读取失败），不得继续对外冒充 auth。
+        const errKind = this._readErrorKind(stateRead.error);
+        let blocked = stateRead.error.blocked || 'ad_state_read';
+        if (errKind === 'cookie_invalid' || errKind === 'cookie_blocked' || errKind === 'identity') blocked = errKind;
+        else if (blocked === 'auth' && errKind !== 'auth') blocked = errKind;
         return {
           ok: true,
           readOnly: true,
           shopId,
           data: rt.lastData,
           adState: rt.lastAdState,
-          blocked: stateRead.error.blocked || 'ad_state_read',
+          blocked,
           reason: stateRead.error.reason,
           zeroClick: true,
         };
       }
+      // 成功同店新回读：清除旧错误/旧阻断原因，再写入本轮只读观测。
+      this._clearReadFailure(shopCfg.id);
+      // 只读观测更新状态；失败/unknown 也不得保留旧动作确认时间去配对新状态
+      this._applyObservedAdState(shopCfg.id, stateRead.state || 'unknown', '只读清单/页面回读');
       if (data.ok === false) {
         rt.lastData.blockedReason = data.reason;
         return {
@@ -1520,9 +1560,15 @@ class Monitor {
       };
     } catch (e) {
       const reason = e.reason || e.message;
-      rt.lastError = reason;
+      // F5-R9：AuthError/blocked=auth 只是"读取被拒绝"，不是登录失效的充分证据。
+      // 按具体原因分类（Cookie 解析/结构、Cookie 读取受阻、身份），无正证据的通用
+      // auth 一律按读取失败保留原 reason，绝不要求扫码。
+      const cls = this._readFailureClass(reason);
+      const authType = (e instanceof AuthError || (e && e.code === 'AUTH'));
+      const blocked = cls || (authType ? 'read_failed' : 'data');
+      this._applyReadFailure(shopId, { reason, blocked, auth: cls === 'auth' || undefined });
       this._memPush(this.recentErrors, { scope: `shop:${shopId}`, error: reason }, undefined, 'error');
-      this._audit({ kind: 'shop-refresh', shopId, ok: false, reason, zeroClick: true });
+      this._audit({ kind: 'shop-refresh', shopId, ok: false, reason, blocked, zeroClick: true });
       return { ok: false, reason, zeroClick: true };
     }
   }
@@ -1585,6 +1631,8 @@ class Monitor {
     if (!this._isShopActive(shopId)) {
       return { ok: false, status: 'blocked', reason: '店铺已删除或停用，不再值守（软删除不复活）', deleted: shopCfg.deleted === true };
     }
+    // 明确新会话/用户登录接管可重置恢复事件：取消旧链等待 timer，避免与本次接管叠加。
+    this._clearReadRecovery(shopId, 'login-takeover');
     // 同店处理互斥：目标店正在被处理 → 有界等待释放；等待结束后先复核 running，再取得资格
     if (this._shopBusy(shopId)) {
       const sch = this.config.schedule || {};
@@ -1735,6 +1783,8 @@ class Monitor {
       this._audit({ kind: 'shop-delete', shopId, ok: false, reason: persist.reason, persisted: false, rolledBack: true });
       return { ok: false, reason: persist.reason, rolledBack: true, persisted: false };
     }
+    // 删除店：取消该店恢复链等待 timer；迟到结果按 cancelled 丢弃，绝不打开页面或覆盖新状态。
+    this._cancelReadRecovery(shopId, 'shop-deleted');
     // 绝不 abort 其他店的在途令牌；只在后续动作入口复核 _isShopActive
     this._audit({
       kind: 'shop-delete',
@@ -1758,6 +1808,421 @@ class Monitor {
   }
 
   /**
+   * 读取失败细分（2026-10-18 F5-R9）：
+   * 通用 AuthError / blocked=auth **不是**「登录失效」的充分证据。Cookie 文件解析/结构
+   * 损坏、文件缺失/不可读、工作副本同步锁、身份冲突/未配置都由 AuthError 抛出，但它们
+   * 是本地可修复故障，不要求用户扫码。只有正式登录检测给出的持续登录页/登录失效正证据
+   * 才归 auth。返回 null 表示无特定类别（由调用方按原 blocked 处理）。
+   */
+  _readFailureClass(reason) {
+    const r = String(reason || '');
+    // Cookie 结构/解析坏：文件本身异常（不要求扫码）。
+    if (/Cookie\s*文件解析失败|Cookie\s*文件内容不是非空数组|Cookie\s*数组中存在缺少|Cookie\s*文件格式|Cookie\s*结构/.test(r)) return 'cookie_invalid';
+    // Cookie 读取/访问受阻：缺文件、路径不可读、同步锁、权限（本地故障，不要求扫码）。
+    // 不把裸 ENOENT/EACCES 当 Cookie 故障（浏览器启动失败等应归 read_failed）。
+    if (/未找到店铺[^\n]*Cookie\s*文件|Cookie\s*文件名未配置|Cookie\s*文件名非法|Cookie\s*文件不存在|Cookie\s*文件不可读|Cookie[^\n]{0,40}(EACCES|EPERM|ENOENT)|正在同步该店\s*Cookie\s*副本|工作副本锁|工作副本写入失败|工作副本状态不可判定|无法创建本项目\s*Cookie\s*工作目录/.test(r)) return 'cookie_blocked';
+    // 身份冲突/未配置：与登录失效无关。
+    if (/身份|accountId|账户\s*ID/.test(r)) return 'identity';
+    // 登录正证据：正式登录检测的有界收敛结论。
+    if (/登录失效|登录已失效|请重新扫码登录|重新扫码|持续登录页|登录验证未通过|会话已失效|登录态无效|未登录/.test(r)) return 'auth';
+    return null;
+  }
+
+  /**
+   * 读取错误分类（页面展示与重试门共用）：
+   * - auth：正式登录检测已证明持续登录页/登录失效（只有此类可要求重新登录）；
+   * - cookie_invalid：Cookie 文件解析/结构坏（本地故障，不要求扫码）；
+   * - cookie_blocked：Cookie 文件缺失/不可读/同步锁（本地故障，不要求扫码）；
+   * - identity：身份冲突/未配置；
+   * - retrying：同一周期内正在做唯一一次有界只读重读；
+   * - timeout：总截止已到（收口/清理结果另见 error.cleanup）；
+   * - read_failed：其他读取失败（导航未稳定、清单不一致等），不得冒充登录失效。
+   * 无正证据的通用 auth（blocked=auth / auth=true）一律降为 read_failed，绝不据此要求扫码。
+   */
+  _readErrorKind(err) {
+    if (!err) return null;
+    if (err.retrying === true) return 'retrying';
+    if (err.blocked === 'cookie_invalid' || err.blocked === 'cookie_blocked' || err.blocked === 'identity') return err.blocked;
+    if (err.timeout === true) return 'timeout';
+    const cls = this._readFailureClass(err.reason);
+    if (cls) return cls;
+    return 'read_failed';
+  }
+
+  /**
+   * 只对**明确瞬态且可安全重读**的错误允许一次额外完整回读：
+   * - 清单末页行数与 total 不一致、分页 total 变化；
+   * - 管理页导航未稳定/刷新后未恢复计划视图。
+   * 明确 Auth/身份/人工检查/危险弹窗/重复 ID/超时收口未证明等一律不重试。
+   */
+  _isTransientReadError(err) {
+    if (!err || err.status !== 'blocked') return false;
+    if (err.blocked === 'auth' || err.blocked === 'identity' || err.timeout === true) return false;
+    const reason = String(err.reason || '');
+    if (/登录失效|请重新扫码登录|身份|人工检查|删除确认|重复|计划 ID 跨页重复|无法核验|截止/.test(reason)) return false;
+    return /末页已读行数\s*\d+\s*与\s*total\s*\d+\s*不一致|分页 total 不一致|导航"乘方"未到达管理页|乘方页未找到.*子标签|刷新后未能恢复商品计划视图|回读前刷新乘方管理页失败|乘方「[^」]+」刷新失败/.test(reason);
+  }
+
+  _pendingReadGateFor(shopId) {
+    const key = String(shopId);
+    if (this._pendingReadGates && this._pendingReadGates.has(key)) return this._pendingReadGates.get(key);
+    if (this._pendingReadGate && String(this._pendingReadGate.shopId) === key) return this._pendingReadGate;
+    return null;
+  }
+
+  _hasPendingReadGate(shopId) {
+    return this._pendingReadGateFor(shopId) != null;
+  }
+
+  _setPendingReadGate(shopId, gate) {
+    const key = String(shopId);
+    gate.shopId = key;
+    if (!this._pendingReadGates) this._pendingReadGates = new Map();
+    this._pendingReadGates.set(key, gate);
+    this._pendingReadGate = gate;
+  }
+
+  _clearPendingReadGate(shopId) {
+    const key = String(shopId);
+    if (this._pendingReadGates) this._pendingReadGates.delete(key);
+    if (this._pendingReadGate && String(this._pendingReadGate.shopId) === key) this._pendingReadGate = null;
+  }
+
+  // ── 按店有限恢复链（2026-10-18 F4-R8）─────────────────────────────
+  // 设计边界：
+  //  - 每店最多一条活动链；链只由真实读取失败触发，计数只随物理读取递增；
+  //  - 等待用可取消 timer（不 await 5 分钟占住 pollOnce，不阻塞其他店）；
+  //  - 同店与既有 _shopProcessing 互斥；普通巡查/手动刷新遇到活动链只合并返回，不叠加新链；
+  //  - stop/删除/代数变化取消 timer 与迟到结果；满 10 次停止，不再自行第 11 次。
+  //  - 仅内存态：进程重启后不恢复计数/句柄（见报告的重启边界）。
+  _readRecoveryFor(shopId) {
+    const key = String(shopId);
+    const rec = this._readRecoveries && this._readRecoveries.get(key);
+    if (!rec || rec.cancelled) return null;
+    if (rec.monitorGen !== this._gen) {
+      this._cancelReadRecovery(key, 'generation-change');
+      return null;
+    }
+    return rec;
+  }
+
+  _readRecoveryActive(rec) {
+    return !!(rec && !rec.cancelled && (rec.phase === 'waiting' || rec.phase === 'running' || rec.phase === 'idle'));
+  }
+
+  /** 只读投影：店铺行/机读状态共用同一来源（不重算次数，不猜下一次时间）。 */
+  _readRecoveryView(shopId) {
+    const rec = this._readRecoveryFor(shopId);
+    if (!rec) return null;
+    const max = READ_RECOVERY_MAX_RETRIES;
+    const waiting = rec.phase === 'waiting' && rec.nextAt != null;
+    let nextText = null;
+    if (waiting) {
+      const w = shanghaiWall(rec.nextAt);
+      nextText = `${String(w.hour).padStart(2, '0')}:${String(w.minute).padStart(2, '0')}`;
+    }
+    let text;
+    if (rec.phase === 'exhausted') text = `已重试${max}次仍失败`;
+    else if (rec.phase === 'stopped') text = `恢复已停止（${String(rec.lastReason || '不可重试错误').slice(0, 60)}）`;
+    else if (waiting) text = `恢复中（${rec.attempts}/${max}），下次重试 ${nextText}`;
+    else text = `恢复中（${rec.attempts}/${max}）`;
+    return {
+      active: rec.phase === 'waiting' || rec.phase === 'running',
+      phase: rec.phase,
+      attempts: rec.attempts,
+      maxRetries: max,
+      nextRetryAt: waiting ? new Date(rec.nextAt).toISOString() : null,
+      lastReason: rec.lastReason || null,
+      text,
+    };
+  }
+
+  _ensureReadRecovery(shopCfg, error, attempts) {
+    const key = String(shopCfg.id);
+    const existing = this._readRecoveries.get(key);
+    if (existing && !existing.cancelled) return existing; // 同店重复触发不叠加、不重置已用次数
+    if (existing && existing.cancelled) this._readRecoveries.delete(key);
+    const rec = {
+      shopId: key,
+      attempts: Math.max(0, Math.min(Number(attempts) || 0, READ_RECOVERY_MAX_RETRIES)),
+      phase: 'idle',
+      nextAt: null,
+      lastReason: String((error && error.reason) || '读取失败'),
+      lastBlocked: (error && error.blocked) || 'ad_state_read',
+      timer: null,
+      gen: (this._readRecoverySeq = (this._readRecoverySeq || 0) + 1),
+      monitorGen: this._gen,
+      cancelled: false,
+      runningPromise: null,
+    };
+    this._readRecoveries.set(key, rec);
+    this._audit({
+      kind: 'ad-state-read', shopId: key, event: 'recovery-scheduled',
+      attempts: rec.attempts, maxRetries: READ_RECOVERY_MAX_RETRIES,
+      groupSize: READ_RECOVERY_GROUP_SIZE, groupWaitMs: READ_RECOVERY_GROUP_WAIT_MS,
+      reason: rec.lastReason,
+    });
+    // 同步阶段已做首次+1次重读（attempts=1）：同组第 2 次可立即；若尚未重读（attempts=0）则首组 2 次。
+    const delay = (rec.attempts > 0 && rec.attempts % READ_RECOVERY_GROUP_SIZE === 0)
+      ? READ_RECOVERY_GROUP_WAIT_MS : 0;
+    this._scheduleReadRecoveryCheck(rec, delay);
+    return rec;
+  }
+
+  _scheduleReadRecoveryCheck(rec, delayMs) {
+    if (!rec || rec.cancelled) return;
+    if (rec.timer) {
+      try { this._clearTimeoutFn(rec.timer); } catch (_) { /* 清理失败不影响新登记 */ }
+      rec.timer = null;
+    }
+    const delay = Math.max(0, Number(delayMs) || 0);
+    rec.phase = 'waiting';
+    rec.nextAt = this.nowFn() + delay;
+    const gen = rec.gen;
+    const h = this._setTimeoutFn(() => {
+      rec.timer = null;
+      rec.runningPromise = this._runReadRecoveryGroup(rec, gen).catch((e) => {
+        try { this._audit({ kind: 'ad-state-read', shopId: rec.shopId, event: 'recovery-error', reason: String((e && e.message) || e).slice(0, 160) }); } catch (_) { /* 审计失败不影响 */ }
+      });
+    }, delay);
+    rec.timer = h;
+    if (h && typeof h.unref === 'function') h.unref();
+  }
+
+  /** 本组应执行到的累计重试次数（每 2 次一组；奇数先补齐同组）。 */
+  _readRecoveryGroupTarget(attempts) {
+    const rem = attempts % READ_RECOVERY_GROUP_SIZE;
+    const add = rem === 0 ? READ_RECOVERY_GROUP_SIZE : (READ_RECOVERY_GROUP_SIZE - rem);
+    return Math.min(attempts + add, READ_RECOVERY_MAX_RETRIES);
+  }
+
+  _recordRecoveryState(rec, error) {
+    if (!rec || rec.cancelled) return;
+    const view = this._readRecoveryView(rec.shopId);
+    if (!view) return;
+    const reason = error ? String(error.reason || '读取失败') : (rec.lastReason || '读取失败');
+    const rt = this._runtime(rec.shopId);
+    rt.lastReadError = {
+      kind: 'retrying',
+      reason,
+      blocked: (error && error.blocked) || rec.lastBlocked || 'ad_state_read',
+      retrying: true,
+      retried: true,
+      retryCount: rec.attempts,
+      recovery: view,
+      at: new Date(this.nowFn()).toISOString(),
+    };
+    rt.lastError = reason;
+    if (rt.lastData) rt.lastData.blockedReason = reason;
+    this._applyObservedAdState(rec.shopId, 'unknown', `有限恢复重试（${rec.attempts}/${READ_RECOVERY_MAX_RETRIES}）`);
+  }
+
+  _applyReadRecoverySuccess(shopCfg, result, rec) {
+    const shopId = String(shopCfg.id);
+    const rt = this._runtime(shopId);
+    const state = (result && result.state) || 'unknown';
+    this._audit({
+      kind: 'ad-state-read', shopId, event: 'recovery-success',
+      attempts: rec ? rec.attempts : 0, state,
+    });
+    this._clearReadFailure(shopId); // 同时清旧错误/旧阻断原因/旧恢复链
+    this._applyObservedAdState(shopId, state, `有限恢复重试成功（第${rec ? rec.attempts : 0}次，只读回读）`);
+    if (result && result.balance !== undefined) this._applyBalanceToLastData(rt, result);
+    rt.lastDataAt = new Date(this.nowFn()).toISOString();
+    this._clearReadRecovery(shopId, 'recovery-success');
+  }
+
+  _markReadRecoveryExhausted(rec, reason) {
+    if (!rec) return;
+    rec.phase = 'exhausted';
+    rec.nextAt = null;
+    if (rec.timer) {
+      try { this._clearTimeoutFn(rec.timer); } catch (_) { /* 清理失败不影响 */ }
+      rec.timer = null;
+    }
+    rec.lastReason = String(reason || rec.lastReason || '读取失败');
+    const rt = this._runtime(rec.shopId);
+    const view = this._readRecoveryView(rec.shopId);
+    rt.lastReadError = {
+      kind: 'read_failed',
+      reason: rec.lastReason,
+      blocked: rec.lastBlocked || 'ad_state_read',
+      retrying: false,
+      retried: true,
+      retryCount: rec.attempts,
+      recovery: view,
+      at: new Date(this.nowFn()).toISOString(),
+    };
+    rt.lastError = rec.lastReason;
+    if (rt.lastData) rt.lastData.blockedReason = rec.lastReason;
+    this._audit({ kind: 'ad-state-read', shopId: rec.shopId, event: 'recovery-exhausted', attempts: rec.attempts, maxRetries: READ_RECOVERY_MAX_RETRIES, reason: rec.lastReason });
+  }
+
+  _stopReadRecovery(rec, error) {
+    if (!rec) return;
+    rec.phase = 'stopped';
+    rec.nextAt = null;
+    if (rec.timer) {
+      try { this._clearTimeoutFn(rec.timer); } catch (_) { /* 清理失败不影响 */ }
+      rec.timer = null;
+    }
+    rec.lastReason = String((error && error.reason) || rec.lastReason || '不可重试错误');
+    const rt = this._runtime(rec.shopId);
+    const view = this._readRecoveryView(rec.shopId);
+    rt.lastReadError = {
+      kind: this._readErrorKind(error),
+      reason: rec.lastReason,
+      blocked: (error && error.blocked) || rec.lastBlocked || 'ad_state_read',
+      retrying: false,
+      retried: true,
+      retryCount: rec.attempts,
+      recovery: view,
+      at: new Date(this.nowFn()).toISOString(),
+    };
+    rt.lastError = rec.lastReason;
+    if (rt.lastData) rt.lastData.blockedReason = rec.lastReason;
+    this._audit({ kind: 'ad-state-read', shopId: rec.shopId, event: 'recovery-stopped', attempts: rec.attempts, reason: rec.lastReason });
+  }
+
+  _cancelReadRecovery(shopId, reason) {
+    const key = String(shopId);
+    const rec = this._readRecoveries && this._readRecoveries.get(key);
+    if (!rec) return false;
+    rec.cancelled = true;
+    rec.phase = 'cancelled';
+    rec.nextAt = null;
+    rec.gen += 1;
+    if (rec.timer) {
+      try { this._clearTimeoutFn(rec.timer); } catch (_) { /* 清理失败不影响 */ }
+      rec.timer = null;
+    }
+    this._readRecoveries.delete(key);
+    this._audit({ kind: 'ad-state-read', shopId: key, event: 'recovery-cancelled', reason });
+    return true;
+  }
+
+  _clearReadRecovery(shopId, reason) {
+    const key = String(shopId);
+    const rec = this._readRecoveries && this._readRecoveries.get(key);
+    if (!rec) return false;
+    rec.cancelled = true;
+    rec.phase = 'cleared';
+    rec.nextAt = null;
+    rec.gen += 1;
+    if (rec.timer) {
+      try { this._clearTimeoutFn(rec.timer); } catch (_) { /* 清理失败不影响 */ }
+      rec.timer = null;
+    }
+    this._readRecoveries.delete(key);
+    this._audit({ kind: 'ad-state-read', shopId: key, event: 'recovery-cleared', reason });
+    return true;
+  }
+
+  _cancelAllReadRecoveries(reason) {
+    for (const id of Array.from(this._readRecoveries.keys())) this._cancelReadRecovery(id, reason);
+  }
+
+  async _runReadRecoveryGroup(rec, gen) {
+    if (!rec || rec.cancelled || rec.gen !== gen) return;
+    if (rec.monitorGen !== this._gen) { this._cancelReadRecovery(rec.shopId, 'generation-change'); return; }
+    const shopCfg = this._findShop(rec.shopId);
+    if (!shopCfg || !this._isShopActive(rec.shopId)) {
+      this._cancelReadRecovery(rec.shopId, 'shop-inactive');
+      return;
+    }
+    if (rec.attempts >= READ_RECOVERY_MAX_RETRIES) {
+      this._markReadRecoveryExhausted(rec, rec.lastReason);
+      return;
+    }
+    // 同店互斥：主轮询/手动刷新/登录接管在途 → 不叠加同店读取，稍后再试（不计次数、不新开 opener）。
+    if (!this._tryAcquireShop(rec.shopId)) {
+      this._scheduleReadRecoveryCheck(rec, 5000);
+      this._recordRecoveryState(rec, null);
+      return;
+    }
+    rec.phase = 'running';
+    rec.nextAt = null;
+    try {
+      const target = this._readRecoveryGroupTarget(rec.attempts);
+      while (rec.attempts < target && rec.attempts < READ_RECOVERY_MAX_RETRIES) {
+        if (rec.cancelled || rec.gen !== gen || rec.monitorGen !== this._gen) return;
+        if (!this._isShopActive(rec.shopId)) { this._cancelReadRecovery(rec.shopId, 'shop-inactive'); return; }
+        const seq0 = this._readAttemptSeq || 0;
+        const r = await this._readChengfangAdStateBounded(shopCfg, { recoveryAttempt: true });
+        const attempted = (this._readAttemptSeq || 0) > seq0;
+        // 迟到结果：stop/删除/代数变化后一律不动作、不覆盖新状态。
+        if (rec.cancelled || rec.gen !== gen || rec.monitorGen !== this._gen) return;
+        if (!this._isShopActive(rec.shopId)) { this._cancelReadRecovery(rec.shopId, 'shop-inactive'); return; }
+        if (!attempted) {
+          // 收口门未推进（无物理读取）：不消耗重试次数，等待下一次检查，绝不新开 opener。
+          rec.lastReason = String((r && r.error && r.error.reason) || '收口未完成，等待下一次检查');
+          if (r && r.error && r.error.blocked) rec.lastBlocked = r.error.blocked;
+          this._scheduleReadRecoveryCheck(rec, READ_RECOVERY_GROUP_WAIT_MS);
+          this._recordRecoveryState(rec, r && r.error);
+          return;
+        }
+        rec.attempts += 1;
+        if (!r || !r.error) {
+          this._applyReadRecoverySuccess(shopCfg, r, rec);
+          return;
+        }
+        rec.lastReason = String(r.error.reason || '读取失败');
+        if (r.error.blocked) rec.lastBlocked = r.error.blocked;
+        if (!this._isTransientReadError(r.error)) {
+          // Auth/身份/超时/清单不可重试等：不盲试，链停止并保留原因与已尝试次数。
+          this._stopReadRecovery(rec, r.error);
+          return;
+        }
+        if (rec.attempts >= READ_RECOVERY_MAX_RETRIES) {
+          this._markReadRecoveryExhausted(rec, rec.lastReason);
+          return;
+        }
+      }
+      // 组结束：等待从本组末次完成时算起，至少 300000ms 后才允许下一组。
+      this._scheduleReadRecoveryCheck(rec, READ_RECOVERY_GROUP_WAIT_MS);
+      this._recordRecoveryState(rec, null);
+    } finally {
+      this._releaseShop(rec.shopId);
+    }
+  }
+
+  /** 回读失败：撤销旧 on 证据，写完整原因（lastError/today.blockedReason/结构化分类一致）。 */
+  _applyReadFailure(shopId, err) {
+    const rt = this._runtime(shopId);
+    const reason = String((err && err.reason) || '未知读取失败');
+    const recovery = (err && err.recovery) || this._readRecoveryView(shopId);
+    const kind = (recovery && recovery.active) ? 'retrying' : this._readErrorKind(err);
+    rt.lastReadError = {
+      kind,
+      reason,
+      blocked: (err && err.blocked) || 'ad_state_read',
+      retrying: kind === 'retrying',
+      retried: (err && err.retried === true) || !!(recovery && recovery.attempts > 0),
+      retryCount: (err && err.retryCount) || (recovery && recovery.attempts) || 0,
+      recovery: recovery || null,
+      at: new Date(this.nowFn()).toISOString(),
+    };
+    rt.lastError = reason;
+    if (rt.lastData) rt.lastData.blockedReason = reason;
+    // 新 Auth 失败撤销旧 on 证据：旧 adBelief/旧确认时间不得继续作为本轮可信依据。
+    if (kind === 'auth') {
+      if (this.adBelief) delete this.adBelief[shopId];
+      try { this._saveState(); } catch (_) { /* 持久化失败不掩盖本次错误 */ }
+    }
+    this._applyObservedAdState(shopId, 'unknown', `只读回读失败：${reason}`);
+  }
+
+  /** 同店成功新回读：清除旧读取错误与旧阻断原因（不得残留旧 Auth/导航失败）。 */
+  _clearReadFailure(shopId) {
+    const rt = this._runtime(shopId);
+    rt.lastReadError = null;
+    rt.lastError = null;
+    if (rt.lastData) delete rt.lastData.blockedReason;
+    // 正常新成功可重置恢复事件：清 timer/进度/旧错误（幂等；无链时无动作）。
+    this._clearReadRecovery(shopId, 'read-success');
+  }
+
+  /**
    * 本轮回读 currentAdState（on/off/mixed/unknown）。
    * - 测试可注入 opts.readAdState；
    * - 清单身份/完整性失败 → 返回 error（调用方必须 blocked，不得包成 ok）；
@@ -1771,14 +2236,35 @@ class Monitor {
         // 注入契约扩展（2026-09-25 阶段 6）：可返回 {state, identity}（携带页面身份锚点）；
         // 2026-09-27 余额扩展：可返回 {state, identity, balance}（账户级只读展示字段）；
         // 字符串返回值保持既有语义（无 identity/balance）。
+        // 注入对象必须原样保留 error/switchEvidence/inventory：旧实现只取 state/identity/balance/rows，
+        // 会把真实读取失败丢成"无 error 的 unknown"，下游因此无法区分读取失败与开关不可识别。
         if (r && typeof r === 'object' && !Array.isArray(r)) {
-          return { state: normalizeAdState(r.state), identity: r.identity || null, balance: r.balance || null };
+          return {
+            state: r.error ? 'unknown' : normalizeAdState(r.state),
+            identity: r.identity || null,
+            balance: r.balance || null,
+            rows: r.rows,
+            inventory: r.inventory,
+            error: r.error || undefined,
+            switchEvidence: r.switchEvidence || null,
+          };
         }
         return { state: normalizeAdState(r), balance: null };
       } catch (e) {
+        const reason = e.reason || e.message;
+        const isIdentity = /身份/.test(String(reason));
+        const authType = (e instanceof AuthError || (e && e.code === 'AUTH')) && !isIdentity;
+        // F5-R9：通用 AuthError 不升级为 auth；Cookie 解析/结构/读取受阻、身份按具体故障分类。
+        const cls = this._readFailureClass(reason);
+        const blocked = cls || (isIdentity ? 'identity' : (authType ? 'read_failed' : ((e && e.code === 'DATA_GUARD') ? 'inventory' : 'ad_state_read')));
         return {
           state: 'unknown',
-          error: { status: 'blocked', reason: e.reason || e.message, blocked: 'ad_state_read' },
+          error: {
+            status: 'blocked',
+            reason,
+            blocked,
+            auth: cls === 'auth' || undefined,
+          },
         };
       }
     }
@@ -1801,13 +2287,15 @@ class Monitor {
         balance: null,
       };
     } catch (e) {
-      // 身份/分页/完整性失败：blocked，不得映射成 ok/unknown 零点击
+      // 身份/分页/完整性/Cookie 故障：blocked，不得映射成 ok/unknown 零点击
+      const reason = e.reason || e.message;
+      const cls = this._readFailureClass(reason);
       return {
         state: 'unknown',
         error: {
           status: 'blocked',
-          reason: e.reason || e.message,
-          blocked: /身份/.test(String(e.reason || e.message)) ? 'identity' : 'inventory',
+          reason,
+          blocked: cls || (/身份/.test(String(reason)) ? 'identity' : 'inventory'),
         },
       };
     }
@@ -1825,11 +2313,14 @@ class Monitor {
    */
   async _closeSessionBounded(session, waitMs) {
     const browser = session && (session.browser || (session.page && session.page.browser && session.page.browser()));
-    if (!browser || typeof browser.close !== 'function') return { closed: true, error: null, promise: null };
+    const closeFn = browser && typeof browser.close === 'function'
+      ? () => browser.close()
+      : (session && typeof session.close === 'function' ? () => session.close() : null);
+    if (!closeFn) return { closed: true, error: null, promise: null };
     let settledOk = false;
     let settledErr = null;
     const p = Promise.resolve()
-      .then(() => browser.close())
+      .then(() => closeFn())
       .then(() => { settledOk = true; }, (e) => { settledErr = e || new Error('browser.close rejected'); });
     await Promise.race([p, new Promise((r) => setTimeout(r, waitMs))]);
     return { closed: settledOk && !settledErr, error: settledErr, promise: p };
@@ -1868,6 +2359,11 @@ class Monitor {
   async _advanceReadGate(gate, settleBoundMs, closeWaitMs) {
     const settled = await Promise.race([gate.workRec.settledP.then(() => true), new Promise((r) => setTimeout(r, settleBoundMs)).then(() => false)]);
     if (!settled) return { done: false, why: 'work 未 settle' };
+    // 会话从未建立（opener 在返回会话前失败）：绝不以 _closeSessionBounded(null) 的
+    // closed:true 假放行；只能凭适配器登记的收口句柄推进真实关闭与连接核验。
+    if (!(gate.sessionRef && typeof gate.sessionRef === 'function') || !gate.sessionRef()) {
+      return this._advanceOpenerCleanupGate(gate, closeWaitMs);
+    }
     for (let i = 0; i < gate.closes.length; i++) {
       const c = gate.closes[i];
       if (c.closed === true) continue;
@@ -1883,6 +2379,34 @@ class Monitor {
     const bad = gate.closes.filter((c) => c.closed !== true);
     if (bad.length > 0) return { done: false, why: `仍有未完成收口：${bad.map((c) => c.label).join('、')}` };
     return { done: true, why: null };
+  }
+
+  /**
+   * opener 未返回会话时的收口推进（2026-10-18 F3-R7，跨周期收口门）：
+   * 失败路径已创建浏览器却无严格关闭证明时，只有适配器登记在 WeakMap 的收口句柄能推进
+   * 本次真实关闭并独立核验连接；缺任何句柄一律保持未证明（保守阻断，不启动新 opener），
+   * 绝不调用 _closeSessionBounded(null) 取 closed=true 假放行。
+   * 推进成功（close 完成且 isConnected()===false）后由调用方清门，恢复正常读取。
+   */
+  async _advanceOpenerCleanupGate(gate, closeWaitMs) {
+    const handle = gate && gate.cleanupHandle;
+    if (!handle || typeof handle !== 'object') {
+      return { done: false, why: 'opener 失败未提供收口句柄：本次关闭无法核验（保守阻断，不启动新回读）' };
+    }
+    if (typeof handle.isConnected !== 'function') {
+      return { done: false, why: 'opener 收口句柄缺少连接核验（isConnected），关闭不可证明（保守阻断）' };
+    }
+    const provablyClosed = () => { try { return handle.isConnected() === false; } catch (_) { return false; } };
+    if (provablyClosed()) return { done: true, why: null };
+    let closeResolved = false;
+    if (typeof handle.close === 'function') {
+      const p = Promise.resolve()
+        .then(() => handle.close())
+        .then(() => { closeResolved = true; }, () => { closeResolved = false; });
+      await Promise.race([p, new Promise((r) => setTimeout(r, closeWaitMs))]);
+    }
+    if (closeResolved && provablyClosed()) return { done: true, why: null };
+    return { done: false, why: `opener 收口句柄推进后仍无法证明已关闭（close ${closeResolved ? '成功但连接核验仍在线' : '被拒绝或超时'}）` };
   }
 
   /**
@@ -1951,80 +2475,229 @@ class Monitor {
    * （_advanceReadGate），未完成前不开新读取——不产生重叠读取。
    * 审计 kind:ad-state-read：start / done(ok|error) / deadline(cleanup=closed|blocked) / blocked，带 lastStep 与原因。
    */
-  async _readChengfangAdStateBounded(shopCfg) {
+  async _readChengfangAdStateBounded(shopCfg, opts = {}) {
     const timeoutMs = this._adStateMsOption('adStateReadTimeoutMs', 300000);
     const settleBoundMs = this._adStateMsOption('adStateSettleWaitMs', 5000);
     const closeWaitMs = this._adStateMsOption('adStateCloseWaitMs', 10000);
-    if (this._pendingReadGate) {
-      const adv = await this._advanceReadGate(this._pendingReadGate, settleBoundMs, closeWaitMs);
+    const recoveryMode = opts && opts.recoveryAttempt === true;
+    const gate = this._pendingReadGateFor(shopCfg.id);
+    if (gate) {
+      const adv = await this._advanceReadGate(gate, settleBoundMs, closeWaitMs);
       if (!adv.done) {
         try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'blocked', reason: `上一回读未完成收口（${adv.why}），保持阻断（不启动新回读）` }); } catch (_) { /* 审计失败不影响 */ }
         return { state: 'unknown', error: { status: 'blocked', reason: `上一回读未完成收口（${adv.why}），保持阻断（不启动新回读）`, blocked: 'ad_state_read', blockedBy: 'unread_session' } };
       }
-      this._pendingReadGate = null;
+      this._clearPendingReadGate(shopCfg.id);
     }
-    try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'start', timeoutMs }); } catch (_) { /* 审计失败不影响 */ }
-    const steps = [];
-    const closes = [];
-    let session = null;
-    let timedOut = false;
-    const work = this._readChengfangAdState(shopCfg, {
-      steps,
-      onSession: (s) => {
-        session = s;
-        if (timedOut) {
-          // 迟到会话（截止后才建立/返回）：立即严格关闭；关闭一发起就同步登记为 pending，
-          // 旧 work 先 settle 时绝不因「closes 尚为空/条目未完成」误判全部已关闭（二次补验证修正）
-          this._closeSessionTracked(s, closeWaitMs, closes, 'late-session');
-        }
-      },
-    });
-    const workRec = this._settleRecord(work);
-    let timer = null;
-    let deadlineFired = false;
-    let result;
-    try {
-      result = await Promise.race([
-        work,
-        new Promise((resolve) => { timer = setTimeout(() => { timedOut = true; deadlineFired = true; resolve({ __readDeadline: true }); }, timeoutMs); }),
-      ]);
-    } catch (e) {
-      clearTimeout(timer);
-      // work 理论上不 reject（内层全兜底）；防御性透传前尽量终止会话
-      if (session) await this._closeSessionBounded(session, closeWaitMs).catch(() => {});
-      throw e;
-    }
-    clearTimeout(timer);
-    if (!deadlineFired) {
-      try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'done', outcome: result && result.error ? 'error' : 'ok', lastStep: steps.length ? steps[steps.length - 1] : null }); } catch (_) { /* 审计失败不影响 */ }
-      return result;
-    }
-    // ── 截止收口：每一步都是真实收口证明，不以定时等待结束或 browser.closed 假值放行
-    const lastStep = steps.length ? steps[steps.length - 1] : null;
-    if (session) {
-      // 关闭一发起就同步登记为 pending（见 _closeSessionTracked）
-      this._closeSessionTracked(session, closeWaitMs, closes, 'session');
-    }
-    const settledNow = await Promise.race([workRec.settledP.then(() => true), new Promise((r) => setTimeout(r, settleBoundMs)).then(() => false)]);
-    if (settledNow) {
-      // work 已 settle：迟到会话登记必然已完成（onSession 同步登记先于 settle）——排空在途关闭结果
-      for (let i = 0; i < closes.length; i++) {
-        const c = closes[i];
-        if (c.promise && c.closed === null) await Promise.race([c.promise, new Promise((r) => setTimeout(r, closeWaitMs))]);
+    // 活动恢复链合并：普通巡查/手动刷新/登录接管遇到本店活动链时不得再叠加另一条 10 次链。
+    // 只返回真实恢复进度（机读仍 unknown），由链按自己的 timer 继续；不同店互不影响。
+    let recoveryExhausted = false;
+    if (!recoveryMode) {
+      const rec = this._readRecoveryFor(shopCfg.id);
+      if (this._readRecoveryActive(rec)) {
+        const view = this._readRecoveryView(shopCfg.id);
+        return {
+          state: 'unknown',
+          error: {
+            status: 'blocked',
+            reason: `本店有限恢复进行中（${view.attempts}/${view.maxRetries}）：${view.lastReason || '等待下次重试'}；本轮不叠加新读取`,
+            blocked: 'ad_state_read',
+            blockedBy: 'recovery_inflight',
+            retried: true,
+            retryCount: view.attempts,
+            recovery: view,
+          },
+        };
       }
+      // 满 10 次/不可重试而停止后：普通下一轮巡查仍按既有调度只做一次真实读取，
+      // 不再自动生成新的 10 次链（避免无限新链）；成功读取会在 _clearReadFailure 重置事件。
+      recoveryExhausted = !!(rec && (rec.phase === 'exhausted' || rec.phase === 'stopped'));
     }
-    const pendingClose = closes.some((c) => c.closed === null);
-    const allClosed = closes.every((c) => c.closed === true);
-    if (!settledNow || !allClosed) {
-      this._pendingReadGate = { workRec, sessionRef: () => session, closes };
-      const why = !settledNow
-        ? 'work 未 settle'
-        : closes.filter((c) => c.closed !== true).map((c) => `${c.label}${c.closed === null ? ' 关闭进行中' : ' 关闭失败'}${c.error ? ': ' + String((c.error && c.error.message) || c.error).slice(0, 120) : ''}`).join('；');
-      try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'deadline', lastStep, timeoutMs, cleanup: 'blocked', why: why + (pendingClose ? '（存在在途关闭）' : '') }); } catch (_) { /* 审计失败不影响 */ }
-      return { state: 'unknown', error: { status: 'blocked', reason: `回读截止（${timeoutMs}ms）已到：${why}，已保持阻断（不启动新回读）；最后步骤：${lastStep || '未记录'}`, blocked: 'ad_state_read', timeout: true, lastStep, cleanup: 'blocked' } };
+    const maxAttempts = (recoveryMode || recoveryExhausted) ? 1 : 2;
+    // 共享总截止：首读与同周期最多一次瞬态重读共用同一个 deadlineAt，重读只使用剩余预算。
+    // 恢复链的每次物理读取独立进入本方法（各自新的 deadline），5 分钟组间等待不计入读取超时。
+    const deadlineAt = Date.now() + timeoutMs;
+    let attempt = 0;
+    let firstTransientReason = null;
+    while (true) {
+      const remaining = deadlineAt - Date.now();
+      if (remaining <= 0) {
+        const why = '总期限已到（重读前无剩余预算）';
+        try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'deadline', timeoutMs, cleanup: 'closed', why }); } catch (_) { /* 审计失败不影响 */ }
+        return { state: 'unknown', error: { status: 'blocked', reason: `回读截止（${timeoutMs}ms）已到：${why}`, blocked: 'ad_state_read', timeout: true, cleanup: 'closed' } };
+      }
+      try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'start', timeoutMs: remaining, attempt: attempt + 1 }); } catch (_) { /* 审计失败不影响 */ }
+      const steps = [];
+      const closes = [];
+      let session = null;
+      let timedOut = false;
+      const meta = {
+        steps,
+        closeWaitMs,
+        onSession: (s) => {
+          session = s;
+          if (timedOut) {
+            // 迟到会话（截止后才建立/返回）：立即严格关闭；关闭一发起就同步登记为 pending，
+            // 旧 work 先 settle 时绝不因「closes 尚为空/条目未完成」误判全部已关闭（二次补验证修正）
+            this._closeSessionTracked(s, closeWaitMs, closes, 'late-session');
+          }
+        },
+      };
+      this._readAttemptSeq = (this._readAttemptSeq || 0) + 1; // 物理读取计数（恢复链只认此值）
+      const work = this._readChengfangAdState(shopCfg, meta);
+      const workRec = this._settleRecord(work);
+      let timer = null;
+      let deadlineFired = false;
+      let result;
+      try {
+        result = await Promise.race([
+          work,
+          new Promise((resolve) => { timer = setTimeout(() => { timedOut = true; deadlineFired = true; resolve({ __readDeadline: true }); }, remaining); }),
+        ]);
+      } catch (e) {
+        clearTimeout(timer);
+        // work 理论上不 reject（内层全兜底）；防御性透传前尽量终止会话
+        if (session) await this._closeSessionBounded(session, closeWaitMs).catch(() => {});
+        throw e;
+      }
+      clearTimeout(timer);
+      if (!deadlineFired) {
+        try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'done', outcome: result && result.error ? 'error' : 'ok', lastStep: steps.length ? steps[steps.length - 1] : null, attempt: attempt + 1 }); } catch (_) { /* 审计失败不影响 */ }
+        // 正常结束也必须证明会话严格关闭；关闭失败/未确认一律阻断本店，且不得据此重读。
+        // 缺省 closeState 不再默认已关闭：没有证据就是未证明（不虚设 closed=true）。
+        const closeState = meta.closeState || { closed: false, error: new Error('缺少本次会话关闭证明'), source: 'missing' };
+        if (closeState.closed !== true) {
+          const hadSession = closeState.source === 'session';
+          const transient = !!(result && result.error && this._isTransientReadError(result.error));
+          // opener 在返回会话前已明确失败（Auth/身份/清单等不可重试原因）：保留原错误分类，
+          // 不因「缺关闭证明」改写成登录失效或读取失败；本次同样不会启动第二次读取。
+          if (!hadSession && result && result.error && !transient) return result;
+          const why = `本次会话未获得严格关闭证明${closeState.error ? ': ' + String((closeState.error && closeState.error.message) || closeState.error).slice(0, 120) : ''}`;
+          const orig = result && result.error && result.error.reason ? `；原始错误：${result.error.reason}` : '';
+          if (hadSession) {
+            this._setPendingReadGate(shopCfg.id, {
+              workRec,
+              sessionRef: () => session,
+              closes: [{ label: 'session', closed: false, error: closeState.error || null, promise: null }],
+            });
+          } else if (transient) {
+            // 跨周期收口门（F3-R7）：无严格关闭证明的瞬态导航失败必须按店登记持久内存门；
+            // 下一周期先凭收口句柄推进本次真实关闭，未证实前绝不启动新 opener。
+            // 缺句柄的未知失败保守阻断（_advanceOpenerCleanupGate 无法核验即保持门）。
+            // Auth/身份等不可重试分类走上方早退分支保持原语义，不改写、不扩大重试。
+            this._setPendingReadGate(shopCfg.id, {
+              workRec,
+              sessionRef: () => null,
+              cleanupHandle: (meta && meta.openerCleanupHandle) || null,
+              closes: [{ label: 'opener-cleanup', closed: false, error: closeState.error || null, promise: null }],
+            });
+          }
+          try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'blocked', reason: why + orig, attempt: attempt + 1 }); } catch (_) { /* 审计失败不影响 */ }
+          return { state: 'unknown', error: { status: 'blocked', reason: `回读结束但${why}${orig}，已保持阻断（不启动新回读）`, blocked: 'ad_state_read', blockedBy: 'unread_session' } };
+        }
+        // 明确瞬态且可安全重读：同一周期内最多一次额外完整回读（清空上一份分页累计，重新开 session）。
+        // 恢复链的单次读取（maxAttempts=1）或已满 10 次的普通巡查不得再触发同周期重读。
+        if (maxAttempts > 1 && attempt === 0 && result && result.error && this._isTransientReadError(result.error)
+            && !this._hasPendingReadGate(shopCfg.id)) {
+          const rem2 = deadlineAt - Date.now();
+          if (rem2 > 0) {
+            firstTransientReason = String(result.error.reason || '');
+            const rt = this._runtime(shopCfg.id);
+            rt.lastReadError = {
+              kind: 'retrying',
+              reason: firstTransientReason,
+              blocked: result.error.blocked || 'ad_state_read',
+              retrying: true,
+              retried: false,
+              at: new Date(this.nowFn()).toISOString(),
+            };
+            try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'retry', attempt: 2, reason: firstTransientReason, remainingMs: rem2 }); } catch (_) { /* 审计失败不影响 */ }
+            attempt = 1;
+            continue;
+          }
+        }
+        let out = result;
+        if (attempt > 0 && result && result.error) {
+          out = {
+            ...result,
+            error: {
+              ...result.error,
+              retried: true,
+              retryCount: 1,
+              reason: `首次回读失败（${firstTransientReason || '瞬态错误'}）；已重试1次仍未恢复：${result.error.reason}`,
+            },
+          };
+        }
+        if (attempt > 0) {
+          // 重试结束必须收口"正在重试"标记：成功清除，失败改为最终分类（避免 UI 永久停在重试中）。
+          const rt = this._runtime(shopCfg.id);
+          if (out && out.error) {
+            rt.lastReadError = {
+              kind: this._readErrorKind(out.error),
+              reason: String(out.error.reason || ''),
+              blocked: out.error.blocked || 'ad_state_read',
+              retrying: false,
+              retried: true,
+              at: new Date(this.nowFn()).toISOString(),
+            };
+          } else if (rt.lastReadError && rt.lastReadError.kind === 'retrying') {
+            rt.lastReadError = null;
+          }
+        }
+        // 同步阶段（首次 + 同周期 1 次重读）仍未恢复 → 启动按店有限恢复链。
+        // 这 1 次即时重读已计入 10 次；链只执行剩余次数，绝不嵌套成 20 次。
+        if (!recoveryMode && !recoveryExhausted && out && out.error
+            && this._isTransientReadError(out.error)
+            && !this._hasPendingReadGate(shopCfg.id)) {
+          const rec = this._ensureReadRecovery(shopCfg, out.error, attempt);
+          if (rec) {
+            const view = this._readRecoveryView(shopCfg.id);
+            out = {
+              ...out,
+              error: {
+                ...out.error,
+                retryCount: attempt,
+                recovery: view,
+                reason: `${out.error.reason}；已启动有限恢复（${rec.attempts}/${READ_RECOVERY_MAX_RETRIES}）`,
+              },
+            };
+            this._recordRecoveryState(rec, out.error);
+          }
+        }
+        if (recoveryExhausted && out && !out.error) {
+          // 满 10 次后的普通巡查真实读取成功：正常新成功重置恢复事件（清旧错误/进度）。
+          this._clearReadFailure(shopCfg.id);
+          this._applyObservedAdState(shopCfg.id, out.state || 'unknown', '满10次后普通巡查只读回读成功');
+        }
+        return out;
+      }
+      // ── 截止收口：每一步都是真实收口证明，不以定时等待结束或 browser.closed 假值放行
+      const lastStep = steps.length ? steps[steps.length - 1] : null;
+      if (session) {
+        // 关闭一发起就同步登记为 pending（见 _closeSessionTracked）
+        this._closeSessionTracked(session, closeWaitMs, closes, 'session');
+      }
+      const settledNow = await Promise.race([workRec.settledP.then(() => true), new Promise((r) => setTimeout(r, settleBoundMs)).then(() => false)]);
+      if (settledNow) {
+        // work 已 settle：迟到会话登记必然已完成（onSession 同步登记先于 settle）——排空在途关闭结果
+        for (let i = 0; i < closes.length; i++) {
+          const c = closes[i];
+          if (c.promise && c.closed === null) await Promise.race([c.promise, new Promise((r) => setTimeout(r, closeWaitMs))]);
+        }
+      }
+      const pendingClose = closes.some((c) => c.closed === null);
+      const allClosed = closes.every((c) => c.closed === true);
+      if (!settledNow || !allClosed) {
+        this._setPendingReadGate(shopCfg.id, { workRec, sessionRef: () => session, closes });
+        const why = !settledNow
+          ? 'work 未 settle'
+          : closes.filter((c) => c.closed !== true).map((c) => `${c.label}${c.closed === null ? ' 关闭进行中' : ' 关闭失败'}${c.error ? ': ' + String((c.error && c.error.message) || c.error).slice(0, 120) : ''}`).join('；');
+        try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'deadline', lastStep, timeoutMs, cleanup: 'blocked', why: why + (pendingClose ? '（存在在途关闭）' : ''), attempt: attempt + 1 }); } catch (_) { /* 审计失败不影响 */ }
+        return { state: 'unknown', error: { status: 'blocked', reason: `回读截止（${timeoutMs}ms）已到：${why}，已保持阻断（不启动新回读）；最后步骤：${lastStep || '未记录'}`, blocked: 'ad_state_read', timeout: true, lastStep, cleanup: 'blocked' } };
+      }
+      try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'deadline', lastStep, timeoutMs, cleanup: 'closed', attempt: attempt + 1 }); } catch (_) { /* 审计失败不影响 */ }
+      return { state: 'unknown', error: { status: 'blocked', reason: `回读截止（${timeoutMs}ms）已到，已终止本次会话；最后步骤：${lastStep || '未记录'}`, blocked: 'ad_state_read', timeout: true, lastStep, cleanup: 'closed' } };
     }
-    try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'deadline', lastStep, timeoutMs, cleanup: 'closed' }); } catch (_) { /* 审计失败不影响 */ }
-    return { state: 'unknown', error: { status: 'blocked', reason: `回读截止（${timeoutMs}ms）已到，已终止本次会话；最后步骤：${lastStep || '未记录'}`, blocked: 'ad_state_read', timeout: true, lastStep, cleanup: 'closed' } };
   }
 
   /**
@@ -2197,19 +2870,54 @@ class Monitor {
       // 透出本轮回读的页面身份（供账户映射自动建立使用；不改变既有状态语义）
       return { state, rows, identity, balance, switchEvidence };
     } catch (e) {
+      const reason = e.reason || e.message;
+      const isIdentity = /身份/.test(String(reason));
+      const authType = (e instanceof AuthError || (e && e.code === 'AUTH')) && !isIdentity;
+      // opener 在返回会话前失败时，适配器可能已创建并关闭了浏览器；只有它给出的
+      // 「本次已严格关闭」独立核对证据才能作为同一周期重读的依据。
+      const cleanup = readChengfangCleanupEvidence(e);
+      if (_meta && cleanup) _meta.openerCleanup = cleanup;
+      // 跨周期收口句柄（F3-R7）：opener 失败但已创建浏览器时，句柄随原始错误一并透传，
+      // 供外壳登记持久门并在后续周期推进真实关闭；句柄本身绝不进入返回值或日志。
+      if (_meta && typeof readChengfangCleanupHandle === 'function') {
+        const cleanupHandle = readChengfangCleanupHandle(e);
+        if (cleanupHandle) _meta.openerCleanupHandle = cleanupHandle;
+      }
+      // F5-R9：Cookie 解析/结构/读取受阻、身份、通用 Auth 均按具体故障分类；
+      // 只有正式登录检测的正证据才是 auth（可要求重新登录），其余保持原 reason。
+      const cls = this._readFailureClass(reason);
+      const blocked = cls || (isIdentity ? 'identity' : (authType ? 'read_failed' : 'inventory'));
       return {
         state: 'unknown',
         error: {
           status: 'blocked',
-          reason: e.reason || e.message,
-          blocked: /身份/.test(String(e.reason || e.message)) ? 'identity' : 'inventory',
+          reason,
+          blocked,
+          auth: cls === 'auth' || undefined,
         },
       };
     } finally {
-      try {
-        if (session && typeof session.close === 'function') await session.close();
-        else if (session && session.browser) await session.browser.close();
-      } catch (_) { /* 关闭失败不冒泡 */ }
+      // 严格关闭并记录结果：外层只有拿到 closed===true 才允许同一周期内重读；
+      // 关闭失败/未确认一律阻断，绝不把"关不掉"当作可重试。
+      // 关键修正（2026-10-18 F2-R3）：opener 抛错时 session 仍为 null，旧实现据此
+      // 默认 closed=true，等于把「浏览器可能已创建但未证明关闭」当成可安全重读。
+      let closed = false;
+      let closeError = null;
+      let source = 'missing';
+      if (session) {
+        const waitMs = (_meta && _meta.closeWaitMs) || 10000;
+        const cr = await this._closeSessionBounded(session, waitMs);
+        closed = cr.closed === true;
+        closeError = cr.error || null;
+        source = 'session';
+      } else if (_meta && _meta.openerCleanup) {
+        closed = _meta.openerCleanup.closed === true;
+        source = 'opener-cleanup';
+        if (!closed) closeError = new Error(`opener 失败路径未证明本次浏览器已关闭（${_meta.openerCleanup.source || 'unknown'}）`);
+      } else {
+        closeError = new Error('本次回读未建立可核验的会话，也没有可核验的关闭证明');
+      }
+      if (_meta) _meta.closeState = { closed, error: closeError, source };
     }
   }
 
@@ -2504,12 +3212,11 @@ class Monitor {
       this._applyBalanceToLastData(rt, stateRead);
       if (stateRead.error) {
         const err = stateRead.error;
-        rt.lastData.blockedReason = err.reason;
+        // 失败/unknown：新错误覆盖旧因，撤销旧 on 证据；只读观测不得伪称动作确认。
+        this._applyReadFailure(shopCfg.id, err);
         // 本轮没有可信决策 → 不保留上一轮的 ROI 提示（避免陈旧警告）
         rt.lastData.roiTooLow = false;
         rt.lastData.pauseEligible = false;
-        // 失败/unknown：只读观测，不得伪称动作确认；旧确认时间随观测失效
-        this._applyObservedAdState(shopCfg.id, 'unknown', `只读回读失败：${err.reason || 'unknown'}`);
         this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: err.reason }, undefined, 'error');
         this._emitJudgement(shopCfg, { data, over: data.evaluation.over === true, status: 'blocked', reason: err.reason, currentAdState: stateRead.state });
         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: err.reason, blocked: err.blocked, zeroClick: true });
@@ -2524,6 +3231,7 @@ class Monitor {
         };
       }
       const currentAdState = stateRead.state;
+      this._clearReadFailure(shopCfg.id);
       this._applyObservedAdState(shopCfg.id, currentAdState, '只读清单/页面回读');
       rt.lastDataAt = new Date(this.nowFn()).toISOString();
       const thresholdCents = this._thresholdCents(shopCfg);
@@ -3261,6 +3969,11 @@ class Monitor {
         platform: s.platform || 'douyin',
         cookieInfo,
         lastError: rt.lastError || null,
+        // 读取失败结构化状态（完整原因 + 分类：retrying/read_failed/auth/timeout）。
+        // 只用于如实展示与重试/扫码判定，绝不被当作 on/off 或成功证据。
+        lastReadError: rt.lastReadError || null,
+        // 按店有限恢复进度（真实 timer/计数投影；active=等待/执行中，exhausted=已重试10次仍失败）
+        readRecovery: this._readRecoveryView(s.id),
         today: rt.lastData || null,
         lastDataAt: rt.lastDataAt || (rt.lastData && rt.lastData.fetchedAt) || null,
         // 50 元门槛：只展示同店同日有效投影，不把 null 当 0 重算
@@ -3355,6 +4068,7 @@ class Monitor {
           pauseEligible: (t && t.businessDate === today) ? t.pauseEligible === true : false,
           roiTooLow: !!(t && t.businessDate === today && t.roiTooLow === true),
           lastError: rt.lastError || (t && t.blockedReason) || null,
+          readRecovery: this._readRecoveryView(s.id),
           // 状态供界面兼容；正常配置店铺不显示待核验标记。
           identityPending: this._shopIdentityState(s).pending,
           identityNote: this._shopIdentityState(s).reason,

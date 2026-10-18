@@ -1046,7 +1046,173 @@ test('子标签 ready 不是浮窗消失的证明：就绪后的未知浮窗仍�
   await browser.close();
 });
 
-// ── 6) 无模型运行依赖 ──────────────────────────────────────────────────
+// ── 6) 真实脱敏 DOM 形状回归（F1-R5：分类回归补修）─────────────────────
+
+/** 共享埋点属性 [data-e2e="oc_emptyKey_overall-prom"] 的普通非模态元素（导航/徽标/工具栏/popover）。 */
+function addSharedE2eChrome(root) {
+  const mk = (cls) => {
+    const n = new FakeNode('div', { class: cls, 'data-e2e': 'oc_emptyKey_overall-prom' }, '导航/工具栏文案');
+    root.appendChild(n);
+    return n;
+  };
+  return [
+    mk('ocean-vmok-plugin-navigator ocean-vmok-plugin-nav-absolute ocean-vmok-plugin-nav-transparent'),
+    mk('ocean-vmok-plugin-oc-new-badge ocean-vmok-plugin-oc-new-badge-right'),
+    mk('ocean-vmok-plugin-navigator-right-tool'),
+    mk('ocean-vmok-plugin-oc-popover'),
+  ];
+}
+
+/** 首页普通右侧货款直投卡片：270x190，只有业务"去开启"CTA，无跳过/我知道了/关闭。 */
+function addFundGuide(root) {
+  const card = new FakeNode('div', { class: 'productFundModuleGuide-BSA0DN' },
+    '开启货款直投升级版，抢量快人一步!告别手动充值，一键操作效率高 精准预估消耗 按需转入不停投');
+  root.appendChild(card);
+  const cta = new FakeNode('button', { class: 'fund-cta' }, '去开启');
+  card.appendChild(cta);
+  return { card, cta };
+}
+
+/** 真实介绍 modal：modal-wrap 容器语义 + 唯一白名单 X。 */
+function addRealModal(root, opts = {}) {
+  const works = opts.works !== false;
+  const wrap = new FakeNode('div', {
+    class: 'tools-vmok-plugin-modal__wrap ocean-vmok-plugin-oc-modal-wrap overall-release-modal-v2-wrap',
+    'data-e2e': 'oc_emptyKey_home',
+  }, opts.text || '联盟合作达人自动投 抢占流量不错过');
+  root.appendChild(wrap);
+  const x = new FakeNode('span', { class: 'tools-vmok-plugin-modal__close-icon' });
+  x.onClick = () => { if (works) removeNode(wrap); };
+  wrap.appendChild(x);
+  return { wrap, x };
+}
+
+// ① 共享E2E导航/徽标/工具栏/popover + 一个真实modal：只点modal唯一X，导航/业务零点击
+test('共享E2E非模态元素 + 一个真实modal：只关真实modal唯一X，导航零点击', () => {
+  const dom = makeDom();
+  const chrome = addSharedE2eChrome(dom.root);
+  const modal = addRealModal(dom.root);
+  const r = runInPage(handleChengfangOverlayInPage, { click: true }, { document: dom.document, url: QC_URL });
+  assert.equal(r.trusted, true);
+  assert.equal(r.state, 'dismissable');
+  assert.equal(r.action, 'dismiss-intro');
+  assert.equal(r.clicked, true);
+  assert.ok(!r.blockers.some((b) => b.startsWith('multiple-intro')), '共享埋点不得再触发 multiple-intro');
+  assert.equal(modal.x.clicked, 1, '只点真实modal唯一X');
+  for (const c of chrome) assert.equal(c.clicked, 0, '导航/徽标/工具栏/popover 绝不点击');
+});
+
+// ② 单独 fundGuide 普通卡片：不报浮窗/零点击
+test('普通货款直投卡片单独存在：不报浮窗（state none），不点去开启', () => {
+  const dom = makeDom();
+  const fund = addFundGuide(dom.root);
+  const r = runInPage(handleChengfangOverlayInPage, { click: true }, { document: dom.document, url: QC_URL });
+  assert.equal(r.state, 'none');
+  assert.equal(r.clicked, false);
+  assert.equal(fund.cta.clicked, 0, '无浮层语义的业务卡片 CTA 绝不点击');
+});
+
+// ③ fundGuide + 真实modal：只关modal，不点"去开启"
+test('货款直投卡片 + 真实modal：只关真实modal，不点业务"去开启"', () => {
+  const dom = makeDom();
+  const fund = addFundGuide(dom.root);
+  const modal = addRealModal(dom.root);
+  const r = runInPage(handleChengfangOverlayInPage, { click: true }, { document: dom.document, url: QC_URL });
+  assert.equal(r.state, 'dismissable');
+  assert.equal(r.action, 'dismiss-intro');
+  assert.equal(r.clicked, true);
+  assert.equal(modal.x.clicked, 1);
+  assert.equal(fund.cta.clicked, 0, '真实modal与货款卡片并存时仍只关modal');
+});
+
+// ④ 真实多个独立modal / 危险 / 未知：仍阻断（多候选保护未删）
+test('多个独立真实modal / 危险文本：保留多候选阻断，不刷绿', () => {
+  const a = makeDom();
+  const m1 = addRealModal(a.root);
+  const m2 = addRealModal(a.root);
+  const ra = runInPage(handleChengfangOverlayInPage, { click: true }, { document: a.document, url: QC_URL });
+  assert.equal(ra.state, 'blocked');
+  assert.ok(ra.blockers.some((b) => b.startsWith('multiple-intro')), '两个真实独立modal仍必须阻断');
+  assert.equal(m1.x.clicked, 0);
+  assert.equal(m2.x.clicked, 0);
+
+  const b = makeDom();
+  const dm = addRealModal(b.root, { text: '确认删除这 30 条计划？删除后不可恢复' });
+  const rb = runInPage(handleChengfangOverlayInPage, { click: true }, { document: b.document, url: QC_URL });
+  assert.equal(rb.state, 'blocked');
+  assert.ok(rb.blockers.includes('danger-text'));
+  assert.equal(dm.x.clicked, 0);
+
+  const c = makeDom();
+  const um = addRealModal(c.root);
+  addUnknownModal(c.root);
+  const rc = runInPage(handleChengfangOverlayInPage, { click: true }, { document: c.document, url: QC_URL });
+  assert.equal(rc.state, 'blocked');
+  assert.ok(rc.blockers.some((x) => x.startsWith('unknown-overlay')));
+  assert.equal(um.x.clicked, 0);
+});
+
+// ⑤ 单店正常打开完成dismiss后二次消失 + 独立工作路径checkpoint调用及源路径零写
+test('正常同店恢复：dismiss 消失后实际调用 checkpoint，其 cookieSession.filePath 只指向推广值守独立副本', async () => {
+  const f = baseFixture('overlay-cookie-workcopy');
+  const reviewPage = makePage({ url: QC_URL });
+  const { browser, reviewContext } = makeReviewBrowser(reviewPage);
+  const sourceShared = {
+    filePath: 'C:/mock/app/cookies/商品分析源店铺.json',
+    startFingerprint: { sha256: 'deadbeef' },
+    identityPage: { mock: 'original-context-page' },
+  };
+  const held = await retainChengfangPageForManualReview({
+    context: f.context, target: f.target, shopCfg: f.shopCfg, loginCfg: {},
+    browserFactory: async () => browser,
+    cookieSession: { filePath: 'C:/mock/guard/cookies/推广值守独立工作副本.json', startFingerprint: sourceShared.startFingerprint, identityPage: sourceShared.identityPage },
+  });
+  assert.equal(held.held, true);
+  const modal = addRealModal(reviewPage._dom.root);
+  let checkpointArgs = null;
+  try {
+    const r = await openChengfangShop({
+      shopCfg: f.shopCfg, loginCfg: {},
+      openHome: async () => { throw new Error('不得新开'); },
+      sessionCheckpoint: async (args) => { checkpointArgs = args; return { saved: true, skipped: false }; },
+    });
+    assert.equal(r.recoveredFromManualReview, true);
+    assert.equal(modal.x.clicked, 1, '真实modal关闭后才继续');
+    assert.ok(checkpointArgs, 'manager-ready checkpoint 必须实际被调用');
+    assert.equal(checkpointArgs.context, reviewContext);
+    assert.equal(checkpointArgs.target, reviewPage);
+    assert.deepEqual(Object.keys(checkpointArgs.cookieSession).sort(), ['filePath', 'startFingerprint'],
+      '仅传 filePath/startFingerprint，绝不带原 context identityPage');
+    assert.equal(Object.prototype.hasOwnProperty.call(checkpointArgs.cookieSession, 'identityPage'), false);
+    assert.equal(checkpointArgs.cookieSession.filePath, 'C:/mock/guard/cookies/推广值守独立工作副本.json',
+      '只能走推广值守独立副本');
+    assert.doesNotMatch(String(checkpointArgs.cookieSession.filePath), /app[\\/]cookies/, '绝不指回商品分析源Cookie');
+    assert.notEqual(checkpointArgs.cookieSession.filePath, sourceShared.filePath, '不回写源路径');
+  } finally {
+    await browser.close();
+  }
+});
+
+// ⑥ 保存冲突/错身份：checkpoint 返回 skipped，未知绝不谎报 saved
+test('错身份/保存冲突：checkpoint skipped，绝不谎报 saved', async () => {
+  const held = await holdWithReviewWindow('overlay-cookie-conflict');
+  addRealModal(held.reviewPage._dom.root);
+  try {
+    const r = await openChengfangShop({
+      shopCfg: held.shopCfg, loginCfg: {},
+      openHome: async () => { throw new Error('不得新开'); },
+      sessionCheckpoint: async () => ({ saved: false, skipped: true, reason: '身份冲突/未唯一匹配，未保存' }),
+    });
+    assert.equal(r.recoveredFromManualReview, true);
+    assert.equal(r.cookieCheckpoint.saved, false, '缺正证据不得记为 saved');
+    assert.equal(r.cookieCheckpoint.skipped, true);
+    assert.match(r.cookieCheckpoint.reason, /身份冲突/);
+  } finally {
+    await held.browser.close();
+  }
+});
+
+// ── 7) 无模型运行依赖 ──────────────────────────────────────────────────
 
 test('实现无模型/网络运行依赖（纯页面探针 + mock 即可运行）', () => {
   const src = fs.readFileSync(require.resolve('../src/adapters/chengfang-reader'), 'utf8');

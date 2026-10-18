@@ -1476,9 +1476,12 @@ function readChengfangAccountInPage() {
  *
  * 安全边界（全部 fail-closed）：
  *  - 只认严格可信千川来源：https + origin 全等 + 非登录/授权中转 + 受支持管理路径；
- *  - 只认已知白名单容器：介绍浮层 [data-e2e="oc_emptyKey_overall-prom"] /
- *    .ocean-vmok-plugin-oc-modal-wrap（关闭控件必须落在容器内且唯一）；
- *    引导容器 [class*=guide|Guide|tour|Tour]（"跳过/跳过引导/我知道了"必须落在容器内且唯一）；
+ *  - 只认已知白名单容器：介绍浮层只认 modal 容器语义（.ocean-vmok-plugin-oc-modal-wrap /
+ *    .tools-vmok-plugin-modal__wrap / [class*=modal-wrap|modal__wrap]），**不**以共享埋点属性
+ *    [data-e2e="oc_emptyKey_overall-prom"] 当弹窗根（该属性被导航/徽标/工具栏/popover 共用）；
+ *    关闭控件必须落在容器内且唯一；
+ *    引导容器 [class*=guide|Guide|tour|Tour] 必须**容器内确有唯一可见"跳过/我知道了"**才算引导
+ *    浮窗；无跳过/关闭控件的普通营销卡片（货款直投等"去开启"CTA）不当浮窗、绝不点业务 CTA；
  *  - CSS 只是**发现线索**，不能代替内容判定：白名单容器正文出现删除/暂停/开启确认、
  *    互斥/终止/不可恢复、小店随心推、授权登录等危险业务文本 → 一律阻断，绝不点 X；
  *  - 未知可见浮层（dialog/alertdialog/modal/popup/mask/dialog/confirm 类，且不属于上述
@@ -1538,10 +1541,30 @@ function handleChengfangOverlayInPage(options) {
   // 小店随心推、授权登录等一律优先阻断。文本归一化后匹配，避免换行/空格绕过。
   const DANGER_TEXT_RE = /(?:确认|确定|是否)[^。！？\n]{0,16}(?:删除|暂停|开启|关闭|终止)|(?:删除|暂停|开启|终止)[^。！？\n]{0,16}(?:不可恢复|确认|是否)|互斥|小店随心推|授权登录|扫码登录|重新登录|删除后不可恢复|终止[^。！？\n]{0,8}不可恢复|(?:暂停|删除|开启|终止)\s*[0-9一二三四五六七八九十百千]+\s*条/;
 
-  const introRoots = dedupeOuter(all('[data-e2e="oc_emptyKey_overall-prom"], .ocean-vmok-plugin-oc-modal-wrap').filter(visible));
+  // 介绍/模态浮窗根：只认已知 modal 容器语义（modal-wrap / modal__wrap 外壳），
+  // 绝不把共享埋点属性 [data-e2e="oc_emptyKey_overall-prom"] 本身当弹窗根——该属性被
+  // 导航/徽标/右侧工具栏/popover 等多个**非模态、无关闭控件**元素共用，据此发现会与真实
+  // modal 并列出 multiple-intro 假阻断（2026-10-18 真实 DOM 取证）。真实 modal 靠其
+  // modal-wrap 类被识别，仍要求容器内唯一可见关闭控件（见下 dismissable 分支）才可点。
+  const introRoots = dedupeOuter(all(
+    '.ocean-vmok-plugin-oc-modal-wrap, .tools-vmok-plugin-modal__wrap, '
+    + '[class*="modal-wrap"], [class*="modal__wrap"]'
+  ).filter(visible));
+  // 引导容器：class 含 guide/tour 只是线索；必须**容器内确有唯一可见"跳过/我知道了"**才算
+  // 引导浮窗。普通右侧营销卡片（如 productFundModuleGuide，270x190，只有业务"去开启"CTA、
+  // 无跳过/关闭控件）没有浮层语义 → 不是阻断引导，忽略之，绝不点它的业务 CTA。
+  const hasSkipControl = (el) => {
+    if (!el || !el.querySelectorAll) return false;
+    return dedupeOuter(Array.prototype.slice.call(el.querySelectorAll('button, a, [role="button"], span')).filter((b) => {
+      if (!visible(b)) return false;
+      const t = String(b.textContent || '').replace(/\s+/g, '');
+      return t === '跳过' || t === '跳过引导' || t === '我知道了';
+    })).length > 0;
+  };
   const guideRoots = dedupeOuter(all('[class*="guide"], [class*="Guide"], [class*="tour"], [class*="Tour"]').filter((el) => {
     if (!visible(el)) return false;
-    return !introRoots.some((r) => r === el || (r.contains && r.contains(el)));
+    if (introRoots.some((r) => r === el || (r.contains && r.contains(el)))) return false;
+    return hasSkipControl(el);
   }));
   const known = introRoots.concat(guideRoots);
   // 未知/业务浮层候选：除常见 modal/popup/mask 外，必须纳入 dialog/confirm 类

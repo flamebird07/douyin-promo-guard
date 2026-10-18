@@ -25,7 +25,10 @@
 const path = require('path');
 const { AuthError, DataGuardError } = require('../lib/errors');
 const { openQianchuanHome, closeBrowser } = require('./qianchuan-reader');
-const { checkpointQianchuanSessionCookies } = require('../login/session-cookie-checkpoint');
+const {
+  checkpointQianchuanSessionCookies,
+  probeQianchuanHeaderIdentityInPage,
+} = require('../login/session-cookie-checkpoint');
 
 // 自动会话始终保持后台运行；仅控件定位失败时，另开一份同店铺可见会话供人工检查。
 // 每店最多保留一个窗口，用户关闭窗口后下一轮才允许再次尝试。
@@ -119,12 +122,48 @@ function hasChengfangManualReview(shopCfg) {
   return true;
 }
 
-async function retainChengfangPageForManualReview({ context, target, shopCfg, loginCfg, browserFactory }) {
+/** 本次进程内的「保留窗口恢复者」占位：同店同一时刻只允许一个恢复者，绝不并发新开。 */
+const manualReviewRecoveries = new Set();
+
+/** 保留窗口内冻结的原始账户身份（只在内存；不写配置、不进日志）。 */
+function readHeldFrozenAccountId(held) {
+  const v = held && held.frozenAccountId;
+  return (typeof v === 'string' && /^\d{8,20}$/.test(v)) ? v : null;
+}
+
+/** 保留窗口地址必须是严格可信千川乘方管理页（URL 解析，绝不子串匹配）。 */
+function isTrustedChengfangUrl(u) {
+  if (typeof u !== 'string' || u.length === 0) return false;
+  let p;
+  try { p = new URL(u); } catch (_) { return false; }
+  if (p.origin !== 'https://qianchuan.jinritemai.com') return false;
+  if (/\/login|\/passport|\/signin|sso\.jinritemai/i.test(p.pathname)) return false;
+  return CHENGFANG_URL_RE.test(p.pathname);
+}
+
+async function retainChengfangPageForManualReview({ context, target, shopCfg, loginCfg, browserFactory, cookieSession }) {
   const key = manualReviewShopKey(shopCfg);
   if (!key || !context || !target || typeof context.storageState !== 'function') return { held: false, reason: '页面会话不可用' };
   if (hasChengfangManualReview(shopCfg)) return { held: true, reused: true };
   const url = typeof target.url === 'function' ? target.url() : '';
   if (!/^https:\/\/qianchuan\.jinritemai\.com\//i.test(url)) return { held: false, reason: '当前不是千川页面' };
+  // 保留时从**原会话当前唯一头部正证据**冻结账户ID：后续恢复只认这个冻结值。
+  // 缺失/多候选/可见登录控件 → 不冻结（legacy/held 无身份一律不猜、不解除）。
+  let frozenAccountId = null;
+  try {
+    if (typeof target.evaluate === 'function') {
+      const obs = await target.evaluate(probeQianchuanHeaderIdentityInPage);
+      if (obs && obs.unique === true && obs.loginVisible !== true
+        && typeof obs.accountId === 'string' && /^\d{8,20}$/.test(obs.accountId)) {
+        frozenAccountId = obs.accountId;
+      }
+    }
+  } catch (_) { frozenAccountId = null; }
+  // 仅保留文件路径/起始指纹两项元信息：绝不复制 identityPage（原 context 的页面在
+  // 新 reviewContext 里不构成同 context 证据），也不复制任何 Cookie 值。
+  const reviewCookieSession = (cookieSession && typeof cookieSession.filePath === 'string' && cookieSession.startFingerprint)
+    ? { filePath: cookieSession.filePath, startFingerprint: cookieSession.startFingerprint }
+    : null;
   let browser = null;
   try {
     const storageState = await context.storageState(); // 仅在内存传递，绝不写入日志或文件
@@ -145,7 +184,7 @@ async function retainChengfangPageForManualReview({ context, target, shopCfg, lo
     const page = await reviewContext.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     if (typeof page.bringToFront === 'function') await page.bringToFront();
-    const held = { browser, page };
+    const held = { browser, page, context: reviewContext, frozenAccountId, cookieSession: reviewCookieSession };
     manualReviewSessions.set(key, held);
     if (typeof page.on === 'function') page.on('close', () => {
       if (manualReviewSessions.get(key) === held) manualReviewSessions.delete(key);
@@ -154,7 +193,7 @@ async function retainChengfangPageForManualReview({ context, target, shopCfg, lo
     if (typeof browser.on === 'function') browser.on('disconnected', () => {
       if (manualReviewSessions.get(key) === held) manualReviewSessions.delete(key);
     });
-    return { held: true, reused: false };
+    return { held: true, reused: false, identityFrozen: frozenAccountId != null };
   } catch (e) {
     if (browser) await closeBrowser(browser);
     return { held: false, reason: `可见窗口打开失败：${e.message}` };
@@ -173,13 +212,35 @@ async function holdOnMissingChengfangControl(error, session) {
     shopCfg: session.shopCfg,
     loginCfg: session.loginCfg,
     browserFactory: session.reviewBrowserFactory,
+    cookieSession: session.cookieSession,
   });
   const suffix = held.held
-    ? '；已保留可见千川页面供人工检查，关闭检查窗口后才恢复该店自动尝试'
+    ? '；已保留可见千川页面供人工检查：请在保留窗口里点**浮窗右上角的 ❌** 关闭引导/介绍浮层（不是关闭整个浏览器，也不需要重新扫码）；'
+      + '下一轮自动尝试会先核验同店身份与浮窗是否真的消失，核验通过才继续，未通过继续阻断'
     : `；未能打开人工检查窗口（${held.reason}），该轮仍停止自动操作`;
   error.reason = `${error.reason || error.message}${suffix}`;
   error.message = error.reason;
   return held.held;
+}
+
+/**
+ * 只读控件恢复策略（业务动作永不隐式重放）：
+ *  - IDEMPOTENT：重复执行同一目标状态是安全的（切同一 tab / 设同一页大小 / 回第一页）；
+ *  - PROOF_REQUIRED：导航类动作（翻页）不幂等，必须先用前后页码快照证明「第一次未生效」
+ *    才允许重试一次，否则宁可如实抛错，绝不二次翻页/漏页。
+ * 业务动作 clickBatchPause / clickBatchEnable / clickRowSwitch / setRowCheckbox /
+ * selectAllInPage 永远不在恢复集合内。
+ */
+const IDEMPOTENT_READ_ONLY_METHODS = new Set(['switchView', 'switchPageSize', 'ensureFirstPage']);
+const PROOF_REQUIRED_READ_ONLY_METHODS = new Set(['clickNextPage']);
+
+/** 只读页码快照（供导航类动作证明是否已生效；失败返回 null，按不可重试处理）。 */
+async function readChengfangRecoveryPageState(page) {
+  if (!page || typeof page.evaluate !== 'function') return null;
+  try {
+    const st = await page.evaluate(collectChengfangPaginationInPage);
+    return (st && typeof st === 'object') ? st : null;
+  } catch (_) { return null; }
 }
 
 function watchChengfangControlsForManualReview(controller, session) {
@@ -190,14 +251,113 @@ function watchChengfangControlsForManualReview(controller, session) {
     if (typeof controller[name] !== 'function') continue;
     const original = controller[name];
     controller[name] = async function (...args) {
+      const page = args[0] && args[0].page;
+      const needsProof = PROOF_REQUIRED_READ_ONLY_METHODS.has(name);
+      const idempotent = IDEMPOTENT_READ_ONLY_METHODS.has(name);
+      // 导航类动作在第一次调用前记录页码，失败后只有证明「页码未变」才允许一次重试。
+      const preState = (needsProof && page) ? await readChengfangRecoveryPageState(page) : null;
+      let err = null;
       try { return await original.apply(this, args); }
-      catch (e) {
-        await holdOnMissingChengfangControl(e, session);
-        throw e;
+      catch (e) { err = e; }
+      let retryable = false;
+      if (page && (idempotent || needsProof) && isMissingChengfangControl(err)) {
+        const dr = await dismissKnownChengfangOverlays({
+          page,
+          audit: session.audit,
+          shopId: session.shopCfg && session.shopCfg.id,
+          maxRounds: 1,
+        });
+        if (dr.dismissed === true || dr.state === 'none') {
+          if (idempotent) retryable = true;
+          else {
+            const postState = await readChengfangRecoveryPageState(page);
+            retryable = !!(preState && postState
+              && preState.activePage != null && postState.activePage != null
+              && String(preState.activePage) === String(postState.activePage));
+          }
+        }
       }
+      if (retryable) {
+        try { return await original.apply(this, args); }
+        catch (e2) { err = e2; }
+      }
+      await holdOnMissingChengfangControl(err, session);
+      throw err;
     };
   }
   return controller;
+}
+
+/**
+ * 有界关闭已知引导/介绍浮窗（节点侧）：只调用页面内的白名单探针/关闭器，绝不盲点任何 X。
+ *
+ * 规则：
+ *  - 探针必须确认严格可信千川 origin/path；否则零点击；
+ *  - 未知/多义/多个独立浮窗 → 阻断（零点击），不做任何猜测；
+ *  - 已知浮窗只点容器内**唯一**关闭控件（intro）或唯一"跳过/我知道了"（guidance 容器内）；
+ *  - 点击后必须**连续两次**观察到浮窗消失才算完成；未消失如实返回失败，绝不伪造关闭。
+ * @returns {Promise<{dismissed:boolean, state:string, action?:string|null, reason?:string}>}
+ */
+async function dismissKnownChengfangOverlays({ page, audit, shopId, maxRounds = 2, gapMs = 250 }) {
+  const emit = (action, result, reason) => {
+    if (typeof audit !== 'function') return;
+    try { audit({ kind: 'chengfang-overlay', shopId: shopId || null, action, result, reason: reason || null }); } catch (_) { /* 审计失败不影响结果 */ }
+  };
+  if (!page || typeof page.evaluate !== 'function') {
+    return { dismissed: false, state: 'unavailable', reason: '页面不可用' };
+  }
+  const wait = async (ms) => {
+    if (typeof page.waitForTimeout === 'function') { try { await page.waitForTimeout(ms); return; } catch (_) { /* 落到本地等待 */ } }
+    await new Promise((r) => setTimeout(r, ms));
+  };
+  let lastState = 'unknown';
+  for (let round = 0; round < Math.max(1, maxRounds); round++) {
+    let probe = null;
+    try { probe = await page.evaluate(handleChengfangOverlayInPage, { click: false }); }
+    catch (e) { return { dismissed: false, state: 'probe-failed', reason: `浮窗探测失败：${(e && e.message) || e}` }; }
+    lastState = (probe && probe.state) || 'unknown';
+    if (!probe || probe.trusted !== true) {
+      emit('probe', 'blocked', '当前不是可信千川页面（严格 origin/path），零点击');
+      return { dismissed: false, state: 'untrusted', reason: '当前不是可信千川页面，零点击' };
+    }
+    if (probe.state === 'blocked') {
+      const reason = (probe.blockers || []).join(',') || '未知/多义浮窗';
+      emit('probe', 'blocked', reason);
+      return { dismissed: false, state: 'blocked', reason };
+    }
+    if (probe.state === 'no-control') {
+      emit('probe', 'blocked', '已知浮窗缺少唯一点击控件，零点击');
+      return { dismissed: false, state: 'no-control', reason: '已知浮窗缺少唯一点击控件，零点击' };
+    }
+    if (probe.state === 'none') {
+      return { dismissed: round > 0, state: 'none', action: null };
+    }
+    // dismissable：点击容器内唯一控件（页面内会再校验一次，避免 TOCTOU）
+    let clicked = null;
+    try { clicked = await page.evaluate(handleChengfangOverlayInPage, { click: true }); }
+    catch (e) { return { dismissed: false, state: 'click-failed', reason: `浮窗关闭点击失败：${(e && e.message) || e}` }; }
+    if (!clicked || clicked.clicked !== true) {
+      const reason = (clicked && clicked.blockers && clicked.blockers.join(',')) || '关闭控件未派发点击';
+      emit('dismiss', 'failed', reason);
+      return { dismissed: false, state: (clicked && clicked.state) || 'click-failed', reason };
+    }
+    // 二次观察：连续两次探针都必须看到"无浮窗"才算完成
+    let gone = 0;
+    for (let i = 0; i < 2; i++) {
+      await wait(gapMs);
+      let again = null;
+      try { again = await page.evaluate(handleChengfangOverlayInPage, { click: false }); } catch (_) { again = null; }
+      if (again && again.trusted === true && again.state === 'none') gone += 1;
+      else break;
+    }
+    if (gone === 2) {
+      emit(clicked.action, 'dismissed', null);
+      return { dismissed: true, state: 'none', action: clicked.action };
+    }
+    emit(clicked.action, 'failed', '点击后二次观察未消失');
+    return { dismissed: false, state: 'not-disappeared', action: clicked.action, reason: '点击后浮窗未在二次观察中消失' };
+  }
+  return { dismissed: false, state: lastState, reason: '超过有界轮次仍未完成' };
 }
 
 const CHENGFANG_URL_MARKER = '/uni-prom/overall';
@@ -1311,30 +1471,162 @@ function readChengfangAccountInPage() {
   return out;
 }
 
-/** 进入商品的计划视图；只关闭乘方介绍浮层和切换视图，不触碰投放开关。 */
-function advanceChengfangPlanViewInPage() {
+/**
+ * 千川引导/介绍浮窗白名单探针与关闭器（自包含：会被 page.evaluate 序列化执行）。
+ *
+ * 安全边界（全部 fail-closed）：
+ *  - 只认严格可信千川来源：https + origin 全等 + 非登录/授权中转 + 受支持管理路径；
+ *  - 只认已知白名单容器：介绍浮层 [data-e2e="oc_emptyKey_overall-prom"] /
+ *    .ocean-vmok-plugin-oc-modal-wrap（关闭控件必须落在容器内且唯一）；
+ *    引导容器 [class*=guide|Guide|tour|Tour]（"跳过/跳过引导/我知道了"必须落在容器内且唯一）；
+ *  - CSS 只是**发现线索**，不能代替内容判定：白名单容器正文出现删除/暂停/开启确认、
+ *    互斥/终止/不可恢复、小店随心推、授权登录等危险业务文本 → 一律阻断，绝不点 X；
+ *  - 未知可见浮层（dialog/alertdialog/modal/popup/mask/dialog/confirm 类，且不属于上述
+ *    白名单子树）→ 阻断；外壳同时包含已知浮窗与其它疑似业务对话框时，不把整棵外壳
+ *    当白名单；多个独立白名单浮窗 / 多候选控件 → 阻断；一律零点击。
+ *  - 绝不以 [class*=modal] 泛化盲点 X，绝不点击业务确认/删除/开关类控件。
+ *
+ * 兼容语义：本函数同时是 advanceChengfangPlanViewInPage 的兼容实现（alias）。
+ * 未显式传 {click:false} 时执行点击；page.evaluate 序列化后完全自包含。
+ * @param {{click?:boolean}} [options] click=false 时只探测；其余情况对唯一控件派发一次点击
+ */
+function handleChengfangOverlayInPage(options) {
+  const wantClick = !options || options.click !== false;
+  const out = {
+    trusted: false, path: '', state: 'blocked', kind: null, key: null,
+    closeCandidates: 0, textCandidates: 0, blockers: [], clicked: false, action: 'none',
+  };
+  const doc = (typeof document !== 'undefined' && document) ? document : null;
+  const loc = (typeof location !== 'undefined' && location) ? location : null;
+  if (!doc || typeof doc.querySelectorAll !== 'function' || !loc) {
+    out.blockers.push('no-document');
+    return out;
+  }
+  let parsed = null;
+  try { parsed = new URL(String(loc.href || '')); } catch (_) { parsed = null; }
+  if (!parsed) { out.blockers.push('unparsable-url'); return out; }
+  out.path = String(parsed.pathname || '');
+  if (parsed.origin !== 'https://qianchuan.jinritemai.com') { out.blockers.push('untrusted-origin'); return out; }
+  if (/\/login|\/passport|\/signin|sso\.jinritemai/i.test(out.path)) { out.blockers.push('login-path'); return out; }
+  if (!/^\/(?:home|uni-prom|overall-prom|promotion-v2|brand_bid)(?:\/|$)/.test(out.path)) {
+    out.blockers.push('unsupported-path');
+    return out;
+  }
+  out.trusted = true;
+
+  const visible = (el) => {
+    if (!el) return false;
+    let r;
+    try { r = el.getBoundingClientRect(); } catch (_) { return false; }
+    if (!r || !(r.width > 0 && r.height > 0)) return false;
+    if (typeof getComputedStyle === 'function') {
+      let cs = null;
+      try { cs = getComputedStyle(el); } catch (_) { cs = null; }
+      if (cs) {
+        if (String(cs.display || '').toLowerCase() === 'none') return false;
+        if (String(cs.visibility || '').toLowerCase() === 'hidden') return false;
+      }
+    }
+    return true;
+  };
+  const all = (sel) => {
+    try { return Array.prototype.slice.call(doc.querySelectorAll(sel)); } catch (_) { return []; }
+  };
+  const dedupeOuter = (els) => els.filter((el) => !els.some((o) => o !== el && o.contains && o.contains(el)));
+
+  // 危险业务文本：CSS 像 intro 不代表内容安全；删除/暂停/开启确认、互斥/终止、
+  // 小店随心推、授权登录等一律优先阻断。文本归一化后匹配，避免换行/空格绕过。
+  const DANGER_TEXT_RE = /(?:确认|确定|是否)[^。！？\n]{0,16}(?:删除|暂停|开启|关闭|终止)|(?:删除|暂停|开启|终止)[^。！？\n]{0,16}(?:不可恢复|确认|是否)|互斥|小店随心推|授权登录|扫码登录|重新登录|删除后不可恢复|终止[^。！？\n]{0,8}不可恢复|(?:暂停|删除|开启|终止)\s*[0-9一二三四五六七八九十百千]+\s*条/;
+
+  const introRoots = dedupeOuter(all('[data-e2e="oc_emptyKey_overall-prom"], .ocean-vmok-plugin-oc-modal-wrap').filter(visible));
+  const guideRoots = dedupeOuter(all('[class*="guide"], [class*="Guide"], [class*="tour"], [class*="Tour"]').filter((el) => {
+    if (!visible(el)) return false;
+    return !introRoots.some((r) => r === el || (r.contains && r.contains(el)));
+  }));
+  const known = introRoots.concat(guideRoots);
+  // 未知/业务浮层候选：除常见 modal/popup/mask 外，必须纳入 dialog/confirm 类
+  // （business-confirm 等），否则已知浮窗旁边的业务确认框永远不会进入 foreign 扫描。
+  const dialogCands = dedupeOuter(all(
+    '[role="dialog"], [role="alertdialog"], [class*="modal"], [class*="Modal"], '
+    + '[class*="popup"], [class*="Popup"], [class*="mask"], [class*="Mask"], '
+    + '[class*="dialog"], [class*="Dialog"], [class*="confirm"], [class*="Confirm"]'
+  ).filter(visible));
+  const inKnown = (el) => known.some((k) => k === el || (k.contains && k.contains(el)));
+  const foreign = [];
+  for (const el of dialogCands) {
+    if (inKnown(el)) continue;
+    const wrapsKnown = known.some((k) => el.contains && el.contains(k));
+    if (wrapsKnown) {
+      // 外壳包着已知浮窗时，只有外壳内还存在已知子树之外的弹层候选才按未知处理：
+      // 同一外壳混有业务对话框时绝不把整棵树当白名单。
+      const other = dialogCands.some((c) => c !== el && !inKnown(c)
+        && el.contains(c) && !(c.contains && c.contains(el)));
+      if (!other) continue;
+    }
+    foreign.push(el);
+  }
+  // 危险文本扫描：白名单容器与短文本弹层候选（页面级大 mask 不做全文扫描，
+  // 避免把列表正文误判为浮窗；其内部真实业务弹层会作为独立候选被扫描）。
+  let dangerText = false;
+  for (const el of known.concat(dialogCands)) {
+    const t = String((el && el.textContent) || '').replace(/\s+/g, ' ').trim();
+    if (!t || t.length > 1200) continue;
+    if (DANGER_TEXT_RE.test(t)) { dangerText = true; break; }
+  }
+  if (dangerText) out.blockers.push('danger-text');
+  if (foreign.length > 0) out.blockers.push(`unknown-overlay:${foreign.length}`);
+  if (introRoots.length > 1) out.blockers.push(`multiple-intro:${introRoots.length}`);
+  if (guideRoots.length > 1) out.blockers.push(`multiple-guide:${guideRoots.length}`);
+  if (introRoots.length === 1 && guideRoots.length > 0) out.blockers.push('intro-and-guide');
+  if (out.blockers.length > 0) { out.state = 'blocked'; return out; }
+  if (introRoots.length === 0 && guideRoots.length === 0) { out.state = 'none'; return out; }
+
+  let root = null;
+  let control = null;
+  if (introRoots.length === 1) {
+    out.kind = 'intro';
+    root = introRoots[0];
+    const e2e = (root.getAttribute ? String(root.getAttribute('data-e2e') || '') : '');
+    out.key = e2e || 'ocean-modal';
+    const cands = dedupeOuter(Array.prototype.slice.call(root.querySelectorAll('.tools-vmok-plugin-modal__close-icon')).filter(visible));
+    out.closeCandidates = cands.length;
+    if (cands.length === 0) { out.state = 'no-control'; return out; }
+    if (cands.length > 1) { out.blockers.push(`ambiguous-close:${cands.length}`); out.state = 'blocked'; return out; }
+    control = cands[0];
+    out.action = 'dismiss-intro';
+  } else {
+    out.kind = 'guide';
+    root = guideRoots[0];
+    out.key = String(root.className || '').slice(0, 60) || 'guide';
+    const cands = dedupeOuter(Array.prototype.slice.call(root.querySelectorAll('button, a, [role="button"], span')).filter((el) => {
+      if (!visible(el)) return false;
+      const t = String(el.textContent || '').replace(/\s+/g, '');
+      return t === '跳过' || t === '跳过引导' || t === '我知道了';
+    }));
+    out.textCandidates = cands.length;
+    if (cands.length === 0) { out.state = 'no-control'; return out; }
+    if (cands.length > 1) { out.blockers.push(`ambiguous-skip:${cands.length}`); out.state = 'blocked'; return out; }
+    control = cands[0];
+    out.action = 'skip-guide';
+  }
+  out.state = 'dismissable';
+  if (!wantClick) return out;
+  try { control.click(); } catch (_) { out.blockers.push('click-threw'); out.state = 'blocked'; return out; }
+  out.clicked = true;
+  return out;
+}
+
+/**
+ * 进入商品的计划视图（只读 tab 导航；**不处理浮窗**）。
+ * 浮窗只由 handleChengfangOverlayInPage / dismissKnownChengfangOverlays 关闭，
+ * 二者不得混在一起：导航函数绝不点击任何关闭/跳过控件。
+ */
+function navigateChengfangPlanViewInPage() {
   const visible = (el) => {
     if (!el) return false;
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   };
-  const guides = [...document.querySelectorAll('[role="dialog"], [class*="guide"], [class*="Guide"], [class*="tour"], [class*="Tour"], .ocean-vmok-plugin-oc-modal-wrap')];
-  const skipButtons = [...new Set(guides.flatMap(root => [...root.querySelectorAll('button, a, [role="button"], span')]))]
-    .filter(el => visible(el) && /^(跳过|跳过引导)$/.test((el.textContent || '').trim()));
-  // 同一个按钮内部的 span 不作为第二个候选；有多个独立候选时不猜测。
-  const skips = skipButtons.filter(el => !skipButtons.some(parent => parent !== el && parent.contains(el)));
-  if (skips.length === 1) {
-    skips[0].click();
-    return { action: 'skip-guide' };
-  }
-  const introClose = document.querySelector(
-    '[data-e2e="oc_emptyKey_overall-prom"] .tools-vmok-plugin-modal__close-icon, '
-      + '.ocean-vmok-plugin-oc-modal-wrap .tools-vmok-plugin-modal__close-icon'
-  );
-  if (visible(introClose)) {
-    introClose.click();
-    return { action: 'dismiss-intro' };
-  }
   const tabs = [...document.querySelectorAll('[role="tab"]')];
   const findTab = (name) => tabs.find((el) => visible(el) && (el.textContent || '').trim() === name);
   const product = findTab('商品');
@@ -1351,17 +1643,292 @@ function advanceChengfangPlanViewInPage() {
   return { action: 'none' };
 }
 
+/**
+ * 纯浮窗关闭入口（保留原导出名）：只关闭白名单浮窗，不做任何 tab 导航。
+ *
+ * 直接 alias 到真正自包含的页面函数：page.evaluate(advanceChengfangPlanViewInPage)
+ * 只会序列化本函数自身，任何模块闭包引用都会在浏览器里 ReferenceError。
+ * 兼容语义：未传 {click:false} 即执行一次唯一控件点击，返回 clicked/action/blockers。
+ */
+const advanceChengfangPlanViewInPage = handleChengfangOverlayInPage;
+
 // ── 页面驱动（真实页面；browserFactory 可注入供测试）────────────────
 
+/**
+ * 已保留同店检查窗口的「有界只读恢复」。
+ *
+ * 只有同时满足以下全部条件才解除 manualReview，并把**已验证的保留 page/context/browser**
+ * 交回正常只读打开链复用（不关闭用户窗口、不新开浏览器）：
+ *  1) 同一保留项（同店 key）、page 未关闭、context 存在；同店同一时刻只允许一个恢复者；
+ *  2) 保留时已从**原会话**冻结了唯一头部账户ID（legacy/缺失 → 永远阻断，不猜）；
+ *  3) 保留页地址是严格可信千川乘方管理页；
+ *  4) 保留页当前新鲜唯一头部账户ID 与冻结值全等，且无可见登录表单/控件；
+ *  5) 只有白名单浮窗，且关闭后**二次观察消失**；未知/多义/多个独立浮窗 → 阻断；
+ *  6) 必要子标签（商品自选/全店托管）就绪（只读导航，有界）；
+ *  7) 异步边界后再做一次新鲜核验（窗口/地址/身份/浮窗），任一漂移 → 保持 guard。
+ * 任何异常/超时/未落定一律不释放 guard；不伪造关闭、不写任何 Cookie。
+ */
+async function releaseChengfangManualReviewForReadOnlyOpen({ shopCfg, audit }) {
+  const key = manualReviewShopKey(shopCfg);
+  const held = manualReviewSessions.get(key);
+  const fail = (reason) => ({ released: false, reason });
+  if (!held) return fail('没有保留的检查窗口');
+  if (manualReviewRecoveries.has(key)) return fail('另一个恢复流程正在进行，禁止第二个恢复者或新开页面');
+  manualReviewRecoveries.add(key);
+  const emit = (result, reason) => {
+    if (typeof audit !== 'function') return;
+    try {
+      audit({
+        kind: 'chengfang-overlay', shopId: (shopCfg && shopCfg.id) || null,
+        action: 'release-manual-review', result, reason: reason || null,
+      });
+    } catch (_) { /* 审计失败不影响恢复结果 */ }
+  };
+  const wait = async (ms) => {
+    if (held.page && typeof held.page.waitForTimeout === 'function') {
+      try { await held.page.waitForTimeout(ms); return; } catch (_) { /* 落到本地等待 */ }
+    }
+    await new Promise((r) => setTimeout(r, ms));
+  };
+  // 成功返回时**不释放同店 lease，也不删除 manualReviewSessions**：后续最终身份/
+  // URL/浮窗复核与 Cookie checkpoint 仍在这一临界区内完成；期间任何并发 opener
+  // 都会看到「另一个恢复流程正在进行」，绝不会新开 browser。安全交回或异常收口时
+  // 才由 openChengfangShop 统一清理。
+  let leaseHandedOff = false;
+  try {
+    if (!held.page) return fail('保留窗口页面缺失');
+    if (typeof held.page.isClosed === 'function' && held.page.isClosed()) {
+      manualReviewSessions.delete(key);
+      return fail('保留的检查窗口已关闭');
+    }
+    if (!held.context) return fail('保留窗口缺少会话上下文');
+    const frozen = readHeldFrozenAccountId(held);
+    if (!frozen) return fail('保留窗口未冻结原始账户身份（legacy/证据缺失），不猜测、不解除');
+    let url = '';
+    try { url = String(held.page.url()); } catch (_) { return fail('保留窗口地址不可读'); }
+    if (!isTrustedChengfangUrl(url)) return fail('保留窗口不是可信千川乘方管理页');
+    const headerOk = async () => {
+      let obs = null;
+      try { obs = await held.page.evaluate(probeQianchuanHeaderIdentityInPage); } catch (_) { obs = null; }
+      if (!obs || obs.unique !== true || typeof obs.accountId !== 'string') {
+        return { ok: false, reason: '保留窗口千川头部账户身份缺失或候选不唯一' };
+      }
+      if (obs.loginVisible === true) return { ok: false, reason: '保留窗口存在可见登录表单/控件' };
+      if (obs.accountId !== frozen) return { ok: false, reason: '保留窗口账户与冻结的原始账户不一致（身份漂移/跨店）' };
+      return { ok: true };
+    };
+    const h1 = await headerOk();
+    if (!h1.ok) return fail(h1.reason);
+    // 只关白名单浮窗；未知/多义/多个独立浮窗由探针阻断（零点击）
+    const dr = await dismissKnownChengfangOverlays({
+      page: held.page, audit, shopId: shopCfg && shopCfg.id, maxRounds: 2,
+    });
+    if (!(dr.dismissed === true || dr.state === 'none')) {
+      return fail(`浮窗未安全关闭（${dr.reason || dr.state}）`);
+    }
+    // 必要子标签就绪：只读 tab 导航（有界），绝不点业务控件
+    let ready = null;
+    for (let i = 0; i < 10; i++) {
+      let st = null;
+      try { st = await held.page.evaluate(readChengfangAccountInPage); } catch (_) { st = null; }
+      if (st && isTrustedChengfangUrl(String(st.url || '')) && st.hasSubTabs === true) { ready = st; break; }
+      try { await held.page.evaluate(navigateChengfangPlanViewInPage); } catch (_) { /* 只读导航失败按未就绪处理 */ }
+      await wait(500);
+    }
+    if (!ready) return fail('保留窗口未达到子标签就绪（必要子标签未出现）');
+    // 异步边界后的最终新鲜核验：窗口 / 地址 / 身份 / 浮窗
+    if (typeof held.page.isClosed === 'function' && held.page.isClosed()) return fail('保留窗口在核验期间被关闭');
+    let url2 = '';
+    try { url2 = String(held.page.url()); } catch (_) { return fail('保留窗口地址在核验期间不可读'); }
+    if (url2 !== url || !isTrustedChengfangUrl(url2)) return fail('核验期间保留窗口地址漂移');
+    const h2 = await headerOk();
+    if (!h2.ok) return fail(h2.reason);
+    const final = await dismissKnownChengfangOverlays({
+      page: held.page, audit, shopId: shopCfg && shopCfg.id, maxRounds: 1, gapMs: 0,
+    });
+    if (!(final.dismissed === true || final.state === 'none')) return fail('核验结束时仍有浮窗');
+    // lease 与 guard 均保持，交给 openChengfangShop 在最终新鲜复核 + checkpoint 后收口。
+    leaseHandedOff = true;
+    emit('released', null);
+    return {
+      released: true, page: held.page, context: held.context, browser: held.browser,
+      account: ready, frozenAccountId: frozen, shopKey: key,
+      cookieSession: held.cookieSession,
+    };
+  } catch (e) {
+    emit('held', '恢复流程异常');
+    return fail(`恢复流程异常（guard 保持）：${(e && e.message) || e}`);
+  } finally {
+    if (!leaseHandedOff) manualReviewRecoveries.delete(key);
+  }
+}
+
+/** 人工检查 guard 的标准错误（同店保留窗口未安全交回时使用；绝不静默继续）。 */
+function chengfangManualReviewError(reason) {
+  return new DataGuardError(
+    '该店千川页面正在等待人工检查：请在保留的检查窗口里点**浮窗右上角的 ❌** 关闭引导/介绍浮层'
+    + '（不是关闭整个浏览器，也不需要重新扫码）；下一轮会先核验同店身份与浮窗是否真的消失，'
+    + `核验通过才继续。本轮不解除、不自动操作。未继续原因：${reason}`
+  );
+}
+
+/** 浮窗探针结果门禁：未知/危险/多义/未消失一律阻断，绝不放行到业务路径。 */
+const OVERLAY_BLOCKING_STATES = new Set([
+  'blocked', 'no-control', 'probe-failed', 'click-failed', 'not-disappeared',
+]);
+
+function assertChengfangOverlaySafe(result, { phase, allowUntrusted }) {
+  if (!result || typeof result !== 'object') {
+    throw new DataGuardError(`浮窗探测失败（${phase}）：无结果，停止自动操作`);
+  }
+  if (result.state === 'dismissed' || result.state === 'none') return;
+  if (result.state === 'untrusted') {
+    if (allowUntrusted === true) return;
+    throw new DataGuardError(`浮窗探测不在可信千川页面（${phase}）：停止自动操作`);
+  }
+  if (OVERLAY_BLOCKING_STATES.has(result.state)) {
+    throw new DataGuardError(`浮窗阻断（${phase}）：${result.reason || result.state}，停止自动操作`);
+  }
+  throw new DataGuardError(`浮窗状态未知（${phase}）：${result.state || 'unknown'}，停止自动操作`);
+}
+
 async function openChengfangShop(p) {
+  const audit = typeof p.audit === 'function' ? p.audit : () => {};
   if (hasChengfangManualReview(p.shopCfg)) {
-    throw new DataGuardError('该店千川页面正在等待人工检查；请先查看并关闭保留的可见窗口，本轮不再自动操作');
+    const rel = await releaseChengfangManualReviewForReadOnlyOpen({ shopCfg: p.shopCfg, audit });
+    if (!rel.released) throw chengfangManualReviewError(rel.reason);
+    // lease 从 release 一直保留到这里：最终复核、Cookie checkpoint 与安全交回
+    // 全部处在同一临界区，期间并发 opener 只能看到「另一个恢复流程正在进行」。
+    const guardKey = rel.shopKey || manualReviewShopKey(p.shopCfg);
+    try {
+      // 复用已核验的保留窗口（不关闭用户窗口、不新开浏览器）。
+      if (!rel.page) throw chengfangManualReviewError('保留窗口页面缺失');
+      if (typeof rel.page.isClosed === 'function' && rel.page.isClosed()) {
+        throw chengfangManualReviewError('保留窗口在最终核验前被关闭');
+      }
+      if (!rel.context) throw chengfangManualReviewError('保留窗口缺少会话上下文');
+      // 最终新鲜核验：**不得退回 release 时的旧快照**；读取异常/漂移一律保持 guard。
+      let st = null;
+      try { st = await rel.page.evaluate(readChengfangAccountInPage); }
+      catch (e) {
+        throw chengfangManualReviewError(`最终页面身份读取异常（不退回旧快照）：${(e && e.message) || e}`);
+      }
+      if (!st || !isTrustedChengfangUrl(String(st.url || '')) || st.hasSubTabs !== true) {
+        throw chengfangManualReviewError('最终页面身份/URL/子标签复核失败，不交回不可信会话');
+      }
+      if (st.accountId != null && rel.frozenAccountId
+          && String(st.accountId) !== String(rel.frozenAccountId)) {
+        throw chengfangManualReviewError('最终页面身份与冻结账户不一致（跨店/漂移），不交回会话');
+      }
+      let hdr = null;
+      try { hdr = await rel.page.evaluate(probeQianchuanHeaderIdentityInPage); } catch (_) { hdr = null; }
+      if (!hdr || hdr.unique !== true || hdr.loginVisible === true
+          || typeof hdr.accountId !== 'string' || hdr.accountId !== rel.frozenAccountId) {
+        throw chengfangManualReviewError('最终头部身份复核失败或漂移，不交回会话');
+      }
+      // 未知/危险浮层最终零点击复核：未知或未消失 → 保持 guard，不交回会话。
+      const finalOverlay = await dismissKnownChengfangOverlays({
+        page: rel.page, audit, shopId: p.shopCfg && p.shopCfg.id, maxRounds: 1, gapMs: 0,
+      });
+      if (!(finalOverlay.dismissed === true || finalOverlay.state === 'none')) {
+        throw chengfangManualReviewError(`最终浮窗复核未通过（${finalOverlay.reason || finalOverlay.state}）`);
+      }
+      let urlNow = '';
+      try { urlNow = String(rel.page.url()); } catch (_) {
+        throw chengfangManualReviewError('最终地址不可读，不交回会话');
+      }
+      if (!isTrustedChengfangUrl(urlNow)) {
+        throw chengfangManualReviewError('最终地址不再是可信千川乘方管理页，不交回会话');
+      }
+      // 成功 dismiss 后的 Cookie 仍走既有检查点（指纹冲突/同店身份守卫由它自身判定）；
+      // 新 reviewContext 不是原 context：只传 filePath/startFingerprint 两项元信息，
+      // 绝不带原 context 的 identityPage 引用，也绝不另写 Cookie 文件。
+      // 检查点跳过/异常如实记录，不据此宣称会话已被核验写入。
+      let cookieCheckpoint;
+      try {
+        cookieCheckpoint = await (p.sessionCheckpoint || checkpointQianchuanSessionCookies)({
+          context: rel.context, cookieSession: rel.cookieSession, target: rel.page,
+          shopCfg: p.shopCfg, audit,
+        });
+      } catch (e) {
+        cookieCheckpoint = { saved: false, skipped: true, reason: `会话检查点异常（不影响本次打开结果）: ${(e && e.message) || e}` };
+      }
+      // checkpoint 是恢复交回前最后一个长 await：页面在等待期间仍可能换身份/换页/
+      // 新增浮窗/被关闭。删除 guard 与交回会话之前必须再做一次**纯只读**新鲜复核
+      // （绝不点击、不导航：复核自身不能再引入异步竞态）；任一异常/漂移一律保持
+      // guard、不交回旧快照、不新开浏览器，异常收口只释放 lease 供下一轮重试。
+      if (typeof rel.page.isClosed === 'function' && rel.page.isClosed()) {
+        throw chengfangManualReviewError('会话检查点期间保留窗口被关闭，不交回会话');
+      }
+      let stFresh = null;
+      try { stFresh = await rel.page.evaluate(readChengfangAccountInPage); }
+      catch (e) {
+        throw chengfangManualReviewError(`检查点后最终身份读取异常（不退回旧快照）：${(e && e.message) || e}`);
+      }
+      if (!stFresh || !isTrustedChengfangUrl(String(stFresh.url || '')) || stFresh.hasSubTabs !== true) {
+        throw chengfangManualReviewError('检查点后最终页面身份/URL/子标签复核失败，不交回会话');
+      }
+      if (stFresh.accountId != null && rel.frozenAccountId
+          && String(stFresh.accountId) !== String(rel.frozenAccountId)) {
+        throw chengfangManualReviewError('检查点后页面身份与冻结账户不一致（跨店/漂移），不交回会话');
+      }
+      let urlFresh = '';
+      try { urlFresh = String(rel.page.url()); } catch (_) {
+        throw chengfangManualReviewError('检查点后最终地址不可读，不交回会话');
+      }
+      if (!isTrustedChengfangUrl(urlFresh)) {
+        throw chengfangManualReviewError('检查点后地址不再是可信千川乘方管理页（窗口换页/切登录），不交回会话');
+      }
+      if (urlFresh !== urlNow) {
+        throw chengfangManualReviewError('检查点前后保留窗口地址不一致（窗口换页），不交回会话');
+      }
+      let hdrFresh = null;
+      try { hdrFresh = await rel.page.evaluate(probeQianchuanHeaderIdentityInPage); } catch (_) { hdrFresh = null; }
+      if (!hdrFresh || hdrFresh.unique !== true || hdrFresh.loginVisible === true
+          || typeof hdrFresh.accountId !== 'string' || hdrFresh.accountId !== rel.frozenAccountId) {
+        throw chengfangManualReviewError('检查点后最终头部身份复核失败或漂移，不交回会话');
+      }
+      // 浮窗最终负证据：纯只读探针（click:false），未知/未消失/不可信一律保持 guard。
+      let overlayFresh = null;
+      try { overlayFresh = await rel.page.evaluate(handleChengfangOverlayInPage, { click: false }); }
+      catch (_) { overlayFresh = null; }
+      if (!overlayFresh || overlayFresh.trusted !== true || overlayFresh.state !== 'none') {
+        const reason = overlayFresh
+          ? ((overlayFresh.blockers || []).join(',') || overlayFresh.state || 'unknown')
+          : 'probe-failed';
+        throw chengfangManualReviewError(`检查点后最终浮窗只读复核未通过（${reason}），不交回会话`);
+      }
+      // 安全交回：只有到这里才解除 guard 与同店 lease。
+      manualReviewSessions.delete(guardKey);
+      manualReviewRecoveries.delete(guardKey);
+      return {
+        browser: rel.browser, target: rel.page, account: stFresh, context: rel.context,
+        cookieSession: null, cookieCheckpoint, recoveredFromManualReview: true,
+      };
+    } catch (e) {
+      // 异常收口：释放并发 lease，但保留 manualReviewSessions → guard 不解除、可重试。
+      manualReviewRecoveries.delete(guardKey);
+      try {
+        audit({
+          kind: 'chengfang-overlay', shopId: (p.shopCfg && p.shopCfg.id) || null,
+          action: 'release-manual-review', result: 'held', reason: '最终复核未通过，guard 保持',
+        });
+      } catch (_) { /* 审计失败不影响异常传播 */ }
+      throw e;
+    }
   }
   const openHome = p.openHome || openQianchuanHome;
   const { browser, context, target, cookieSession } = await openHome(p.loginCfg, p.shopCfg, p);
   try {
     await target.waitForTimeout(2000);
-    try { await target.getByText('我知道了', { exact: true }).first().click({ timeout: 3000 }); } catch (_) {}
+    // 普通打开阶段：只做有界白名单浮窗关闭（未知/多义/多个独立浮窗一律零点击）。
+    // 结果必须显式判定：未知/危险浮层存在时立即阻断，绝不忽略后继续导航或返回成功。
+    // 此时可能仍在千川首页/登录中转页，untrusted 不阻断；一旦探针可信且报 blocked/
+    // no-control/未消失，则不进入业务路径。
+    const initialOverlay = await dismissKnownChengfangOverlays({
+      page: target, audit, shopId: p.shopCfg && p.shopCfg.id, maxRounds: 2,
+    });
+    assertChengfangOverlaySafe(initialOverlay, { phase: '普通打开-导航前', allowUntrusted: true });
     let st = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       await target.evaluate(() => {
@@ -1381,7 +1948,13 @@ async function openChengfangShop(p) {
     const deadlineTab = Date.now() + 15000;
     let hasTabs = false;
     while (Date.now() < deadlineTab) {
-      await target.evaluate(advanceChengfangPlanViewInPage).catch(() => {});
+      // 浮窗关闭与 tab 导航严格分离：先关白名单浮窗，再做只读导航。
+      // 已到达乘方管理页，探针必须可信且安全；未知/危险/未消失即阻断，不继续 tab 导航。
+      const tabOverlay = await dismissKnownChengfangOverlays({
+        page: target, audit, shopId: p.shopCfg && p.shopCfg.id, maxRounds: 1,
+      });
+      assertChengfangOverlaySafe(tabOverlay, { phase: '乘方管理页-子标签等待', allowUntrusted: false });
+      await target.evaluate(navigateChengfangPlanViewInPage).catch(() => {});
       await target.waitForTimeout(2000);
       const check = await target.evaluate(readChengfangAccountInPage);
       if (check && check.hasSubTabs) { st = check; hasTabs = true; break; }
@@ -1390,7 +1963,11 @@ async function openChengfangShop(p) {
       // 子标签（商品自选/全店托管）异步渲染，轮询等待（最长 40s）
       const deadline = Date.now() + 40000;
       while (Date.now() < deadline) {
-        await target.evaluate(advanceChengfangPlanViewInPage).catch(() => {});
+        const tabOverlay = await dismissKnownChengfangOverlays({
+          page: target, audit, shopId: p.shopCfg && p.shopCfg.id, maxRounds: 1,
+        });
+        assertChengfangOverlaySafe(tabOverlay, { phase: '乘方管理页-子标签长等待', allowUntrusted: false });
+        await target.evaluate(navigateChengfangPlanViewInPage).catch(() => {});
         await target.waitForTimeout(2000);
         const check = await target.evaluate(readChengfangAccountInPage);
         if (check && check.hasSubTabs) { st = check; hasTabs = true; break; }
@@ -1399,6 +1976,12 @@ async function openChengfangShop(p) {
     if (!hasTabs) {
       throw new DataGuardError('乘方页未找到"商品自选/全店托管"子标签（尝试进入"商品→计划视图"后仍未出现），拒绝继续');
     }
+    // 子标签 ready 不是「浮窗已消失」的证明：交回前再做一次严格零点击复核，
+    // 未知/危险/未消失浮窗一律阻断，绝不带着未知浮层进入业务路径。
+    const readyOverlay = await dismissKnownChengfangOverlays({
+      page: target, audit, shopId: p.shopCfg && p.shopCfg.id, maxRounds: 1,
+    });
+    assertChengfangOverlaySafe(readyOverlay, { phase: '子标签就绪后', allowUntrusted: false });
     // R58 会话检查点（manager-ready 返回）：到达乘方管理页并见到子标签后，再以
     // 当前时刻正证据持久化一次刷新 Cookie；跳过/失败不改写本次成功结果。
     let cookieCheckpoint;
@@ -1411,7 +1994,7 @@ async function openChengfangShop(p) {
     return { browser, target, account: st, context, cookieSession, cookieCheckpoint };
   } catch (e) {
     await holdOnMissingChengfangControl(e, {
-      context, target, shopCfg: p.shopCfg, loginCfg: p.loginCfg,
+      context, target, shopCfg: p.shopCfg, loginCfg: p.loginCfg, cookieSession, audit,
       browserFactory: p.browserFactory, reviewBrowserFactory: p.reviewBrowserFactory,
     });
     // R58 失败路径检查点：关闭浏览器前再尝试一次——仅当当前时刻地址/身份仍是
@@ -1589,11 +2172,12 @@ function createChengfangController(p) {
       if (typeof page.reload !== 'function') return { refreshed: false, reason: 'page.reload 不可用', ui: 'aurora' };
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch((e) => { throw new DataGuardError(`回读前刷新乘方管理页失败：${e.reason || e.message}`); });
       await sleep(loadWaitMs);
-      // 部分店铺刷新后回到「商品视图」甚至展示介绍浮层；先恢复计划视图。
+      // 部分店铺刷新后回到「商品视图」甚至展示介绍浮层；先关白名单浮窗，再做只读 tab 导航。
       let hasSubTabs = false;
       for (let attempt = 0; attempt < 12; attempt++) {
-        const advanced = await page.evaluate(advanceChengfangPlanViewInPage).catch(() => null);
-        if (advanced && advanced.action !== 'none') await sleep(1000);
+        const dr = await dismissKnownChengfangOverlays({ page, maxRounds: 1 }).catch(() => null);
+        const advanced = await page.evaluate(navigateChengfangPlanViewInPage).catch(() => null);
+        if ((dr && dr.dismissed) || (advanced && advanced.action !== 'none')) await sleep(1000);
         const st = await page.evaluate(readChengfangAccountInPage).catch(() => null);
         if (st && st.hasSubTabs) { hasSubTabs = true; break; }
         await sleep(1000);
@@ -1907,9 +2491,14 @@ module.exports = {
   clickChengfangFirstPageInPage,
   readChengfangAccountInPage,
   advanceChengfangPlanViewInPage,
+  navigateChengfangPlanViewInPage,
+  handleChengfangOverlayInPage,
+  dismissKnownChengfangOverlays,
+  isTrustedChengfangUrl,
   isMissingChengfangControl,
   hasChengfangManualReview,
   retainChengfangPageForManualReview,
+  releaseChengfangManualReviewForReadOnlyOpen,
   watchChengfangControlsForManualReview,
   openChengfangShop,
   createChengfangController,

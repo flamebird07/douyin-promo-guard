@@ -210,34 +210,48 @@ const qcOkPage = () => makePage(QC_URL, [el({ attrs: { class: 'summaryCard-main'
 const qcBlankPage = () => makePage(QC_URL, []);
 
 // ── fake browser/context（脚本化逐上下文页面队列）─────────────────────
+// COOKIE-PROCESS-ISOLATION-20261026：browserFactory 每次调用必须返回**全新**浏览器
+// 实例（恢复成功后重开必须换新进程）；上下文队列经共享 counters 全局排队，行为脚本不变。
+// close 后 isConnected() 必须变 false（关闭证明语义）。
 
-function makeBrowser(contextSpecs, counters) {
-  return {
-    newContext: async () => {
-      counters.contexts += 1;
-      const spec = contextSpecs[counters.contexts - 1] || {};
-      const opened = [];
-      return {
-        addCookies: async () => { counters.addedCookieSets += 1; },
-        newPage: async () => {
-          counters.pages += 1;
-          const pg = spec.pages.shift();
-          if (!pg) throw new Error('stub: 该上下文没有预置页面（会话数超出脚本）');
-          opened.push(pg);
-          return pg;
-        },
-        close: async () => {
-          if (spec.failClose === true) throw new Error('stub: context close refused');
-          counters.ctxCloses += 1;
-          for (const p of opened) p.__closed = true;
-        },
-        cookies: async () => [],
-        waitForEvent: () => Promise.resolve(null),
-        on() {}, off() {},
-      };
-    },
-    close: async () => { counters.browserCloses += 1; },
-    isConnected: () => true,
+function makeBrowserFactory(contextSpecs, counters) {
+  let nextId = 0;
+  return async () => {
+    nextId += 1;
+    const browser = {
+      __id: nextId,
+      __closed: false,
+      newContext: async () => {
+        counters.contexts += 1;
+        const spec = contextSpecs[counters.contexts - 1] || {};
+        const opened = [];
+        return {
+          addCookies: async () => { counters.addedCookieSets += 1; },
+          newPage: async () => {
+            counters.pages += 1;
+            const pg = spec.pages.shift();
+            if (!pg) throw new Error('stub: 该上下文没有预置页面（会话数超出脚本）');
+            opened.push(pg);
+            return pg;
+          },
+          close: async () => {
+            if (spec.failClose === true) throw new Error('stub: context close refused');
+            counters.ctxCloses += 1;
+            for (const p of opened) p.__closed = true;
+          },
+          cookies: async () => [],
+          waitForEvent: () => Promise.resolve(null),
+          on() {}, off() {},
+        };
+      },
+      close: async () => {
+        if (browser.__closed) return;
+        browser.__closed = true;
+        counters.browserCloses += 1;
+      },
+      isConnected: () => !browser.__closed,
+    };
+    return browser;
   };
 }
 
@@ -247,9 +261,9 @@ function mkCounters() {
 function countingRestore(ref) {
   return async (...a) => { ref.n += 1; return session.restoreDutyWorkCopy(...a); };
 }
-function baseOpts(d, browser, restoreRunner, extra = {}) {
+function baseOpts(d, browserFactory, restoreRunner, extra = {}) {
   return Object.assign({
-    browserFactory: async () => browser,
+    browserFactory,
     settleTimeoutMs: 30, settleIntervalMs: 10,
     readinessTimeoutMs: 30, readinessIntervalMs: 10,
     restoreRecoveryDir: d.recoveryDir,
@@ -273,17 +287,18 @@ test('1) QC 阶段真实 Auth → 既有四层恢复恰好一次 → 干净重�
   fs.writeFileSync(path.join(d.recoveryDir, FILE), fresh);
   const counters = mkCounters();
   const calls = { n: 0 };
-  const browser = makeBrowser([
+  const browserFactory = makeBrowserFactory([
     { pages: [fxgPage(), qcAuthPage()] },
     { pages: [fxgPage(), qcOkPage()] },
   ], counters);
-  const res = await openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browser, countingRestore(calls), {
+  const res = await openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browserFactory, countingRestore(calls), {
     restoreVerify: verifyOk,
   }));
   assert.strictEqual(calls.n, 1, '整次 open 调用恰好一次恢复（初始收敛未用配额）');
   assert.strictEqual(counters.contexts, 2, '失效会话 + 恢复后干净重开各一次');
   assert.strictEqual(counters.ctxCloses, 1, '恢复前旧上下文必须先关闭');
-  assert.strictEqual(counters.browserCloses, 0, '成功路径浏览器交还调用方，不在此关闭');
+  assert.strictEqual(counters.browserCloses, 1, '恢复前旧店铺浏览器进程必须关闭（候选切换不留旧 Cookie 进程）');
+  assert.strictEqual(res.browser.__id, 2, '恢复后重开必须在全新浏览器进程（非初始进程）');
   assert.strictEqual(res.navMode, 'direct-home-url');
   assert.strictEqual(String(res.target.url()), QC_URL, '复验成功的 target 必须是重开会话里的千川首页');
   assert.ok(fs.readFileSync(workFile).equals(fresh), '恢复成功必须提升值守工作副本');
@@ -295,12 +310,12 @@ test('2) 初始收敛已恢复一次 → QC 阶段再 Auth 不二次恢复（共
   fs.writeFileSync(path.join(d.recoveryDir, FILE), bytesOf(makeCookies('fresh')));
   const counters = mkCounters();
   const calls = { n: 0 };
-  const browser = makeBrowser([
+  const browserFactory = makeBrowserFactory([
     { pages: [fxgPage({ forceUrl: LOGIN_URL, url: LOGIN_URL }), qcAuthPage()] },
     { pages: [fxgPage(), qcAuthPage()] },
   ], counters);
   await assert.rejects(
-    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browser, countingRestore(calls), {
+    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browserFactory, countingRestore(calls), {
       restoreVerify: verifyOk,
     })),
     (e) => {
@@ -312,7 +327,7 @@ test('2) 初始收敛已恢复一次 → QC 阶段再 Auth 不二次恢复（共
   );
   assert.strictEqual(calls.n, 1, '合计恰好一次恢复（初始收敛那次）');
   assert.strictEqual(counters.contexts, 2, '不得开出第三个上下文');
-  assert.strictEqual(counters.browserCloses, 1);
+  assert.strictEqual(counters.browserCloses, 2, '恢复前旧进程关闭 + 失败出口关闭重开的新进程');
 });
 
 test('3) 恢复禁用（restoreOnAuthFailure=false）→ QC Auth 不恢复、不关上下文', async () => {
@@ -321,9 +336,9 @@ test('3) 恢复禁用（restoreOnAuthFailure=false）→ QC Auth 不恢复、不
   fs.writeFileSync(path.join(d.recoveryDir, FILE), bytesOf(makeCookies('fresh')));
   const counters = mkCounters();
   const calls = { n: 0 };
-  const browser = makeBrowser([{ pages: [fxgPage(), qcAuthPage()] }], counters);
+  const browserFactory = makeBrowserFactory([{ pages: [fxgPage(), qcAuthPage()] }], counters);
   await assert.rejects(
-    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browser, countingRestore(calls), {
+    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browserFactory, countingRestore(calls), {
       restoreOnAuthFailure: false,
     })),
     (e) => {
@@ -344,9 +359,9 @@ test('4) QC 非认证类失败（DataGuard）→ 零恢复', async () => {
   fs.writeFileSync(path.join(d.recoveryDir, FILE), bytesOf(makeCookies('fresh')));
   const counters = mkCounters();
   const calls = { n: 0 };
-  const browser = makeBrowser([{ pages: [fxgPage(), qcBlankPage()] }], counters);
+  const browserFactory = makeBrowserFactory([{ pages: [fxgPage(), qcBlankPage()] }], counters);
   await assert.rejects(
-    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browser, countingRestore(calls))),
+    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browserFactory, countingRestore(calls))),
     (e) => {
       assert.ok(e instanceof DataGuardError, `非认证失败必须按数据护栏处理：${e && e.message}`);
       assert.ok(!(e instanceof AuthError));
@@ -365,9 +380,9 @@ test('5) 恢复无可验证候选 → 如实保留认证失败 + 恢复说明，
   fs.writeFileSync(path.join(d.recoveryDir, FILE), bytesOf(makeCookies('also-stale')));
   const counters = mkCounters();
   const calls = { n: 0 };
-  const browser = makeBrowser([{ pages: [fxgPage(), qcAuthPage()] }], counters);
+  const browserFactory = makeBrowserFactory([{ pages: [fxgPage(), qcAuthPage()] }], counters);
   await assert.rejects(
-    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browser, countingRestore(calls), {
+    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browserFactory, countingRestore(calls), {
       restoreVerify: async () => ({ ok: false, reason: '桩：候选登录无效' }),
     })),
     (e) => {
@@ -390,10 +405,10 @@ test('5b) 恢复链抛异常 → 认证失败如实保留（异常不吞不伪�
   fs.writeFileSync(path.join(d.workDir, FILE), bytesOf(makeCookies('stale')));
   const counters = mkCounters();
   const calls = { n: 0 };
-  const browser = makeBrowser([{ pages: [fxgPage(), qcAuthPage()] }], counters);
+  const browserFactory = makeBrowserFactory([{ pages: [fxgPage(), qcAuthPage()] }], counters);
   const throwingRunner = async () => { calls.n += 1; throw new Error('fake-secret-must-not-appear'); };
   await assert.rejects(
-    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browser, throwingRunner)),
+    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browserFactory, throwingRunner)),
     (e) => {
       assert.ok(e instanceof AuthError);
       assert.match(e.message, /千川视图读取遇到登录页或登录控件/);
@@ -413,12 +428,12 @@ test('6) 恢复重开后 QC 仍 Auth → 合计仍只一次恢复、两个上下
   fs.writeFileSync(path.join(d.recoveryDir, FILE), bytesOf(makeCookies('fresh-but-qc-rejects')));
   const counters = mkCounters();
   const calls = { n: 0 };
-  const browser = makeBrowser([
+  const browserFactory = makeBrowserFactory([
     { pages: [fxgPage(), qcAuthPage()] },
     { pages: [fxgPage(), qcAuthPage()] },
   ], counters);
   await assert.rejects(
-    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browser, countingRestore(calls), {
+    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browserFactory, countingRestore(calls), {
       restoreVerify: verifyOk,
     })),
     (e) => {
@@ -429,7 +444,7 @@ test('6) 恢复重开后 QC 仍 Auth → 合计仍只一次恢复、两个上下
   );
   assert.strictEqual(calls.n, 1, '重试仍失效不得第二轮恢复');
   assert.strictEqual(counters.contexts, 2, '至多两个上下文');
-  assert.strictEqual(counters.browserCloses, 1);
+  assert.strictEqual(counters.browserCloses, 2, '恢复前旧进程关闭 + 失败出口关闭重开的新进程');
 });
 
 test('7) 原上下文关闭失败 → 0 次恢复、无第二上下文（绝不重叠会话）', async () => {
@@ -438,9 +453,9 @@ test('7) 原上下文关闭失败 → 0 次恢复、无第二上下文（绝不�
   fs.writeFileSync(path.join(d.recoveryDir, FILE), bytesOf(makeCookies('fresh')));
   const counters = mkCounters();
   const calls = { n: 0 };
-  const browser = makeBrowser([{ pages: [fxgPage(), qcAuthPage()], failClose: true }], counters);
+  const browserFactory = makeBrowserFactory([{ pages: [fxgPage(), qcAuthPage()], failClose: true }], counters);
   await assert.rejects(
-    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browser, countingRestore(calls), {
+    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browserFactory, countingRestore(calls), {
       restoreVerify: verifyOk,
     })),
     (e) => {
@@ -466,9 +481,9 @@ test('8) 复核无新鲜登录正证据 → 不恢复，原 AuthError 原样上�
   // 第 3 次 = open 层复核取证前 DOM 已变化（登录控件消失）→ 无新鲜正证据 → 不恢复。
   const roots = [el({ tag: 'input', attrs: { type: 'password' }, rect: { width: 220, height: 32 } })];
   const qc = makePage(QC_URL, roots, { mutateAt: 3, mutate: () => { roots.splice(0, roots.length); } });
-  const browser = makeBrowser([{ pages: [fxgPage(), qc] }], counters);
+  const browserFactory = makeBrowserFactory([{ pages: [fxgPage(), qc] }], counters);
   await assert.rejects(
-    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browser, countingRestore(calls), {
+    () => openQianchuanHome(loginCfgOf(d), shopCfg, baseOpts(d, browserFactory, countingRestore(calls), {
       restoreVerify: verifyOk,
     })),
     (e) => {

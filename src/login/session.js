@@ -246,24 +246,61 @@ function captureAnalyzerSourceCandidateGuard(fsm, loginCfg, name, workReal, recR
 }
 
 /**
- * 默认候选验证器（生产实际接通；测试注入 verify 覆盖）：在调用方提供的**已打开浏览器**
- * 上开隔离新上下文注入候选 Cookie，访问抖店首页，先做与主链**同一份**有界被动收敛
- *（lib/settle-policy：默认 45s/3s，零点击/零导航/零请求，严格首页 host+path 判定），
- * 收敛到首页后才做语义身份轮询（probeDoudianShopIdentityInPage +
- * decideDoudianIdentity 同口径）。绝不凭 mtime/结构放行；探测上下文用毕即关。
- * 未提供 browser 时 fail-closed 拒绝验证（绝不静默自启真实浏览器——离线测试
+ * 默认候选验证器（生产实际接通；测试注入 verify 覆盖）：**每个候选**都通过显式提供的
+ * candidateBrowserFactory 启动一份全新独立浏览器进程，在该进程内注入候选 Cookie、访问
+ * 抖店首页，先做与主链**同一份**有界被动收敛（lib/settle-policy：默认 45s/3s，零点击/
+ * 零导航/零请求，严格首页 host+path 判定），收敛到首页后才做语义身份轮询
+ *（probeDoudianShopIdentityInPage + decideDoudianIdentity 同口径）。绝不凭 mtime/结构
+ * 放行。COOKIE-PROCESS-ISOLATION-20261026：不再接收/复用调用方共享的 opts.browser
+ *（同进程开 context 不满足"每份 Cookie 独立浏览器进程"）；工厂返回重复/被禁止的实例
+ *（如主店铺浏览器）→ fail-closed 拒绝验证。验证结束后 context 与**本候选专属浏览器
+ * 进程**都必须关闭；关闭未获证明（close 抛错或仍连接）→ 本次验证绝不判成功，并以
+ * stopChain 要求恢复链立即停止（候选 N 未收口前不得启动候选 N+1，也不得提升）。
+ * 未显式提供工厂时 fail-closed 拒绝验证（绝不静默自启真实浏览器——离线测试
  * 与无浏览器环境一律不提升候选，防真实浏览器/网络副作用）。
  */
 function createDefaultCandidateVerifier(loginCfg, opts = {}) {
+  const factory = typeof opts.candidateBrowserFactory === 'function' ? opts.candidateBrowserFactory : null;
+  const forbidden = Array.isArray(opts.forbiddenBrowsers)
+    ? opts.forbiddenBrowsers.filter((b) => b && typeof b === 'object') : [];
+  if (!factory) {
+    return async function verifyCandidate() {
+      return { ok: false, classification: 'verify-error', reason: '未提供候选专用浏览器工厂（candidateBrowserFactory）：无法独立验证候选（fail-closed，拒绝复用共享浏览器，拒绝自启真实浏览器，不提升）' };
+    };
+  }
+  const usedBrowsers = new Set();
+  // 不确定启动/收口后的闩锁：工厂抛错（可能已创建未返回的资源）或拒绝实例关闭未获证明后，
+  // 本验证器后续调用一律直接 fail-closed 停链，绝不再调用工厂（不盲目重试）。
+  let latchReason = null;
   return async function verifyCandidate(p) {
-    const browser = opts.browser || null;
-    if (!browser || typeof browser.newContext !== 'function') {
-      return { ok: false, reason: '未提供可用浏览器实例：无法独立验证候选（fail-closed，拒绝自启真实浏览器，不提升）' };
+    if (latchReason) {
+      return { ok: false, classification: 'verify-error', stopChain: true, reason: latchReason };
     }
+    let browser = null;
+    try {
+      browser = await factory();
+    } catch (_) {
+      latchReason = '候选专用浏览器启动失败且资源收口状态不确定（工厂异常可能已创建未返回的进程）：已闩锁停止恢复链，后续候选一律拒绝启动（fail-closed，不提升；异常详情可能含敏感环境信息，已脱敏不回显）';
+      return { ok: false, classification: 'verify-error', stopChain: true, reason: '候选专用浏览器启动失败（工厂异常后资源状态不确定）：停止恢复链并闩锁后续候选，不提升（异常详情可能含敏感环境信息，已脱敏不回显）' };
+    }
+    if (!browser || typeof browser.newContext !== 'function' || usedBrowsers.has(browser) || forbidden.includes(browser)) {
+      // 拒绝实例必须保守关闭且**关闭需获证明**：未获证明不得让下一候选启动（不确定收口）。
+      let closeProven = false;
+      if (browser && typeof browser.close === 'function') {
+        try { await browser.close(); closeProven = true; } catch (_) { closeProven = false; }
+        if (closeProven && typeof browser.isConnected === 'function') {
+          try { if (browser.isConnected() !== false) closeProven = false; } catch (_) { closeProven = false; }
+        }
+      }
+      if (!closeProven) {
+        latchReason = '被拒绝的候选浏览器实例关闭未获证明（close 异常或仍连接）：已闩锁停止恢复链，绝不带不确定收口进入下一候选';
+        return { ok: false, classification: 'verify-error', stopChain: true, reason: '候选浏览器工厂返回不可用或重复/共享的浏览器实例（每个候选必须是全新独立进程），且该实例关闭未获证明：停止恢复链，不提升' };
+      }
+      return { ok: false, classification: 'verify-error', reason: '候选浏览器工厂返回不可用或重复/共享的浏览器实例（每个候选必须是全新独立进程）：fail-closed 拒绝验证，不提升' };
+    }
+    usedBrowsers.add(browser);
     let ctx = null;
-    let sawLoginEvidence = false;
-    let reachedVerifiedIdentityUrl = false;
-    let lastIdentityReason = null;
+    let outcome = null;
     try {
       ctx = await browser.newContext({ viewport: { width: 1920, height: 1080 }, timezoneId: 'Asia/Shanghai' });
       await ctx.addCookies(p.cookies);
@@ -283,6 +320,9 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
       // 完整身份探针预算；到上界仍非身份页则不二次空等，单轮如实分类。
       const onIdentityPage = settled.ok === true || isVerifiedDoudianIdentityUrl(String(settled.url || ''));
       const maxAttempts = onIdentityPage ? Math.max(1, Math.ceil(identityMs / pacing.intervalMs)) : 1;
+      let sawLoginEvidence = false;
+      let reachedVerifiedIdentityUrl = false;
+      let lastIdentityReason = null;
       for (let i = 0; i < maxAttempts; i += 1) {
         if (i > 0) {
           const sleep = opts.verifySleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -306,34 +346,48 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
         let back = null;
         try { back = await ctx.cookies(); } catch (_) { back = null; }
         if (!Array.isArray(back) || back.length === 0) {
-          return { ok: false, classification: 'verify-error', reason: '独立验证上下文未返回非空最终 Cookie 集合（读取异常或空）：fail-closed 拒绝验证/提升（待重试，不要求扫码）' };
+          outcome = { ok: false, classification: 'verify-error', reason: '独立验证上下文未返回非空最终 Cookie 集合（读取异常或空）：fail-closed 拒绝验证/提升（待重试，不要求扫码）' };
+          break;
         }
         const afterCapture = await page.evaluate(probeDoudianShopIdentityInPage);
         const finalIdentity = decideDoudianIdentity({ url: String(page.url()), expectedNames: p.expectedShopNames, observed: afterCapture });
         if (!finalIdentity.ok || String(page.url()) !== url || finalIdentity.name !== rd.name) {
-          return { ok: false, classification: 'identity-unverified', reason: 'Cookie 捕获期间页面或身份漂移：拒绝提升' };
+          outcome = { ok: false, classification: 'identity-unverified', reason: 'Cookie 捕获期间页面或身份漂移：拒绝提升' };
+          break;
         }
         const finalCookies = await ctx.cookies();
         if (!sameCookieSet(back, finalCookies) || String(page.url()) !== url) {
-          return { ok: false, classification: 'verify-error', reason: '身份复验期间 Cookie 或页面变化：拒绝提升较早快照' };
+          outcome = { ok: false, classification: 'verify-error', reason: '身份复验期间 Cookie 或页面变化：拒绝提升较早快照' };
+          break;
         }
-        await ctx.close();
-        ctx = null;
-        return { ok: true, finalCookies };
+        outcome = { ok: true, finalCookies };
+        break;
       }
-      if (sawLoginEvidence) {
-        return { ok: false, classification: 'login-invalid', reason: '候选在独立新上下文命中登录页地址或可见登录控件（登录无效，需重新扫码）' };
+      if (!outcome) {
+        if (sawLoginEvidence) {
+          outcome = { ok: false, classification: 'login-invalid', reason: '候选在独立浏览器进程命中登录页地址或可见登录控件（登录无效，需重新扫码）' };
+        } else if (reachedVerifiedIdentityUrl) {
+          outcome = { ok: false, classification: 'identity-unverified', reason: `候选在独立浏览器进程到达受信抖店首页但未取得唯一本店语义身份/疑错店（${lastIdentityReason || '身份未核实'}）：待核实/重试，不要求扫码` };
+        } else {
+          outcome = { ok: false, classification: 'identity-unverified', reason: '候选未在独立浏览器进程取得受信抖店首页的唯一本店语义身份（登录无效/错店/待核实，不要求扫码）' };
+        }
       }
-      if (reachedVerifiedIdentityUrl) {
-        return { ok: false, classification: 'identity-unverified', reason: `候选在独立新上下文到达受信抖店首页但未取得唯一本店语义身份/疑错店（${lastIdentityReason || '身份未核实'}）：待核实/重试，不要求扫码` };
-      }
-      return { ok: false, classification: 'identity-unverified', reason: '候选未在独立新上下文取得受信抖店首页的唯一本店语义身份（登录无效/错店/待核实，不要求扫码）' };
     } catch (_) {
       // 外部异常可能回显 Cookie 值/带 token 的 URL：只记录固定脱敏原因。验证异常绝不判"登录无效"。
-      return { ok: false, classification: 'verify-error', reason: '候选验证异常（异常详情可能含 Cookie/令牌等敏感值，已脱敏不回显）：拒绝验证/提升，待重试不要求扫码' };
-    } finally {
-      if (ctx) { try { await ctx.close(); } catch (_) { /* 关闭失败不掩盖结果 */ } }
+      outcome = { ok: false, classification: 'verify-error', reason: '候选验证异常（异常详情可能含 Cookie/令牌等敏感值，已脱敏不回显）：拒绝验证/提升，待重试不要求扫码' };
     }
+    if (ctx) { try { await ctx.close(); } catch (_) { /* 关闭失败不掩盖结果 */ } }
+    // 本候选专属浏览器进程用毕必须真正关闭：close 抛错或仍连接 → 绝不判成功，并停止恢复链。
+    let browserClosed = true;
+    try { await browser.close(); } catch (_) { browserClosed = false; }
+    if (browserClosed && typeof browser.isConnected === 'function') {
+      try { if (browser.isConnected() !== false) browserClosed = false; } catch (_) { browserClosed = false; }
+    }
+    if (!browserClosed) {
+      latchReason = '候选专用浏览器进程关闭未获证明（close 异常或仍连接）：停止恢复链，不提升、不进入下一候选';
+      return { ok: false, classification: 'verify-error', stopChain: true, reason: latchReason };
+    }
+    return outcome;
   };
 }
 
@@ -416,8 +470,9 @@ function archiveEpochMs(c) {
  *
  * @param {object} loginCfg 配置 login 段
  * @param {string} cookieFile 精确店铺文件名（safeCookieBaseName 规则）
- * @param {object} opts { shopCfg, verify?, browser?, vaultModule?, vaultRoots?,
- *                        recoveryDir?, workDir?, fsModule?, nowFn?, audit? }
+ * @param {object} opts { shopCfg, verify?, candidateBrowserFactory?, forbiddenBrowsers?,
+ *                        vaultModule?, vaultRoots?, recoveryDir?, workDir?, fsModule?,
+ *                        nowFn?, audit? }
  * @returns {Promise<{ok:true, source:string, sourceSha256:string, targetSha256:string, backupPath:string|null, attempts:object[]}
  *                   |{ok:false, reason:string, attempts:object[]}>}
  */
@@ -563,8 +618,12 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
       attempts.push({
         source: cand.source, result: 'verify-failed',
         ...(vr && vr.classification ? { classification: vr.classification } : {}),
+        ...(vr && vr.stopChain === true ? { stopChain: true } : {}),
         reason: (vr && vr.reason) || '未通过验证',
       });
+      // COOKIE-PROCESS-ISOLATION-20261026：候选专属浏览器进程关闭未获证明 → 立即
+      // 终止恢复链（不提升、不再启动下一候选进程；候选 N 收口前不得进入 N+1）。
+      if (vr && vr.stopChain === true) break;
       continue;
     }
     // 第六轮 F1（根因修复）：只提升「验证 context 的最终已验证集合」的确定性序列化字节。

@@ -908,7 +908,9 @@ test('千川真实入口：登录失效正证据 → 四层恢复（排除当前
   assert.ok(fs.readFileSync(path.join(d.workDir, fileName)).equals(bytesOf(fresh)), '恢复成功必须提升值守工作副本');
   assert.ok(fs.readFileSync(path.join(d.recoveryDir, fileName)).equals(bytesOf(fresh)), '入口链路全程不改写恢复副本');
   assert.strictEqual(counters.contexts, 2, '初次失效会话 + 恢复后有界重试各一次（绝不循环）');
-  assert.strictEqual(counters.browserCloses, 1, '异常出口关闭本次创建的浏览器');
+  // COOKIE-PROCESS-ISOLATION-20261026：恢复切换候选前关闭旧店铺浏览器进程（1）+
+  // 重开用全新进程、异常出口关闭新进程（2）。
+  assert.strictEqual(counters.browserCloses, 2, '恢复前关闭旧进程 + 异常出口关闭重开的新进程');
 });
 
 test('千川真实入口：恢复无可验证候选 → AuthError 原语义保留 + 如实恢复说明，工作副本未被盲覆盖', async () => {
@@ -973,7 +975,9 @@ test('罗盘真实入口：登录失效 → 排除当前工作字节 → 恢复�
   );
   assert.ok(fs.readFileSync(path.join(d.workDir, fileName)).equals(bytesOf(fresh)), '入口恢复链提升成功');
   assert.ok(fs.readFileSync(path.join(d.recoveryDir, fileName)).equals(bytesOf(fresh)), '恢复副本只读');
-  assert.strictEqual(counters.browserCloses, 1, 'finally 关闭本次浏览器');
+  // COOKIE-PROCESS-ISOLATION-20261026：恢复切换候选前关闭旧店铺浏览器进程（1）+
+  // 重开用全新进程、finally 关闭新进程（2）。
+  assert.strictEqual(counters.browserCloses, 2, '恢复前关闭旧进程 + finally 关闭重开的新进程');
 });
 
 test('罗盘真实入口：restoreOnAuthFailure=false 关闭恢复 → 原 AuthError 无恢复说明', async () => {

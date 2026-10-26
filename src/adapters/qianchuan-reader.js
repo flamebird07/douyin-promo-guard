@@ -43,6 +43,8 @@ const { resolveCookieFile, restoreDutyWorkCopy } = require('../login/session');
 const { fingerprintFile } = require('../login/cookie-writeback');
 const { maskUrlQueries } = require('../lib/log');
 const { checkpointQianchuanSessionCookies } = require('../login/session-cookie-checkpoint');
+// COOKIE-PROCESS-ISOLATION-20261026：恢复候选专用独立浏览器进程工厂/关闭证明助手。
+const { createCandidateBrowserFactory, closeBrowserProven } = require('../login/candidate-browser');
 const { beginLauncherScope, runInLauncherScope, attestFromLauncherScope } = require('../lib/resource-attestation');
 const { closableSideOfAd } = require('./ad-controller');
 // AD-DOUDIAN-ARRIVAL-OVERLAY-20261019-F1：抖店首页营销浮窗有限处理（同页根证，与
@@ -720,6 +722,60 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
 async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
   let browser = null;
   const launchScope = beginLauncherScope('qianchuan-home');
+  // COOKIE-PROCESS-ISOLATION-20261026：本次 open 内的店铺浏览器启动/关闭助手。
+  // 恢复链切换候选前必须先关闭当前店铺浏览器进程（不能带着旧 Cookie 活着），恢复成功
+  // 重载新工作副本前必须启动**全新**店铺浏览器进程；每次启动都同步登记 onResource 收口
+  // 句柄（同一早期所有权协议，重开的新进程同样登记，绝不留无主进程）。
+  const shopBrowserIdentities = [];
+  // COOKIE-PROCESS-ISOLATION-20261026 校正：店铺浏览器启动也经同一"每次全新实例"工厂包装
+  // （对象身份查重）：注入工厂在恢复后返回**同一个旧浏览器对象**（复用旧进程）→ 在
+  // addCookies 之前拒绝（关闭并抛错，走既有 catch 收口），绝不带着旧 Cookie 进程重载。
+  // 生产默认 fallbackLaunch 每次 chromium.launch 全新进程，行为不变。onResource 早登记
+  // 语义由工厂内部同步完成（与下方候选工厂同一协议），launcher 范围证明照旧包住启动调用。
+  const shopBrowserFactory = createCandidateBrowserFactory({
+    injectedFactory: typeof opts.browserFactory === 'function' ? opts.browserFactory : null,
+    fallbackLaunch: () => {
+      const { chromium } = require('playwright');
+      return chromium.launch({
+        headless: opts.headless !== false,
+        executablePath: loginCfg.edgePath,
+        args: ['--window-size=1920,1080'],
+      });
+    },
+    onResource: typeof opts.onResource === 'function' ? opts.onResource : null,
+  });
+  const launchShopBrowser = async () => {
+    const opened = await runInLauncherScope(launchScope, () => shopBrowserFactory());
+    shopBrowserIdentities.push(opened);
+    return opened;
+  };
+  // 关闭当前店铺浏览器并给出证明；先摘引用（关闭后绝不再被当作活会话/不被重复收口），
+  // 未获证明时保留给出错出口再试关闭。
+  const closeShopBrowserProven = async () => {
+    if (!browser) return true;
+    const closing = browser;
+    browser = null;
+    const ok = await closeBrowserProven(closing);
+    if (!ok) browser = closing;
+    return ok;
+  };
+  // 候选专用浏览器工厂：每个恢复候选一份全新独立浏览器进程（显式注入优先；测试用
+  // browserFactory 包装并强制每次新实例；生产默认 Playwright chromium.launch，每次调用
+  // 即每次全新进程）。绝不把当前/历史店铺浏览器共享给候选验证（forbiddenBrowsers 拒绝）。
+  const candidateBrowserFactory = typeof opts.restoreCandidateBrowserFactory === 'function'
+    ? opts.restoreCandidateBrowserFactory
+    : createCandidateBrowserFactory({
+      injectedFactory: typeof opts.browserFactory === 'function' ? opts.browserFactory : null,
+      fallbackLaunch: () => {
+        const { chromium } = require('playwright');
+        return chromium.launch({
+          headless: opts.headless !== false,
+          executablePath: loginCfg.edgePath,
+          args: ['--window-size=1920,1080'],
+        });
+      },
+      onResource: typeof opts.onResource === 'function' ? opts.onResource : null,
+    });
   try {
     const resolved = resolveCookieFile(loginCfg, shopCfg.cookieFile);
     // 会话 Cookie 回写所需的元信息（2026-09-16 用户明确授权）：
@@ -732,29 +788,7 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
       readOnly: resolved.readOnly,
       startFingerprint: fingerprintFile(resolved.path),
     };
-    if (opts.browserFactory) {
-      browser = await runInLauncherScope(launchScope, () => opts.browserFactory());
-    } else {
-      const { chromium } = require('playwright');
-      browser = await runInLauncherScope(launchScope, () => chromium.launch({
-        headless: opts.headless !== false,
-        executablePath: loginCfg.edgePath,
-        args: ['--window-size=1920,1080'],
-      }));
-    }
-    // 所有权早登记（2026-10-23 DIAN-4 长期 unknown 门修复）：浏览器一创建就**同步**把可核验
-    // 收口句柄交给调用方，先于其后的任何 await。调用方（Monitor 收口门）据此在截止/失败时
-    // 真实关闭并独立核验连接；没有这一步，"opener 仍挂账时被截止"就没有任何可核验事实，
-    // 本店会长期 unknown。句柄是闭包对象：不可序列化、绝不进日志/返回值。
-    if (typeof opts.onResource === 'function' && browser) {
-      const owned = browser;
-      const handle = { close: () => owned.close() };
-      if (typeof owned.isConnected === 'function') {
-        // 读取异常一律按"仍在线"处理：宁可保守阻断，绝不伪造已关闭。
-        handle.isConnected = () => { try { return owned.isConnected() !== false; } catch (_) { return true; } };
-      }
-      try { opts.onResource(handle); } catch (_) { /* 登记失败不改变打开链路结果 */ }
-    }
+    browser = await launchShopBrowser();
     // AD-COOKIE-FOUR-TIER-20261019-F1：会话打开收口（含恢复成功后的有界一次重试）。
     const openFxgSession = async () => {
       const ctx = await browser.newContext({ viewport: { width: 1920, height: 1080 }, timezoneId: 'Asia/Shanghai' });
@@ -801,7 +835,8 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
         return await runner(loginCfg, shopCfg.cookieFile, {
           shopCfg,
           excludeWorkCopy: true,
-          browser: opts.restoreBrowser || browser,
+          candidateBrowserFactory,
+          forbiddenBrowsers: shopBrowserIdentities.slice(),
           verify: opts.restoreVerify,
           vaultModule: opts.restoreVaultModule,
           vaultRoots: opts.restoreVaultRoots,
@@ -815,11 +850,19 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     };
     if (fail && fail.kind === 'login' && opts.restoreOnAuthFailure !== false) {
       await sess.ctx.close();
+      // 候选切换前先关闭当前店铺浏览器进程（不能带着旧 Cookie 进程活着等候选验证）；
+      // 关闭未获证明 → 阻断恢复（绝不重叠会话/绝不带旧进程继续）。
+      const browserClosed = await closeShopBrowserProven();
+      if (!browserClosed) {
+        throw new AuthError('登录失效后原店铺浏览器进程关闭未获证明：阻断四层恢复（绝不重叠会话/绝不带着旧 Cookie 进程继续）');
+      }
       const restore = await runRestoreChain();
       fail.restore = restore;
       if (restore.ok) {
-        // 恢复提升已更新工作副本：刷新会话指纹基线（提升后字节即新基线），有界重试一次
+        // 恢复提升已更新工作副本：刷新会话指纹基线（提升后字节即新基线），并在**全新
+        // 店铺浏览器进程**上有界重试一次（旧进程已关闭，绝不复用旧 Cookie 进程重载）。
         cookieSession.startFingerprint = fingerprintFile(resolved.path);
+        browser = await launchShopBrowser();
         sess = await openFxgSession();
         fail = sess.settled.ok ? null : await classifySettleFailure(sess);
       }
@@ -882,13 +925,21 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
           qcFailure = new AuthError(`${e.message}；原会话上下文关闭未获证明：阻断四层恢复重开，绝不重叠会话`);
           break;
         }
+        // 会话中段恢复同样先关闭当前店铺浏览器进程：候选切换与重载都不得复用旧 Cookie 进程。
+        const browserClosed = await closeShopBrowserProven();
+        if (!browserClosed) {
+          qcFailure = new AuthError(`${e.message}；原店铺浏览器进程关闭未获证明：阻断四层恢复重开，绝不重叠会话`);
+          break;
+        }
         const restore = await runRestoreChain();
         if (!restore.ok) {
           qcFailure = new AuthError(`${e.message}；四层恢复未取得可验证候选（${restore.reason || '未提升'}），工作副本现状未被盲覆盖`);
           break;
         }
-        // 恢复提升已更新工作副本：刷新指纹基线（提升后字节即新基线），重开干净上下文重走全链路。
+        // 恢复提升已更新工作副本：刷新指纹基线（提升后字节即新基线），启动全新店铺浏览器
+        // 进程重开干净上下文重走全链路（旧进程已关闭，绝不复用旧 Cookie 进程重载）。
         cookieSession.startFingerprint = fingerprintFile(resolved.path);
+        browser = await launchShopBrowser();
         sess = await openFxgSession();
         if (!sess.settled.ok) {
           const reopenFail = await classifySettleFailure(sess);

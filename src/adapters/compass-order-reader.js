@@ -35,6 +35,8 @@ const { resolveCookieFile, restoreDutyWorkCopy } = require('../login/session');
 const { fingerprintFile } = require('../login/cookie-writeback');
 // R87：关闭前罗盘会话收尾检查点（同 context 严格语义店名 + 目标文件名绑定 + 既有写入器 CAS）。
 const { checkpointCompassSessionCookies } = require('../login/session-cookie-checkpoint');
+// COOKIE-PROCESS-ISOLATION-20261026：恢复候选专用独立浏览器进程工厂/关闭证明助手。
+const { createCandidateBrowserFactory, closeBrowserProven } = require('../login/candidate-browser');
 // R53：单向复用 R51 的抖店首页自动 SSO 有界收敛与登录正证据分类
 // （qianchuan-reader 不 import 本文件，无循环依赖）。
 const {
@@ -267,6 +269,30 @@ function createCompassOrderReader(p) {
   const nowFn = p.nowFn || (() => Date.now());
   const headless = p.headless !== false;
   const evidenceDir = p.evidenceDir || path.join(__dirname, '..', '..', 'evidence');
+  // COOKIE-PROCESS-ISOLATION-20261026：店铺浏览器启动助手（恢复重载时启动**全新**进程）
+  // 与恢复候选专用独立浏览器工厂（每个候选一份全新进程；绝不复用共享店铺浏览器）。
+  // 校正：店铺浏览器启动同样经"每次全新实例"工厂包装（对象身份查重）——注入工厂在恢复后
+  // 返回**同一个旧浏览器对象**（复用旧进程）→ 在 addCookies 之前拒绝（关闭并抛错），
+  // 绝不带旧 Cookie 进程重载新工作副本。生产默认 chromium.launch 每次全新进程，行为不变。
+  const shopBrowserFactory = createCandidateBrowserFactory({
+    injectedFactory: typeof p.browserFactory === 'function' ? p.browserFactory : null,
+    fallbackLaunch: () => require('playwright').chromium.launch({
+      headless,
+      executablePath: loginCfg.edgePath,
+      args: ['--window-size=1920,1080'],
+    }),
+  });
+  const launchShopBrowser = () => shopBrowserFactory();
+  const candidateBrowserFactory = typeof p.restoreCandidateBrowserFactory === 'function'
+    ? p.restoreCandidateBrowserFactory
+    : createCandidateBrowserFactory({
+      injectedFactory: typeof p.browserFactory === 'function' ? p.browserFactory : null,
+      fallbackLaunch: () => require('playwright').chromium.launch({
+        headless,
+        executablePath: loginCfg.edgePath,
+        args: ['--window-size=1920,1080'],
+      }),
+    });
 
   async function readOrderSummary({ shopCfg }) {
     const startedAt = nowFn();
@@ -278,13 +304,8 @@ function createCompassOrderReader(p) {
       startFingerprint: fingerprintFile(resolved.path),
     };
     // browserFactory 可注入（离线测试）；默认行为与原实现完全一致。
-    const browser = p.browserFactory
-      ? await p.browserFactory()
-      : await require('playwright').chromium.launch({
-        headless,
-        executablePath: loginCfg.edgePath,
-        args: ['--window-size=1920,1080'],
-      });
+    let browser = await launchShopBrowser();
+    const shopBrowserIdentities = [browser];
     // R87：finally 中收尾保存所需的当前会话引用（try 块内 const 在 finally 不可见）。
     let sessionCtx = null;
     let sessionTarget = null;
@@ -329,13 +350,21 @@ function createCompassOrderReader(p) {
       // AuthError，不盲覆盖、不跨店、不循环（p.restoreOnAuthFailure===false 关闭）。
       if (fail && fail.kind === 'login' && p.restoreOnAuthFailure !== false) {
         await sess.ctx.close();
+        // 候选切换前先关闭当前店铺浏览器进程（不能带着旧 Cookie 进程活着等候选验证）；
+        // 关闭未获证明 → 阻断恢复（绝不重叠会话/绝不带旧进程继续）。
+        const browserClosed = await closeBrowserProven(browser);
+        if (browserClosed) browser = null;
+        if (!browserClosed) {
+          throw new AuthError('登录失效后原店铺浏览器进程关闭未获证明：阻断四层恢复（绝不重叠会话/绝不带着旧 Cookie 进程继续）');
+        }
         let restore = null;
         try {
           const runner = p.restoreRunner || restoreDutyWorkCopy;
           restore = await runner(loginCfg, shopCfg.cookieFile, {
             shopCfg,
             excludeWorkCopy: true,
-            browser: p.restoreBrowser || browser,
+            candidateBrowserFactory,
+            forbiddenBrowsers: shopBrowserIdentities.slice(),
             verify: p.restoreVerify,
             vaultModule: p.restoreVaultModule,
             vaultRoots: p.restoreVaultRoots,
@@ -348,7 +377,11 @@ function createCompassOrderReader(p) {
         }
         fail.restore = restore;
         if (restore.ok) {
+          // 恢复提升已更新工作副本：刷新指纹基线，并在**全新**店铺浏览器进程上重开有界一次
+          //（旧进程已关闭，绝不复用旧 Cookie 进程重载）。
           cookieSession.startFingerprint = fingerprintFile(resolved.path);
+          browser = await launchShopBrowser();
+          shopBrowserIdentities.push(browser);
           sess = await openFxgSession();
           fail = sess.settled.ok ? null : await classifySettleFailure(sess);
         }
@@ -532,7 +565,8 @@ function createCompassOrderReader(p) {
           audit: p.audit,
         });
       } catch (_) { /* 收尾保存失败不得阻止关闭，也不改变已确认的业务结果 */ }
-      await browser.close().catch(() => {});
+      // 恢复失败路径中浏览器可能已因候选切换被证明关闭并置空：不为 null 才需要收口。
+      if (browser) await browser.close().catch(() => {});
     }
   }
 

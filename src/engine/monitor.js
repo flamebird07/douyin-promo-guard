@@ -3181,6 +3181,30 @@ class Monitor {
         rt.lastData.blockedReason = data.reason;
         this._emitJudgement(shopCfg, { data, over: null, status: 'blocked', reason: data.reason });
         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: data.reason, blocked: data.blocked });
+        // zero_orders 只读状态观测（2026-10-26 S3）：0费0单是"无需关闭"的合法结果，
+        // 但不得因此跳过状态回读——否则旧 on/off 观测超过前端有效期后持续"未知"。
+        // 仅做一次只读观测；成功/失败都如实落状态，绝不进入 evaluatePeriodic/开关动作。
+        if (data.blocked === 'zero_orders') {
+          let stateRead;
+          try {
+            stateRead = await this._readCurrentAdState(shopCfg);
+          } catch (e) {
+            stateRead = { state: 'unknown', error: { status: 'blocked', reason: e.reason || e.message, blocked: 'ad_state_read' } };
+          }
+          this._applyBalanceToLastData(rt, stateRead);
+          if (stateRead.error) {
+            this._applyReadFailure(shopCfg.id, stateRead.error);
+          } else {
+            this._clearReadFailure(shopCfg.id);
+            this._applyObservedAdState(shopCfg.id, stateRead.state, 'zero_orders 只读状态回读');
+            rt.lastDataAt = new Date(this.nowFn()).toISOString();
+          }
+          this._audit({
+            kind: 'ad-state-read', shopId: shopCfg.id, event: 'zero-orders-observe',
+            state: stateRead.state || 'unknown', ok: !stateRead.error,
+            reason: stateRead.error ? log.sanitize(String(stateRead.error.reason || stateRead.error.message || '广告状态读取失败').slice(0, 200)) : null,
+          });
+        }
         return { status: 'blocked', reason: data.reason, blocked: data.blocked };
       }
 

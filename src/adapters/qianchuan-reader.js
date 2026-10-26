@@ -478,13 +478,30 @@ async function collectLoginExpiryEvidence(page) {
     const probe = await page.evaluate(() => {
       const needles = ['扫码登录', '登录抖音', '立即登录', '手机号登录', '请先登录'];
       const out = { loginForm: false, loginControl: false, loginDialog: false };
+      // S6 2026-10-26：登录正证据必须来自**真实渲染可见**的元素。旧实现只查自身
+      // computed style（隐藏祖先/收起容器内的控件会被误判可见），且 loginForm 用
+      // querySelector 命中即 true（隐藏的 password 输入框也算登录表单），会把已登录
+      // 页面上残留的隐藏登录组件误判为登录失效。可见性判据（保守，API 不可得一律
+      // 判不可见，绝不凭空出具登录正证据）：
+      //  1) 自身与全部祖先 computed style 不得 display:none / visibility:hidden；
+      //  2) 布局盒尺寸非零（getBoundingClientRect width/height > 0）。
       const visible = (el) => {
+        if (!el) return false;
         try {
-          if (typeof getComputedStyle === 'function') {
-            const cs = getComputedStyle(el);
+          if (typeof getComputedStyle !== 'function') return false;
+          let node = el;
+          let hops = 0;
+          while (node && node !== document && hops < 100) {
+            const cs = getComputedStyle(node);
             if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) return false;
+            const parent = node.parentElement || (node.parentNode && node.parentNode.nodeType === 1 ? node.parentNode : null);
+            node = parent;
+            hops += 1;
           }
-        } catch (_) { /* 样式不可得：保守视为可见 */ }
+          if (typeof el.getBoundingClientRect !== 'function') return false;
+          const rect = el.getBoundingClientRect();
+          if (!rect || !(rect.width > 0) || !(rect.height > 0)) return false;
+        } catch (_) { return false; }
         return true;
       };
       const isControl = (el) => {
@@ -502,7 +519,13 @@ async function collectLoginExpiryEvidence(page) {
         return txt.length > 0 && txt.length <= 12 && needles.some((n) => txt.includes(n));
       };
       try {
-        if (typeof document.querySelector === 'function' && document.querySelector('input[type="password"], form [name*="passport"], [class*="login-form"] input')) out.loginForm = true;
+        // 遍历全部候选而非只看第一个：隐藏残留表单在前、真实可见表单在后时也能命中。
+        if (typeof document.querySelectorAll === 'function') {
+          const forms = document.querySelectorAll('input[type="password"], form [name*="passport"], [class*="login-form"] input');
+          for (let i = 0; i < forms.length; i += 1) {
+            if (visible(forms[i])) { out.loginForm = true; break; }
+          }
+        }
       } catch (_) { /* 探针降级 */ }
       try {
         const dlgs = typeof document.querySelectorAll === 'function' ? document.querySelectorAll('[role="dialog"], dialog') : [];

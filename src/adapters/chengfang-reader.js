@@ -298,7 +298,8 @@ function watchChengfangControlsForManualReview(controller, session) {
  *  - 点击后必须**连续两次**观察到浮窗消失才算完成；未消失如实返回失败，绝不伪造关闭。
  * @returns {Promise<{dismissed:boolean, state:string, action?:string|null, reason?:string}>}
  */
-async function dismissKnownChengfangOverlays({ page, audit, shopId, maxRounds = 2, gapMs = 250 }) {
+async function dismissKnownChengfangOverlays({ page, audit, shopId, maxRounds = 2, gapMs = 250,
+  transientBudgetMs = 3000, transientGapMs = 300, maxTransientRereads = 10 }) {
   const emit = (action, result, reason) => {
     if (typeof audit !== 'function') return;
     try { audit({ kind: 'chengfang-overlay', shopId: shopId || null, action, result, reason: reason || null }); } catch (_) { /* 审计失败不影响结果 */ }
@@ -310,11 +311,22 @@ async function dismissKnownChengfangOverlays({ page, audit, shopId, maxRounds = 
     if (typeof page.waitForTimeout === 'function') { try { await page.waitForTimeout(ms); return; } catch (_) { /* 落到本地等待 */ } }
     await new Promise((r) => setTimeout(r, ms));
   };
+  let transientRereads = 0;
+  let transientDeadline = null;
   let lastState = 'unknown';
   for (let round = 0; round < Math.max(1, maxRounds); round++) {
     let probe = null;
-    try { probe = await page.evaluate(handleChengfangOverlayInPage, { click: false }); }
-    catch (e) { return { dismissed: false, state: 'probe-failed', reason: `浮窗探测失败：${(e && e.message) || e}` }; }
+    for (;;) {
+      try { probe = await page.evaluate(handleChengfangOverlayInPage, { click: false }); }
+      catch (e) { return { dismissed: false, state: 'probe-failed', reason: `浮窗探测失败：${(e && e.message) || e}` }; }
+      if (!probe || probe.trusted !== true || probe.state !== 'no-control') break;
+      const now = Date.now();
+      if (transientDeadline === null) transientDeadline = now + Math.max(0, transientBudgetMs);
+      if (transientRereads >= maxTransientRereads || now >= transientDeadline) break;
+      transientRereads += 1;
+      emit('probe', 'transient-reread', `已知浮窗控件尚未就绪（有界重读 ${transientRereads}/${maxTransientRereads}）`);
+      await wait(Math.min(transientGapMs, transientDeadline - now));
+    }
     lastState = (probe && probe.state) || 'unknown';
     if (!probe || probe.trusted !== true) {
       emit('probe', 'blocked', '当前不是可信千川页面（严格 origin/path），零点击');
@@ -1546,10 +1558,12 @@ function handleChengfangOverlayInPage(options) {
   // 导航/徽标/右侧工具栏/popover 等多个**非模态、无关闭控件**元素共用，据此发现会与真实
   // modal 并列出 multiple-intro 假阻断（2026-10-18 真实 DOM 取证）。真实 modal 靠其
   // modal-wrap 类被识别，仍要求容器内唯一可见关闭控件（见下 dismissable 分支）才可点。
+  // 插件会将 popup 锁定类写到 body；页面根不能吞掉实际浮窗候选。
+  const notPageRoot = (el) => !!el && el !== doc && el !== doc.documentElement && el !== doc.body;
   const introRoots = dedupeOuter(all(
-    '.ocean-vmok-plugin-oc-modal-wrap, .tools-vmok-plugin-modal__wrap, '
+    '.ocean-vmok-plugin-oc-modal-wrap, .tools-vmok-plugin-modal__wrap, .overall-release-modal-v2-wrap, '
     + '[class*="modal-wrap"], [class*="modal__wrap"]'
-  ).filter(visible));
+  ).filter((el) => notPageRoot(el) && visible(el)));
   // 引导容器：class 含 guide/tour 只是线索；必须**容器内确有唯一可见"跳过/我知道了"**才算
   // 引导浮窗。普通右侧营销卡片（如 productFundModuleGuide，270x190，只有业务"去开启"CTA、
   // 无跳过/关闭控件）没有浮层语义 → 不是阻断引导，忽略之，绝不点它的业务 CTA。
@@ -1562,7 +1576,7 @@ function handleChengfangOverlayInPage(options) {
     })).length > 0;
   };
   const guideRoots = dedupeOuter(all('[class*="guide"], [class*="Guide"], [class*="tour"], [class*="Tour"]').filter((el) => {
-    if (!visible(el)) return false;
+    if (!notPageRoot(el) || !visible(el)) return false;
     if (introRoots.some((r) => r === el || (r.contains && r.contains(el)))) return false;
     return hasSkipControl(el);
   }));
@@ -1573,9 +1587,9 @@ function handleChengfangOverlayInPage(options) {
     '[role="dialog"], [role="alertdialog"], [class*="modal"], [class*="Modal"], '
     + '[class*="popup"], [class*="Popup"], [class*="mask"], [class*="Mask"], '
     + '[class*="dialog"], [class*="Dialog"], [class*="confirm"], [class*="Confirm"]'
-  ).filter(visible));
+  ).filter((el) => notPageRoot(el) && visible(el)));
   const inKnown = (el) => known.some((k) => k === el || (k.contains && k.contains(el)));
-  const foreign = [];
+  let foreign = [];
   for (const el of dialogCands) {
     if (inKnown(el)) continue;
     const wrapsKnown = known.some((k) => el.contains && el.contains(k));
@@ -1587,6 +1601,26 @@ function handleChengfangOverlayInPage(options) {
       if (!other) continue;
     }
     foreign.push(el);
+  }
+  const classTokens = (el) => String(
+    (el.getAttribute && el.getAttribute('class')) || el.className || ''
+  ).split(/\s+/).filter(Boolean);
+  // 仅同父紧邻、唯一且无内容的精确遮罩可归属于新版介绍窗。
+  if (introRoots.length === 1 && classTokens(introRoots[0]).includes('overall-release-modal-v2-wrap')) {
+    const root = introRoots[0];
+    const masks = foreign.filter((el) => {
+      if (!classTokens(el).includes('tools-vmok-plugin-popup__mask')) return false;
+      if (!el.parentNode || el.parentNode !== root.parentNode) return false;
+      if (el.nextElementSibling !== root && root.nextElementSibling !== el) return false;
+      if (String(el.textContent || '').trim()) return false;
+      if (Array.prototype.some.call(el.childNodes || [], (node) => node.nodeType === 1)) return false;
+      if (dialogCands.some((other) => other !== el && el.contains && el.contains(other))) return false;
+      return true;
+    });
+    if (masks.length === 1) {
+      foreign = foreign.filter((el) => el !== masks[0]);
+      out.affiliatedMask = { cls: 'tools-vmok-plugin-popup__mask' };
+    }
   }
   // 危险文本扫描：白名单容器与短文本弹层候选（页面级大 mask 不做全文扫描，
   // 避免把列表正文误判为浮窗；其内部真实业务弹层会作为独立候选被扫描）。
@@ -1611,7 +1645,28 @@ function handleChengfangOverlayInPage(options) {
     root = introRoots[0];
     const e2e = (root.getAttribute ? String(root.getAttribute('data-e2e') || '') : '');
     out.key = e2e || 'ocean-modal';
-    const cands = dedupeOuter(Array.prototype.slice.call(root.querySelectorAll('.tools-vmok-plugin-modal__close-icon')).filter(visible));
+    // 旧白名单 X。
+    let cands = Array.prototype.slice.call(
+      root.querySelectorAll('.tools-vmok-plugin-modal__close-icon')
+    ).filter(visible);
+    // 新版介绍浮窗（overall-release-modal-v2-wrap）：唯一可见关闭控件为
+    // button.close-button[aria-label="关闭"][type="button"]，内部含
+    // iconpark-icon[name="oc-icon-close"]。仅在同一已知 root 且具 overall-release-modal-v2-wrap
+    // 类时纳入：绝不泛匹配任意 aria-label=关闭、绝不放宽 root、绝不点业务 CTA。
+    const rootClass = String((root.getAttribute && root.getAttribute('class')) || root.className || '');
+    if (rootClass.split(/\s+/).indexOf('overall-release-modal-v2-wrap') !== -1) {
+      const v2 = Array.prototype.slice.call(
+        root.querySelectorAll('button.close-button[aria-label="关闭"][type="button"]')
+      );
+      for (const b of v2) {
+        if (!visible(b)) continue;
+        let icon = null;
+        try { icon = b.querySelector('iconpark-icon[name="oc-icon-close"]'); } catch (_) { icon = null; }
+        if (!icon) continue;
+        cands.push(b);
+      }
+    }
+    cands = dedupeOuter(cands);
     out.closeCandidates = cands.length;
     if (cands.length === 0) { out.state = 'no-control'; return out; }
     if (cands.length > 1) { out.blockers.push(`ambiguous-close:${cands.length}`); out.state = 'blocked'; return out; }

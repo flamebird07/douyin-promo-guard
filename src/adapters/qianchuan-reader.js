@@ -196,6 +196,11 @@ function readinessFailureReason(last) {
  * 直到（同一轮）统计周期为当天且"账户整体消耗(元)"卡片可解析，或到达上界。
  * 到达上界返回 { ok:false, reason }（调用方按 DataGuardError 处理），绝不部分采信。
  * 依赖注入：nowFn/sleep 可注入（离线测试）；默认 sleep 用 target.waitForTimeout（纯等待，无副作用）。
+ *
+ * POPUP-CLOSE-20261025：可选 overlayCloser（内部 hook，默认不存在=行为与旧版完全一致）：
+ * 每轮探测前先对**已知介绍浮窗**做一次有界收口（复用 chengfang-reader 既有白名单关闭器），
+ * 覆盖"读取开始前已有"与"等待期间晚到"两类浮窗；无浮窗时仅多一次只读探针、零点击、
+ * 零额外固定等待；关闭结果只如实记录（overlayOutcomes），不改变就绪/失败判定口径。
  */
 async function waitForQianchuanConsumeReady(target, opts = {}) {
   // 有限正参数归一化：非法 timeout/interval（0/负数/NaN/Infinity/非数）一律回落默认值，
@@ -207,17 +212,26 @@ async function waitForQianchuanConsumeReady(target, opts = {}) {
   // 独立硬限次：即使 nowFn 冻结/回拨（deadline 永不越过）也保证有限次探测后收敛。
   const maxAttempts = Math.max(1, Math.min(MAX_READINESS_ATTEMPTS, Math.ceil(timeoutMs / intervalMs) + 1));
   const deadline = nowFn() + timeoutMs;
+  const overlayCloser = typeof opts.overlayCloser === 'function' ? opts.overlayCloser : null;
+  const overlayOutcomes = overlayCloser ? [] : null;
   let last = null;
   let attempts = 0;
   for (;;) {
+    if (overlayCloser) {
+      const closed = await overlayCloser();
+      if (closed) overlayOutcomes.push({ dismissed: closed.dismissed === true, state: closed.state || null });
+    }
     last = await probeQianchuanConsumeReadiness(target, nowFn());
     attempts += 1;
-    if (last.ready) return { ok: true, attempts, period: last.period, cardText: last.cardText, cents: last.parsed.cents };
+    if (last.ready) return {
+      ok: true, attempts, period: last.period, cardText: last.cardText, cents: last.parsed.cents,
+      ...(overlayOutcomes ? { overlayOutcomes } : {}),
+    };
     if (attempts >= maxAttempts) break;                 // 硬限次上界：冻结/回拨时钟下也收敛
     if (!(nowFn() + intervalMs <= deadline)) break;     // 墙钟上界：再等也会越过上界，不再空转
     await sleep(intervalMs);
   }
-  return { ok: false, attempts, reason: readinessFailureReason(last) };
+  return { ok: false, attempts, reason: readinessFailureReason(last), ...(overlayOutcomes ? { overlayOutcomes } : {}) };
 }
 
 /** "更新于：09-13 11:17" → 补当前年份。 */
@@ -728,6 +742,21 @@ function collectQianchuanRowsInPage() {
 
 // ── 费用读取器 ────────────────────────────────────────────────────
 
+/**
+ * POPUP-CLOSE-20261025：费用读取链路的已知介绍浮窗收口（只读复用，不重复造选择器）。
+ * chengfang-reader 顶部 require 本模块，顶层反向 require 会成循环依赖；因此这里在
+ * **读函数执行时** lazy require——彼时两模块均已完成初始化。已有关闭器
+ * dismissKnownChengfangOverlays / handleChengfangOverlayInPage 支持千川首页 /home 路径上
+ * overall-release-modal-v2-wrap 介绍浮窗（唯一 button.close-button[aria-label="关闭"]），
+ * 并自带未知/多义/危险阻断、有限瞬态重读与点击后消失验证；本函数不扩大关闭范围、
+ * 不点任何业务 CTA（投放乘方/开启货款直投）。
+ */
+function closeKnownIntroOverlayAroundCostRead(target) {
+  // chengfang-reader 顶层依赖本模块，反向依赖必须延迟到运行时。
+  const { dismissKnownChengfangOverlays } = require('./chengfang-reader');
+  return dismissKnownChengfangOverlays({ page: target, maxRounds: 2 });
+}
+
 function createQianchuanCostReader(p) {
   const loginCfg = p.loginCfg;
   const nowFn = p.nowFn || (() => Date.now());
@@ -744,6 +773,9 @@ function createQianchuanCostReader(p) {
         // Cookie 文件绑定决定店铺归属；页面账户 ID 仅为可选观测，缺失/不同均不得拒绝费用数据。
         const acct = await readQianchuanAccountId(target);
         const accountId = acct && acct.accountId ? acct.accountId : null;
+        const runOverlayClose = async () => {
+          try { return await closeKnownIntroOverlayAroundCostRead(target); } catch (_) { return null; }
+        };
 
         // 有界被动就绪等待（客户实测：卡片/周期延时导致 04:15、13:41 UTC 即刻漏读）：
         // 固定初等等待后仅在已打开页面上重读 DOM，等**同一轮**周期=当天且账户整体消耗卡可解析；
@@ -753,6 +785,7 @@ function createQianchuanCostReader(p) {
           intervalMs: p.readinessIntervalMs,
           nowFn,
           sleep: p.sleep,
+          overlayCloser: runOverlayClose,
         });
         if (!ready.ok) throw new DataGuardError(ready.reason);
 
@@ -783,6 +816,7 @@ function createQianchuanCostReader(p) {
           return el ? (el.textContent || '').trim() : null;
         }).catch(() => null);
         const pageUpdatedAt = normalizeQcUpdatedAt(updatedAtRaw || '', nowFn());
+        const finalOverlay = await runOverlayClose();
 
         try {
           if (!fs.existsSync(evidenceDir)) fs.mkdirSync(evidenceDir, { recursive: true });
@@ -821,6 +855,10 @@ function createQianchuanCostReader(p) {
           coverageNote: '账户整体消耗包含乘方/标准投放/全域投放/品牌投放四分项（实测之和吻合）；'
             + '页面未发现账户切换器；账户与店铺绑定经抖店首页入口授权链路（页面不展示店铺名/店铺ID，属间接证据）',
           valueCents: parsed.cents,
+          introOverlay: {
+            duringWait: (ready.overlayOutcomes || []).slice(),
+            final: finalOverlay ? { dismissed: finalOverlay.dismissed === true, state: finalOverlay.state || null } : null,
+          },
         };
       } finally {
         await closeBrowser(browser);

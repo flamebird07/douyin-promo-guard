@@ -234,6 +234,8 @@ function atomicWriteInWorkDir(fsm, workDir, targetPath, buf, opts = {}) {
  *                               路径绝不置 true（普通来源变化不覆盖健康副本）
  * @param {string} [o.expectedSourceSha256] 本次已验证登录的 commit.sha256：helper 内
  *                               每一次来源读取都必须等于它，否则 fail-closed
+ * @param {object} [o.frozenDest] 分发开始前冻结的目的 captureFile 指纹（CAS 基线）；
+ *                               与当前不符 = 并发写入（较新登录胜出，本轮不提交）
  * @param {function} [o.nowFn]   可注入时钟（毫秒）
  * @returns {{path:string, dir:string, readOnly:false,
  *            sourceSync:{status:string, reason?:string, sourceSha256?:string, sidecarFailed?:boolean}}}
@@ -280,7 +282,19 @@ function ensureWorkCopy(o) {
   // ── 冻结捕获：来源 + 目的初始状态（CAS 基线，整个调用期间沿用，不重新解释）──
   const src = captureFile(fsm, srcPath);
   const workInitial = healthyCopy(fsm, workPath);
-  const destInitial = workInitial.cap;   // 含 absent（{error:'missing'}）与非普通文件
+  // 可选 frozenDest：调用方（登录分发编排）在**开始分发前**冻结的目的指纹。若当前目的
+  // 已与冻结值不同，说明期间出现并发写入（较新登录/写回链）→ 较新者胜出，本轮不提交；
+  // 当前内容不可用且与冻结值不同 → fail-closed，不覆盖未知并发内容。
+  let destInitial = workInitial.cap;   // 含 absent（{error:'missing'}）与非普通文件
+  if (o.frozenDest && typeof o.frozenDest === 'object') {
+    if (!sameFingerprint(workInitial.cap, o.frozenDest)) {
+      if (workInitial.healthy) {
+        return retained('dest-drift-retained', '工作副本在分发起始冻结后已被并发写入者更新（较新登录/写回胜出）：保留并发新文件，本轮不提交（不 rebase、不合并）');
+      }
+      throw new AuthError('工作副本在分发起始冻结后出现不可用/未知并发内容：fail-closed，不覆盖未知内容');
+    }
+    destInitial = o.frozenDest;
+  }
 
   // ── 本次已验证登录快照绑定：helper 第一次读取就必须等于 commit.sha256 ──
   if (expectedSha && (src.error || src.sha256 !== expectedSha)) {

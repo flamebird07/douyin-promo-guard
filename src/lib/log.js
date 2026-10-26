@@ -145,7 +145,24 @@ function write(level, args) {
   } catch (_) { /* 日志落盘失败不阻塞业务 */ }
 }
 
+const URL_MASK_MARK = '…（查询参数已遮蔽';
+
+function maskUrlQueries(text) {
+  return String(text).replace(LONG_URL_RE, (raw, offset, whole) => {
+    const trail = /[.,。；;）)]+$/.exec(raw);
+    const u = trail ? raw.slice(0, raw.length - (trail[0] || '').length) : raw;
+    if (!/[?#]/.test(u)) return raw;
+    // 幂等：源侧已遮过的 URL（`?` 后紧跟遮蔽标记）整段原样保留，落盘/展示边界二次处理不叠标记。
+    // 只跳过"已被遮的这一个"，同串里其它未遮 URL 仍照常遮蔽（不做整串短路，避免漏遮）。
+    if (String(whole).slice(offset + raw.length).startsWith(URL_MASK_MARK)) return raw;
+    const cut = /^(https?:\/\/[^/?#]+\/[^?#]*)/.exec(u);
+    const base = cut ? cut[1] : u.slice(0, 48);
+    return `${base}?${URL_MASK_MARK}，原 URL 共 ${u.length} 字符）${trail ? trail[0] : ''}`;
+  });
+}
+
 module.exports = {
+  maskUrlQueries,
   sanitize,
   scrubSensitiveText,
   scrubDeep,

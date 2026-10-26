@@ -38,7 +38,35 @@
 
 const crypto = require('crypto');
 const path = require('path');
-const { writebackSessionCookies, fingerprintFile } = require('./cookie-writeback');
+const {
+  writebackSessionCookies, fingerprintFile,
+  protectedAuthCookies, cookieIdentityKey, isExpiredCookie, sha256Of, sameCookieSet,
+} = require('./cookie-writeback');
+// 独立候选验证复用主链**同一份**有界被动收敛语义（45s/3s/严格首页判定/双保险限次），
+// 避免中转期误判登录失效；语义本体在 lib/settle-policy（叶子模块，qianchuan-reader 也引用）。
+const {
+  waitForDoudianHomepageSettled, settlePacing, sanitizePositiveMs,
+} = require('../lib/settle-policy');
+
+/** 抖店首页（独立新上下文候选验证目标；不依赖 session.js，避免循环依赖）。 */
+const FXG_HOME_URL = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
+/** 写回目标隔离：恢复目录 / 分析工作目录 / 原始归档（生产默认路径，由 __dirname 解析）。 */
+const GUARD_PROJECT_ROOT = path.resolve(__dirname, '..', '..');
+const BILL_MANAGER_ROOT = path.resolve(GUARD_PROJECT_ROOT, '..', 'bill-manager');
+const WRITEBACK_PROTECTED_DIRS = [
+  path.join(GUARD_PROJECT_ROOT, 'cookie-recovery'),
+  path.join(BILL_MANAGER_ROOT, 'cookies'),
+  path.join(BILL_MANAGER_ROOT, 'cookie-archive', 'raw'),
+];
+
+/**
+ * 检查点自产异常标记（2026-10-18 D）：message 仅含阶段原因（URL/身份判定文本），
+ * 绝不含 Cookie 值；写入器只回显带此标记的异常，任意第三方异常一律降级为安全错误码。
+ */
+function markAuditSafe(e) {
+  if (e && typeof e === 'object') e.reasonSafeForAudit = true;
+  return e;
+}
 
 const QC_HOST = 'qianchuan.jinritemai.com';
 /** 受支持的千川首页/管理路径（严格前缀 + 边界，pathname 不含 query/hash）。 */
@@ -51,6 +79,8 @@ const QC_LOGIN_PATH_RE = /\/login|\/passport|\/signin|sso\.jinritemai/i;
  *  fund-control/account-center 重定向页身份区同位置同结构；其余路径一律不算。 */
 const FXG_HOST = 'fxg.jinritemai.com';
 const FXG_SUPPORTED_PATH_RE = /^\/ffa\/mshop\/(?:homepage|fund-control\/account-center)(?:\/|$)/;
+/** 收敛到身份页之后，语义身份探针的有界等待（节拍复用主链收敛间隔；非中转等待）。 */
+const DEFAULT_VERIFY_IDENTITY_WAIT_MS = 20000;
 
 /**
  * 严格可信来源 + 受支持路径判定（URL 解析，绝不子串匹配）。
@@ -309,6 +339,142 @@ async function discoverUnknownShopAccountId({ context, identityPage, target, sho
 }
 
 /**
+ * 生产默认候选验证器（AD-COOKIE-FOUR-TIER 第 5 轮）：对**拟写入的同一冻结字节**在独立
+ * 新上下文注入，访问抖店首页，要求受信 FXG 首页 + 语义店铺名唯一且与期望严格匹配 +
+ * 无可见登录控件；并回读新上下文 Cookie，确认原集合中仍有效的关键认证 Cookie 未被
+ * 丢失/置空/改过期。无可用浏览器（browser 或 context.browser()）→ fail-closed，绝不
+ * 自启真实浏览器，也绝不因"无法验证"而放行写入。
+ *
+ * @param {object} p { context, browser?, expectedNames:string[], maxWaitMs?, sleep?, homeUrl? }
+ * @returns {(cand:{cookies:object[],serialized:string,buf:Buffer,sha256:string})=>Promise<{ok:boolean,name?:string,reason?:string}>}
+ */
+function createCheckpointCandidateVerifier(p = {}) {
+  const expectedNames = (Array.isArray(p.expectedNames) ? p.expectedNames : [])
+    .map((n) => String(n == null ? '' : n).trim())
+    .filter((n) => n.length > 0);
+  const sleepFn = typeof p.sleep === 'function' ? p.sleep : ((ms) => new Promise((r) => setTimeout(r, ms)));
+  return async function verifyCandidate(cand) {
+    if (!cand || !Buffer.isBuffer(cand.buf)) {
+      return { ok: false, reason: '候选冻结字节缺失：拒绝验证/写入' };
+    }
+    const bufSha = sha256Of(cand.buf);
+    if (typeof cand.sha256 === 'string' && cand.sha256 && bufSha !== cand.sha256) {
+      return { ok: false, reason: '候选冻结字节与拟写入 sha256 不一致：拒绝验证/写入' };
+    }
+    if (typeof cand.serialized === 'string' && sha256Of(Buffer.from(cand.serialized, 'utf8')) !== bufSha) {
+      return { ok: false, reason: '候选序列化字节与冻结字节不一致：拒绝验证/写入' };
+    }
+    let parsed;
+    try { parsed = JSON.parse(cand.buf.toString('utf8')); } catch (_) {
+      return { ok: false, reason: '候选冻结字节不是有效 JSON：拒绝验证/写入' };
+    }
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      return { ok: false, reason: '候选 Cookie 为空：拒绝验证/写入' };
+    }
+    if (expectedNames.length === 0) {
+      return { ok: false, reason: '缺少期望店铺名：无法验证正确店铺（fail-closed，拒绝写入）' };
+    }
+    let browser = p.browser || null;
+    if (!browser && p.context && typeof p.context.browser === 'function') {
+      try { browser = p.context.browser(); } catch (_) { browser = null; }
+    }
+    if (!browser || typeof browser.newContext !== 'function') {
+      return { ok: false, reason: '无可用浏览器实例：无法独立验证候选（fail-closed，拒绝写入，绝不自启真实浏览器）' };
+    }
+    let ctx = null;
+    let sawLoginEvidence = false;
+    let reachedVerifiedIdentityUrl = false;
+    let lastIdentityReason = null;
+    try {
+      ctx = await browser.newContext({ viewport: { width: 1920, height: 1080 }, timezoneId: 'Asia/Shanghai' });
+      await ctx.addCookies(parsed);
+      const page = await ctx.newPage();
+      await page.goto(p.homeUrl || FXG_HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      // 主链同款有界被动收敛（默认 45s/3s，零点击/零导航/零请求；实测约 30s 落首页）：
+      // 收敛成功才进入身份探针；到达上界仍未落首页则不二次空等，单轮如实分类。
+      const settleOpts = {
+        settleTimeoutMs: p.settleTimeoutMs,
+        settleIntervalMs: p.settleIntervalMs,
+        settleNowFn: p.nowFn,
+        settleSleep: sleepFn,
+      };
+      const settled = await waitForDoudianHomepageSettled(page, settleOpts);
+      const pacing = settlePacing(settleOpts);
+      const identityMs = sanitizePositiveMs(p.maxWaitMs, DEFAULT_VERIFY_IDENTITY_WAIT_MS);
+      // 已落在任一受信任身份页（首页收敛成功，或直接落在账户中心等受支持路径）才给
+      // 完整身份探针预算；到上界仍非身份页则不二次空等，单轮如实分类。
+      const onIdentityPage = settled.ok === true || isVerifiedDoudianIdentityUrl(String(settled.url || ''));
+      const maxAttempts = onIdentityPage ? Math.max(1, Math.ceil(identityMs / pacing.intervalMs)) : 1;
+      for (let i = 0; i < maxAttempts; i += 1) {
+        if (i > 0) await sleepFn(pacing.intervalMs);
+        let url = '';
+        try { url = String(page.url()); } catch (_) { continue; }
+        if (!isVerifiedDoudianIdentityUrl(url)) {
+          // 明确登录页/登录中转地址 = 登录无效正证据（与"身份未核实/错店"区分）。
+          if (/\/login|\/passport|\/signin|\/logout|sso\.jinritemai|\/account\/logout/i.test(url)) sawLoginEvidence = true;
+          continue;
+        }
+        reachedVerifiedIdentityUrl = true;
+        let observed = null;
+        try { observed = await page.evaluate(probeDoudianShopIdentityInPage); } catch (_) { observed = null; }
+        if (observed && observed.loginVisible === true) sawLoginEvidence = true;
+        const rd = decideDoudianIdentity({ url, expectedNames, observed });
+        if (!rd.ok) { lastIdentityReason = rd.reason; continue; }
+        // 关键认证 Cookie 回读：独立上下文注入后仍须存在、非空、未过期（值可轮换）。
+        // 只有成功取得**非空**最终集合才可继续；读取异常或空集合一律 fail-closed 为
+        // verify-error（不回显异常细节，绝不因候选无受保护 auth 而让空集合冒充成功）。
+        let back = null;
+        try { back = await ctx.cookies(); } catch (_) { back = null; }
+        if (!Array.isArray(back) || back.length === 0) {
+          return { ok: false, classification: 'verify-error', reason: '独立验证上下文未返回非空最终 Cookie 集合（读取异常或空）：fail-closed 拒绝验证/写入（待重试，不要求扫码）' };
+        }
+        const byKey = new Map();
+        for (const c of back) {
+          const k = cookieIdentityKey(c);
+          if (!byKey.has(k)) byKey.set(k, []);
+          byKey.get(k).push(c);
+        }
+        for (const pc of protectedAuthCookies(parsed)) {
+          const arr = byKey.get(cookieIdentityKey(pc));
+          if (!arr || arr.length !== 1
+            || typeof arr[0].value !== 'string' || arr[0].value.length === 0
+            || isExpiredCookie(arr[0])) {
+            return { ok: false, classification: 'auth-lost', reason: `候选在独立新上下文丢失/改坏关键登录 Cookie ${pc.name}：拒绝写入` };
+          }
+        }
+        const afterCapture = await page.evaluate(probeDoudianShopIdentityInPage);
+        const finalIdentity = decideDoudianIdentity({ url: String(page.url()), expectedNames, observed: afterCapture });
+        if (!finalIdentity.ok || String(page.url()) !== url || finalIdentity.name !== rd.name) {
+          return { ok: false, classification: 'identity-unverified', reason: 'Cookie 捕获期间页面或身份漂移：拒绝写入' };
+        }
+        const finalCookies = await ctx.cookies();
+        if (!sameCookieSet(back, finalCookies) || String(page.url()) !== url) {
+          return { ok: false, classification: 'verify-error', reason: '身份复验期间 Cookie 或页面变化：拒绝提交较早快照' };
+        }
+        await ctx.close();
+        ctx = null;
+        return { ok: true, name: rd.name, finalCookies };
+      }
+      // 未通过：区分「明确登录页/登录控件（登录无效）」与「身份探针未取得唯一店名/错店（需核实/重试）」，
+      // 不把两者都误写成要求重新扫码。
+      if (sawLoginEvidence) {
+        return { ok: false, classification: 'login-invalid', reason: '候选在独立新上下文命中登录页地址或可见登录控件（登录无效，需重新扫码）' };
+      }
+      if (reachedVerifiedIdentityUrl) {
+        return { ok: false, classification: 'identity-unverified', reason: `候选在独立新上下文到达受信抖店首页但未取得唯一本店语义身份/疑错店（${lastIdentityReason || '身份未核实'}）：待核实/重试，不要求扫码` };
+      }
+      return { ok: false, classification: 'identity-unverified', reason: '候选未在独立新上下文到达受信抖店首页取得唯一本店语义身份（登录无效/错店/待核实，不要求扫码）' };
+    } catch (_) {
+      // 外部异常（浏览器/页面驱动）可能回显 Cookie 值或带 token 的完整 URL：
+      // 只记录固定脱敏原因，绝不拼接 e.message / String(e）。验证异常绝不判为"登录无效"。
+      return { ok: false, classification: 'verify-error', reason: '候选验证异常（异常详情可能含 Cookie/令牌等敏感值，已脱敏不回显）：拒绝验证/写入，待重试不要求扫码' };
+    } finally {
+      if (ctx) { try { await ctx.close(); } catch (_) { /* 关闭失败不掩盖结果 */ } }
+    }
+  };
+}
+
+/**
  * 会话 Cookie 检查点：在"当前时刻"正证据成立时，把本会话（context 内）刷新后的
  * Cookie 经既有授权写入器持久化到本次实际加载的精确文件；成功且落盘与自有 owned
  * 序列化逐字节一致时推进会话起始指纹。任何跳过/失败都只如实返回，绝不抛出业务语义。
@@ -334,9 +500,14 @@ async function checkpointQianchuanSessionCookies(p) {
   if (!cookieSession || typeof cookieSession.filePath !== 'string' || !cookieSession.startFingerprint) {
     return skip('缺少会话 Cookie 元信息（路径/起始指纹）：跳过会话检查点');
   }
+  if (cookieSession.readOnly === true) return skip('只读角色不可由会话检查点更新');
   if (!context || typeof context.cookies !== 'function') {
     return skip('context 不具备 cookies 能力（离线/注入会话）：跳过会话检查点');
   }
+  const bound = () => {
+    try { return target.context() === context && !target.isClosed(); } catch (_) { return false; }
+  };
+  if (!bound()) return skip('千川页已关闭或不属于本次上下文：跳过会话检查点');
 
   let url = '';
   try { url = String(target.url()); } catch (_) { return skip('当前页面地址不可读：跳过会话检查点'); }
@@ -374,8 +545,11 @@ async function checkpointQianchuanSessionCookies(p) {
   const ownedContext = new Proxy(context, {
     get(target, prop) {
       if (prop === 'cookies') {
-        return async function ownedCookiesOnce() {
+        return async function ownedCookiesWithIdentity() {
+          // 真实 context.cookies() 的任意异常不打标记（其 message 可能含 Cookie 值，
+          // 由写入器降级为安全错误码）；以下 try 内的 throw 均为检查点自产阶段原因。
           const arr = await target.cookies();
+          try {
           if (!Array.isArray(arr) || arr.length === 0) {
             throw new Error('本次会话 Cookie 为空（登录态可疑）：取消会话检查点');
           }
@@ -393,6 +567,7 @@ async function checkpointQianchuanSessionCookies(p) {
             observed: obsNow,
           });
           if (!re.ok) throw new Error(`Cookie 取回后当前事实复验失败（${re.reason}）`);
+          if (!bound()) throw new Error('Cookie 取回后千川页关闭或上下文绑定漂移：取消会话检查点');
           if (urlAfterProbe !== urlNow || !isVerifiedQianchuanUrl(urlAfterProbe)) {
             throw new Error('复验期间页面发生导航：取消会话检查点');
           }
@@ -450,12 +625,36 @@ async function checkpointQianchuanSessionCookies(p) {
           }
           ownedArray = arr;
           return arr;
+          } catch (e) { throw markAuditSafe(e); }
         };
       }
       const v = Reflect.get(target, prop, target);
       return typeof v === 'function' ? v.bind(target) : v;
     },
   });
+
+  // ── 写前独立候选验证（生产自动接通）────────────────────────────────────
+  // 对写入器即将落盘的**同一冻结字节**在隔离新上下文验证可复用 + 正确店铺 + 关键 auth
+  // 未丢失；验证期间并发新登录由写入器 precommitBaseline 捕获（较新者胜出）。
+  const expectedNames = [];
+  for (const n of (discoveryNames && discoveryNames.length
+    ? discoveryNames
+    : [shopCfg && shopCfg.compassShopName, shopCfg && shopCfg.name])) {
+    const t = String(n == null ? '' : n).trim();
+    if (t && !expectedNames.includes(t)) expectedNames.push(t);
+  }
+  // 默认恒构造生产验证器：无 browser 时由验证器自身 fail-closed（绝不自启真实浏览器，
+  // 也绝不让生产路径因缺 browser 而静默跳过写前验证）。测试只可注入 precommitVerify 或
+  // 经 candidateVerifyOptions 注入 sleep/maxWaitMs，不得绕过验证。
+  let precommitVerify = null;
+  if (typeof p.precommitVerify === 'function') {
+    precommitVerify = p.precommitVerify;
+  } else {
+    precommitVerify = createCheckpointCandidateVerifier(Object.assign(
+      {}, (p && p.candidateVerifyOptions) || {},
+      { context, expectedNames, browser: p.browser },
+    ));
+  }
 
   const res = await writebackSessionCookies({
     context: ownedContext,
@@ -465,30 +664,45 @@ async function checkpointQianchuanSessionCookies(p) {
     loginOk: true,    // 严格可信千川管理页 + 唯一匹配账户 + 无可见登录表单 = 当前登录有效的正证据
     shopId: (shopCfg && shopCfg.id) || null,
     audit,
+    precommitVerify,
+    precommitBaseline: cookieSession.startFingerprint,
+    workRoot: path.dirname(cookieSession.filePath),
+    protectedDirs: WRITEBACK_PROTECTED_DIRS,
   });
   if (!res || res.ok !== true) {
     return { saved: false, skipped: true, reason: (res && res.reason) || '会话 Cookie 回写未执行' };
   }
 
-  // 指纹推进：仅当落盘文件与写入器实际写入的那份 owned 序列化逐字节一致才采用；
-  // 否则保留原指纹（并发新登录/内容漂移方向上继续冲突保护，不采用任意"刚变化的文件"）。
-  let expectedSha = null;
-  if (ownedArray) {
+  // 指纹推进：仅当落盘文件与写入器本次冻结写入的确切字节逐字节一致才采用（写入器可能
+  // 落盘的是验证 context 的最终已验证集合，与候选 ownedArray 不同属正常）。任何不一致
+  // （并发新登录/漂移）都不采用新指纹——后续回写继续受原指纹冲突保护。
+  let expectedSha = (res && typeof res.expectedSha256 === 'string' && res.expectedSha256)
+    ? res.expectedSha256 : null;
+  if (expectedSha === null && ownedArray) {
     expectedSha = crypto.createHash('sha256')
       .update(JSON.stringify(ownedArray, null, 2)).digest('hex');
   }
   const fp = fingerprintFile(cookieSession.filePath);
   if (fp.exists === true && expectedSha !== null && fp.sha256 === expectedSha) {
     cookieSession.startFingerprint = fp;
+    const propagate = await propagateCommittedCheckpoint({
+      context,
+      cookieFilePath: cookieSession.filePath,
+      expectedSha256: expectedSha,
+      finalCookies: res.finalCookies,
+      vaultModule: p.vaultModule,
+      vaultRoots: p.vaultRoots,
+      audit,
+    });
     return {
       saved: true, skipped: false, fingerprintAdvanced: true, reason: null,
-      count: res.count, bytes: res.bytes,
+      count: res.count, bytes: res.bytes, propagate,
       ...(discoveredAccountId ? { discoveredAccountId } : {}),
     };
   }
   return {
     saved: true, skipped: false, fingerprintAdvanced: false,
-    reason: '落盘内容与会话 owned Cookie 序列化不一致：不推进会话起始指纹（保留原指纹，后续回写继续受冲突保护）',
+    reason: '落盘内容与本次写入器冻结字节不一致：不推进会话起始指纹（保留原指纹，后续回写继续受冲突保护）',
     count: res.count,
     ...(discoveredAccountId ? { discoveredAccountId } : {}),
   };
@@ -608,6 +822,32 @@ function safeShopFileName(rawName) {
   return String(rawName == null ? '' : rawName).replace(/[\\/:*?"<>|]/g, '_');
 }
 
+async function propagateCommittedCheckpoint(p = {}) {
+  const out = {
+    attempted: false,
+    recovery: { ok: false, skipped: true, reason: '未进入写路径' },
+    archive: { ok: false, skipped: true, reason: '未进入写路径' },
+    absorb: { ok: false, skipped: true, reason: '未执行' },
+  };
+  const audit = typeof p.audit === 'function' ? p.audit : () => {};
+  const protectedReason = '工作会话检查点只更新值守工作副本：只读恢复副本/原始归档不可由检查点反向刷新（COOKIE-FOUR-REPAIR-20261024）';
+  out.recovery = { ok: false, skipped: true, reason: protectedReason };
+  out.archive = { ok: false, skipped: true, reason: protectedReason };
+  // Playwright 不提供 Cookie compare-and-set；读取后再 addCookies 仍会覆盖异步推进的新值。
+  out.absorb = { ok: false, skipped: true, reason: '活上下文不回灌验证快照：避免覆盖并行响应更新的 Cookie；最终集合仅供下一新上下文加载' };
+  try {
+    audit({
+      kind: 'checkpoint-propagate',
+      shop: path.basename(String((p && p.cookieFilePath) || '')).replace(/\.json$/i, '') || null,
+      recoveryOk: out.recovery.ok === true, recoverySkipped: !!out.recovery.skipped,
+      archiveOk: out.archive.ok === true, archiveSkipped: !!out.archive.skipped,
+      absorbOk: out.absorb.ok === true, absorbSkipped: !!out.absorb.skipped,
+      sha256Prefix: String(p.expectedSha256 || '').slice(0, 12),
+    });
+  } catch (_) { /* 审计失败不影响主流程 */ }
+  return out;
+}
+
 /**
  * 罗盘会话收尾 Cookie 检查点（R87）：在"当前时刻"罗盘经营页严格语义店铺名正证据成立、
  * 且目标文件 basename 与该语义店名的安全文件名精确一致时，把本会话（context 内）刷新后的
@@ -635,6 +875,7 @@ async function checkpointCompassSessionCookies(p) {
   if (!cookieSession || typeof cookieSession.filePath !== 'string' || !cookieSession.startFingerprint) {
     return skip('缺少会话 Cookie 元信息（路径/起始指纹）：跳过罗盘收尾检查点');
   }
+  if (cookieSession.readOnly === true) return skip('只读角色不可由会话检查点更新');
   if (!context || typeof context.cookies !== 'function') {
     return skip('context 不具备 cookies 能力（离线/注入会话）：跳过罗盘收尾检查点');
   }
@@ -698,8 +939,10 @@ async function checkpointCompassSessionCookies(p) {
   const ownedContext = new Proxy(context, {
     get(t, prop) {
       if (prop === 'cookies') {
-        return async function ownedCookiesOnce() {
+        return async function ownedCookiesWithIdentity() {
+          // 同千川口径：真实 t.cookies() 的任意异常不打标记；try 内均为自产阶段原因。
           const arr = await t.cookies();
+          try {
           if (!Array.isArray(arr) || arr.length === 0) {
             throw new Error('本次会话 Cookie 为空（登录态可疑）：取消罗盘收尾检查点');
           }
@@ -723,12 +966,24 @@ async function checkpointCompassSessionCookies(p) {
           }
           ownedArray = arr;
           return arr;
+          } catch (e) { throw markAuditSafe(e); }
         };
       }
       const v = Reflect.get(t, prop, t);
       return typeof v === 'function' ? v.bind(t) : v;
     },
   });
+
+  // 写前独立候选验证（同千川口径；默认恒构造，无 browser 时验证器自身 fail-closed）
+  let precommitVerify = null;
+  if (typeof p.precommitVerify === 'function') {
+    precommitVerify = p.precommitVerify;
+  } else {
+    precommitVerify = createCheckpointCandidateVerifier(Object.assign(
+      {}, (p && p.candidateVerifyOptions) || {},
+      { context, expectedNames, browser: p.browser },
+    ));
+  }
 
   const res = await writebackSessionCookies({
     context: ownedContext,
@@ -738,27 +993,41 @@ async function checkpointCompassSessionCookies(p) {
     loginOk: true,
     shopId,
     audit,
+    precommitVerify,
+    precommitBaseline: cookieSession.startFingerprint,
+    workRoot: path.dirname(cookieSession.filePath),
+    protectedDirs: WRITEBACK_PROTECTED_DIRS,
   });
   if (!res || res.ok !== true) {
     return { saved: false, skipped: true, reason: (res && res.reason) || '罗盘会话 Cookie 回写未执行' };
   }
 
-  let expectedSha = null;
-  if (ownedArray) {
+  let expectedSha = (res && typeof res.expectedSha256 === 'string' && res.expectedSha256)
+    ? res.expectedSha256 : null;
+  if (expectedSha === null && ownedArray) {
     expectedSha = crypto.createHash('sha256')
       .update(JSON.stringify(ownedArray, null, 2)).digest('hex');
   }
   const fp = fingerprintFile(cookieSession.filePath);
   if (fp.exists === true && expectedSha !== null && fp.sha256 === expectedSha) {
     cookieSession.startFingerprint = fp;
+    const propagate = await propagateCommittedCheckpoint({
+      context,
+      cookieFilePath: cookieSession.filePath,
+      expectedSha256: expectedSha,
+      finalCookies: res.finalCookies,
+      vaultModule: p.vaultModule,
+      vaultRoots: p.vaultRoots,
+      audit,
+    });
     return {
       saved: true, skipped: false, fingerprintAdvanced: true, reason: null,
-      count: res.count, bytes: res.bytes, shopName: decision.name,
+      count: res.count, bytes: res.bytes, shopName: decision.name, propagate,
     };
   }
   return {
     saved: true, skipped: false, fingerprintAdvanced: false,
-    reason: '落盘内容与会话 owned Cookie 序列化不一致：不推进会话起始指纹（保留原指纹，后续回写继续受冲突保护）',
+    reason: '落盘内容与本次写入器冻结字节不一致：不推进会话起始指纹（保留原指纹，后续回写继续受冲突保护）',
     count: res.count, shopName: decision.name,
   };
 }
@@ -774,8 +1043,10 @@ module.exports = {
   decideDoudianIdentity,
   decideCompassCheckpoint,
   discoverUnknownShopAccountId,
+  createCheckpointCandidateVerifier,
   checkpointQianchuanSessionCookies,
   checkpointCompassSessionCookies,
+  propagateCommittedCheckpoint,
   safeShopFileName,
   QC_HOST,
   FXG_HOST,

@@ -31,7 +31,7 @@ const path = require('path');
 const { AuthError, DataGuardError } = require('../lib/errors');
 const { parseIntegerCount } = require('../lib/money');
 const { shanghaiDate, shanghaiMs } = require('../lib/time');
-const { resolveCookieFile } = require('../login/session');
+const { resolveCookieFile, restoreDutyWorkCopy } = require('../login/session');
 const { fingerprintFile } = require('../login/cookie-writeback');
 // R87：关闭前罗盘会话收尾检查点（同 context 严格语义店名 + 目标文件名绑定 + 既有写入器 CAS）。
 const { checkpointCompassSessionCookies } = require('../login/session-cookie-checkpoint');
@@ -43,6 +43,9 @@ const {
   DEFAULT_SETTLE_TIMEOUT_MS,
   sanitizePositiveMs,
 } = require('./qianchuan-reader');
+// AD-DOUDIAN-ARRIVAL-OVERLAY-20261019-F1：抖店首页营销浮窗有限处理（根证 2026-10-19：
+// 唯一可见 .ws-arrival-modal-wrap 拦截"成交订单数"点击）。本模块不写 Cookie、不改四层。
+const { dismissDoudianArrivalOverlay } = require('./doudian-arrival-overlay');
 
 const HOME_URL = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
 const ORDER_LABEL = '成交订单数';
@@ -84,12 +87,15 @@ function extractOrderValueInPage(args) {
     return { code: 'no_card_item', reason: '未找到指标所属的 aurora-data-card-card-item 容器' };
   }
   const valueNodes = cardItem.querySelectorAll('.aurora-data-card-value-main');
+  // 用户确认（2026-10-25）：罗盘"成交订单数"现场显示横杠（-）就是 0，属正常读数；
+  // 两种正常布局下的横杠都按数值 0 沿同一正常分支流转（含双口径核验），不按占位符阻止。
+  let valueText = null;
   if (valueNodes.length === 0) {
     // 当前值节点 .value-main 缺失。但罗盘在"暂无实时数值"时仍保留同一卡片 main-left 的
-    // 当前数据容器 .aurora-data-card-data（实测显示 "-" 占位；昨日值在 .aurora-data-card-information
-    // 兄弟节点，绝不在此读取）。严格只锁定与当前 pay_cnt 卡片 main-left 绑定的唯一数据容器，
-    // 据其文本区分"占位/加载中"与"真缺失/版式无法确认/歧义"；
-    // 绝不把容器里的数字当回退解析，也不把占位当 0。
+    // 当前数据容器 .aurora-data-card-data（用户确认此时显示 "-" 即 0；昨日值在
+    // .aurora-data-card-information 兄弟节点，绝不在此读取）。严格只锁定与当前 pay_cnt
+    // 卡片 main-left 绑定的唯一数据容器，据其文本区分横杠 0/加载中与真缺失/版式无法确认/歧义；
+    // 绝不把容器里的数字当回退解析。
     const leftCol = cardItem.querySelector('.aurora-data-card-main-left');
     const curData = leftCol ? leftCol.querySelectorAll('.aurora-data-card-data') : [];
     const hasYesterday = /昨日/.test(cardItem.textContent || '');
@@ -99,33 +105,40 @@ function extractOrderValueInPage(args) {
         return { code: 'value_loading', reason: '罗盘当前成交订单数为空（实时数据加载中），等待返回有效数值' };
       }
       if (/^[—\-–]+$/.test(curText)) {
-        return { code: 'value_placeholder', reason: `罗盘当前成交订单数暂未返回有效数值（显示"${curText}"），等待实时数据`, hasYesterday };
+        // 用户确认：横杠即 0，视为正常值继续走双口径核验
+        valueText = '0';
+      } else {
+        // 数据容器存在但无 .value-main 且内容非横杠：版式无法确认，保持数据护栏，不回退解析数字
+        return { code: 'value_node_missing', reason: `当前值节点 .aurora-data-card-value-main 缺失，且左栏数据容器内容「${curText}」无法确认为有效当前值（不回退解析容器数字）`, hasYesterday };
       }
-      // 数据容器存在但无 .value-main 且内容非纯占位：版式无法确认，保持数据护栏，不回退解析数字
-      return { code: 'value_node_missing', reason: `当前值节点 .aurora-data-card-value-main 缺失，且左栏数据容器内容「${curText}」无法确认为有效当前值（不回退解析容器数字）`, hasYesterday };
+    } else {
+      // 当前数据容器缺失或重复：结构性问题，保持 value_node_missing，不回退
+      return {
+        code: 'value_node_missing',
+        reason: curData.length === 0
+          ? '当前值节点 .aurora-data-card-value-main 缺失'
+          : `当前值节点 .aurora-data-card-value-main 缺失，且左栏数据容器出现 ${curData.length} 处，无法唯一定位`,
+        hasYesterday,
+      };
     }
-    // 当前数据容器缺失或重复：结构性问题，保持 value_node_missing，不回退
-    return {
-      code: 'value_node_missing',
-      reason: curData.length === 0
-        ? '当前值节点 .aurora-data-card-value-main 缺失'
-        : `当前值节点 .aurora-data-card-value-main 缺失，且左栏数据容器出现 ${curData.length} 处，无法唯一定位`,
-      hasYesterday,
-    };
-  }
-  if (valueNodes.length > 1) {
+  } else if (valueNodes.length > 1) {
     return { code: 'value_node_missing', reason: `当前值节点出现 ${valueNodes.length} 处，无法唯一定位` };
-  }
-  const vEl = valueNodes[0];
-  const r = vEl.getBoundingClientRect();
-  if (r.width === 0 && r.height === 0) {
-    return { code: 'value_hidden', reason: '当前值节点不可见（display:none 或未渲染）' };
-  }
-  const raw = (vEl.textContent || '').trim();
-  if (raw === '') return { code: 'value_loading', reason: '当前值节点为空（数据加载中）' };
-  if (/^[—\-–]+$/.test(raw)) return { code: 'value_placeholder', reason: `当前值为占位符「${raw}」` };
-  if (!/^[\d,]+$/.test(raw)) {
-    return { code: 'value_not_plain_number', reason: `当前值「${raw}」不是纯整数（万级/小数展示不用于订单数）` };
+  } else {
+    const vEl = valueNodes[0];
+    const r = vEl.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) {
+      return { code: 'value_hidden', reason: '当前值节点不可见（display:none 或未渲染）' };
+    }
+    const raw = (vEl.textContent || '').trim();
+    if (raw === '') return { code: 'value_loading', reason: '当前值节点为空（数据加载中）' };
+    if (/^[—\-–]+$/.test(raw)) {
+      // 用户确认：横杠即 0，视为正常值继续走双口径核验
+      valueText = '0';
+    } else if (!/^[\d,]+$/.test(raw)) {
+      return { code: 'value_not_plain_number', reason: `当前值「${raw}」不是纯整数（万级/小数展示不用于订单数）` };
+    } else {
+      valueText = raw;
+    }
   }
   // 双口径核验：页面顶部 aurora-tabs 组中"实时"与"全店"都必须处于选中态
   const tabState = (text) => {
@@ -157,7 +170,7 @@ function extractOrderValueInPage(args) {
   const tsMatch = overviewContainer ? (overviewContainer.textContent || '').match(/\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}/) : null;
   return {
     code: 'ok',
-    valueText: raw,
+    valueText,
     labelText,
     cardText: (cardItem.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160),
     saleScope: {
@@ -261,6 +274,7 @@ function createCompassOrderReader(p) {
     // R87：会话收尾保存元信息——加载前指纹必须在 addCookies 之前捕获（冲突保护基线）。
     const cookieSession = {
       filePath: resolved.path,
+      readOnly: resolved.readOnly,
       startFingerprint: fingerprintFile(resolved.path),
     };
     // browserFactory 可注入（离线测试）；默认行为与原实现完全一致。
@@ -274,34 +288,114 @@ function createCompassOrderReader(p) {
     // R87：finally 中收尾保存所需的当前会话引用（try 块内 const 在 finally 不可见）。
     let sessionCtx = null;
     let sessionTarget = null;
+    let context = null;
+    let page = null;
     try {
-      const context = await browser.newContext({ viewport: { width: 1920, height: 1080 }, timezoneId: 'Asia/Shanghai' });
-      sessionCtx = context;
-      const cookies = JSON.parse(fs.readFileSync(resolved.path, 'utf-8'));
-      await context.addCookies(cookies);
-      const page = await context.newPage();
-
+      // AD-COOKIE-FOUR-TIER-20261019-F1：会话打开收口（含恢复成功后的有界一次重试）。
       // 1) 抖店主页面（入口），核验登录态（R53：复用 R51 有界自动 SSO 收敛）。
       //    根证：有效 Cookie 装入全新浏览器后先停在 /login/common 中转，~30s 才落首页；
       //    旧实现固定等 6s 即把中转地址判 AuthError → 伪登录过期（误要求重扫）。
       //    收敛成功才继续；上界到达才做登录正证据分类：
       //    真过期（登录页地址/可见登录表单控件）仍 AuthError；
       //    页面被关闭/教程/未知导航按 DataGuard 导航事实处理，不触发重扫。
-      await page.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForTimeout(6000);
-      const settled = await waitForDoudianHomepageSettled(page, p);
-      if (!settled.ok) {
-        if (settled.reason === 'settle-page-closed') {
-          throw new DataGuardError(`抖店主页面在自动登录收敛期内被关闭（最后地址 ${settled.url || '未知'}）；按导航事实处理，需人工核实`);
+      const openFxgSession = async () => {
+        const ctx = await browser.newContext({ viewport: { width: 1920, height: 1080 }, timezoneId: 'Asia/Shanghai' });
+        try {
+          const cookies = JSON.parse(fs.readFileSync(resolved.path, 'utf-8'));
+          await ctx.addCookies(cookies);
+          const pg = await ctx.newPage();
+          await pg.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+          await pg.waitForTimeout(6000);
+          const settled = await waitForDoudianHomepageSettled(pg, p);
+          return { ctx, pg, settled };
+        } catch (e) {
+          try { await ctx.close(); } catch (_) { /* 关闭失败不掩盖原始错误 */ }
+          throw e;
         }
-        const evidence = await collectLoginExpiryEvidence(page);
+      };
+      const classifySettleFailure = async (sess) => {
+        if (sess.settled.reason === 'settle-page-closed') return { kind: 'page-closed', restore: null };
+        const evidence = await collectLoginExpiryEvidence(sess.pg);
         if (evidence.loginUrl || evidence.loginControlVisible || evidence.loginFormVisible || evidence.loginDialogVisible) {
-          throw new AuthError(`登录失效：抖店页面在 ${settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(p.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${page.url()}），请重新扫码登录`);
+          return { kind: 'login', restore: null };
         }
-        throw new DataGuardError(`抖店主页面在有界自动登录收敛期内未到达首页（${settled.attempts} 次探测，当前 ${settled.url || page.url()}）；未见登录正证据，按导航事实处理，需人工核实`);
+        return { kind: 'nav', restore: null };
+      };
+      let sess = await openFxgSession();
+      let fail = sess.settled.ok ? null : await classifySettleFailure(sess);
+      // 仅明确登录失效正证据进入四层恢复链（导航/页面关闭类不触碰 Cookie）：
+      // 值守工作副本当前字节排除（刚在本浏览器失败）→ 恢复副本 → 匹配店铺最近原始快照；
+      // 候选独立新上下文验证通过才冻结基线 CAS 提升；成功重试一次；全部失败如实保留
+      // AuthError，不盲覆盖、不跨店、不循环（p.restoreOnAuthFailure===false 关闭）。
+      if (fail && fail.kind === 'login' && p.restoreOnAuthFailure !== false) {
+        await sess.ctx.close();
+        let restore = null;
+        try {
+          const runner = p.restoreRunner || restoreDutyWorkCopy;
+          restore = await runner(loginCfg, shopCfg.cookieFile, {
+            shopCfg,
+            excludeWorkCopy: true,
+            browser: p.restoreBrowser || browser,
+            verify: p.restoreVerify,
+            vaultModule: p.restoreVaultModule,
+            vaultRoots: p.restoreVaultRoots,
+            recoveryDir: p.restoreRecoveryDir,
+            nowFn,
+            audit: p.audit,
+          });
+        } catch (e) {
+          restore = { ok: false, reason: '恢复链异常：' + ((e && e.message) || e) };
+        }
+        fail.restore = restore;
+        if (restore.ok) {
+          cookieSession.startFingerprint = fingerprintFile(resolved.path);
+          sess = await openFxgSession();
+          fail = sess.settled.ok ? null : await classifySettleFailure(sess);
+        }
+      }
+      context = sess.ctx;
+      page = sess.pg;
+      sessionCtx = context;
+      if (fail) {
+        if (fail.kind === 'page-closed') {
+          throw new DataGuardError(`抖店主页面在自动登录收敛期内被关闭（最后地址 ${sess.settled.url || '未知'}）；按导航事实处理，需人工核实`);
+        }
+        if (fail.kind === 'login') {
+          const restoreNote = fail.restore
+            ? `；四层恢复未取得可验证候选（${fail.restore.reason || '未提升'}），工作副本现状未被盲覆盖`
+            : '';
+          throw new AuthError(`登录失效：抖店页面在 ${sess.settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(p.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${page.url()}），请重新扫码登录${restoreNote}`);
+        }
+        throw new DataGuardError(`抖店主页面在有界自动登录收敛期内未到达首页（${sess.settled.attempts} 次探测，当前 ${sess.settled.url || page.url()}）；未见登录正证据，按导航事实处理，需人工核实`);
       }
 
       // 2) 点击"成交订单数"文字入口；处理新标签页或当前页跳转
+      //    AD-DOUDIAN-ARRIVAL-OVERLAY-20261019-F1：入口点击前处置首页营销浮窗——
+      //    严格可信 host/path + 唯一可见根 + 唯一明确 dismiss 控件才点击；检测到
+      //    登录/支付/删除等业务危险内容、多根/多控件 → 零点击阻断（DataGuard，绝不
+      //    点击"立即报名"、绝不遮罩删除）；0 浮窗立即无操作；点击后有界轮回读消失。
+      //    关闭标记以非枚举属性挂 cookieSession，随同一会话进入 finally 收尾检查点；
+      //    Cookie 持久化链路不变（到达罗盘并严格店铺身份后仅由
+      //    checkpointCompassSessionCookies 写 guard 工作副本，首页未身份验证绝不保存）。
+      const overlay = await dismissDoudianArrivalOverlay(page, {
+        // 地址门复用 SSO 收敛已严格核验的首页地址（不额外读取页面地址）；
+        // 点击时刻仍由页内 location.href 严格 host/path 复核兜底。
+        urlHint: sess.settled.url,
+        sleep: p.overlaySleep, maxRounds: p.overlayMaxRounds, intervalMs: p.overlayIntervalMs,
+      });
+      Object.defineProperty(cookieSession, 'arrivalOverlay', {
+        value: {
+          stage: 'compass-home',
+          status: overlay.status,
+          closed: overlay.closed === true,
+          clickedCount: overlay.clickedCount,
+          rounds: overlay.rounds,
+        },
+        enumerable: false, configurable: true, writable: true,
+      });
+      if (overlay.blocked || overlay.status === 'still_present') {
+        throw new DataGuardError(`抖店首页营销浮窗处理受阻：${overlay.reason}；绝不点击浮窗内其他控件`);
+      }
       //    R54：SSO 收敛后首页 URL 已就绪但 SPA 入口渲染有延迟，首次 count=0
       //    属瞬时渲染而非结构性缺失——先做有界被动等待（复用既有 locator，
       //    ≤20s，无新定时器/服务）；等待后仍缺失才维持原 DataGuard 语义。
@@ -353,7 +447,10 @@ function createCompassOrderReader(p) {
       }
       if (!probed || probed.code !== 'ok') {
         const reason = probed && probed.reason ? probed.reason : '页面提取失败';
-        throw new DataGuardError(`"成交订单数"读取失败：${reason}（不回退读取昨日值/同行基准）`);
+        const detail = probed && probed.code === 'value_placeholder'
+          ? { source: 'compass-order-reader', metric: 'pay_cnt', observation: 'value_placeholder' }
+          : null;
+        throw new DataGuardError(`"成交订单数"读取失败：${reason}（不回退读取昨日值/同行基准）`, detail);
       }
       const saleScope = probed.saleScope || {};
       if (!saleScope.saleAllActive) {

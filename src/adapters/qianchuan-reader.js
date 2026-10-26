@@ -39,73 +39,34 @@ const path = require('path');
 const { AuthError, DataGuardError } = require('../lib/errors');
 const { parseMoneyCents } = require('../lib/money');
 const { shanghaiDate } = require('../lib/time');
-const { resolveCookieFile } = require('../login/session');
+const { resolveCookieFile, restoreDutyWorkCopy } = require('../login/session');
 const { fingerprintFile } = require('../login/cookie-writeback');
+const { maskUrlQueries } = require('../lib/log');
 const { checkpointQianchuanSessionCookies } = require('../login/session-cookie-checkpoint');
+const { beginLauncherScope, runInLauncherScope, attestFromLauncherScope } = require('../lib/resource-attestation');
 const { closableSideOfAd } = require('./ad-controller');
+// AD-DOUDIAN-ARRIVAL-OVERLAY-20261019-F1：抖店首页营销浮窗有限处理（同页根证，与
+// compass-order-reader 共用；本模块不写 Cookie、不改四层，循环依赖不存在）。
+const { dismissDoudianArrivalOverlay } = require('./doudian-arrival-overlay');
+// 抖店首页有界被动收敛语义（叶子模块，与登录侧独立候选验证共用同一份）。
+const {
+  isDoudianHomepageUrl,
+  waitForDoudianHomepageSettled,
+  sanitizePositiveMs,
+  DEFAULT_SETTLE_TIMEOUT_MS,
+  DEFAULT_SETTLE_INTERVAL_MS,
+  MAX_SETTLE_ATTEMPTS,
+} = require('../lib/settle-policy');
 
 const HOME_URL = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
 const QC_HOME_MARKER = 'qianchuan.jinritemai.com';
 const CONSUME_LABEL = '账户整体消耗';
 
 // ── 抖店首页自动 SSO 收敛（R51）────────────────────────────────────
-// 根证 reference-readonly-session.json（2026-10-15 只读复测）：同一已保存 Cookie 装入
-// 全新无头 Edge 后，DOMContentLoaded 后 5s/15s 仍在 /login/common（自动 SSO 中转），
-// 30s 才自动落到 /ffa/mshop/homepage/index（title=首页），全程零人工/零点击/零写入。
-// 旧实现固定等 5s 后立即把中转 URL 判成 AuthError → FALSE-EXPIRED（伪登录过期），
-// 上层 requiresLogin=true 要求重扫。修复：先做**有界被动收敛等待**（只在已打开页面
-// 上轮询地址，不点击/不导航/零请求），收敛成功才继续；到达上界仍未到首页才做登录
-// 正证据分类。上界 45s > 实测 30s 收敛点；快路径（已是首页）零额外等待。
-const HOME_HOST = 'fxg.jinritemai.com';
-const HOME_PATH_PREFIX = '/ffa/mshop/homepage';
-const DEFAULT_SETTLE_TIMEOUT_MS = 45000;
-const DEFAULT_SETTLE_INTERVAL_MS = 3000;
-const MAX_SETTLE_ATTEMPTS = 1000;
-
-/** 是否已真正落在抖店首页：严格 origin+path 解析（防 lookalike 域名/子串伪造，
- *  如 https://fxg.jinritemai.com.evil.test/ffa/mshop/homepage/index 不得算成功）。 */
-function isDoudianHomepageUrl(u) {
-  if (typeof u !== 'string' || u.length === 0) return false;
-  let p;
-  try { p = new URL(u); } catch (_) { return false; }
-  return p.protocol === 'https:' && p.hostname === HOME_HOST && p.pathname.startsWith(HOME_PATH_PREFIX);
-}
-
-/**
- * 有界被动等待抖店首页自动 SSO 收敛：轮询 page.url()（零点击/零导航/零请求），
- * 直到严格命中首页 host/path 或到达上界。快路径：已是首页 → attempts=0 立即返回。
- * 双保险上界：墙钟 deadline（nowFn 单调前进时）+ 独立硬限次（nowFn 冻结/回拨也收敛）。
- * 页面被关闭 → 有界返回 {ok:false, reason:'settle-page-closed'}，绝不空转。
- * 依赖注入：settleNowFn/settleSleep 可注入（离线测试，免真实等待）。
- */
-async function waitForDoudianHomepageSettled(page, opts = {}) {
-  const timeoutMs = sanitizePositiveMs(opts.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS);
-  const intervalMs = sanitizePositiveMs(opts.settleIntervalMs, DEFAULT_SETTLE_INTERVAL_MS);
-  const nowFn = opts.settleNowFn || opts.nowFn || (() => Date.now());
-  const sleep = opts.settleSleep || opts.sleep || ((ms) => page.waitForTimeout(ms));
-  const maxAttempts = Math.max(1, Math.min(MAX_SETTLE_ATTEMPTS, Math.ceil(timeoutMs / intervalMs) + 1));
-  const deadline = nowFn() + timeoutMs;
-  const urlNow = () => {
-    try { return String(page.url()); } catch (_) { return ''; }
-  };
-  const pageClosed = () => {
-    try { return typeof page.isClosed === 'function' ? page.isClosed() === true : false; } catch (_) { return true; }
-  };
-  const first = urlNow();
-  if (isDoudianHomepageUrl(first)) return { ok: true, url: first, attempts: 0, waited: false };
-  let attempts = 0;
-  let url = first;
-  for (;;) {
-    attempts += 1;
-    url = urlNow();
-    if (isDoudianHomepageUrl(url)) return { ok: true, url, attempts, waited: true };
-    if (pageClosed()) return { ok: false, reason: 'settle-page-closed', url, attempts };
-    if (attempts >= maxAttempts) break;              // 硬限次上界：冻结/回拨时钟下也收敛
-    if (!(nowFn() + intervalMs <= deadline)) break;  // 墙钟上界：不再空转
-    try { await sleep(intervalMs); } catch (_) { /* 页面关闭等：下一轮 pageClosed 收敛 */ }
-  }
-  return { ok: false, reason: 'settle-timeout', url, attempts };
-}
+// 语义本体已下沉到 lib/settle-policy（45s/3s/严格首页判定/双保险限次），本模块只做
+// 引用与原样再导出：登录侧的独立候选验证与主链必须共用**同一份**收敛语义，而登录
+// 模块被本模块 require（反向 require 成循环依赖），故二者都指向该叶子模块。
+// 根证仍是 reference-readonly-session.json：约 30s 才自动落首页，上界必须 > 实测值。
 
 // 费用卡就绪等待的有界默认（仅在已打开页面上被动重读 DOM：不 reload、不点击、不导航、零网络请求）。
 const DEFAULT_READINESS_TIMEOUT_MS = 60000;
@@ -114,13 +75,6 @@ const DEFAULT_READINESS_INTERVAL_MS = 3000;
 // 冻结/回拨（或 interval 非法导致 deadline 永不越过），必须靠限次收敛，绝不空转。
 // maxAttempts = ceil(timeout/interval)+1，并夹到 [1, MAX_READINESS_ATTEMPTS]。
 const MAX_READINESS_ATTEMPTS = 1000;
-
-/** 归一化有限正毫秒：非有限（NaN/Infinity）或非正（0/负数）一律回落默认值（避免 0 造成零等待、
- *  负数造成不死循环/忙等）。 */
-function sanitizePositiveMs(v, fallback) {
-  const n = Number(v);
-  return (Number.isFinite(n) && n > 0) ? n : fallback;
-}
 
 /** 已知投放类型（来自首页 summaryCard 分项实测：乘方+标准+全域+品牌=整体）。 */
 const KNOWN_AD_TYPES = [
@@ -145,7 +99,7 @@ function extractConsumeCentsFromCardText(text) {
 function verifyStatPeriod(values, nowMs) {
   const today = shanghaiDate(nowMs);
   if (!Array.isArray(values) || values.length < 2) {
-    return { ok: false, reason: `统计周期控件未读到起止日期（实测 ${JSON.stringify(values)}）` };
+    return { ok: false, reason: '千川账户费用的当天日期证据尚未读到：不能将未知日期费用作为今天数据' };
   }
   const [s, e] = values;
   if (s !== today || e !== today) {
@@ -161,26 +115,48 @@ function verifyStatPeriod(values, nowMs) {
  * 任一不满足都视为未就绪（尤其严禁在周期为昨日/延期 UI 时直接采信）。
  */
 async function probeQianchuanConsumeReadiness(target, nowMs) {
-  const period = await target.evaluate(() => {
-    const wrap = document.querySelector('[class*="report-shortcuts-datepicker"]');
-    if (!wrap) return null;
-    return [...wrap.querySelectorAll('input')].map((i) => i.value);
-  }).catch(() => null);
-  const scope = verifyStatPeriod(period, nowMs);
-
-  const cardText = await target.evaluate(() => {
-    const cards = document.querySelectorAll('[class*="summaryCard"]');
-    for (const c of cards) {
-      const tx = (c.textContent || '').replace(/\s+/g, ' ').trim();
-      if (tx.includes('账户整体消耗')) return tx;
+  let snapshot = null;
+  let failure = null;
+  try {
+    const before = target.url();
+    if (!isQianchuanHomeUrl(before)) {
+      failure = '当前页面不是可信千川首页：拒绝读取费用';
+    } else {
+      snapshot = await target.evaluate(() => {
+        const shopView = /店铺视图[：:]/.test(document.body ? document.body.innerText : '');
+        const wrap = shopView ? null : document.querySelector('[class*="report-shortcuts-datepicker"]');
+        const period = wrap ? [...wrap.querySelectorAll('input')].map(i => i.value) : null;
+        const texts = shopView ? [] : [...document.querySelectorAll('[class*="summaryCard"]')]
+          .map(c => (c.textContent || '').replace(/\s+/g, ' ').trim());
+        const cardText = texts.find(text => text.includes('账户整体消耗')) || null;
+        const updated = shopView ? null : document.querySelector('[class*="refreshTime"]');
+        const breakdown = [];
+        for (const text of texts) {
+          const match = /(乘方计划消耗|标准投放消耗|全域投放消耗|品牌投放消耗|账户整体消耗)\(元\)\s*([\d,]+(?:\.\d+)?)/.exec(text);
+          if (match) breakdown.push({ item: match[1], raw: match[2] });
+        }
+        const loginVisible = [...document.querySelectorAll('input[type="password"], input[placeholder*="手机"], input[placeholder*="验证码"], button, [class*="login"]')].some(el => {
+          const rect = el.getBoundingClientRect();
+          const style = getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'
+            && (el.tagName === 'INPUT' || /^登录$/.test((el.textContent || '').trim()));
+        });
+        return { href: location.href, period, cardText, breakdown, updatedAtRaw: updated ? (updated.textContent || '').trim() : null, loginVisible, shopView };
+      });
+      if (target.url() !== before || !snapshot || snapshot.href !== before) failure = '费用探测期间页面导航：拒绝混用不同页面数据';
+      else if (snapshot.loginVisible) failure = '千川首页存在可见登录控件：拒绝采信残留费用';
+      else if (snapshot.shopView) failure = '千川仍处于店铺视图：不能将店铺整体消耗作为账户费用';
     }
-    return null;
-  }).catch(() => null);
+  } catch (_) {
+    failure = '千川费用 DOM evaluate 读取异常：本轮未取得日期与费用快照';
+  }
+  const period = snapshot ? snapshot.period : null;
+  const cardText = snapshot ? snapshot.cardText : null;
+  const scope = failure ? { ok: false, reason: failure } : verifyStatPeriod(period, nowMs);
   const parsed = cardText
     ? extractConsumeCentsFromCardText(cardText)
     : { ok: false, reason: `千川首页未找到"${CONSUME_LABEL}(元)"卡片（不替换成余额/预算/其他消耗指标）` };
-
-  return { period, scope, cardText, parsed, ready: scope.ok === true && !!cardText && parsed.ok === true };
+  return { ...snapshot, period, scope, cardText, parsed, ready: scope.ok === true && parsed.ok === true };
 }
 
 /** 就绪上界失败时，按真实 DOM 事实给出与严格解析一致的 DataGuard 原因（不臆造数值）。 */
@@ -199,7 +175,7 @@ function readinessFailureReason(last) {
  *
  * POPUP-CLOSE-20261025：可选 overlayCloser（内部 hook，默认不存在=行为与旧版完全一致）：
  * 每轮探测前先对**已知介绍浮窗**做一次有界收口（复用 chengfang-reader 既有白名单关闭器），
- * 覆盖"读取开始前已有"与"等待期间晚到"两类浮窗；无浮窗时仅多一次只读探针、零点击、
+ * 覆盖"读取开始前已有"与"等待期间晚到"两类浮窗。无浮窗时仅多一次只读探针、零点击、
  * 零额外固定等待；关闭结果只如实记录（overlayOutcomes），不改变就绪/失败判定口径。
  */
 async function waitForQianchuanConsumeReady(target, opts = {}) {
@@ -218,15 +194,14 @@ async function waitForQianchuanConsumeReady(target, opts = {}) {
   let attempts = 0;
   for (;;) {
     if (overlayCloser) {
+      // 晚到浮窗收口：每轮探测前先跑一次既有白名单关闭器（含有限瞬态重读与点击后消失验证）。
+      // 关闭失败（未知/多义/未消失）只如实记录，不放宽就绪口径，也不点任何业务 CTA。
       const closed = await overlayCloser();
       if (closed) overlayOutcomes.push({ dismissed: closed.dismissed === true, state: closed.state || null });
     }
     last = await probeQianchuanConsumeReadiness(target, nowFn());
     attempts += 1;
-    if (last.ready) return {
-      ok: true, attempts, period: last.period, cardText: last.cardText, cents: last.parsed.cents,
-      ...(overlayOutcomes ? { overlayOutcomes } : {}),
-    };
+    if (last.ready) return { ...last, ok: true, attempts, cents: last.parsed.cents, ...(overlayOutcomes ? { overlayOutcomes } : {}) };
     if (attempts >= maxAttempts) break;                 // 硬限次上界：冻结/回拨时钟下也收敛
     if (!(nowFn() + intervalMs <= deadline)) break;     // 墙钟上界：再等也会越过上界，不再空转
     await sleep(intervalMs);
@@ -335,7 +310,9 @@ function qianchuanHomeUrl(shopCfg) {
 
 /** 是否已真正落在千川首页（排除登录/授权中转页，避免把登录页当成功）。 */
 function isQianchuanHomeUrl(u) {
-  return typeof u === 'string' && u.includes(QC_HOME_MARKER) && !/\/login|\/passport|\/signin|sso\.jinritemai/i.test(u);
+  let parsed;
+  try { parsed = new URL(u); } catch (_) { return false; }
+  return parsed.origin === `https://${QC_HOME_MARKER}` && /^\/home\/?$/.test(parsed.pathname);
 }
 
 // ── 页面导航胶水（实机验证；browserFactory 可注入用于测试）─────────
@@ -403,15 +380,28 @@ async function locateQianchuanEntry(page) {
  *
  * @returns {{ok:boolean, target?:object, url:string, mode?:string, attempts?:number, reason?:string}}
  */
-async function reachQianchuanHome({ page, context, shopCfg }) {
+async function reachQianchuanHome({ page, context, shopCfg, overlayOpts = {} }) {
   let lastUrl = null;
   let lastReason = '点击"巨量千川"后未到达千川';
+  let overlayResult = null;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     if (attempt > 1) {
       await page.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
       await page.waitForTimeout(3000);
     }
-    const popupPromise = context.waitForEvent('page', { timeout: 25000 }).catch(() => null);
+    // AD-DOUDIAN-ARRIVAL-OVERLAY-20261019-F1：点"巨量千川"入口前处置首页营销浮窗
+    // （根证 2026-10-19：唯一可见 .ws-arrival-modal-wrap 拦截入口点击）。
+    // 0 浮窗立即无操作；业务危险/多根/多控件 → 零点击阻断（含跳过只读兜底，需人工）；
+    // 绝不点击"立即报名"或遮罩删除；探测异常非阻断，保持原链路行为。
+    const overlay = await dismissDoudianArrivalOverlay(page, overlayOpts);
+    overlayResult = overlay;
+    if (overlay.blocked || overlay.status === 'still_present') {
+      return {
+        ok: false, url: page.url(),
+        reason: `抖店首页营销浮窗处理受阻：${overlay.reason}；绝不点击浮窗内其他控件`,
+        overlay: overlayResult,
+      };
+    }
     const located = await locateQianchuanEntry(page);
     if (!located.ok) {
       lastUrl = page.url();
@@ -421,6 +411,7 @@ async function reachQianchuanHome({ page, context, shopCfg }) {
       continue;
     }
     const entry = located.locator;
+    const popupPromise = page.waitForEvent('popup', { timeout: 25000 }).catch(() => null);
     let clickErr = null;
     try {
       await entry.click({ timeout: 15000 });
@@ -433,7 +424,7 @@ async function reachQianchuanHome({ page, context, shopCfg }) {
     await target.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
     await target.waitForTimeout(8000);
     const url = target.url();
-    if (isQianchuanHomeUrl(url)) return { ok: true, target, url, mode: 'entry-click', attempts: attempt };
+    if (isQianchuanHomeUrl(url)) return { ok: true, target, url, mode: 'entry-click', attempts: attempt, overlay: overlayResult };
     lastUrl = url;
     lastReason = clickErr ? `点击"巨量千川"未成功：${(clickErr && clickErr.message) || clickErr}` : '点击"巨量千川"后未到达千川';
     // 非千川的残留标签先关掉，避免干扰下一次尝试（主页面保留）
@@ -453,10 +444,10 @@ async function reachQianchuanHome({ page, context, shopCfg }) {
     await qcFallbackPage.waitForTimeout(6000);
   } catch (_) { qcFallbackPage = null; }
   const url = qcFallbackPage ? String(qcFallbackPage.url()) : '';
-  if (qcFallbackPage && isQianchuanHomeUrl(url)) return { ok: true, target: qcFallbackPage, url, mode: 'direct-home-url', attempts: 4 };
+  if (qcFallbackPage && isQianchuanHomeUrl(url)) return { ok: true, target: qcFallbackPage, url, mode: 'direct-home-url', attempts: 4, overlay: overlayResult };
   lastUrl = url || lastUrl;
   lastReason = `${lastReason}（直连千川首页兜底亦未到达）`;
-  return { ok: false, url: lastUrl || (page.url && page.url()) || '', reason: lastReason };
+  return { ok: false, url: lastUrl || (page.url && page.url()) || '', reason: lastReason, overlay: overlayResult };
 }
 
 /**
@@ -585,13 +576,150 @@ async function collectLoginExpiryEvidence(page) {
   return ev;
 }
 
+async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
+  const timeoutMs = sanitizePositiveMs(opts.readinessTimeoutMs, DEFAULT_READINESS_TIMEOUT_MS);
+  const intervalMs = sanitizePositiveMs(opts.readinessIntervalMs, DEFAULT_READINESS_INTERVAL_MS);
+  const nowFn = opts.nowFn || (() => Date.now());
+  const sleep = opts.sleep || (ms => target.waitForTimeout(ms));
+  const deadline = nowFn() + timeoutMs;
+  const maxAttempts = Math.min(MAX_READINESS_ATTEMPTS, Math.ceil(timeoutMs / intervalMs) + 1);
+  const expectedName = String((shopCfg && (shopCfg.compassShopName || shopCfg.name)) || '').trim();
+  let switched = false;
+  let popupClosed = false;
+  let blockedSwitchUrl = null;
+  let reason = '千川视图内容未就绪或结构未识别：未取得账户数据';
+  const fail = async message => {
+    const evidence = await collectLoginExpiryEvidence(target);
+    if (evidence.loginUrl || evidence.loginControlVisible || evidence.loginFormVisible || evidence.loginDialogVisible) {
+      throw new AuthError('千川视图读取遇到登录页或登录控件：尚未取得账户数据');
+    }
+    throw new DataGuardError(message);
+  };
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const before = target.url();
+    if (!isQianchuanHomeUrl(before)) return fail('千川视图导航未停留在可信首页：未取得账户数据');
+    if (blockedSwitchUrl !== null && before !== blockedSwitchUrl) {
+      return fail('千川受阻切换再观察期间发生导航：停止后续点击');
+    }
+    let view;
+    try {
+      view = await target.evaluate(() => {
+        const visible = el => {
+          const rect = el.getBoundingClientRect();
+          const style = getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+        };
+        const shopView = /店铺视图[：:]/.test(document.body ? document.body.innerText : '');
+        const switchPresent = [...document.querySelectorAll('button')]
+          .some(el => (el.textContent || '').trim() === '切至账户视图');
+        const accountContent = [...document.querySelectorAll('[class*="summaryCard"]')]
+          .some(el => visible(el) && (el.textContent || '').includes('账户整体消耗'));
+        const popup = { present: false, safe: false };
+        if (shopView || switchPresent) {
+          const closes = [...document.querySelectorAll('button.close-button')];
+          const dialogs = [...document.querySelectorAll('[role="dialog"], dialog, [aria-modal="true"]')].filter(visible);
+          popup.present = closes.some(visible) || dialogs.length > 0;
+          if (popup.present && closes.length === 1) {
+            const close = closes[0];
+            const content = close.parentElement;
+            if (content && content.classList.contains('content') && visible(content) && visible(close)) {
+              const controls = [...content.querySelectorAll('button, [role="button"], a[href], input, select, textarea')];
+              const business = controls.filter(el => el !== close && el.tagName === 'BUTTON');
+              const links = controls.filter(el => el.tagName === 'A' && el.hasAttribute('href'));
+              popup.safe = (controls.length === 3 || controls.length === 4) && controls.includes(close)
+                && business.length === 2 && business.every(visible)
+                && links.length === controls.length - 3
+                && business.filter(el => (el.textContent || '').trim() === '投放乘方').length === 1
+                && business.filter(el => (el.textContent || '').trim() === '开启货款直投').length === 1
+                && /^[xX×]?$/.test((close.textContent || '').trim())
+                && /^(?:关闭|close)?$/i.test((close.getAttribute('aria-label') || '').trim())
+                && dialogs.every(dialog => dialog.contains(close));
+            }
+          }
+        }
+        return { href: location.href, shopView, switchPresent, accountContent, popup };
+      });
+    } catch (_) {
+      return fail('千川视图 DOM 读取异常：未执行其他导航或按钮操作');
+    }
+    if (!view || view.href !== before || target.url() !== before) {
+      return fail('千川视图探测期间发生导航：拒绝混用不同页面数据');
+    }
+    const shopView = view.shopView || view.switchPresent;
+    const evidence = await collectLoginExpiryEvidence(target);
+    if (evidence.loginUrl || evidence.loginControlVisible || evidence.loginFormVisible || evidence.loginDialogVisible) {
+      throw new AuthError('千川视图读取遇到登录页或登录控件：尚未取得账户数据');
+    }
+    if (target.url() !== before) return fail('千川视图核验期间发生导航：未取得账户数据');
+    if (blockedSwitchUrl !== null && !switched
+      && (!view.shopView || !view.switchPresent || (!popupClosed && (!view.popup.present || !view.popup.safe)))) {
+      return fail('千川受阻切换未取得同页店铺视图及唯一已证营销弹窗的新鲜证据：停止后续点击');
+    }
+    if (!shopView && view.accountContent === true) return { switched };
+    if (shopView && expectedName) {
+      let identityOk;
+      try {
+        const title = target.getByText(`店铺视图：${expectedName}`, { exact: true });
+        identityOk = await title.count() === 1 && await title.isVisible();
+      } catch (_) {
+        return fail('千川店铺视图身份读取异常：停止读取，不选择其他账户');
+      }
+      if (!identityOk) return fail('千川店铺视图身份与目标店铺不一致或不唯一：停止读取，不选择其他账户');
+    }
+    if (shopView && !switched) {
+      reason = '千川店铺视图未找到唯一的“切至账户视图”按钮：未执行切换';
+      const button = target.getByRole('button', { name: '切至账户视图', exact: true, includeHidden: true });
+      let count;
+      try { count = await button.count(); } catch (_) {
+        return fail('千川“切至账户视图”按钮定位失败：未执行切换');
+      }
+      if (count > 1) return fail('千川“切至账户视图”按钮重名：无法唯一定位，未执行切换');
+      if (count === 1) {
+        if (target.url() !== before) return fail('千川切换前发生导航：未执行切换');
+        if (view.popup.present) {
+          if (!view.popup.safe || popupClosed) {
+            return fail('千川营销弹窗未知、不唯一、不匹配或关闭后仍存在：停止后续点击，未点击业务按钮');
+          }
+          try {
+            const close = target.locator('.content > button.close-button');
+            if (await close.count() !== 1) return fail('千川营销弹窗关闭按钮不唯一：未执行关闭');
+            if (target.url() !== before) return fail('千川弹窗关闭前发生导航：未执行关闭');
+            await close.click({ timeout: Math.min(timeoutMs, 1500) });
+          } catch (_) {
+            return fail('千川已证营销弹窗关闭按钮不可操作或导航异常：未尝试其他按钮');
+          }
+          popupClosed = true;
+          if (target.url() !== before) return fail('千川营销弹窗关闭期间发生导航：未执行视图切换');
+        } else {
+          try {
+            // 不强制点击；Playwright 的可见、启用和命中测试保护被遮挡的按钮。
+            await button.click({ timeout: Math.min(timeoutMs, 10000) });
+            switched = true;
+            reason = '千川切换后账户视图内容未就绪或结构未识别：未读取店铺汇总，未取得账户数据';
+          } catch (error) {
+            if (popupClosed || blockedSwitchUrl !== null || !error || error.name !== 'TimeoutError'
+              || !/intercepts pointer events/i.test(String(error.message)) || target.url() !== before) {
+              return fail('千川“切至账户视图”按钮不可操作或切换导航失败：未尝试其他按钮');
+            }
+            blockedSwitchUrl = before;
+            reason = '千川视图切换被遮挡：未在有界再观察内确认并关闭唯一已证营销弹窗';
+          }
+        }
+      }
+    }
+    if (attempt + 1 >= maxAttempts || !(nowFn() + intervalMs <= deadline)) break;
+    await sleep(intervalMs);
+  }
+  return fail(reason);
+}
+
 /**
  * Cookie → 抖店首页 → 登录检查 → 点"巨量千川" → 千川落地页。
  * 任意初始化失败都会关闭本次创建的浏览器后抛错；成功返回后由调用者负责释放。
  */
 async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
   let browser = null;
-  let context = null;
+  const launchScope = beginLauncherScope('qianchuan-home');
   try {
     const resolved = resolveCookieFile(loginCfg, shopCfg.cookieFile);
     // 会话 Cookie 回写所需的元信息（2026-09-16 用户明确授权）：
@@ -605,40 +733,192 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
       startFingerprint: fingerprintFile(resolved.path),
     };
     if (opts.browserFactory) {
-      browser = await opts.browserFactory();
+      browser = await runInLauncherScope(launchScope, () => opts.browserFactory());
     } else {
       const { chromium } = require('playwright');
-      browser = await chromium.launch({
+      browser = await runInLauncherScope(launchScope, () => chromium.launch({
         headless: opts.headless !== false,
         executablePath: loginCfg.edgePath,
         args: ['--window-size=1920,1080'],
+      }));
+    }
+    // 所有权早登记（2026-10-23 DIAN-4 长期 unknown 门修复）：浏览器一创建就**同步**把可核验
+    // 收口句柄交给调用方，先于其后的任何 await。调用方（Monitor 收口门）据此在截止/失败时
+    // 真实关闭并独立核验连接；没有这一步，"opener 仍挂账时被截止"就没有任何可核验事实，
+    // 本店会长期 unknown。句柄是闭包对象：不可序列化、绝不进日志/返回值。
+    if (typeof opts.onResource === 'function' && browser) {
+      const owned = browser;
+      const handle = { close: () => owned.close() };
+      if (typeof owned.isConnected === 'function') {
+        // 读取异常一律按"仍在线"处理：宁可保守阻断，绝不伪造已关闭。
+        handle.isConnected = () => { try { return owned.isConnected() !== false; } catch (_) { return true; } };
+      }
+      try { opts.onResource(handle); } catch (_) { /* 登记失败不改变打开链路结果 */ }
+    }
+    // AD-COOKIE-FOUR-TIER-20261019-F1：会话打开收口（含恢复成功后的有界一次重试）。
+    const openFxgSession = async () => {
+      const ctx = await browser.newContext({ viewport: { width: 1920, height: 1080 }, timezoneId: 'Asia/Shanghai' });
+      try {
+        const cookies = JSON.parse(fs.readFileSync(resolved.path, 'utf-8'));
+        await ctx.addCookies(cookies);
+        const pg = await ctx.newPage();
+        await pg.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await pg.waitForTimeout(5000);
+        // R51：自动 SSO 中转（/login/common → 首页，实测 ~30s）不得在 5s 处被判伪过期。
+        // 空首页不代表登录完成；地址与可见身份均就绪才继续。
+        // 上界到达才做登录正证据分类（真过期仍 AuthError；其余按导航事实 DataGuard）。
+        const settled = await waitForDoudianHomepageSettled(pg, opts);
+        return { ctx, pg, settled };
+      } catch (e) {
+        try { await ctx.close(); } catch (_) { /* 关闭失败不掩盖原始错误 */ }
+        throw e;
+      }
+    };
+    // 收敛失败的既有分类（与旧实现逐字同口径）：page-closed / 登录正证据 / 导航事实。
+    const classifySettleFailure = async (sess) => {
+      if (sess.settled.reason === 'settle-page-closed') return { kind: 'page-closed', restore: null };
+      const evidence = await collectLoginExpiryEvidence(sess.pg);
+      if (evidence.loginUrl || evidence.loginControlVisible || evidence.loginFormVisible || evidence.loginDialogVisible) {
+        return { kind: 'login', restore: null };
+      }
+      return { kind: 'nav', restore: null };
+    };
+    let sess = await openFxgSession();
+    let fail = sess.settled.ok ? null : await classifySettleFailure(sess);
+    // 仅明确登录失效正证据进入四层恢复链（导航/页面关闭类一律不触碰 Cookie）：
+    // 值守工作副本当前字节排除（刚在本浏览器验证失败）→ 恢复副本 → 匹配店铺最近原始快照；
+    // 候选先在隔离新上下文独立验证（正确店名+有效登录），验证通过才按冻结基线 CAS 提升
+    //（保留上一版；验证期间并发新登录胜出）；成功重载恢复副本有界重试一次；全部失败
+    // 如实保留原 AuthError，不盲覆盖、不跨店猜文件、不循环。opts.restoreOnAuthFailure===false 关闭。
+    // S8 2026-10-26：恢复配额下沉为**整次 open 调用共享**（初始收敛与千川账户视图阶段
+    // 合计至多一次）：初始阶段已用过 → 千川阶段的 AuthError 不再二次恢复；反之亦然。
+    let restoreUsed = false;
+    const runRestoreChain = async () => {
+      if (restoreUsed) return { ok: false, reason: '本次打开的四层恢复配额已用尽（初始收敛与千川阶段共享一次）' };
+      restoreUsed = true;
+      try {
+        const runner = opts.restoreRunner || restoreDutyWorkCopy;
+        return await runner(loginCfg, shopCfg.cookieFile, {
+          shopCfg,
+          excludeWorkCopy: true,
+          browser: opts.restoreBrowser || browser,
+          verify: opts.restoreVerify,
+          vaultModule: opts.restoreVaultModule,
+          vaultRoots: opts.restoreVaultRoots,
+          recoveryDir: opts.restoreRecoveryDir,
+          nowFn: opts.nowFn,
+          audit: opts.audit,
+        });
+      } catch (e) {
+        return { ok: false, reason: '恢复链异常（未回显可能含凭据的异常详情）' };
+      }
+    };
+    if (fail && fail.kind === 'login' && opts.restoreOnAuthFailure !== false) {
+      await sess.ctx.close();
+      const restore = await runRestoreChain();
+      fail.restore = restore;
+      if (restore.ok) {
+        // 恢复提升已更新工作副本：刷新会话指纹基线（提升后字节即新基线），有界重试一次
+        cookieSession.startFingerprint = fingerprintFile(resolved.path);
+        sess = await openFxgSession();
+        fail = sess.settled.ok ? null : await classifySettleFailure(sess);
+      }
+    }
+    let context = sess.ctx;
+    let page = sess.pg;
+    if (fail) {
+      if (fail.kind === 'page-closed') {
+        throw new DataGuardError(`抖店主页面在自动登录收敛期内被关闭（最后地址 ${sess.settled.url ? maskUrlQueries(sess.settled.url) : '未知'}）；按导航事实处理，需人工核实`);
+      }
+      if (fail.kind === 'login') {
+        const restoreNote = fail.restore
+          ? `；四层恢复未取得可验证候选（${fail.restore.reason || '未提升'}），工作副本现状未被盲覆盖`
+          : '';
+        throw new AuthError(`登录失效：抖店页面在 ${sess.settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(opts.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${maskUrlQueries(page.url())}），请重新扫码登录${restoreNote}`);
+      }
+      throw new DataGuardError(`抖店主页面在有界自动登录收敛期内未到达首页（${sess.settled.attempts} 次探测，当前 ${maskUrlQueries(sess.settled.url || page.url())}）；未见登录正证据，按导航事实处理，需人工核实`);
+    }
+    // S8 2026-10-26：千川账户视图阶段补齐同一四层恢复链。此前 ensureQianchuanAccountView
+    // 在千川入口抛出的 AuthError 直接外抛，已保存的有效同店候选从未被尝试（已核读源码
+    // 核实的缺口）。约束：仅在 genuine AuthError（登录正证据语义）上触发，且先在同一
+    // target 上重新取证复核（S6 修复后的同一探针）；恢复配额与初始收敛共享（整次 open
+    // 至多一次）；恢复成功 → 刷新指纹基线 → 重开干净上下文 → 按原链路重走 FXG→千川与
+    // 同一身份核验；旧上下文必须先被证明关闭（close 抛错或页面仍开放一律阻断恢复，
+    // 绝不重叠会话）；导航/DataGuard/超时类错误绝不触发恢复；恢复失败/异常/禁用/重试
+    // 仍失效 → 如实保留认证错误并收口资源，绝不伪造成功。
+    let reached = null;
+    let qcFailure = null;
+    for (let round = 0; round < 2; round += 1) {
+      reached = await reachQianchuanHome({
+        page: sess.pg, context: sess.ctx, shopCfg,
+        // 地址门复用 SSO 收敛已严格核验的首页地址（重试轮 goto 目标即该首页；点击时刻
+        // 仍由浮窗模块页内 location.href 严格 host/path 复核兜底），避免额外地址读取扰动链路。
+        overlayOpts: {
+          urlHint: sess.settled.url,
+          sleep: opts.overlaySleep, maxRounds: opts.overlayMaxRounds, intervalMs: opts.overlayIntervalMs,
+        },
+      });
+      if (!reached.ok) {
+        qcFailure = new DataGuardError(`${reached.reason}（当前: ${reached.url}）；若需额外登录/授权请先人工完成一次`);
+        break;
+      }
+      try {
+        await ensureQianchuanAccountView(reached.target, shopCfg, opts);
+        break;
+      } catch (e) {
+        if (!(e instanceof AuthError) || round === 1) { qcFailure = e; break; }
+        // 同一 target 重新取证复核：没有新鲜登录正证据就不恢复（原 AuthError 原样上抛）。
+        const reconfirm = await collectLoginExpiryEvidence(reached.target);
+        const positive = reconfirm.loginUrl || reconfirm.loginControlVisible
+          || reconfirm.loginFormVisible || reconfirm.loginDialogVisible;
+        if (!positive || opts.restoreOnAuthFailure === false || restoreUsed) { qcFailure = e; break; }
+        // 旧上下文必须先被证明关闭：close 抛错或页面仍报告未关闭 → 阻断恢复重开。
+        let closedOk = true;
+        try { await sess.ctx.close(); } catch (_) { closedOk = false; }
+        if (closedOk && typeof sess.pg.isClosed === 'function') {
+          try { if (sess.pg.isClosed() !== true) closedOk = false; } catch (_) { closedOk = false; }
+        }
+        if (!closedOk) {
+          qcFailure = new AuthError(`${e.message}；原会话上下文关闭未获证明：阻断四层恢复重开，绝不重叠会话`);
+          break;
+        }
+        const restore = await runRestoreChain();
+        if (!restore.ok) {
+          qcFailure = new AuthError(`${e.message}；四层恢复未取得可验证候选（${restore.reason || '未提升'}），工作副本现状未被盲覆盖`);
+          break;
+        }
+        // 恢复提升已更新工作副本：刷新指纹基线（提升后字节即新基线），重开干净上下文重走全链路。
+        cookieSession.startFingerprint = fingerprintFile(resolved.path);
+        sess = await openFxgSession();
+        if (!sess.settled.ok) {
+          const reopenFail = await classifySettleFailure(sess);
+          qcFailure = reopenFail.kind === 'login'
+            ? new AuthError(`恢复重开后抖店登录仍失效（当前 ${maskUrlQueries(sess.pg.url())}）：本次恢复已结束，当前会话仍未通过验证`)
+            : new DataGuardError(`恢复重开后抖店主页面在有界自动登录收敛期内未到达首页（当前 ${maskUrlQueries(sess.settled.url || sess.pg.url())}）；未见登录正证据，按导航事实处理，需人工核实`);
+          break;
+        }
+        context = sess.ctx;
+        page = sess.pg;
+      }
+    }
+    if (qcFailure) throw qcFailure;
+    const target = reached.target;
+    // AD-DOUDIAN-ARRIVAL-OVERLAY：浮窗关闭标记以非枚举属性挂到本次 cookieSession
+    // （与 R73 identityPage 同口径，不进 JSON 序列化），随同一会话上下文进入
+    // 入口/收尾两处检查点。Cookie 持久化链路不变：仅到达千川并经严格身份正证据
+    // 成立后由 checkpointQianchuanSessionCookies 写 guard 工作副本，绝不在首页保存。
+    if (reached.overlay) {
+      Object.defineProperty(cookieSession, 'arrivalOverlay', {
+        value: {
+          stage: 'qianchuan-home',
+          status: reached.overlay.status,
+          closed: reached.overlay.closed === true,
+          clickedCount: reached.overlay.clickedCount,
+          rounds: reached.overlay.rounds,
+        },
+        enumerable: false, configurable: true, writable: true,
       });
     }
-    context = await browser.newContext({ viewport: { width: 1920, height: 1080 }, timezoneId: 'Asia/Shanghai' });
-    const cookies = JSON.parse(fs.readFileSync(resolved.path, 'utf-8'));
-    await context.addCookies(cookies);
-    const page = await context.newPage();
-    await page.goto(HOME_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(5000);
-    // R51：自动 SSO 中转（/login/common → 首页，实测 ~30s）不得在 5s 处被判伪过期。
-    // 先有界被动收敛（仅轮询地址，零点击/零导航/零请求）；收敛成功才继续既有链路；
-    // 上界到达才做登录正证据分类（真过期仍 AuthError；其余按导航事实 DataGuard）。
-    const settled = await waitForDoudianHomepageSettled(page, opts);
-    if (!settled.ok) {
-      if (settled.reason === 'settle-page-closed') {
-        throw new DataGuardError(`抖店主页面在自动登录收敛期内被关闭（最后地址 ${settled.url || '未知'}）；按导航事实处理，需人工核实`);
-      }
-      const evidence = await collectLoginExpiryEvidence(page);
-      if (evidence.loginUrl || evidence.loginControlVisible || evidence.loginFormVisible || evidence.loginDialogVisible) {
-        throw new AuthError(`登录失效：抖店页面在 ${settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(opts.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${page.url()}），请重新扫码登录`);
-      }
-      throw new DataGuardError(`抖店主页面在有界自动登录收敛期内未到达首页（${settled.attempts} 次探测，当前 ${settled.url || page.url()}）；未见登录正证据，按导航事实处理，需人工核实`);
-    }
-    const reached = await reachQianchuanHome({ page, context, shopCfg });
-    if (!reached.ok) {
-      throw new DataGuardError(`${reached.reason}（当前: ${reached.url}）；若需额外登录/授权请先人工完成一次`);
-    }
-    const target = reached.target;
     // R73：把原抖店身份页以**非枚举临时引用**挂到本次 cookieSession 上，供会话检查点在
     // 未知 accountId 时于同一 context 的原抖店页取严格语义店铺名正证据（自动发现账户）；
     // 后续复用同一 cookieSession 的检查点（如乘方链路）同样可取得。非枚举：不进入
@@ -646,17 +926,7 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     Object.defineProperty(cookieSession, 'identityPage', {
       value: page, enumerable: false, configurable: true, writable: true,
     });
-    // R58 会话检查点：已核验到达千川（严格可信来源+受支持路径）后、继续后续导航前，
-    // 把本会话刷新后的 Cookie 经授权写入器持久化（当前新鲜同账户正证据成立时才写；
-    // 配置无 accountId 时仅在 R73 严格自动发现正证据成立时才写，否则跳过）。
-    // 任何跳过/失败都不改写本次打开结果、不掩盖原始错误。
-    let cookieCheckpoint;
-    try {
-      const runCheckpoint = opts.sessionCheckpoint || checkpointQianchuanSessionCookies;
-      cookieCheckpoint = await runCheckpoint({ context, cookieSession, target, shopCfg, audit: opts.audit });
-    } catch (e) {
-      cookieCheckpoint = { saved: false, skipped: true, reason: `会话检查点异常（不影响本次打开结果）: ${(e && e.message) || e}` };
-    }
+    const cookieCheckpoint = { saved: false, skipped: true, reason: '检查点延迟到关闭前：不在首次业务读取前创建并行验证会话' };
     // R87 关闭前收尾检查点登记：把同一检查点实现登记到以本次 owned browser 为键的 WeakMap，
     // 供 closeBrowser 在关闭前以**当前时刻事实**（同 context + 严格可信 URL + 新鲜语义身份）
     // 再保存一次。管理/发布/发现共用 closeBrowser 均走同一检查；未知/非受支持页面由检查点自身
@@ -669,6 +939,12 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     } catch (_) { /* 登记失败不改变打开结果 */ }
     return { browser, context, page, target, cookieSession, navMode: reached.mode, cookieCheckpoint };
   } catch (e) {
+    // 可信"未创建"（2026-10-23 验收边界 1 收紧）：证明只能由**包住 launcher 调用的范围**出具。
+    // 失败严格发生在进入 factory/launch 之前（Cookie 解析、指纹读取等）才可登记；一旦进入过
+    // launcher，即使局部 browser 仍为 null，也无法排除其内部已创建资源后再 reject，故**绝不**
+    // 出具证明——Monitor 据此保持 unknown 保守阻断，而不是被一句"没拿到句柄"放行。
+    // browser 已创建时同理走收口句柄（真实连接状态判定），不由本函数标记。
+    if (e && typeof e === 'object') attestFromLauncherScope(launchScope, e);
     // 任意初始化失败：关闭本次创建的浏览器，再抛出原始错误
     if (browser) await browser.close().catch(() => {});
     throw e;
@@ -775,7 +1051,6 @@ function collectQianchuanRowsInPage() {
  * 不点任何业务 CTA（投放乘方/开启货款直投）。
  */
 function closeKnownIntroOverlayAroundCostRead(target) {
-  // chengfang-reader 顶层依赖本模块，反向依赖必须延迟到运行时。
   const { dismissKnownChengfangOverlays } = require('./chengfang-reader');
   return dismissKnownChengfangOverlays({ page: target, maxRounds: 2 });
 }
@@ -796,10 +1071,13 @@ function createQianchuanCostReader(p) {
         // Cookie 文件绑定决定店铺归属；页面账户 ID 仅为可选观测，缺失/不同均不得拒绝费用数据。
         const acct = await readQianchuanAccountId(target);
         const accountId = acct && acct.accountId ? acct.accountId : null;
+
+        // POPUP-CLOSE-20261025：介绍浮窗收口（读取开始前 + 就绪等待每轮 + 截图前）。
+        // 无浮窗时只多两次只读探针、零点击、零无条件固定等待；关闭不成功不声称成功，
+        // 结果如实随返回值记录（introOverlay），不改变费用/周期/身份任何既有口径。
         const runOverlayClose = async () => {
           try { return await closeKnownIntroOverlayAroundCostRead(target); } catch (_) { return null; }
         };
-
         // 有界被动就绪等待（客户实测：卡片/周期延时导致 04:15、13:41 UTC 即刻漏读）：
         // 固定初等等待后仅在已打开页面上重读 DOM，等**同一轮**周期=当天且账户整体消耗卡可解析；
         // 上界到达即按 DataGuard 失败（零请求、不替换余额、不放宽任何守卫）。
@@ -812,50 +1090,16 @@ function createQianchuanCostReader(p) {
         });
         if (!ready.ok) throw new DataGuardError(ready.reason);
 
-        const period = await target.evaluate(() => {
-          const wrap = document.querySelector('[class*="report-shortcuts-datepicker"]');
-          if (!wrap) return null;
-          return [...wrap.querySelectorAll('input')].map((i) => i.value);
-        }).catch(() => null);
-        const scope = verifyStatPeriod(period, nowFn());
-        if (!scope.ok) throw new DataGuardError(scope.reason);
-
-        const cardText = await target.evaluate(() => {
-          const cards = document.querySelectorAll('[class*="summaryCard"]');
-          for (const c of cards) {
-            const tx = (c.textContent || '').replace(/\s+/g, ' ').trim();
-            if (tx.includes('账户整体消耗')) return tx;
-          }
-          return null;
-        }).catch(() => null);
-        if (!cardText) {
-          throw new DataGuardError('千川首页未找到"账户整体消耗(元)"卡片（不替换成余额/预算/其他消耗指标）');
-        }
-        const parsed = extractConsumeCentsFromCardText(cardText);
-        if (!parsed.ok) throw new DataGuardError(parsed.reason);
-
-        const updatedAtRaw = await target.evaluate(() => {
-          const el = document.querySelector('[class*="refreshTime"]');
-          return el ? (el.textContent || '').trim() : null;
-        }).catch(() => null);
-        const pageUpdatedAt = normalizeQcUpdatedAt(updatedAtRaw || '', nowFn());
+        // 截图前再次处理晚到浮窗；未消失时保留实际诊断，不声称已关闭。
         const finalOverlay = await runOverlayClose();
+
+        const { period, scope, cardText, parsed, updatedAtRaw, breakdown } = ready;
+        const pageUpdatedAt = normalizeQcUpdatedAt(updatedAtRaw || '', nowFn());
 
         try {
           if (!fs.existsSync(evidenceDir)) fs.mkdirSync(evidenceDir, { recursive: true });
           await target.screenshot({ path: path.join(evidenceDir, `qc-cost-${Date.now()}.png`), timeout: 8000 });
         } catch (_) { /* 不阻塞 */ }
-
-        // 分项消耗（覆盖表依据：账户整体=乘方+标准+全域+品牌）
-        const breakdown = await target.evaluate(() => {
-          const out = [];
-          for (const c of document.querySelectorAll('[class*="summaryCard"]')) {
-            const tx = (c.textContent || '').replace(/\s+/g, ' ').trim();
-            const m = /(乘方计划消耗|标准投放消耗|全域投放消耗|品牌投放消耗|账户整体消耗)\(元\)\s*([\d,]+(?:\.\d+)?)/.exec(tx);
-            if (m) out.push({ item: m[1], raw: m[2] });
-          }
-          return out;
-        }).catch(() => []);
 
         return {
           source: 'promo-page',
@@ -1327,6 +1571,7 @@ module.exports = {
   createQianchuanAdListReader,
   createQianchuanAdController,
   openQianchuanHome,
+  ensureQianchuanAccountView,
   closeBrowser,
   readQianchuanAccountId,
   extractConsumeCentsFromCardText,

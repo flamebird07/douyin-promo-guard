@@ -176,7 +176,9 @@ function backupGuardWorkFile(fsm, workPath, nowFn) {
 /** 归档层候选（bill-manager/cookie-vault.js；模块缺失/读取失败 → 诚实 unavailable）。
  *  读取窗口有界（默认 RESTORE_MAX_CANDIDATES）：vault 已按 createdAtMs/versionId 全量
  *  倒序再有界截断，故这里取到的是**真实最新**的一批，不是 manifest 追加顺序的头部。
- *  每个候选带 createdAtMs（归档入册时间），供上层按不同 SHA/时间桶排名。 */
+ *  每个候选带 createdAtMs（归档入册时间）与 origin（来源类别），供上层按
+ *  来源类别 + 不同 SHA/时间桶排名。读取窗口内**先非 legacy 后 legacy-unverified**，
+ *  类内保持 vault 的既有新→旧顺序：较新的 legacy 不得把已验证快照挤出有界窗口。 */
 function listArchiveCandidatesGuard(shopSafeName, opts, fsm, limit = RESTORE_MAX_CANDIDATES) {
   let vaultMod = opts.vaultModule || null;
   if (!vaultMod) {
@@ -200,10 +202,19 @@ function listArchiveCandidatesGuard(shopSafeName, opts, fsm, limit = RESTORE_MAX
   const items = [];
   const roots = vaultMod.defaultRoots({ guardRoot: GUARD_ROOT_DIR, ...(opts.vaultRoots || {}) });
   const maxRead = Math.max(1, Math.min(RESTORE_MAX_CANDIDATES, Number(limit) || 1));
-  for (const v of versions.versions.slice(0, maxRead)) {
+  // 来源优先（先划分再按既有硬上限截断）：非 legacy（含 unknown/verified-login）在前，
+  // legacy-unverified 作为回退在后；两类内部保持 vault 已给出的新→旧顺序。
+  const nonLegacyVersions = [];
+  const legacyVersions = [];
+  for (const v of versions.versions) {
+    if (v && v.origin === 'legacy-unverified') legacyVersions.push(v);
+    else nonLegacyVersions.push(v);
+  }
+  for (const v of nonLegacyVersions.concat(legacyVersions).slice(0, maxRead)) {
+    const origin = (v && v.origin) || 'unknown';
     const r = vaultMod.readSnapshotVersion({ versionPath: v.versionPath, expectedSha256: v.sha256 || undefined, fsModule: fsm });
-    if (r.ok) items.push({ source: `raw-archive:${v.versionId}`, buf: r.buf, sha256: r.sha256, path: v.versionPath, createdAtMs: Number(v.createdAtMs) || 0 });
-    else items.push({ source: `raw-archive:${v.versionId}`, error: r.reason });
+    if (r.ok) items.push({ source: `raw-archive:${v.versionId}`, buf: r.buf, sha256: r.sha256, path: v.versionPath, createdAtMs: Number(v.createdAtMs) || 0, origin });
+    else items.push({ source: `raw-archive:${v.versionId}`, error: r.reason, origin });
   }
   return { ok: true, items, manifestMissing: versions.manifestMissing === true, archiveRoot: roots.archiveRoot };
 }
@@ -395,11 +406,13 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
  * 恢复候选排名（硬上限内选「真实最新 + 更早的不同检查点」）：
  *  - 三个上层候选（值守工作副本 / 商品分析来源 / 恢复副本）各至多一条，恒定保留（它们是
  *    现存状态本身，不参与归档时间排名）；
- *  - 归档候选按 createdAtMs 全量倒序（缺失时回落 versionId 内嵌 UTC 时刻，绝不回落
- *    manifest 追加顺序——那是最旧的一批）；
+ *  - 归档候选先按来源类别（非 legacy 在前，legacy-unverified 回退在后；unknown/其他
+ *    来源按非 legacy 兼容），类内按 createdAtMs 全量倒序（缺失时回落 versionId 内嵌
+ *    UTC 时刻，绝不回落 manifest 追加顺序——那是最旧的一批）；
  *  - **同 sha 去重不占额度**：字节完全相同就是同一个检查点，重复验证只会白耗额度；
- *  - 归档层内**同一分钟桶只占一个额度**：同一分钟的多次入档是同一会话态的重复快照，
- *    保留其中较新的一条、跳过更早的且**不占额度**，把额度留给真正更早的不同检查点；
+ *  - 归档层内**同一来源类别 + 同一分钟桶只占一个额度**：同一分钟的多次入档是同一
+ *    会话态的重复快照，保留其中较新的一条、跳过更早的且**不占额度**；不同来源类别
+ *    各自成桶，故较新的 legacy 不会遮蔽同分钟的已验证快照；
  *  - 额度用尽后其余如实标 beyond-limit（本轮不验证；下次恢复窗口仍可入选）。
  * 排名审计只输出标识（层级 / sha 前缀 / 秒级时刻 / 判定），绝不输出 Cookie 值或完整 sha。
  *
@@ -408,7 +421,8 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
 function rankRestoreCandidatesGuard(cands, limit = RESTORE_MAX_CANDIDATES) {
   const upper = cands.filter((c) => !String(c.source || '').startsWith('raw-archive:'));
   const archives = cands.filter((c) => String(c.source || '').startsWith('raw-archive:'));
-  archives.sort((a, b) => (archiveEpochMs(b) - archiveEpochMs(a))
+  archives.sort((a, b) => (Number(isLegacyArchiveCandidate(a)) - Number(isLegacyArchiveCandidate(b)))
+    || (archiveEpochMs(b) - archiveEpochMs(a))
     || String(b.source).localeCompare(String(a.source)));
   const maxSlots = Math.max(1, Number(limit) || 1);
   const selected = [];
@@ -433,7 +447,10 @@ function rankRestoreCandidatesGuard(cands, limit = RESTORE_MAX_CANDIDATES) {
     if (seenSha.has(c.sha256)) entry.decision = 'skipped-dup-sha';
     else if (selected.length >= maxSlots) entry.decision = 'beyond-limit';
     else {
-      const bucket = at > 0 ? Math.floor(at / 60000) : null;
+      // 分钟桶带来源类别：仅同类同分钟去重；legacy 与已验证快照各自成桶。
+      const bucket = at > 0
+        ? `${isLegacyArchiveCandidate(c) ? 'legacy' : 'nonlegacy'}:${Math.floor(at / 60000)}`
+        : null;
       if (bucket !== null && seenMinute.has(bucket)) entry.decision = 'skipped-dup-minute';
       else {
         entry.decision = 'selected';
@@ -445,6 +462,15 @@ function rankRestoreCandidatesGuard(cands, limit = RESTORE_MAX_CANDIDATES) {
     ranking.push(entry);
   }
   return { selected, ranking, taken: selected.length, considered: cands.length };
+}
+
+/**
+ * 归档候选来源类别：仅精确 origin === 'legacy-unverified' 归为 legacy 回退；
+ * unknown/other（含 verified-login 与历史缺失 origin 的候选）按非 legacy 兼容。
+ * 来源类别只影响候选排序/分钟桶，不构成登录有效性证明——仍走统一原生验证器。
+ */
+function isLegacyArchiveCandidate(c) {
+  return String((c && c.origin) || 'unknown') === 'legacy-unverified';
 }
 
 /** 归档候选时刻：manifest createdAtMs 优先；缺失时解析 versionId 内嵌 UTC 时刻；都没有 → 0（排最后）。 */

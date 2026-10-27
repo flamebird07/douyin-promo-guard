@@ -1,0 +1,21 @@
+--- a/verify-isolated.cjs
++++ b/verify-isolated.cjs
+@@ -26,3 +26,3 @@
+   };
+-  const verifier=session.createDefaultCandidateVerifier(cfg.login,{browser,verifySettleTimeoutMs:180000,verifySettleIntervalMs:3000,verifyMaxWaitMs:60000});
++  const verifier=session.createDefaultCandidateVerifier(cfg.login,{candidateBrowserFactory:async()=>browser,verifySettleTimeoutMs:180000,verifySettleIntervalMs:3000,verifyMaxWaitMs:60000});
+   const r=await verifier({cookies,expectedShopNames:[shop.name],source:'immutable-role-latest-explicit-retest'});
+--- a/verify-candidates.cjs
++++ b/verify-candidates.cjs
+@@ -33,3 +33,3 @@
+   };
+-  const verify=session.createDefaultCandidateVerifier(cfg.login,{browser,verifySettleTimeoutMs:180000,verifySettleIntervalMs:3000,verifyMaxWaitMs:60000});
++  const verify=session.createDefaultCandidateVerifier(cfg.login,{candidateBrowserFactory:async()=>browser,verifySettleTimeoutMs:180000,verifySettleIntervalMs:3000,verifyMaxWaitMs:60000});
+   const r=await verify({cookies,expectedShopNames:[name],source:'minmin-readonly-inventory'});
+--- a/restore-verified-source.cjs
++++ b/restore-verified-source.cjs
+@@ -18,3 +18,3 @@
+  const browser=await req('playwright').chromium.launch({headless:true,executablePath:cfg.login.edgePath,args:['--window-size=1920,1080']});
+- let result;try{result=await session.createDefaultCandidateVerifier(cfg.login,{browser,verifySettleTimeoutMs:180000,verifyMaxWaitMs:60000})({cookies:JSON.parse(bytes.toString('utf8')),expectedShopNames:[name],source:'verified-historical-work-backup'});}finally{await browser.close();}
++ let result;try{result=await session.createDefaultCandidateVerifier(cfg.login,{candidateBrowserFactory:async()=>browser,verifySettleTimeoutMs:180000,verifyMaxWaitMs:60000})({cookies:JSON.parse(bytes.toString('utf8')),expectedShopNames:[name],source:'verified-historical-work-backup'});}finally{await browser.close();}
+  out.validation={ok:result.ok,classification:result.classification,reason:result.reason};

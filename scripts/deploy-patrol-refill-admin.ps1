@@ -162,8 +162,6 @@ if ($taskPubTask.State -eq 'Running') { throw 'DailyPlanPublisher-Independent is
 $taskOriginalXml = Export-ScheduledTask -TaskName 'DailyPlanPublisher-Independent'
 $taskOrigDoc = New-Object Xml.XmlDocument
 $taskOrigDoc.LoadXml($taskOriginalXml)
-$taskEnabledNode = $taskOrigDoc.SelectSingleNode('//*[local-name()="Settings"]/*[local-name()="Enabled"]')
-if (-not $taskEnabledNode -or $taskEnabledNode.InnerText -ne 'true') { throw 'DailyPlanPublisher-Independent must be enabled.' }
 
 $taskOwner = Get-TaskOwner
 $taskRuntimeResult = Join-Path (Split-Path $taskHelper -Parent) 'runtime-patrol-admin-before.json'

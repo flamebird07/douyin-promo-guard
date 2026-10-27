@@ -8,8 +8,8 @@
  * 判定实现：费用整数分 > 订单数 × thresholdCents（整数运算）。
  * - 恰好等于阈值不关闭（严格大于）；
  * - 禁止先算出"每单成本"四舍五入再比较（浮点精度陷阱）；
- * - 订单数必须是非负整数；为 0 或无效时不能用于关闭决策：
- *   费用>0 且订单为 0 → 阻止关闭并说明（用户说明 08:00 后订单不应为 0，需重读核实）；
+ * - 订单数必须是非负整数；0 单与正单走同一公式（客户 2026-10-27 修正：
+ *   0 单有消耗也正常，expectedCents=0，是否超标只看费用与 50 元保护线）；
  * - 费用与订单必须同一店铺、同一业务日期（由 guard 校验后传入）。
  *
  * 50 元保护（客户 2026-10-17）：
@@ -29,7 +29,8 @@ const SPEND_FLOOR_CENTS = 5000;
  * @param {number} p.costCents       整数分（>=0）
  * @param {number} p.orders          整数（>=0）
  * @param {number} p.thresholdCents  整数分/单（>0）
- * @returns {{over:boolean, costCents, orders, expectedCents:number, reason:string, blocked?:string}}
+ * @returns {{over:boolean, spendProtected:boolean, pauseEligible:boolean, roiTooLow:boolean,
+ *   costCents, orders, expectedCents:number, spendFloorCents:number, reason:string}}
  */
 function evaluateWholeShopCostPerOrder({ costCents, orders, thresholdCents }) {
   if (!Number.isSafeInteger(costCents) || costCents < 0) {
@@ -41,21 +42,8 @@ function evaluateWholeShopCostPerOrder({ costCents, orders, thresholdCents }) {
   if (!Number.isSafeInteger(thresholdCents) || thresholdCents <= 0) {
     throw new DataGuardError(`每单成本阈值不是有效正整数分: ${JSON.stringify(thresholdCents)}`);
   }
-  const expectedCents = orders * thresholdCents; // 整数运算：订单数×阈值分
+  const expectedCents = orders * thresholdCents; // 整数运算：订单数×阈值分（0 单 → 0）
   const spendProtected = costCents <= SPEND_FLOOR_CENTS;
-  if (orders === 0) {
-    return {
-      over: false,
-      spendProtected,
-      pauseEligible: false,
-      roiTooLow: false,
-      blocked: 'zero_orders',
-      costCents, orders, expectedCents, spendFloorCents: SPEND_FLOOR_CENTS,
-      reason: costCents > 0
-        ? '全店订单为 0 但推广费用大于 0：数据异常，按用户说明需重新读取核实，阻止本轮关闭'
-        : '全店订单为 0 且推广费用为 0：未超标，不关闭',
-    };
-  }
   const over = costCents > expectedCents;
   const pauseEligible = over && !spendProtected;
   const roiTooLow = pauseEligible;

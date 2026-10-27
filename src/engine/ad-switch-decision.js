@@ -22,7 +22,9 @@
  *   - below + mixed → should_enable（仅开启 off 项，由执行器目标筛选）
  *   - equal + mixed → equal_no_action
  * identityOk 必须严格 === true 才通过；缺失/null/字符串一律 data_blocked。
- * unknown / 数据异常 / 身份不匹配 / 零订单 / 乘法溢出 → fail-closed，零点击。
+ * unknown / 数据异常 / 身份不匹配 / 乘法溢出 → fail-closed，零点击；
+ * 零订单本身不是异常（客户 2026-10-27 修正）：与正单同一公式，0 单时
+ * expectedCents=0，任何正费用都 strictly above，是否可暂停只由 50 元保护线决定。
  *
  * 50 元保护（客户 2026-10-17）：
  * - spendProtected = costCents <= 5000（50.00 元）→ 任何方向都不得自动暂停；
@@ -156,7 +158,7 @@ function decideAdSwitchAction({
   }
   base.expectedCents = expectedCents;
 
-  // 4) 复用 rules 整数判定（零订单等）
+  // 4) 复用 rules 整数判定（零订单与正单同一公式，无零单专用阻断）
   let evalR;
   try {
     evalR = evaluateWholeShopCostPerOrder({ costCents, orders, thresholdCents });
@@ -170,14 +172,6 @@ function decideAdSwitchAction({
       };
     }
     throw e;
-  }
-  if (evalR.blocked === 'zero_orders') {
-    return {
-      ...base,
-      decision: DECISION.DATA_BLOCKED,
-      blocked: 'zero_orders',
-      reason: evalR.reason,
-    };
   }
 
   // 5) metric：低于/等于/高于（严格整数，等于不切换）

@@ -1,0 +1,42 @@
+{
+  "files": [
+    {
+      "path": "src/engine/rules.js",
+      "beforeSha256": "f019dc578741a3219d074166897dbb8774f2f5ff3c9c2a9d2518528947fdc051",
+      "afterSha256": "1f5eb741789e4ebe9e6c8ac6b587ed7b0e7057e9fc043f13d71131de144bb4ea"
+    },
+    {
+      "path": "src/engine/close-coordinator.js",
+      "beforeSha256": "1c85f3562e968e32129c85fc765b6c4213a1293d32ef8fdbfae998f29a751dee",
+      "afterSha256": "f33829cbad9e3e2a8d58a0d34789274a5799631bb0ab0927f040212b9bb94d17"
+    },
+    {
+      "path": "src/engine/ad-switch-decision.js",
+      "beforeSha256": "abe2fd5f9d3401cd9e5438a2b7f279e3297b3eb2e533c3a8c62bdb1642dff9c4",
+      "afterSha256": "fd7fe398716c9c95b8db42255c130197b119385a7d543e4ae68bb124d342fba6"
+    },
+    {
+      "path": "src/engine/monitor.js",
+      "beforeSha256": "4c041bd0e54c7c18c5f2a87d5033ba3ad2ee1c6f8337694c50709753b66cf877",
+      "afterSha256": "f1a2f5a1b74554f2f1247ca74495f570b7619cec130d6b88d25dc64968c1fa20"
+    }
+  ],
+  "tests": {
+    "normalCases": 12,
+    "targetedCases": 177,
+    "targetedPass": 173,
+    "baselineFailures": [
+      "mixed：above+mixed → should_pause（仅停 on 项）；below+mixed → should_enable（仅开 off 项）；equal+mixed 零动作",
+      "mixed 目标筛选语义：above+mixed 进 pause；below+mixed 进 enable；equal+mixed 零动作",
+      "演练模式：100元/100单恰好等于阈值 → 不触发",
+      "Monitor：50.00 元高费比 → spend_protected 投影，原始 over 保持 true，页面/日志不出现 ROI 提示"
+    ],
+    "remainingBaselineFailures": [
+      "mixed：above+mixed → should_pause（仅停 on 项）；below+mixed → should_enable（仅开 off 项）；equal+mixed 零动作",
+      "mixed 目标筛选语义：above+mixed 进 pause；below+mixed 进 enable；equal+mixed 零动作",
+      "演练模式：100元/100单恰好等于阈值 → 不触发",
+      "Monitor：50.00 元高费比 → spend_protected 投影，原始 over 保持 true，页面/日志不出现 ROI 提示"
+    ],
+    "newFailures": []
+  }
+}

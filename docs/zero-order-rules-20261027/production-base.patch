@@ -1,0 +1,183 @@
+diff --git a/src/engine/rules.js b/src/engine/rules.js
+index 090326c..0bd97da 100644
+--- a/src/engine/rules.js
++++ b/src/engine/rules.js
+@@ -8,8 +8,8 @@
+  * 判定实现：费用整数分 > 订单数 × thresholdCents（整数运算）。
+  * - 恰好等于阈值不关闭（严格大于）；
+  * - 禁止先算出"每单成本"四舍五入再比较（浮点精度陷阱）；
+- * - 订单数必须是非负整数；为 0 或无效时不能用于关闭决策：
+- *   费用>0 且订单为 0 → 阻止关闭并说明（用户说明 08:00 后订单不应为 0，需重读核实）；
++ * - 订单数必须是非负整数；0 单与正单走同一公式（客户 2026-10-27 修正：
++ *   0 单有消耗也正常，expectedCents=0，是否超标只看费用与 50 元保护线）；
+  * - 费用与订单必须同一店铺、同一业务日期（由 guard 校验后传入）。
+  *
+  * 50 元保护（客户 2026-10-17 新规则）：
+@@ -31,7 +31,7 @@ const SPEND_FLOOR_CENTS = 5000;
+  * @param {number} p.orders          整数（>=0）
+  * @param {number} p.thresholdCents  整数分/单（>0）
+  * @returns {{over:boolean, spendProtected:boolean, pauseEligible:boolean, roiTooLow:boolean,
+- *   costCents, orders, expectedCents:number, spendFloorCents:number, reason:string, blocked?:string}}
++ *   costCents, orders, expectedCents:number, spendFloorCents:number, reason:string}}
+  */
+ function evaluateWholeShopCostPerOrder({ costCents, orders, thresholdCents }) {
+   if (!Number.isSafeInteger(costCents) || costCents < 0) {
+@@ -43,21 +43,8 @@ function evaluateWholeShopCostPerOrder({ costCents, orders, thresholdCents }) {
+   if (!Number.isSafeInteger(thresholdCents) || thresholdCents <= 0) {
+     throw new DataGuardError(`每单成本阈值不是有效正整数分: ${JSON.stringify(thresholdCents)}`);
+   }
+-  const expectedCents = orders * thresholdCents; // 整数运算：订单数×阈值分
++  const expectedCents = orders * thresholdCents; // 整数运算：订单数×阈值分（0 单 → 0）
+   const spendProtected = costCents <= SPEND_FLOOR_CENTS;
+-  if (orders === 0) {
+-    return {
+-      over: false,
+-      spendProtected,
+-      pauseEligible: false,
+-      roiTooLow: false,
+-      blocked: 'zero_orders',
+-      costCents, orders, expectedCents, spendFloorCents: SPEND_FLOOR_CENTS,
+-      reason: costCents > 0
+-        ? '全店订单为 0 但推广费用大于 0：数据异常，按用户说明需重新读取核实，阻止本轮关闭'
+-        : '全店订单为 0 且推广费用为 0：未超标，不关闭',
+-    };
+-  }
+   const over = costCents > expectedCents;
+   const pauseEligible = over && !spendProtected;
+   const roiTooLow = pauseEligible;
+diff --git a/src/engine/close-coordinator.js b/src/engine/close-coordinator.js
+index ae6b7dd..c5b5323 100644
+--- a/src/engine/close-coordinator.js
++++ b/src/engine/close-coordinator.js
+@@ -23,8 +23,6 @@ const { closeOneAd } = require('./close-flow');
+ const { DataGuardError } = require('../lib/errors');
+ const { shanghaiDate, isAfterDailyStart } = require('../lib/time');
+ 
+-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+-
+ class WholeShopCloseCoordinator {
+   /**
+    * @param {object} p
+@@ -61,8 +59,8 @@ class WholeShopCloseCoordinator {
+   }
+ 
+   /**
+-   * 读取费用+订单（含零订单重读核实），通过后做规则判断。
+-   * @returns {{ok:true, cost, orders, evaluation}} 或 {ok:false, blocked, reason}
++   * 读取费用+订单（零订单与正单同一公式，不做零单专用重读），通过后做规则判断。
++   * @returns {{ok:true, cost, orders, evaluation, rechecked:number}} 或 {ok:false, blocked, reason}
+    */
+   async readAndEvaluate(shopCfg, { readOnlyRefresh = false } = {}) {
+     const cost = await this._readVerifiedSummary('cost', shopCfg);
+@@ -79,25 +77,9 @@ class WholeShopCloseCoordinator {
+     }
+     guard.checkSameShopAndDate(cost, orders);
+ 
+-    // 零订单/无效订单：重新读取核实（用户说明 08:00 后订单不应为 0）
+-    let rechecked = 0;
+-    while (orders.valueCount === 0 && rechecked < (this.config.execution.zeroOrderRecheck ?? 1)) {
+-      rechecked += 1;
+-      this.audit({ kind: 'zero-order-recheck', shopId: shopCfg.id, attempt: rechecked });
+-      await sleep(0);
+-      orders = await this._readVerifiedSummary('orders', shopCfg);
+-      guard.checkSameShopAndDate(cost, orders);
+-    }
+-    if (orders.valueCount === 0) {
+-      const blocked = cost.valueCents > 0
+-        ? '全店订单为 0 但推广费用大于 0：已重新读取核实仍为 0，数据异常，阻止本轮关闭'
+-        : '全店订单为 0（费用也为 0）：无需关闭';
+-      return {
+-        ok: false, blocked: 'zero_orders',
+-        reason: blocked,
+-        cost, orders, rechecked,
+-      };
+-    }
++    // 客户 2026-10-27 修正：0 单有消耗也正常，零订单与正单同一公式判定；
++    // 不再对零单做专用重读/阻断（rechecked 恒为 0，仅为旧调用方字段兼容保留）。
++    const rechecked = 0;
+ 
+     const rule = (this.config.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
+     // 多店铺：店铺级 thresholdCents 覆盖全局规则；判定语义（严格大于）不变
+diff --git a/src/engine/ad-switch-decision.js b/src/engine/ad-switch-decision.js
+index a3d5727..c2a540c 100644
+--- a/src/engine/ad-switch-decision.js
++++ b/src/engine/ad-switch-decision.js
+@@ -24,7 +24,9 @@
+  *     费比恰等于阈值时，统一收敛到 off，仅点 on 项；不沿用历史目标，也不因"无目标"零动作）
+  *   已确认统一的 on/off 在等于阈值时仍保持现状（equal_no_action，零动作）。
+  * identityOk 必须严格 === true 才通过；缺失/null/字符串一律 data_blocked。
+- * unknown / 数据异常 / 身份不匹配 / 零订单 / 乘法溢出 → fail-closed，零点击。
++ * unknown / 数据异常 / 身份不匹配 / 乘法溢出 → fail-closed，零点击；
++ * 零订单本身不是异常（客户 2026-10-27 修正）：与正单同一公式，0 单时
++ * expectedCents=0，任何正费用都 strictly above，是否可暂停只由 50 元保护线决定。
+  *
+  * 50 元保护（客户 2026-10-17）：
+  * - spendProtected = costCents <= 5000（50.00 元）→ 任何方向都不得自动暂停；
+@@ -160,7 +162,7 @@ function decideAdSwitchAction({
+   }
+   base.expectedCents = expectedCents;
+ 
+-  // 4) 复用 rules 整数判定（零订单等）
++  // 4) 复用 rules 整数判定（零订单与正单同一公式，无零单专用阻断）
+   let evalR;
+   try {
+     evalR = evaluateWholeShopCostPerOrder({ costCents, orders, thresholdCents });
+@@ -175,14 +177,6 @@ function decideAdSwitchAction({
+     }
+     throw e;
+   }
+-  if (evalR.blocked === 'zero_orders') {
+-    return {
+-      ...base,
+-      decision: DECISION.DATA_BLOCKED,
+-      blocked: 'zero_orders',
+-      reason: evalR.reason,
+-    };
+-  }
+ 
+   // 5) metric：低于/等于/高于（严格整数，等于不切换）
+   let metric;
+diff --git a/src/engine/monitor.js b/src/engine/monitor.js
+index 61862eb..c4e9f1a 100644
+--- a/src/engine/monitor.js
++++ b/src/engine/monitor.js
+@@ -4158,7 +4158,7 @@ class Monitor {
+       rt.cookieCheckedAt = new Date(this.nowFn()).toISOString();
+       rt.cookieMeta = { count: cookieMeta.count, readOnly: cookieMeta.readOnly, maxExpires: cookieMeta.maxExpires };
+ 
+-      // 2) 读取+核验费用/订单并评估规则（含零订单重读核实）
++      // 2) 读取+核验费用/订单并评估规则（零订单与正单同一公式，2026-10-27 修正）
+       const coord = this._getCoordinator(shopCfg);
+       let data;
+       try {
+@@ -4187,30 +4187,6 @@ class Monitor {
+         rt.lastData.blockedReason = data.reason;
+         this._emitJudgement(shopCfg, { data, over: null, status: 'blocked', reason: data.reason });
+         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: data.reason, blocked: data.blocked });
+-        // zero_orders 只读状态观测（2026-10-26 S3）：0费0单是"无需关闭"的合法结果，
+-        // 但不得因此跳过状态回读——否则旧 on/off 观测超过前端有效期后持续"未知"。
+-        // 仅做一次只读观测；成功/失败都如实落状态，绝不进入 evaluatePeriodic/开关动作。
+-        if (data.blocked === 'zero_orders') {
+-          let stateRead;
+-          try {
+-            stateRead = await this._readCurrentAdState(shopCfg);
+-          } catch (e) {
+-            stateRead = { state: 'unknown', error: { status: 'blocked', reason: e.reason || e.message, blocked: 'ad_state_read' } };
+-          }
+-          this._applyBalanceToLastData(rt, stateRead);
+-          if (stateRead.error) {
+-            this._applyReadFailure(shopCfg.id, stateRead.error);
+-          } else {
+-            this._clearReadFailure(shopCfg.id);
+-            this._applyObservedAdState(shopCfg.id, stateRead.state, 'zero_orders 只读状态回读');
+-            rt.lastDataAt = new Date(this.nowFn()).toISOString();
+-          }
+-          this._audit({
+-            kind: 'ad-state-read', shopId: shopCfg.id, event: 'zero-orders-observe',
+-            state: stateRead.state || 'unknown', ok: !stateRead.error,
+-            reason: stateRead.error ? log.sanitize(String(stateRead.error.reason || stateRead.error.message || '广告状态读取失败').slice(0, 200)) : null,
+-          });
+-        }
+         return { status: 'blocked', reason: data.reason, blocked: data.blocked };
+       }
+ 

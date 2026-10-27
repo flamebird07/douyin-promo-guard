@@ -29,6 +29,9 @@ function writeTempCookie(dir, name, opts = {}) {
 
 /** 构造 loadConfig() 形状的结果（绕过真实配置文件）。 */
 function makeCfgResult(overrides = {}) {
+  // AD-WATCHDOG-TEST-ISOLATION-20261020：测试配置必须同时给出隔离工作根，
+  // 不允许 session.resolveWorkDir / 店铺发现静默回落到生产 cookies/。
+  const cookieWorkDir = overrides.cookieWorkDir || makeTempDir('promo-guard-cookie-work-');
   const config = {
     shops: overrides.shops || [{ id: 'shop-001', name: '测试店铺一', cookieFile: '测试店铺一', accountId: null, enabled: true }],
     promoPage: { url: 'https://example-promo-page.test' },
@@ -47,6 +50,7 @@ function makeCfgResult(overrides = {}) {
     }, overrides.monitor),
     login: Object.assign({
       cookieSourceDir: overrides.cookieDir,
+      cookieWorkDir,
       edgePath: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
       douyinHomeUrl: 'https://fxg.jinritemai.com/ffa/mshop/homepage/index',
     }),

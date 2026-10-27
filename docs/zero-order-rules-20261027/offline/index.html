@@ -1,0 +1,190 @@
+<script>
+// R41-VM-TEST:SHOP_ROW_HTML_START
+          // 2026-10-18 F1 显示口径修复：
+          //  - 每店一个明确短状态（开启/暂停/混合·待确认/读取受阻/登录验证未通过/未知）；
+          //    unknown 绝不改成 on/off；「登录验证未通过」只认后端既有正证据；
+          //  - 费用/订单/费比/余额/阈值/目标ROI/每日数量为紧凑可换行网格（宽屏多列、窄屏自然换行），
+          //    状态/动作区与错误 details 保持分开；
+          //  - 异常原因只保留一处 <details> 可展开完整详情（转义），不再行内+行下重复两遍；
+          //  - 显示实际 lastDataAt 与广告观测/确认时间；旧数据显式标注，不冒充刚刷新；
+          //  - 今日计划摘要按同业务日 planPublishing.today/lastResults 如实显示（无同日证据=待核实）；
+          //  - 修改框/按钮接口（data-wd-act）与 .wd-live-status 热替换锚点保持不变。
+          var plat = r.platformLabel || (r.platform === 'pinduoduo' ? '拼多多' : '抖店');
+          var ad = r.adState || {};
+          var adState = String(ad.state || '');
+          var failView = r.readFailure || null;
+          // 登录验证未通过的正证据（后端判定）：requiresLogin / readFailure.requiresLogin / readErrorKind='auth'
+          var needLogin = r.requiresLogin === true || (failView && failView.requiresLogin === true) || r.readErrorKind === 'auth';
+          // AD-MINMIN-LOGIN-HANDOFF-20261021-F1：本店「登录成功后立即接管」在途（processing）时，
+          // 旧 readFailure 只是上一次检查的历史事实，不能冒充本次刚登录后的终态。
+          // 这里仅覆盖页面显示为「正在核验登录会话」；快照中的持久错误事实原样保留，
+          // 终态（done/failed）后再按正常口径显示新结果。
+          // 注入行内（避免 shopRowHtml 依赖外层快照变量，保持可被 VM 独立抽取测试）。
+          var joinProg = r.loginJoin || r._liveLoginJoin || null;
+          var joinProcessing = !!(joinProg && joinProg.status === 'processing');
+          // 2026-10-18 F1 续：显示优先级（真实生产反例：off+23:40 登录验证失败仍显示「暂停」；
+          // 另一店 on 旧观测 10:47、数据时间 23:39 仍显示「当前开启」）。优先级：
+          //  1) 结构化登录正证据（requiresLogin/readFailure.requiresLogin/readErrorKind='auth'）
+          //     → 登录验证未通过，无论 ad.on/off；错误字符串提及"登录"不臆断为登录失效；
+          //  2) on/off 但存在当前 readFailure/readErrorKind/readErrorReason/lastError → 读取受阻；
+          //  3) 无错误但广告证据时间缺失/非法/超过 35 分钟 → 待核实（上次开启/暂停），不显示绿色当前成功；
+          //     证据时间只认 ad.confirmedAt/observedAt/at（费用 lastDataAt 是数据时间，不混用）；
+          //  4) 新鲜且无错误的 on/off 保留原显示；mixed/unknown 原逻辑不变。
+          var hasReadErr = !!(failView || r.readErrorKind || r.readErrorReason || r.lastError);
+          var onOff = (adState === 'on' || ad.on === true) ? 'on' : ((adState === 'off' || ad.on === false) ? 'off' : null);
+          var shortText, shortColor;
+          if (adState === 'mixed') {
+            // mixed 非完成态：显式待收敛/重试中，绝不显示为一次成功
+            shortText = '混合 · 待确认' + (ad.reconcileText ? '（' + ad.reconcileText + '）' : '') + (ad.unknownBlock ? '（旧动作仍未确认）' : '');
+            shortColor = '#d97706';
+          } else if (joinProcessing) { shortText = '正在核验登录会话'; shortColor = '#2563eb'; }
+          else if (needLogin) { shortText = '登录验证未通过'; shortColor = '#b91c1c'; }
+          else if (onOff && hasReadErr) { shortText = '读取受阻'; shortColor = '#b91c1c'; }
+          else if (onOff) {
+            var evIso = ad.confirmedAt || ad.observedAt || ad.at || null;
+            var evMs = evIso ? Date.parse(evIso) : NaN;
+            if (isFinite(evMs) && (Date.now() - evMs) <= 35 * 60 * 1000) {
+              shortText = onOff === 'on' ? '开启' : '暂停';
+              shortColor = onOff === 'on' ? '#16a34a' : '#b45309';
+            } else {
+              shortText = '待核实（上次' + (onOff === 'on' ? '开启' : '暂停') + '）';
+              shortColor = '#94a3b8';
+            }
+          } else if (adState === 'unknown') {
+            var recProg = r.readRecovery;
+            if (recProg && recProg.text) shortText = '未知（' + recProg.text + '）';
+            else if (r.readRetrying === true || ad.readRetrying === true) shortText = '未知（正在重试读取）';
+            else if (hasReadErr) shortText = '读取受阻';
+            else shortText = '未知';
+            shortColor = shortText === '读取受阻' ? '#b91c1c' : '#999';
+          } else { shortText = ad.note || adState || '未知'; shortColor = '#999'; }
+          var thr = r.thresholdCents != null ? (r.thresholdCents / 100).toFixed(2) + ' 元/单' : '—';
+          // 目标 ROI（客户 2026-10-11）：展示当前保存值；缺字段统一按默认 15 展示。
+          var roiText = (r.targetRoi != null ? r.targetRoi : 15);
+          // 每日计划数量（客户 2026-10-13）：展示本店已保存值（合法整数 1..10），缺省回落 3。
+          var qtyText = (Number.isInteger(r.plansPerShopPerDay) && r.plansPerShopPerDay >= 1 && r.plansPerShopPerDay <= 10) ? r.plansPerShopPerDay : 3;
+          var cost = r.costCents != null ? (r.costCents / 100).toFixed(2) + ' 元' : '—';
+          var orders = r.orders != null ? r.orders + ' 单' : '—';
+          var feeRatio = Number.isSafeInteger(r.costCents) && r.costCents >= 0 && Number.isSafeInteger(r.orders) && r.orders > 0
+            ? (r.costCents / r.orders / 100).toFixed(2) + ' 元/单' : '—';
+          var balance = r.balanceCents != null ? (r.balanceCents / 100).toFixed(2) + ' 元' : '未知';
+          // balanceAt 为 UTC ISO；上海时间固定 UTC+8（无夏令时），行内可见显示本机读取时间
+          // 页面头部自报的"更新"时间是平台口径，不当成本机读取时间使用
+          var balanceTime = '';
+          if (r.balanceCents != null && r.balanceAt) {
+            var balD = new Date(r.balanceAt);
+            if (!isNaN(balD.getTime())) {
+              var balSh = new Date(balD.getTime() + 8 * 3600 * 1000);
+              var balP = function (x) { return ('0' + x).slice(-2); };
+              balanceTime = balP(balSh.getUTCMonth() + 1) + '-' + balP(balSh.getUTCDate()) + ' ' + balP(balSh.getUTCHours()) + ':' + balP(balSh.getUTCMinutes());
+            }
+          }
+          var balanceTitle = '账户级数据，仅展示、不参与自动开关判定';
+          // 实际数据时间：lastDataAt + 陈旧标注（跨业务日 / 超过 30 分钟未刷新），不冒充刚刷新。
+          var staleNote = '';
+          if (r.today && r.today.businessDate && s.businessDate && r.today.businessDate !== s.businessDate) {
+            staleNote = '（非今日数据，陈旧）';
+          } else if (r.lastDataAt) {
+            var ageMs = Date.now() - Date.parse(r.lastDataAt);
+            if (isFinite(ageMs) && ageMs > 35 * 60 * 1000) staleNote = '（超过 30 分钟未刷新，陈旧数据）';
+          }
+          var dataTimeText = r.lastDataAt ? fmtTime(r.lastDataAt) + ' ' + staleNote : '尚无成功读取';
+          // 广告观测时间：只配同源证据（动作确认 / 只读观测），无证据如实标注。
+          var adTimeText;
+          if (ad.evidenceKind === 'action_confirm' && (ad.confirmedAt || ad.at)) adTimeText = '动作确认 ' + fmtTime(ad.confirmedAt || ad.at);
+          else if (ad.evidenceKind === 'read_only' && (ad.observedAt || ad.at)) adTimeText = '只读观测 ' + fmtTime(ad.observedAt || ad.at);
+          else if (ad.at) adTimeText = '观测 ' + fmtTime(ad.at);
+          else adTimeText = '无状态证据时间';
+          // 今日计划摘要（同业务日才展示；无同日证据=待核实，禁止自造成功）。
+          // 摘要只用中文短口径（如 3/3 · 已完成、0/3 · 未完成），不暴露原始状态码；
+          // 完整历史发布原因与时间转义后折叠进 details，明确标为发布记录（当时原因），不推断当前登录失败。
+          var pp = s.planPublishing || null;
+          var pubRec = null;
+          if (pp && pp.today && pp.today.date && s.businessDate && pp.today.date === s.businessDate && pp.today.shops) {
+            pubRec = pp.today.shops[r.id] || null;
+          } else if (pp && pp.lastRunDate && s.businessDate && pp.lastRunDate === s.businessDate && pp.lastResults) {
+            pubRec = pp.lastResults[r.id] || null;
+          }
+          var pubSummary, pubColor, pubDetails = '';
+          if (pubRec) {
+            var denom = qtyText;
+            if (pubRec.status === 'success') {
+              pubSummary = '今日计划：' + (pubRec.plans || 0) + '/' + denom + ' · 已完成';
+              pubColor = '#16a34a';
+            } else {
+              pubSummary = '今日计划：' + (pubRec.plans || 0) + '/' + denom + ' · 未完成';
+              pubColor = '#b45309';
+            }
+            var pubHist = '发布记录（发布环节历史，当时原因，不代表当前登录状态）：'
+              + (pubRec.error ? String(pubRec.error) : '无详细原因')
+              + (pp && pp.lastDispatchAt ? ' ｜ 发布时间 ' + fmtTime(pp.lastDispatchAt) : '');
+            pubDetails = '<details class="wd-pub-details" style="width:100%;margin-top:2px;"><summary style="font-size:11px;color:#94a3b8;cursor:pointer;">发布记录详情（历史原因与时间）</summary>'
+              + '<div style="font-size:11px;color:#94a3b8;white-space:pre-wrap;word-break:break-all;margin-top:4px;">' + esc(pubHist) + '</div></details>';
+          } else { pubSummary = '今日计划：待核实（无同日证据，不推断成败）'; pubColor = '#94a3b8'; }
+          // 异常原因唯一出处：完整详情只放这里（转义 + 可展开），行内不再重复红色长文本。
+          // 接管在途时暂不展示旧错误详情（不清除快照事实）；终态后恢复按正常口径展示。
+          // 优先级：接管失败详情 > 读取错误原因 > 最近错误 > 今日 blockedReason；
+          // 正常 0 单（订单0有/无消耗）后端不再产生 blockedReason，此处无需任何零单特例。
+          var errDetail = joinProcessing ? null
+            : ((failView && failView.detail) || r.readErrorReason || r.lastError
+              || (r.today && r.today.blockedReason)
+              || null);
+          var errHtml = errDetail
+            ? '<details class="wd-row-error" style="width:100%;margin-top:2px;"><summary style="font-size:12px;color:#dc2626;cursor:pointer;">异常原因（' + esc(shortText) + '）· 点击展开完整详情</summary>'
+              + '<div style="font-size:11px;color:#dc2626;white-space:pre-wrap;word-break:break-all;margin-top:4px;">' + esc(String(errDetail)) + '</div></details>'
+            : '';
+          var safeId = esc(r.id);
+          var ops = '<button class="btn" style="font-size:12px;padding:2px 8px;" data-wd-act="refresh" data-wd-id="' + safeId + '">立即更新</button>'
+            + (r.adControl !== false
+              ? ' <button class="btn" style="font-size:12px;padding:2px 8px;" data-wd-act="edit" data-wd-id="' + safeId + '">修改</button>'
+                + ' <button class="btn" style="font-size:12px;padding:2px 8px;background:#fee2e2;color:#b91c1c;" data-wd-act="delete" data-wd-id="' + safeId + '" data-wd-name="' + esc(r.displayName || r.name) + '"' + (deleteBlocked(r.id) ? ' disabled' : '') + '>删除</button>'
+              : ' <span style="font-size:11px;color:#888;">（商品分析专用，无广告控制）</span>');
+          var editBox = '<div class="wd-edit-box" id="wd-edit-' + safeId + '" style="display:none;margin-top:6px;padding:6px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">'
+            + '阈值(元/单) <input class="wd-ethr" type="number" step="0.01" min="0.01" value="' + (r.thresholdCents != null ? (r.thresholdCents / 100) : '') + '" style="width:70px;"> '
+            + '目标ROI <input class="wd-roi" type="number" step="0.1" min="0.01" value="' + esc(String(roiText)) + '" style="width:70px;"> '
+            + '每日计划数量 <input class="wd-eqty" type="number" step="1" min="1" max="10" value="' + esc(String(qtyText)) + '" style="width:60px;"> 条 '
+            + '<button class="btn btn-primary" style="font-size:12px;padding:2px 8px;" data-wd-act="save" data-wd-id="' + safeId + '">保存</button>'
+            + '<button class="btn" style="font-size:12px;padding:2px 8px;" data-wd-act="cancel-edit" data-wd-id="' + safeId + '">取消</button>'
+            + '</div>';
+          return '<div class="wd-shop-row" data-wd-shop="' + safeId + '" style="flex-wrap:wrap;">'
+            // 实时状态外层（display:contents 保持原 flex 布局）：编辑中可被单独热替换，编辑框节点始终锚定在外层之外。
+            + '<div class="wd-live-status" style="display:contents;">'
+            // 第一行：店铺名 + 平台 + 明确短状态 + 徽标 + 操作按钮（不再把红色长错误挤进本行）
+            + '<div style="width:100%;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">'
+            + '<b style="min-width:120px;">' + esc(r.displayName || r.name) + '</b>'
+            + '<span style="font-size:12px;color:#666;">' + esc(plat) + '</span>'
+            + '<span class="wd-shop-state" style="color:' + shortColor + ';font-weight:600;">' + esc(shortText) + '</span>'
+            + (r.identityPending ? '<span style="font-size:11px;color:#b45309;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:1px 8px;font-weight:600;" title="' + esc(r.identityNote || '待身份核验') + '">待身份核验</span>' : '')
+            + '<span style="margin-left:auto;">' + ops + '</span>'
+            + '</div>'
+            // 指标区：紧凑可换行网格（宽屏多列、窄屏自然换行；50 元保护提示只展示后端同店同日受控投影，不在此重算）
+            + '<div class="wd-metrics" style="width:100%;display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,max-content));gap:2px 16px;justify-content:start;font-size:12px;color:#555;line-height:1.6;margin-top:2px;">'
+            + '<div>费用 ' + esc(cost) + '</div>'
+            + '<div>订单 ' + esc(orders) + '</div>'
+            + '<div title="广告费 ÷ 订单数">费比 ' + esc(feeRatio) + '</div>'
+            + '<div title="' + esc(balanceTitle) + '">千川可用余额 ' + esc(balance)
+            + (balanceTime ? '<span style="color:#94a3b8;">（' + esc(balanceTime) + ' 读取）</span>' : '') + '</div>'
+            + '<div>阈值 ' + esc(thr) + '</div>'
+            + '<div>目标ROI ' + esc(String(roiText))
+            + (r.adControl !== false && r.roiTooLow === true
+              ? ' <span class="wd-roi-low" style="font-size:12px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:1px 8px;font-weight:600;" title="消耗已超过50元且费比超标；仅提示，不自动修改ROI">ROI设置过低<span style="font-weight:400;color:#b45309;margin-left:4px;">消耗已超过50元且费比超标</span></span>'
+              : '') + '</div>'
+            + '<div title="每天自动发布的本店铺计划数量，可按店调整 1~10">每日计划数量 ' + esc(String(qtyText)) + ' 条</div>'
+            + '</div>'
+            // 时间行（简化口径）：数据更新（实际 lastDataAt）+ 状态核对（广告观测/确认时间）；
+            // 平台"数据概览"原始口径全文移入 title，不占用行内空间，时间事实不变。
+            + '<div style="width:100%;font-size:11px;color:#94a3b8;margin-top:2px;"'
+            + (r.today && r.today.pageUpdatedAt ? ' title="页面口径（千川数据概览原始口径）：' + esc(r.today.pageUpdatedAt) + '"' : '')
+            + '>数据更新 ' + esc(dataTimeText) + ' ｜ 状态核对 ' + esc(adTimeText) + '</div>'
+            // 今日计划摘要（短中文；历史完成不等于当前开关/投放状态）
+            + '<div style="width:100%;font-size:12px;color:' + pubColor + ';margin-top:2px;">' + esc(pubSummary) + '</div>'
+            + pubDetails
+            // 异常原因唯一出处（可展开完整详情；不隐藏、不重复）
+            + errHtml
+            + (r.identityPending && r.identityNote ? '<div style="width:100%;font-size:11px;color:#b45309;">' + esc(String(r.identityNote).slice(0, 80)) + '</div>' : '')
+            + '</div>'
+            + editBox
+            + '</div>';
+          
+// R41-VM-TEST:SHOP_ROW_HTML_END
+</script>

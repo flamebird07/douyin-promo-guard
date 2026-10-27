@@ -76,9 +76,20 @@ test('unknown → unknown_blocked', () => {
   assert.strictEqual(r.zeroClick, true);
 });
 
-test('零订单 / 非法指标 → data_blocked', () => {
-  assert.strictEqual(dec({ orders: 0, costCents: 5000 }).decision, DECISION.DATA_BLOCKED);
+test('零订单与正单同一公式（不再 data_blocked）；非法指标仍 data_blocked', () => {
+  const protectedZero = dec({ orders: 0, costCents: 5000 });
+  assert.strictEqual(protectedZero.decision, DECISION.SPEND_PROTECTED, '0 单 + 50.00 元：50 元保护，零暂停');
+  assert.strictEqual(protectedZero.blocked, null);
+  assert.strictEqual(protectedZero.expectedCents, 0);
+  assert.strictEqual(protectedZero.pauseEligible, false);
+
+  const pausableZero = dec({ orders: 0, costCents: 5001, currentAdState: 'on' });
+  assert.strictEqual(pausableZero.decision, DECISION.SHOULD_PAUSE, '0 单 + 50.01 元 + on：暂停资格成立');
+  assert.strictEqual(pausableZero.pauseEligible, true);
+
   assert.strictEqual(dec({ costCents: 12.5 }).decision, DECISION.DATA_BLOCKED);
+  assert.strictEqual(dec({ orders: -1 }).decision, DECISION.DATA_BLOCKED);
+  assert.strictEqual(dec({ orders: null }).decision, DECISION.DATA_BLOCKED);
   assert.strictEqual(dec({ dataError: 'parse' }).decision, DECISION.DATA_BLOCKED);
 });
 

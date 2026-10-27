@@ -67,12 +67,13 @@ test('规则：50.00 元保护线与 50.01 元暂停资格的整数边界', () =
   assert.strictEqual(below.roiTooLow, false);
 });
 
-test('规则：订单为 0 且费用>0 → blocked，保护字段不得产生提示', () => {
+test('规则：订单为 0 与正单同一公式（2026-10-27 修正），5001 分零单过线即暂停资格', () => {
   const r = evaluateWholeShopCostPerOrder({ costCents: 5001, orders: 0, thresholdCents: 100 });
-  assert.strictEqual(r.blocked, 'zero_orders');
-  assert.strictEqual(r.over, false);
-  assert.strictEqual(r.pauseEligible, false);
-  assert.strictEqual(r.roiTooLow, false);
+  assert.strictEqual(r.blocked, undefined, '零订单不再是 blocked');
+  assert.strictEqual(r.over, true, '5001 分 > 0×100=0 分');
+  assert.strictEqual(r.spendProtected, false);
+  assert.strictEqual(r.pauseEligible, true);
+  assert.strictEqual(r.roiTooLow, true);
 });
 
 // ── 决策层：保护区零动作，但公共库既有方向语义不变 ────────────────

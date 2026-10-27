@@ -1,16 +1,18 @@
 'use strict';
 
 /**
- * S3 / JIANSHANG-ROI14-20261026：zero_orders 阻断轮询不得跳过只读广告状态观测。
- * 根因：_pollShop 的 data.ok===false 分支直接 return，绕过 _readCurrentAdState/
- * _applyObservedAdState → 旧 on/off 观测超 35 分钟有效期后前端持续"未知"。
- * 验证（全部隔离：临时目录 + 合成假 Cookie + 注入 readAdState/FakeCoordinator，
- * 不启动浏览器/调度器，不读生产路径）：
- * 1. zero_orders 轮询做一次真实只读观测，观测时间用本轮真实时钟推进；
- * 2. 读到 off 如实记 off，绝不触发开启/暂停（evaluatePeriodic/runSwitchAction 计数 0）；
- * 3. 读失败/抛错 → unknown + 完整失败原因（不得吞成成功、不得用旧 on 保绿）；
- * 4. 其他 blocked 类型不新增状态读；
- * 5. ROI/阈值/Cookie/全局开关配置不变；state/audit 落临时目录。
+ * 0 单正常流：_pollShop 与只读状态观测（客户 2026-10-27 修正）。
+ *
+ * 旧版测试把 0 单当成 zero_orders 阻断，验证「阻断轮询也不得跳过只读观测」。
+ * 修正后 0 单与正单走同一公式，本文件改为验证正常零单数据流：
+ * 1. <=50 元（含 0 单）：spend_protected 零动作，仍做一次真实只读状态观测；
+ * 2. on/off/mixed 如实落账，绝不因 0 单触发开启/暂停；
+ * 3. >50 元且严格超标：决策 should_pause；动作派发被测试编排器拦截（mocked controller only，零真实动作）；
+ * 4. 真实读取失败仍 blocked + 完整原因；unknown 仍 unknown_blocked；
+ * 5. 其他数据阻断（身份等）不新增状态读；配置/落盘路径不变。
+ *
+ * 全部隔离：临时目录 + 合成假 Cookie + 注入 readAdState/Coordinator/Orchestrator；
+ * 不启动浏览器/调度器，不访问网络，不读生产路径。
  */
 
 const { test } = require('node:test');
@@ -19,28 +21,31 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { Monitor } = require('../src/engine/monitor');
+const { evaluateWholeShopCostPerOrder } = require('../src/engine/rules');
+const { decideAdSwitchAction, DECISION } = require('../src/engine/ad-switch-decision');
 const { makeTempDir, writeTempCookie, makeCfgResult, makeClock } = require('./helpers');
 const { shanghaiMs } = require('../src/lib/time');
 
 const SHOP = { id: 'shop-jianshang', name: '简尚', cookieFile: '简尚', enabled: true };
 
-function zeroOrdersData(nowMs) {
+function normalZeroData(nowMs, { costCents = 1200, businessDate = '2026-10-26' } = {}) {
   const fetchedAt = new Date(nowMs).toISOString();
+  const evaluation = evaluateWholeShopCostPerOrder({ costCents, orders: 0, thresholdCents: 100 });
   return {
-    ok: false,
-    blocked: 'zero_orders',
-    reason: '当日 0 单（0 费 0 单）：无需关闭',
-    cost: { source: 'mock', businessDate: '2026-10-26', fetchedAt, rawText: null, valueCents: 0, pageUpdatedAt: null },
-    orders: { source: 'mock', businessDate: '2026-10-26', fetchedAt, rawText: null, valueCount: 0, pageUpdatedAt: null },
+    ok: true,
+    rechecked: 0,
+    cost: { source: 'mock', businessDate, fetchedAt, rawText: null, valueCents: costCents, pageUpdatedAt: null },
+    orders: { source: 'mock', businessDate, fetchedAt, rawText: null, valueCount: 0, pageUpdatedAt: null },
+    evaluation,
   };
 }
 
 /**
- * 构造真实 Monitor（不 start()）。coordinator/readAdState 均为注入的假实现：
- * readAdState 计数并按序返回观测结果；switchOrchestrator 的任何 evaluatePeriodic/
- * runSwitchAction 调用都计数并抛错，证明 zero_orders 轮询零广告动作。
+ * 构造真实 Monitor（不 start()）。coordinator 返回正常 0 单数据；readAdState 按序返回；
+ * switchOrchestrator 使用真实 decideAdSwitchAction 判定，但 runSwitchAction 被拦截，
+ * 证明「>50 元可暂停」只到决策层，绝不真正派发（mocked controller only）。
  */
-function setup(t, { readResults } = {}) {
+function setup(t, { costCents = 1200, readResults, coordOverride = null } = {}) {
   const cookieDir = makeTempDir('pg-zo-cookies-');
   const dataDir = makeTempDir('pg-zo-data-');
   const cookieWorkDir = makeTempDir('pg-zo-work-');
@@ -54,15 +59,20 @@ function setup(t, { readResults } = {}) {
     fs.rmSync(cookieWorkDir, { recursive: true, force: true });
   });
   writeTempCookie(cookieDir, SHOP.cookieFile);
-  const cfgResult = makeCfgResult({ cookieDir, cookieWorkDir, shops: [SHOP] });
-  cfgResult.config.login.cookieWorkDir = cookieWorkDir;
+  const cfgResult = makeCfgResult({
+    cookieDir,
+    cookieWorkDir,
+    shops: [SHOP],
+    execution: { realMode: false, dryRun: true },
+    monitor: { legacyWholeShopCloseEnabled: true },
+  });
   const clock = makeClock(shanghaiMs('2026-10-26', '10:00'));
 
-  const coord = {
+  const coord = coordOverride || {
     readAndEvaluateCalls: 0,
     async readAndEvaluate() {
       this.readAndEvaluateCalls += 1;
-      return zeroOrdersData(clock.now());
+      return normalZeroData(clock.now(), { costCents });
     },
   };
 
@@ -76,17 +86,39 @@ function setup(t, { readResults } = {}) {
 
   let evalCalls = 0;
   let runCalls = 0;
+  const actionCalls = [];
   const switchOrchestrator = {
-    evaluatePeriodic() { evalCalls += 1; throw new Error('zero_orders 轮询不得进入 evaluatePeriodic'); },
-    runSwitchAction() { runCalls += 1; throw new Error('zero_orders 轮询不得进入 runSwitchAction'); },
+    evaluatePeriodic(p) {
+      evalCalls += 1;
+      return decideAdSwitchAction({
+        costCents: p.costCents,
+        orders: p.orders,
+        thresholdCents: p.thresholdCents,
+        currentAdState: p.currentAdState,
+        identityOk: p.identityOk === true,
+      });
+    },
+    runSwitchAction(p) {
+      runCalls += 1;
+      actionCalls.push(p.action);
+      return {
+        action: p.action,
+        actionId: 'mock-action-1',
+        serial: 'not_sent',
+        zeroClick: true,
+        decision: DECISION.SHOULD_PAUSE,
+        reason: '测试注入：mocked controller only，未真实派发任何开关',
+      };
+    },
     hasUnknownBlock: () => false,
     peek: () => null,
     pendingMixedReconcile: () => null,
     mixedInflightProof: () => ({ inflight: 0 }),
-    reconcileMixedAndReoperate: () => { throw new Error('zero_orders 轮询不得进入 mixed 交接'); },
+    reconcileMixedAndReoperate: () => null,
   };
 
-  const monitor = new Monitor(cfgResult, null, {
+  const controller = { state: { closeCalls: [] } };
+  const monitor = new Monitor(cfgResult, { controller }, {
     dataDir,
     nowFn: clock.nowFn,
     delayFn: clock.delayFn,
@@ -104,118 +136,149 @@ function setup(t, { readResults } = {}) {
   rt.lastDataAt = oldAt;
 
   return {
-    monitor, clock, coord, rt, oldAt,
-    counts: { read: () => readCalls, eval: () => evalCalls, run: () => runCalls },
+    monitor, clock, coord, rt, oldAt, controller,
+    counts: { read: () => readCalls, eval: () => evalCalls, run: () => runCalls, actions: () => actionCalls },
     poll: () => monitor._pollShop(SHOP, { aborted: false, kind: 'pause' }, 'manual'),
   };
 }
 
 const ON_READ = { state: 'on', rows: [{ id: 'p1', switchChecked: true }], identity: { ok: true }, balance: null };
 const OFF_READ = { state: 'off', rows: [{ id: 'p1', switchChecked: false }], identity: { ok: true }, balance: null };
+const MIXED_READ = { state: 'mixed', rows: [{ id: 'p1', switchChecked: true }, { id: 'p2', switchChecked: false }], identity: { ok: true }, balance: null };
 const FAILED_READ = { state: 'unknown', error: { status: 'blocked', reason: '回读失败：模拟清单不完整', blocked: 'inventory' } };
 
-test('zero_orders 轮询推进只读状态观测：真实读到 on，观测/数据时间用本轮时钟', async (t) => {
-  const { monitor, clock, rt, oldAt, counts, poll } = setup(t, { readResults: [ON_READ] });
+test('0 单 + 12.00 元（≤50 元）：正常判定 spend_protected，仍做一次只读观测，零动作', async (t) => {
+  const { monitor, clock, rt, counts, poll } = setup(t, { costCents: 1200, readResults: [ON_READ] });
   const res = await poll();
 
-  assert.strictEqual(res.status, 'blocked');
-  assert.strictEqual(res.blocked, 'zero_orders', '返回仍为原 zero_orders 无需关闭结果');
-  assert.strictEqual(res.reason, '当日 0 单（0 费 0 单）：无需关闭');
+  assert.strictEqual(res.status, 'ok');
+  assert.strictEqual(res.decision, DECISION.SPEND_PROTECTED);
+  assert.strictEqual(res.zeroClick, true);
+  assert.strictEqual(res.spendProtected, true);
+  assert.strictEqual(res.pauseEligible, false);
+  assert.strictEqual(res.blocked, undefined, '正常 0 单不得带 blocked');
   assert.strictEqual(counts.read(), 1, '恰好一次只读状态观测');
-  assert.strictEqual(counts.eval(), 0, '不得进入 evaluatePeriodic');
+  assert.strictEqual(counts.eval(), 1, '正常进入决策（使用同一公式）');
   assert.strictEqual(counts.run(), 0, '不得进入任何开关动作');
 
   const nowIso = new Date(clock.now()).toISOString();
-  assert.strictEqual(rt.lastAdState, 'on', 'on 来自本轮真实回读，非旧值保绿');
+  assert.strictEqual(rt.lastAdState, 'on', 'on 来自本轮真实回读');
   assert.strictEqual(rt.adStateObservedAt, nowIso, '观测时间推进到本轮真实时钟');
-  assert.notStrictEqual(rt.adStateObservedAt, oldAt);
   assert.strictEqual(rt.lastDataAt, nowIso, 'lastDataAt 同步推进');
-  assert.strictEqual(rt.lastReadError, null, '成功观测清除旧读取错误');
-  assert.strictEqual(rt.adStateEvidenceKind, 'read_only');
+  assert.strictEqual(rt.lastReadError, null);
+  assert.strictEqual(rt.lastData.blockedReason, undefined, '正常 0 单不产生 blockedReason');
   assert.strictEqual(monitor.triggers.length, 0, '零触发记录');
   assert.strictEqual(monitor.actions.length, 0, '零广告动作');
 });
 
-test('读到 off 必须如实记 off，且不得触发开启', async (t) => {
-  const { rt, counts, poll } = setup(t, { readResults: [OFF_READ] });
+test('0 单读到 off：如实记 off，绝不因 0 单触发开启', async (t) => {
+  const { rt, counts, poll } = setup(t, { costCents: 1200, readResults: [OFF_READ] });
   const res = await poll();
 
-  assert.strictEqual(res.status, 'blocked');
-  assert.strictEqual(res.blocked, 'zero_orders');
+  assert.strictEqual(res.status, 'ok');
+  assert.strictEqual(res.decision, DECISION.SPEND_PROTECTED);
   assert.strictEqual(rt.lastAdState, 'off', 'off 如实落账');
-  assert.ok(rt.adStateObservedAt, '写入本轮观测时间');
   assert.strictEqual(counts.run(), 0, 'off 绝不触发开启/暂停');
-  assert.strictEqual(counts.eval(), 0);
+  assert.strictEqual(rt.lastData.blockedReason, undefined);
 });
 
-test('费用大于0但订单0仍保留原阻断原因，只更新广告观测而不操作', async (t) => {
-  const { coord, clock, rt, counts, poll } = setup(t, { readResults: [OFF_READ] });
-  coord.readAndEvaluate = async () => {
-    const data = zeroOrdersData(clock.now());
-    data.cost.valueCents = 1200;
-    data.reason = '全店订单为0但推广费用大于0：已重新读取核实仍为0';
-    return data;
-  };
+test('0 单读到 mixed：如实 pending（非完成态），保护区内零动作', async (t) => {
+  const { rt, counts, poll } = setup(t, { costCents: 1200, readResults: [MIXED_READ] });
   const res = await poll();
-  assert.strictEqual(res.blocked, 'zero_orders');
-  assert.ok(res.reason.includes('推广费用大于0'));
-  assert.strictEqual(rt.lastAdState, 'off');
-  assert.strictEqual(counts.read(), 1);
-  assert.strictEqual(counts.eval(), 0);
+
+  assert.strictEqual(res.status, 'pending');
+  assert.strictEqual(res.pending, true);
+  assert.strictEqual(res.decision, DECISION.SPEND_PROTECTED);
+  assert.strictEqual(res.currentAdState, 'mixed');
+  assert.strictEqual(res.zeroClick, true);
+  assert.strictEqual(rt.lastAdState, 'mixed');
   assert.strictEqual(counts.run(), 0);
+  assert.strictEqual(rt.lastData.blockedReason, undefined, 'mixed 不是数据错误，不得写成 blockedReason');
 });
 
-test('读失败 → unknown + 完整原因，不用旧 on 保绿、不推 lastDataAt', async (t) => {
-  const { rt, oldAt, counts, poll } = setup(t, { readResults: [FAILED_READ] });
+test('0 单读取失败：unknown + 完整原因可见，不推 lastDataAt、不用旧 on 保绿', async (t) => {
+  const { rt, oldAt, counts, poll } = setup(t, { costCents: 1200, readResults: [FAILED_READ] });
   const res = await poll();
 
   assert.strictEqual(res.status, 'blocked');
-  assert.strictEqual(res.blocked, 'zero_orders', '外层仍返回原 zero_orders 结果');
-  assert.strictEqual(res.reason, '当日 0 单（0 费 0 单）：无需关闭');
+  assert.strictEqual(res.blocked, 'inventory');
+  assert.match(res.reason, /模拟清单不完整/, '真实读取失败原因可见');
   assert.strictEqual(rt.lastAdState, 'unknown', '失败不得保留旧 on');
-  assert.strictEqual(rt.adStateConfirmedAt, null);
   assert.ok(rt.lastReadError, '写入结构化读取失败');
-  assert.ok(String(rt.lastReadError.reason).includes('模拟清单不完整'), '保留真实失败原因');
+  assert.match(String(rt.lastReadError.reason), /模拟清单不完整/);
   assert.strictEqual(rt.lastDataAt, oldAt, '失败不得推进 lastDataAt');
-  assert.ok(rt.adStateObservedAt > oldAt, 'unknown 观测时间仍为本轮真实时间');
-  assert.strictEqual(counts.eval(), 0);
+  assert.strictEqual(counts.eval(), 0, '状态回读失败在决策之前返回，不进入 evaluatePeriodic');
   assert.strictEqual(counts.run(), 0);
 });
 
 test('readAdState 抛错走真实失败路径，不得吞成成功', async (t) => {
-  const { rt, counts, poll } = setup(t, { readResults: [new Error('炸读：opener 异常')] });
+  const { rt, counts, poll } = setup(t, { costCents: 1200, readResults: [new Error('炸读：opener 异常')] });
   const res = await poll();
 
   assert.strictEqual(res.status, 'blocked');
-  assert.strictEqual(res.blocked, 'zero_orders');
   assert.strictEqual(rt.lastAdState, 'unknown');
-  assert.ok(String(rt.lastReadError.reason).includes('炸读'), '抛错原因如实保留');
+  assert.match(String(rt.lastReadError.reason), /炸读/);
   assert.strictEqual(counts.read(), 1);
+  assert.strictEqual(counts.run(), 0);
 });
 
-test('其他 blocked 类型不新增状态读', async (t) => {
-  const { monitor, rt, oldAt, counts, poll } = setup(t, { readResults: [ON_READ] });
-  const coord = monitor._getCoordinator();
-  coord.readAndEvaluate = async () => ({
-    ok: false, blocked: 'identity', reason: '店铺身份不一致',
-    cost: zeroOrdersData(0).cost, orders: zeroOrdersData(0).orders,
-  });
+test('0 单 + 50.01 元 + on：决策 should_pause；仅测试编排器记录意图，零真实动作', async (t) => {
+  const { monitor, controller, counts, poll } = setup(t, { costCents: 5001, readResults: [ON_READ] });
   const res = await poll();
 
-  assert.strictEqual(res.blocked, 'identity');
-  assert.strictEqual(counts.read(), 0, '非 zero_orders 不新增只读状态读');
-  assert.strictEqual(rt.lastAdState, 'on', '旧观测不被触碰');
-  assert.strictEqual(rt.adStateObservedAt, oldAt);
+  assert.strictEqual(res.decision, DECISION.SHOULD_PAUSE);
+  assert.strictEqual(res.action, 'pause');
+  assert.strictEqual(res.zeroClick, true, '测试编排器未派发请求 → zeroClick');
+  assert.strictEqual(counts.eval(), 1);
+  assert.strictEqual(counts.run(), 1, '决策要求暂停，进入动作入口一次');
+  assert.deepStrictEqual(counts.actions(), ['pause']);
+  assert.strictEqual(controller.state.closeCalls.length, 0, 'mocked controller only：没有真实关闭调用');
+  assert.strictEqual(monitor.triggers.length, 0, '未派发/未演练，无触发记录');
+  assert.strictEqual(monitor.actions.length, 0, '无执行批次');
 });
 
-test('配置与落盘路径不受影响：阈值/ROI 规则不变，state/audit 全在临时目录', async (t) => {
-  const { monitor, poll } = setup(t, { readResults: [ON_READ] });
+test('0 单 + 50.01 元 + unknown：unknown_blocked，零点击零动作', async (t) => {
+  const { counts, poll } = setup(t, { costCents: 5001, readResults: [{ state: 'unknown', rows: [], identity: { ok: true } }] });
+  const res = await poll();
+
+  assert.strictEqual(res.decision, DECISION.UNKNOWN_BLOCKED);
+  assert.strictEqual(res.zeroClick, true);
+  assert.strictEqual(res.pauseEligible, false, '状态未知不保留暂停资格/ROI 提示');
+  assert.strictEqual(res.roiTooLow, false);
+  assert.strictEqual(counts.run(), 0);
+});
+
+test('其他数据阻断（身份等）不新增状态读，旧观测不被触碰', async (t) => {
+  const coordOverride = {
+    async readAndEvaluate() {
+      return {
+        ok: false, blocked: 'identity', reason: '店铺身份不一致',
+        cost: normalZeroData(0).cost,
+        orders: normalZeroData(0).orders,
+      };
+    },
+  };
+  const { monitor, rt, oldAt, counts, poll } = setup(t, { readResults: [ON_READ], coordOverride });
+  const res = await poll();
+
+  assert.strictEqual(res.status, 'blocked');
+  assert.strictEqual(res.blocked, 'identity');
+  assert.strictEqual(counts.read(), 0, '非正常数据路径不新增只读状态读');
+  assert.strictEqual(rt.lastAdState, 'on', '旧观测不被触碰');
+  assert.strictEqual(rt.adStateObservedAt, oldAt);
+  assert.match(String(monitor.getStatus().shops[0].today.blockedReason), /身份不一致/);
+});
+
+test('配置与落盘路径不受影响：阈值/ROI 规则不变，zeroOrderRecheck 配置字段保留，state/audit 全在临时目录', async (t) => {
+  const { monitor, poll } = setup(t, { costCents: 1200, readResults: [ON_READ] });
   const ruleBefore = JSON.stringify(monitor.config.rules);
   const thresholdBefore = monitor._thresholdCents(SHOP);
+  const recheckBefore = monitor.config.execution.zeroOrderRecheck;
   await poll();
 
   assert.strictEqual(JSON.stringify(monitor.config.rules), ruleBefore, '不改 ROI/阈值规则');
   assert.strictEqual(monitor._thresholdCents(SHOP), thresholdBefore);
+  assert.strictEqual(monitor.config.execution.zeroOrderRecheck, recheckBefore, '旧配置字段原样保留，不迁移');
   assert.ok(monitor.stateFile.includes('pg-zo-data-'), 'state 落临时目录');
   assert.ok(monitor.auditFile.includes('pg-zo-data-'), 'audit 落临时目录');
   assert.ok(monitor.config.login.cookieWorkDir.includes('pg-zo-work-'), 'login 工作目录为本测试临时目录');

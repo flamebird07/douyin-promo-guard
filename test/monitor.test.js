@@ -131,12 +131,19 @@ test('演练模式：100元/100单恰好等于阈值 → 不触发', async (t) =
   assert.strictEqual(monitor.triggers.length, 0);
 });
 
-test('演练模式：零订单重读仍为 0 → 阻止并明确原因', async (t) => {
-  const { monitor, reader } = setup(t, { orders: 0, readerDef: { ordersSequence: [0, 0] } });
+test('演练模式：0 单有消耗按同一公式（50 元内保护，不再阻止）', async (t) => {
+  const { monitor, reader, controller } = setup(t, { costCents: 1200, orders: 0 });
   const r = await monitor.pollOnce('test');
-  assert.strictEqual(r.results[0].status, 'blocked');
-  assert.match(r.results[0].reason, /订单为 0/);
-  assert.ok(reader.readOrderSummaryCalls >= 2, '已重读核实');
+  const res = r.results[0];
+  assert.strictEqual(res.status, 'pending', '本轮回读 mixed + 零动作 → 待收敛；不是 blocked');
+  assert.strictEqual(res.decision, 'spend_protected');
+  assert.strictEqual(res.spendProtected, true);
+  assert.strictEqual(res.pauseEligible, false);
+  assert.strictEqual(res.blocked, undefined);
+  assert.strictEqual(monitor.triggers.length, 0, '保护区内零触发');
+  assert.strictEqual(controller.state.closeCalls.length, 0, '零关闭');
+  assert.strictEqual(reader.readOrderSummaryCalls, 1, '不做零单专用重读');
+  assert.strictEqual(monitor.getStatus().shops[0].today.blockedReason, undefined, '正常 0 单不产生 blockedReason');
 });
 
 // ── 三源身份核验（Codex 问题 #3 回归）───────────────────────────

@@ -23,8 +23,6 @@ const { closeOneAd } = require('./close-flow');
 const { DataGuardError } = require('../lib/errors');
 const { shanghaiDate, isAfterDailyStart } = require('../lib/time');
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 class WholeShopCloseCoordinator {
   /**
    * @param {object} p
@@ -61,33 +59,17 @@ class WholeShopCloseCoordinator {
   }
 
   /**
-   * 读取费用+订单（含零订单重读核实），通过后做规则判断。
-   * @returns {{ok:true, cost, orders, evaluation}} 或 {ok:false, blocked, reason}
+   * 读取费用+订单（零订单与正单同一公式，不做零单专用重读），通过后做规则判断。
+   * @returns {{ok:true, cost, orders, evaluation, rechecked:number}} 或 {ok:false, blocked, reason}
    */
   async readAndEvaluate(shopCfg) {
     const cost = await this._readVerifiedSummary('cost', shopCfg);
     let orders = await this._readVerifiedSummary('orders', shopCfg);
     guard.checkSameShopAndDate(cost, orders);
 
-    // 零订单/无效订单：重新读取核实（用户说明 08:00 后订单不应为 0）
-    let rechecked = 0;
-    while (orders.valueCount === 0 && rechecked < (this.config.execution.zeroOrderRecheck ?? 1)) {
-      rechecked += 1;
-      this.audit({ kind: 'zero-order-recheck', shopId: shopCfg.id, attempt: rechecked });
-      await sleep(0);
-      orders = await this._readVerifiedSummary('orders', shopCfg);
-      guard.checkSameShopAndDate(cost, orders);
-    }
-    if (orders.valueCount === 0) {
-      const blocked = cost.valueCents > 0
-        ? '全店订单为 0 但推广费用大于 0：已重新读取核实仍为 0，数据异常，阻止本轮关闭'
-        : '全店订单为 0（费用也为 0）：无需关闭';
-      return {
-        ok: false, blocked: 'zero_orders',
-        reason: blocked,
-        cost, orders, rechecked,
-      };
-    }
+    // 客户 2026-10-27 修正：0 单有消耗也正常，零订单与正单同一公式判定；
+    // 不再对零单做专用重读/阻断（rechecked 恒为 0，仅为旧调用方字段兼容保留）。
+    const rechecked = 0;
 
     const rule = (this.config.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
     // 多店铺：店铺级 thresholdCents 覆盖全局规则；判定语义（严格大于）不变

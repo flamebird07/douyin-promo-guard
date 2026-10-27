@@ -32,13 +32,19 @@ test('规则边界：禁止四舍五入每单成本（0.99 元/单不得因舍�
   assert.strictEqual(r.over, false);
 });
 
-test('规则：费用为 0 永不触发；订单为 0 阻止关闭', () => {
+test('规则：费用为 0 永不触发；订单为 0 与正单同一公式（不再阻断）', () => {
   const zero = evaluateWholeShopCostPerOrder({ costCents: 0, orders: 50, thresholdCents: 100 });
   assert.strictEqual(zero.over, false);
-  const blocked = evaluateWholeShopCostPerOrder({ costCents: 5000, orders: 0, thresholdCents: 100 });
-  assert.strictEqual(blocked.over, false);
-  assert.strictEqual(blocked.blocked, 'zero_orders');
-  assert.match(blocked.reason, /阻止|异常/);
+  // 客户 2026-10-27 修正：0 单有消耗也正常，expectedCents=0，走同一公式与 50 元保护线
+  const zeroOrders = evaluateWholeShopCostPerOrder({ costCents: 5000, orders: 0, thresholdCents: 100 });
+  assert.strictEqual(zeroOrders.over, true, '5000 分 > 0×100=0 分：原始费比超标');
+  assert.strictEqual(zeroOrders.blocked, undefined, '零订单不再是 blocked');
+  assert.strictEqual(zeroOrders.spendProtected, true, '5000 分 ≤ 5000 分：50 元保护生效');
+  assert.strictEqual(zeroOrders.pauseEligible, false);
+  assert.strictEqual(zeroOrders.roiTooLow, false);
+  const zeroCostZeroOrders = evaluateWholeShopCostPerOrder({ costCents: 0, orders: 0, thresholdCents: 100 });
+  assert.strictEqual(zeroCostZeroOrders.over, false, '0 分 == 0 分：恰好相等不关闭');
+  assert.strictEqual(zeroCostZeroOrders.blocked, undefined);
 });
 
 test('规则：非法输入必须抛错而不是当 0', () => {

@@ -108,21 +108,24 @@ test('触发时超标、操作前重读已恢复到阈值内 → 取消关闭', 
   assert.strictEqual(controller.state.closeCalls.length, 0);
 });
 
-test('全店订单为 0：重读核实仍为 0 → 阻止本轮关闭', async (t) => {
+test('全店订单为 0：与正单同一公式，不再专用重读/阻断（15001 分 > 0 分）', async (t) => {
   const { coord, controller, reader } = setup(t, { costCents: 15001, orders: 0, readerDef: { ordersSequence: [0, 0] } });
   const r = await coord.executeWholeShopCloseBatch({ shopCfg: { id: 'shop-001', cookieFile: 'x' }, cycleToken: { aborted: false } });
-  assert.strictEqual(r.outcome, 'blocked');
-  assert.match(r.reason, /订单为 0/);
-  assert.ok(reader.readOrderSummaryCalls >= 2, '已重新读取核实');
-  assert.strictEqual(controller.state.closeCalls.length, 0);
+  assert.strictEqual(r.outcome, 'all_closed_confirmed', '0 单且 >50 元严格超标：正常关闭，不再被零单阻断');
+  assert.strictEqual(r.counts.confirmed, 3);
+  assert.strictEqual(controller.state.closeCalls.length, 3);
+  assert.strictEqual(reader.readOrderSummaryCalls, 1, '零单不做专用重读（每轮评估只读一次订单）');
 });
 
-test('全店订单为 0：重读后恢复有效数据 → 继续正常判定', async (t) => {
+test('全店订单为 0：不得因 0 单触发额外重读（读序列第二值不生效）', async (t) => {
   const { coord, reader } = setup(t, { costCents: 15001, orders: 0, readerDef: { ordersSequence: [0, 80] } });
   const data = await coord.readAndEvaluate({ id: 'shop-001', cookieFile: 'x' });
   assert.strictEqual(data.ok, true);
-  assert.strictEqual(data.evaluation.over, true, '15001 分 > 80×100=8000 分');
-  assert.ok(reader.readOrderSummaryCalls >= 2);
+  assert.strictEqual(data.orders.valueCount, 0, '本轮使用的就是首次读到的 0 单');
+  assert.strictEqual(data.evaluation.over, true, '15001 分 > 0×100=0 分');
+  assert.strictEqual(data.evaluation.pauseEligible, true, '15001 分 > 5000 分：暂停资格成立');
+  assert.strictEqual(data.rechecked, 0);
+  assert.strictEqual(reader.readOrderSummaryCalls, 1, '零单专用重读已移除');
 });
 
 test('跨店数据：费用来源店铺不匹配 → 零关闭', async (t) => {

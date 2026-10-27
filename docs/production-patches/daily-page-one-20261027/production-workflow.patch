@@ -1,0 +1,46 @@
+--- a/plan-workflow.cjs
++++ b/plan-workflow.cjs
+@@ -249,12 +249,12 @@
+   }
+   // Same-day continuation keeps page/category/lastSelected/attempted. attempted is a
+   // PER-DAY set, never a permanent blacklist (a product that failed today is eligible
+-  // again on a later day). A new day resets every per-day publication fact (plans,
+-  // active, firstPublishedPlan, confirmationConsumptions, manualUiPublicationFacts,
+-  // lastSelected, attempted, hints) but INHERITS the account-level catalog browse
+-  // cursor (category/page/seenProductIds), so already-completed browsing is never
+-  // re-scanned from page 1 on the next business day. Already-published products stay
+-  // deduped by the global published-products store, never by an inherited attempted.
++  // again on a later day). A NEW business day resets EVERY per-day fact INCLUDING the
++  // catalog browse position (page/category/cursor/seenProductIds): the user's explicit
++  // 2026-10-27 rule is "每天从第一页找未发布商品", so each new day re-browses from page 1
++  // of the first category with an empty seen set. Already-published products stay
++  // deduped ONLY by the global published-products store, never by an inherited
++  // attempted or seen set.
+   if (p && p.businessDate === businessDate) {
+     return {
+       businessDate,
+@@ -275,14 +275,16 @@
+       manualUiPublicationFacts: Array.isArray(p.manualUiPublicationFacts) ? p.manualUiPublicationFacts : [],
+     };
+   }
+-  return inheritBrowseCursor(newDayState(businessDate), p);
+-}
+-// Cross-business-day cursor inheritance: the catalog browse position is account-level
+-// semantics, so a new day keeps the sanitized category/page/seenProductIds of the prior
+-// day's state (missing/invalid values fall back to the safe page-1/first-category
+-// defaults). nativeEof/nativeAdvances are per-day scan proofs and restart unproven, so
+-// a native category is never skipped for a whole new day on yesterday's EOF. The base
+-// state's per-day publication facts are never touched here.
++  // New business day: a completely fresh day state at page 1 of the first category
++  // with an empty seen set (user rule 2026-10-27: 每天从第一页找未发布商品). Nothing
++  // is inherited from the previous day — dedupe across days is carried solely by the
++  // global published-products store.
++  return newDayState(businessDate);
++}
++// Retained for backward compatibility only — loadDayState no longer inherits the
++// browse cursor across business days (superseded by the 2026-10-27 user rule above).
++// No caller in this module invokes it anymore; it is kept so external scripts that
++// imported the helper keep working and the historical behaviour stays auditable.
+ function inheritBrowseCursor(fresh, prev) {
+   const p = prev && typeof prev === 'object' ? prev : null;
+   if (!p) return fresh;

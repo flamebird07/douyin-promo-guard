@@ -1,0 +1,17 @@
+[
+  {
+    "id": "guard/src/engine/monitor.js",
+    "beforeSha256": "f1a2f5a1b74554f2f1247ca74495f570b7619cec130d6b88d25dc64968c1fa20",
+    "afterSha256": "c9bcdb29e30ae2d6bfeb3a71bbdaf6c2175557bb8cf705a467e252a448d8a777"
+  },
+  {
+    "id": "app/watch-drill.js",
+    "beforeSha256": "e866156baaf725fafddc86c1d4cf751eb94819ba2b0597a1759c520f6d04c492",
+    "afterSha256": "48412b1817882e556e3f3b47940f77a7381a91b85b75d4ba28c0d27079d20ec8"
+  },
+  {
+    "id": "app/index.html",
+    "beforeSha256": "2f8f8c11f948896bdfa38a25dd665f4b4e57c52eda11d0d82c25f2410cdb1c48",
+    "afterSha256": "657af65e7f72735561fe37e7ca9ed63e2c3e86113d933d8dc32835ab94a074b8"
+  }
+]

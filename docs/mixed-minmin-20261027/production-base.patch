@@ -1,0 +1,174 @@
+diff --git a/src/engine/monitor.js b/src/engine/monitor.js
+index c4e9f1ad1231a5336f5bb47d8f1de4a68cdf50fc..569ead09de5e835c0cbd2a27f72f8356b4cd4f98 100644
+--- a/src/engine/monitor.js
++++ b/src/engine/monitor.js
+@@ -77,6 +77,9 @@ const MIXED_RECONCILE_TEXT = Object.freeze({
+   pending_recheck: '待收敛',
+   rejudging: '重新判定',
+   retrying: '重试中',
++  // 明确没有安排任何收敛动作（店铺停用/只读刷新、或等于阈值/50 元保护等合法零动作）：
++  // mixed 仍是过渡观测、仍非完成态，但不得宣称"待收敛"（没有收敛被安排）。
++  no_repair_scheduled: '混合（未安排收敛，非完成态）',
+ });
+ 
+ class Monitor {
+@@ -3013,12 +3016,21 @@ class Monitor {
+ 
+   /**
+    * mixed 收敛视图（界面/推送消费）：mixed 只作过渡观测，**永不**作为完成态。
+-   * 全部取自真实状态源（运行时观测 + 串行门 + 执行器在途计数），不按文案猜测：
++   * 全部取自真实状态源（运行时观测 + 串行门 + 执行器在途计数 + 最近一次决策 + 店铺启用态），
++   * 不按文案猜测：
+    *   retrying 重试中：该店修复动作正在执行；
+-   *   rejudging 重新判定：旧动作仍是 unknown 阻塞且本轮回读 mixed；
+-   *   pending_recheck 待收敛：本轮回读 mixed，等待下一次重判/修复。
++   *   rejudging 重新判定：旧动作仍是 unknown 阻塞且本轮回读 mixed（证据优先保留）；
++   *   no_repair_scheduled 未安排收敛：店铺停用/仅只读刷新，或最近一次决策是
++   *     等于阈值保持 / 50 元保护等合法零动作——没有任何收敛动作被安排，
++   *     mixed 仍非完成态，但不得宣称"待收敛"；
++   *   pending_recheck 待收敛：活动店铺本轮回读 mixed，等待下一次重判/修复。
++   *
++   * @param {string} shopId
++   * @param {object} [opts] { noRepairScheduled: true, cycleActive: true }
++   *   noRepairScheduled=调用方已确认本轮无收敛安排；cycleActive=本轮真实巡查在途
++   *   （此时不得用 Monitor.running=false 推断"未安排"）。
+    */
+-  _mixedReconcileView(shopId) {
++  _mixedReconcileView(shopId, opts = {}) {
+     const rt = (this._runtimeMap && this._runtimeMap.get(shopId)) || {};
+     const orch = this._switchOrchestrator;
+     const observed = rt.lastAdState || null;
+@@ -3028,9 +3040,27 @@ class Monitor {
+       ? orch.hasUnknownBlock(shopId) === true : false;
+     const pending = orch && typeof orch.pendingMixedReconcile === 'function'
+       ? orch.pendingMixedReconcile(shopId) : null;
++    // 店铺停用/已删除：监控不再轮询，也没有任何收敛动作会被安排（只读刷新不得冒充待收敛）。
++    const shop = (this.config && Array.isArray(this.config.shops))
++      ? this.config.shops.find((s) => s && s.id === shopId) : null;
++    const shopInactive = !!(shop && (shop.deleted === true || shop.enabled === false));
++    // 最近一次决策为合法零动作（等于阈值保持 / 50 元保护）：本轮也没有安排收敛动作。
++    // 每次 _applyObservedAdState 写入新观测都会清空 lastDecision，因此这里读到的只会是
++    // 与当前观测同源的最新决策；后续只读刷新/新日期/新指标不会沿用旧决策。
++    const lastDecision = rt.lastDecision && rt.lastDecision.decision;
++    const decisionNoAction = lastDecision === DECISION.EQUAL_NO_ACTION
++      || lastDecision === DECISION.SPEND_PROTECTED;
++    // 监控未运行时没有后续定时巡查，也就不会安排新的收敛动作；但真实修复在途/unknown
++    // 阻塞是硬证据，必须优先保留（见 evidenceBlocksNoRepair）。
++    // opts.cycleActive=true：调用方正处于本轮真实巡查中，不得用"未运行"推断未安排。
++    const monitorStopped = this.running === false && opts.cycleActive !== true;
++    const evidenceBlocksNoRepair = inflight > 0 || unknownBlock;
++    const noRepairScheduled = !evidenceBlocksNoRepair && (opts.noRepairScheduled === true
++      || shopInactive || decisionNoAction || monitorStopped);
+     let state = null;
+     if (inflight > 0) state = 'retrying';
+     else if (observed === 'mixed' && unknownBlock) state = 'rejudging';
++    else if (noRepairScheduled && (observed === 'mixed' || pending)) state = 'no_repair_scheduled';
+     else if (observed === 'mixed' || pending) state = 'pending_recheck';
+     return {
+       observedAdState: observed,
+@@ -3041,6 +3071,7 @@ class Monitor {
+       unknownBlock,
+       repairInflight: inflight > 0,
+       pendingReconcile: pending || null,
++      noRepairScheduled,
+       reliableTarget: this._reliableConfirmedTarget(shopId),
+     };
+   }
+@@ -4272,13 +4303,34 @@ class Monitor {
+       rt.lastData.spendProtected = decision.spendProtected === true;
+       rt.lastData.pauseEligible = decision.pauseEligible === true;
+       rt.lastData.roiTooLow = decision.roiTooLow === true;
++      // 最近一次决策（供 getStatus/mixed 收敛视图如实区分「有修复安排」与「合法零动作」）。
++      rt.lastDecision = {
++        decision: decision.decision,
++        metric: decision.metric,
++        action: decision.action,
++        targetState: decision.targetState,
++        at: new Date(this.nowFn()).toISOString(),
++      };
+ 
+-      // 每周期一条判断：本轮回读 mixed 且零动作 → pending（待收敛），不是 ok；
++      // 等于阈值保持 / 50 元保护：合法零动作，本轮没有任何收敛动作被安排。
++      // 此时 mixed 仍是过渡观测、仍非完成态，但不得宣称"待收敛"。
++      // 只有「合法零动作 + 本轮读取无错误 + 无真实修复在途/unknown 阻塞」才是未安排收敛；
++      // 真实 unknown 阻塞或修复在途按证据保留（rejudging/retrying），仍如实 pending。
++      const legalNoAction = decision.decision === DECISION.EQUAL_NO_ACTION
++        || decision.decision === DECISION.SPEND_PROTECTED;
++      const mixedViewEarly = currentAdState === 'mixed'
++        ? this._mixedReconcileView(shopCfg.id, { noRepairScheduled: legalNoAction, cycleActive: true })
++        : null;
++      const mixedNoRepair = !!(mixedViewEarly && mixedViewEarly.reconcileState === 'no_repair_scheduled');
++      const mixedPending = currentAdState === 'mixed' && !mixedNoRepair;
++
++      // 每周期一条判断：本轮回读 mixed 且零动作、且存在待执行收敛 → pending（待收敛），不是 ok；
++      // 合法零动作（等于阈值保持/50 元保护）没有安排收敛 → 如实 ok + 非完成态。
+       // mixed + 高于/等于阈值走 should_pause、低于走 should_enable（对侧修复），仍非完成态。
+       this._emitJudgement(shopCfg, {
+         data,
+         over: data.evaluation.over === true,
+-        status: currentAdState === 'mixed' && decision.zeroClick === true ? 'pending' : 'ok',
++        status: mixedPending && decision.zeroClick === true ? 'pending' : 'ok',
+         reason: decision.reason || data.evaluation.reason,
+         decision,
+         currentAdState,
+@@ -4310,26 +4362,30 @@ class Monitor {
+         return this._runShopSwitchAction(shopCfg, 'enable', data, cycleToken, trigger);
+       }
+       // 其余零动作决策（统一 on/off 已达目标或等于阈值保持、数据/身份阻断、unknown fail-closed）。
+-      // 本轮回读仍是 mixed：mixed 不是完成态 → 如实 pending（待收敛/待下一次可信重判），
+-      // 绝不标 ok、也不伪造 on/off。
++      // mixed 只有**存在待执行收敛**时才如实 pending（待收敛/待下一次可信重判）；
++      // 合法零动作（等于阈值保持/50 元保护）没有安排收敛 → ok + 明确"未安排收敛"，
++      // 绝不伪造 on/off，也不谎称待收敛。
+       const mixedStillOpen = currentAdState === 'mixed';
++      // 复用本轮判定时已计算的视图：状态与 status 同源，避免二次读取运行时状态漂移。
++      const mixedView = mixedStillOpen ? mixedViewEarly : null;
+       this._audit({
+         kind: 'poll',
+         shopId: shopCfg.id,
+-        status: mixedStillOpen ? 'pending' : 'ok',
++        status: mixedPending ? 'pending' : 'ok',
+         over: false,
+         decision: decision.decision,
+         metric: decision.metric,
+         currentAdState,
+         zeroClick: true,
+-        ...(mixedStillOpen ? { pending: 'mixed_not_converged' } : {}),
++        ...(mixedPending ? { pending: 'mixed_not_converged' } : {}),
++        ...(mixedNoRepair ? { noRepairScheduled: true } : {}),
+         reason: decision.reason,
+       });
+       return {
+-        status: mixedStillOpen ? 'pending' : 'ok',
++        status: mixedPending ? 'pending' : 'ok',
+         over: false,
+         zeroClick: true,
+-        ...(mixedStillOpen ? { pending: true } : {}),
++        ...(mixedPending ? { pending: true } : {}),
+         decision: decision.decision,
+         metric: decision.metric,
+         currentAdState,
+@@ -4339,11 +4395,11 @@ class Monitor {
+         reason: decision.reason,
+         ...(mixedStillOpen ? {
+           mixedReconcile: {
+-            ...(this._mixedReconcileView(shopCfg.id) || {}),
++            ...(mixedView || {}),
+             stage: 'poll',
+             reconciled: false,
+             converged: false,
+-            state: 'pending_recheck',
++            state: mixedView ? mixedView.reconcileState : 'no_repair_scheduled',
+             targetState: decision.targetState || null,
+             decision: decision.decision,
+             reason: decision.reason,
+@@ -5124,6 +5180,9 @@ class Monitor {
+     rt.adStateConfirmedAt = null;
+     rt.adStateConfirmEvidence = null;
+     rt.adStateEvidenceKind = 'read_only';
++    // 新鲜只读观测使旧决策失效：旧决策可能来自上一轮指标/日期或上一个动作，不能继续
++    // 用于 mixed 收敛视图的"未安排收敛"判断；需要由本轮（或下一轮）重新给出决策。
++    rt.lastDecision = null;
+   }
+ 
+   _runtime(shopId) {

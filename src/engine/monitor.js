@@ -68,6 +68,10 @@ class Monitor {
     this.stateFile = path.join(this.dataDir, 'state.json');
     this.auditFile = path.join(this.dataDir, 'audit.jsonl');
     this.nowFn = opts.nowFn || (() => Date.now());
+    // 值守补发钩子（2026-10-26 patrol-plan-refill）：仅在**完整完成**的普通数据周期
+    // （ok=true 且至少一店真实处理）收口后异步触发；拒绝/跳过/中止/无启用店/UI 只读 GET
+    // 一律不触发。回调异常绝不影响巡查结果与后续调度（publisher 侧失败不殃及值守）。
+    this._onPollComplete = typeof opts.onPollComplete === 'function' ? opts.onPollComplete : null;
     this.delayFn = opts.delayFn || ((ms) => this._chunkedDelay(ms));
     this._injectedDelayFn = opts.delayFn || null; // 测试可控时钟：开启调度循环复用同一时钟门
     // 有限恢复链的可注入 timer（测试用 fake clock；生产即全局 setTimeout/clearTimeout）。
@@ -991,6 +995,7 @@ class Monitor {
     const token = { aborted: false, kind: 'pause' };
     this._activeTokens.add(token);
     this._cycleRunning = true;
+    let completed = null;
     // 巡查周期序号（2026-09-15 修复第 3 项）：一次 pollOnce = 一个完整周期，序号明确递增。
     this.cycleNo += 1;
     const cycleNo = this.cycleNo;
@@ -1063,11 +1068,32 @@ class Monitor {
       }
 
       this.lastCycleAt = new Date(this.nowFn()).toISOString();
-      return { ok: true, trigger, cycleNo, results };
+      completed = { ok: true, trigger, cycleNo, results };
+      return completed;
     } finally {
       this._activeTokens.delete(token);
       this._cycleRunning = false;
       this._currentCycle = null;
+      // 收口后再触发值守补发检查：此时 _cycleRunning 已清、各店处理锁已释放，
+      // 回调只做非阻塞入队（如隐藏子进程触发独立发布器），绝不在巡查路径内等待发布。
+      // patrol-plan-refill 返修：被停止/中止（token.aborted）的周期即使此前已有店真实处理，
+      // 也不是"完整完成的数据周期"，绝不触发补发——数据快照可能停在中途，补发检查必须
+      // 只挂在未被中止的完整周期上。
+      if (completed && !token.aborted && this._onPollComplete) {
+        const eligible = Array.isArray(completed.results)
+          && completed.results.some((x) => x && x.status !== 'skipped');
+        if (eligible) {
+          try {
+            const maybe = this._onPollComplete({
+              cycleNo: completed.cycleNo, trigger: completed.trigger, at: this.nowFn(),
+              shops: Array.isArray(completed.results) ? completed.results.length : 0,
+            });
+            if (maybe && typeof maybe.catch === 'function') maybe.catch(() => { /* 回调自身失败不影响巡查 */ });
+          } catch (e) {
+            try { this._audit({ kind: 'poll', status: 'warn', reason: 'on-poll-complete-error:' + ((e && e.message) || e) }); } catch (_) { /* 审计失败也不再外抛 */ }
+          }
+        }
+      }
     }
   }
 

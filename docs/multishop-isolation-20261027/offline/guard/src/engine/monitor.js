@@ -2270,7 +2270,52 @@ class Monitor {
         note: `有界收口探测（${READ_GATE_PROBE_DELAYS_MS.join('/')}ms）均未证明已关闭或未创建：保持阻断，需人工处置；绝不按时间盲放行`,
       });
     } catch (_) { /* 审计失败不影响 */ }
+    this._armReadGateSettleWake(gate);
     return true;
+  }
+
+  /**
+   * 终态 settle 唤醒（D9G 迟到收口）：探测用尽转 terminal 后底层 work 才 settle 时，
+   * 旧实现要等下一次周期读取才会再推进，期间本店停在 UNKNOWN（资源其实已可证明收口）。
+   * 转 terminal 时挂**一次性** settledP 唤醒（含登记时早已 settle 的情况，settledP 永不
+   * reject）：不是新的轮询服务，只复用既有 _advanceReadGate 的收口证明链（not-created /
+   * 真实关闭+连接核验）。拿到证明才注销登记簿并按身份 CAS 清门；无证明保持阻断，
+   * 零新读取、零 opener、零点击。
+   */
+  _armReadGateSettleWake(gate) {
+    if (!gate || gate.settleWakeArmed) return false;
+    if (!gate.workRec || typeof gate.workRec.settledP.then !== 'function') return false;
+    gate.settleWakeArmed = true;
+    gate.workRec.settledP.then(() => {
+      Promise.resolve(this._runReadGateSettleWake(gate)).catch(() => { /* 唤醒异常：保持阻断 */ });
+    });
+    return true;
+  }
+
+  async _runReadGateSettleWake(gate) {
+    if (!gate) return null;
+    if (this._cleanupRegistryIndexOf(gate) < 0) return null; // 已注销：别处已证明收口（含与探测并发）
+    let adv;
+    try {
+      adv = await this._advanceReadGate(gate, this._adStateMsOption('adStateSettleWaitMs', 5000), this._adStateMsOption('adStateCloseWaitMs', 10000));
+    } catch (e) {
+      adv = { done: false, why: `settle 唤醒收口异常：${String((e && e.message) || e).slice(0, 120)}` };
+    }
+    if (!adv) adv = { done: false, why: 'settle 唤醒收口无结果' };
+    if (!adv.done) {
+      try {
+        this._audit({ kind: 'ad-state-read', shopId: gate.shopId, event: 'gate-settle-wake', gateId: gate.gateId, readEpoch: gate.readEpoch, phase: gate.phase, ok: false, reason: String(adv.why || '').slice(0, 200) });
+      } catch (_) { /* 审计失败不影响 */ }
+      return adv;
+    }
+    if (this._cleanupRegistryIndexOf(gate) < 0) return adv; // await 后复查：与探测/其他唤醒并发时不重复清门
+    // 证明到手（与探测同语义）：先注销收口义务（旧门自己的资源），再按身份 CAS 释放读取许可。
+    const unregistered = this._cleanupUnregister(gate);
+    const cleared = this._clearReadGateIf(gate.shopId, gate, adv.proof || 'closed');
+    try {
+      this._audit({ kind: 'ad-state-read', shopId: gate.shopId, event: 'gate-released', gateId: gate.gateId, readEpoch: gate.readEpoch, via: 'settle-wake', proof: adv.proof || 'closed', proofOwner: adv.proofOwner || null, cleared, unregistered });
+    } catch (_) { /* 审计失败不影响 */ }
+    return adv;
   }
 
   /** 本店全部已知门（当前门 + 登记簿里被替换的旧 epoch 门），去重后按登记顺序。 */

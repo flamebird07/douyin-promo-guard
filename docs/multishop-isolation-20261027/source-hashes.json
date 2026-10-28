@@ -28,5 +28,10 @@
     "id": "guard/src/login/session.js",
     "beforeSha256": "2471de6a3f62fd80828420ae3735ce2bc091d71a1dedf6569a90008e8e69ec24",
     "afterSha256": "36a33012dcfc4841d016250a4939d958b8e9dda2c89e033fef953d571157c40a"
+  },
+  {
+    "id": "guard/src/engine/monitor.js",
+    "beforeSha256": "c9bcdb29e30ae2d6bfeb3a71bbdaf6c2175557bb8cf705a467e252a448d8a777",
+    "afterSha256": "427fb0420d1c08569189577a8341230ebcaa1b31170a46dd9c70dd0a1fed207c"
   }
 ]

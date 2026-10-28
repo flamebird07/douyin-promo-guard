@@ -4,7 +4,7 @@
 
 没有新增功能、设置或界面。两个只读角色共243版本的内容、修改时间和只读属性由本机验收核对；仅正常可写副本按已有恢复流程更新。本机按成员此前恢复三店值守授权，恢复简尚enabled，其余业务阈值、ROI、每日数量不改；生产配置未上传。
 
-测试：最终专项app 34/34；guard 89/89；真实Edge独立PID/临时目录及关闭旧分析进程后全新加载合成Cookie测试通过。另48项旧应用兼容测试有8项既有失败，修改前后逐项一致，无新增失败，详见本机对照日志。
+测试：最终专项app 34/34；guard 126/126；真实Edge独立PID/临时目录及关闭旧分析进程后全新加载合成Cookie测试通过。另48项旧应用兼容测试有8项既有失败，修改前后逐项一致，无新增失败，详见本机对照日志。
 
 本提交交付精确生产差异、批准前后SHA256及无凭据离线源码夹具。历史默认源码与本机已验收生产版本存在其他差异，不用整包旧源码覆盖生产，也不声称默认src已与生产完全一致。配置、真实Cookie、归档、运行数据、私有日志及备份均未上传。生产读取结果和加载证据以本机reports/multishop-isolation-20261027/final-acceptance.json为准。
 
@@ -12,3 +12,7 @@
 
     node --test docs/multishop-isolation-20261027/offline/app/tests/multishop-isolation-regression.test.js
     node --test docs/multishop-isolation-20261027/offline/guard/test/checkpoint-process-isolation.test.js docs/multishop-isolation-20261027/offline/guard/test/multishop-isolation-regression.test.js docs/multishop-isolation-20261027/offline/guard/test/cookie-process-isolation.test.js docs/multishop-isolation-20261027/offline/guard/test/cookie-archive-provenance.test.js docs/multishop-isolation-20261027/offline/guard/test/cookie-workcopy-r96.test.js docs/multishop-isolation-20261027/offline/guard/test/cookie-finalization-r87.test.js
+
+追加修复（2026-10-28）：有限收口探测耗尽后，底层任务迟到结束时，由一次性结束通知复用原关闭证明及身份检查释放阻断；不启动新读取、不开新页面、不增加计时轮询、不伪装健康。新及既有资源收尾/截止测试37项通过，连同最终隔离专项共160项通过。生产三店读取结果仍须独立实测，代码测试不等同于平台会话有效。
+
+补充复验：node --test docs/multishop-isolation-20261027/offline/guard/test/late-read-gate-settle.test.js docs/multishop-isolation-20261027/offline/guard/test/dian4-unknown-gate-ownership.test.js docs/multishop-isolation-20261027/offline/guard/test/enable-read-deadline.test.js

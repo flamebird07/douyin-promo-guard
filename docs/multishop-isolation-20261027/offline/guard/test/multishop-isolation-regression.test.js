@@ -487,7 +487,7 @@ function guardSessionFixture() {
     },
   };
   const sourceState = () => [readOnlyWrites.slice(), ...readOnlyRoots.map(sessionTree)];
-  const restore = (verify, extra = {}) => restoreDutyWorkCopy({ cookieSourceDir: roots.analyzerWorkDir }, 'shopA.json', {
+  const restore = (verify, extra = {}) => restoreDutyWorkCopy(extra.loginCfg || { cookieSourceDir: roots.analyzerWorkDir }, 'shopA.json', {
     shopCfg: { name: 'shopA' }, workDir: roots.guardWorkDir, recoveryDir: roots.recoveryDir,
     vaultRoots: roots, vaultModule, fsModule: fsm, verify, audit: (e) => audit.push(e), ...extra,
   });
@@ -769,3 +769,257 @@ for (const mode of ['manifest', 'missing-manifest']) {
     } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
   });
 }
+
+// ============ D12F：跨调用失败候选进程内存史（login-invalid 才缓存，有界，可重置） ============
+
+function loginInvalidFor(...healthySources) {
+  const calls = [];
+  return {
+    calls,
+    verify: async (p) => {
+      calls.push(p.source);
+      if (healthySources.includes(p.source)) return { ok: true, finalCookies: p.cookies };
+      return { ok: false, classification: 'login-invalid', reason: '合成登录失效（证明性）' };
+    },
+  };
+}
+
+test('D12F 跨调用进展：首轮 5 组 login-invalid，次轮可达第 6/7 组并提升；只读源全程零改动', async () => {
+  const f = guardSessionFixture();
+  try {
+    const healthy = f.snapshot(fullSessionCookies('HEALTHY', 'old'));   // 最旧 = 第 7 组
+    const newer = [];
+    for (let i = 6; i >= 1; i -= 1) newer.push(f.snapshot(fullSessionCookies(`S${i}`, `v${i}`)).versionId); // 新→旧 S1..S6
+    const loginCfg = { cookieSourceDir: f.roots.analyzerWorkDir };
+    const before = f.sourceState();
+    const r1v = loginInvalidFor();
+    const r1 = await f.restore(r1v.verify, { loginCfg, excludeWorkCopy: true });
+    assert.strictEqual(r1.ok, false);
+    assert.strictEqual(r1v.calls.length, 5, '首轮仍只验证首选 5 组（网络/进程边界不变）');
+    assert.ok(r1v.calls.every((s) => newer.includes(s.slice('raw-archive:'.length))));
+    const r2v = loginInvalidFor(`raw-archive:${healthy.versionId}`);
+    const r2 = await f.restore(r2v.verify, { loginCfg, excludeWorkCopy: true });
+    assert.strictEqual(r2.ok, true, '次轮必须跨过已失败 5 组、触达此前不可达的第 6/7 组');
+    assert.strictEqual(r2.source, `raw-archive:${healthy.versionId}`);
+    assert.ok(r2v.calls.length <= 5, '次轮同样不超过首选 5 条验证');
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(f.workPath)), fullSessionCookies('HEALTHY', 'old'));
+    assert.deepStrictEqual(f.sourceState(), before, '归档/恢复/分析只读源 sha 与 mtime 全程不变');
+    assert.ok(!JSON.stringify(f.audit).includes('FAKE-'));
+    assert.ok(!JSON.stringify(f.audit).includes('session:'));
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D12F 同 SID 变体保留：失败会话的新字节变体仍是备用，从未试过会话优先于备用', async () => {
+  const f = guardSessionFixture();
+  try {
+    // D12F2 夹具修正：同 SID 的两个 legacy 变体必须建在**最旧**位置。若 healthy 建成最新
+    // 代表，它会进入首轮 legacy 窗口被验证并记为 login-invalid，次轮再期待它成功就与
+    // 精确 SHA 负缓存（不缓存错分/瞬态，但确实缓存证明性 login-invalid）矛盾。
+    const legacyHealthy = f.snapshot(fullSessionCookies('P0', 'legacy-ok'), true);   // 同 SID 备用变体（最旧，次轮可达）
+    const legacyFail = f.snapshot(fullSessionCookies('P0', 'legacy-fail'), true);    // 同 SID（P0）不同字节
+    const failedPrefers = [];
+    for (let i = 0; i < 5; i += 1) failedPrefers.push(f.snapshot(fullSessionCookies(`P${i}`, `p${i}`)));
+    for (let i = 0; i < 5; i += 1) f.snapshot(fullSessionCookies(`L${i}`, `l${i}`), true);  // 占满首轮 legacy 窗口的独立会话（更新）
+    const loginCfg = {};
+    const r1v = loginInvalidFor();
+    const r1 = await f.restore(r1v.verify, { loginCfg, excludeWorkCopy: true });
+    assert.strictEqual(r1.ok, false);
+    assert.strictEqual(r1v.calls.length, 10, '首轮：5 首选 + 5 legacy 独立会话（同 SID 备用变体排在其后）');
+    assert.ok(!r1v.calls.includes(`raw-archive:${legacyHealthy.versionId}`), '首轮不得提前验证最旧的同 SID 备用变体');
+    assert.ok(!r1v.calls.includes(`raw-archive:${legacyFail.versionId}`), '首轮 legacy 窗口被 5 个独立会话占满');
+    const r2v = loginInvalidFor(`raw-archive:${legacyHealthy.versionId}`);
+    const r2 = await f.restore(r2v.verify, { loginCfg, excludeWorkCopy: true });
+    assert.strictEqual(r2.ok, true, '同 SID 备用变体必须仍可达且可提升（绝不因 SID 一次失败拉黑全会话）');
+    assert.strictEqual(r2.source, `raw-archive:${legacyHealthy.versionId}`);
+    assert.deepStrictEqual(r2v.calls, [`raw-archive:${legacyFail.versionId}`, `raw-archive:${legacyHealthy.versionId}`],
+      '同 SID 已失败字节跳过，未试字节保留；且在无更新候选时作为备用被试到');
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(f.workPath)), fullSessionCookies('P0', 'legacy-ok'));
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D12F 单 SID 多 SHA：逐轮换批字节变体，最终健康变体可达（无无限期拉黑）', async () => {
+  const f = guardSessionFixture();
+  try {
+    const ids = [];
+    for (let i = 0; i < 12; i += 1) ids.push(f.snapshot(fullSessionCookies('A', `sv-${i}`)).versionId);
+    const healthyId = ids[0]; // 最早一条（ids 按新→旧为 ids[11]…ids[0]）才健康
+    const loginCfg = {};
+    for (let round = 1; round <= 3; round += 1) {
+      const v = loginInvalidFor(`raw-archive:${healthyId}`);
+      const r = await f.restore(v.verify, { loginCfg, excludeWorkCopy: true });
+      if (round < 3) {
+        assert.strictEqual(r.ok, false);
+        assert.strictEqual(v.calls.length, 5, `第 ${round} 轮：跨调用换批后仍各只验证 5 条新 SHA`);
+      } else {
+        assert.strictEqual(r.ok, true, '第 3 轮必须触达最旧的健康变体并提升');
+        assert.strictEqual(r.source, `raw-archive:${healthyId}`);
+        assert.ok(v.calls.length <= 5);
+      }
+    }
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D12F 可用候选试尽即重置：0 新验证的一轮之后，下一轮从头重试（有界历史）', async () => {
+  const f = guardSessionFixture();
+  try {
+    const ids = [];
+    for (let i = 0; i < 3; i += 1) ids.push(f.snapshot(fullSessionCookies(`R${i}`, `r${i}`)).versionId);
+    const loginCfg = {};
+    for (const expected of [3, 0, 3]) {
+      const v = loginInvalidFor();
+      const r = await f.restore(v.verify, { loginCfg, excludeWorkCopy: true });
+      assert.strictEqual(r.ok, false);
+      assert.strictEqual(v.calls.length, expected, `该轮应验证 ${expected} 条（试尽后自动重置，不永久拉黑）`);
+    }
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D12F 隔离：不同 loginCfg 对象 / 不同工作副本互不泄漏失败史', async () => {
+  const f = guardSessionFixture();
+  try {
+    for (let i = 0; i < 3; i += 1) f.snapshot(fullSessionCookies(`X${i}`, `x${i}`));
+    const sharedVerify = loginInvalidFor();
+    const r1 = await f.restore(sharedVerify.verify, { loginCfg: { tag: 'cfg1' }, excludeWorkCopy: true });
+    assert.strictEqual(r1.ok, false);
+    assert.strictEqual(sharedVerify.calls.length, 3);
+    const freshVerify = loginInvalidFor();
+    const r2 = await f.restore(freshVerify.verify, { loginCfg: { tag: 'cfg2' }, excludeWorkCopy: true });
+    assert.strictEqual(r2.ok, false);
+    assert.strictEqual(freshVerify.calls.length, 3, '更换配置对象（配置所有者变化）不得继承他人失败史');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D12F 瞬态失败不缓存：verify-error/identity-unverified/stopChain 不写入失败史', async () => {
+  const f = guardSessionFixture();
+  try {
+    const ids = [];
+    for (let i = 0; i < 3; i += 1) ids.push(f.snapshot(fullSessionCookies(`T${i}`, `t${i}`)).versionId);
+    const loginCfg = {};
+    const transient = [
+      { ok: false, classification: 'verify-error', reason: '合成瞬态：网络/收口不确定' },
+      { ok: false, classification: 'identity-unverified', reason: '合成瞬态：身份未核实' },
+    ];
+    let i = 0;
+    const r1 = await f.restore(async (p) => transient[i++ % transient.length], { loginCfg, excludeWorkCopy: true });
+    assert.strictEqual(r1.ok, false);
+    const v2 = loginInvalidFor();
+    const r2 = await f.restore(v2.verify, { loginCfg, excludeWorkCopy: true });
+    assert.strictEqual(r2.ok, false);
+    assert.strictEqual(v2.calls.length, 3, '瞬态失败不得按 login-invalid 缓存：下一轮必须原样重试全部候选');
+    // D12F2 夹具修正：r2 已把 3 条全部记为 login-invalid，同一 loginCfg 的下一轮按设计
+    // 零个新候选（正确的"试尽重置"），无法观测 stopChain；故换一个全新配置对象再测。
+    const stopCfg = {};
+    const stopCalls = [];
+    const r3 = await f.restore(async (p) => { stopCalls.push(p.source); return { ok: false, classification: 'login-invalid', stopChain: true, reason: '合成：收口未证明' }; }, { loginCfg: stopCfg, excludeWorkCopy: true });
+    assert.strictEqual(r3.ok, false);
+    assert.strictEqual(stopCalls.length, 1, 'stopChain 立即停链，绝不开启下一候选浏览器');
+    // 收口未证明的 stopChain 也**不**入失败史（不缓存错误停机原因）：同一 cfg 下一轮
+    // 必须原样重试全部候选，且不会在 stopChain 之后自行启动新候选。
+    const v4 = loginInvalidFor();
+    const r4 = await f.restore(v4.verify, { loginCfg: stopCfg, excludeWorkCopy: true });
+    assert.strictEqual(r4.ok, false);
+    assert.strictEqual(v4.calls.length, 3, 'stopChain 失败不得被缓存：下一轮从头重试全部 3 条');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D12F 并发 CAS 冲突保留新文件：指纹变化重置历史，新候选随后照常提升', async () => {
+  const f = guardSessionFixture();
+  try {
+    const concurrent = Buffer.from(JSON.stringify(fullSessionCookies('C', 'concurrent')));
+    f.snapshot(fullSessionCookies('H1', 'h1'));
+    f.snapshot(fullSessionCookies('H2', 'h2'));
+    const loginCfg = {};
+    const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+    fs.writeFileSync(f.workPath, baseline);
+    const before = f.sourceState();
+    let injected = false;
+    const r1 = await f.restore(async (p) => {
+      if (!injected) { injected = true; fs.writeFileSync(f.workPath, concurrent); } // 首候选验证成功瞬间并发新扫码
+      return { ok: true, finalCookies: p.cookies };
+    }, { loginCfg });
+    assert.strictEqual(r1.ok, false, '首轮验证成功但 CAS 冲突：绝不覆盖并发新扫码文件');
+    assert.ok(r1.attempts.some((a) => a.conflict === true));
+    assert.deepStrictEqual(fs.readFileSync(f.workPath), concurrent, '并发新文件必须原样保留');
+    const v2calls = [];
+    const r2 = await f.restore(async (p) => { v2calls.push(p.source); return { ok: true, finalCookies: p.cookies }; }, { loginCfg });
+    assert.strictEqual(r2.ok, true, '指纹已变化 → 历史重置，新候选照常可验证提升');
+    assert.ok(v2calls.length >= 1);
+    assert.deepStrictEqual(f.sourceState(), before);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+// ============ D12F2：失败史上限必须覆盖一次完整有界候选遍历 ============
+// 单轮候选 SHA 上界 = 上游 6（工作 1 + 分析 1 + 恢复固定 1 + 恢复版本 3）+ 有界归档 200 = 206。
+// 上限 64 会在第 65 个失败处整史清空，使更旧候选永不可达；下列两条用真实 vault/真实模块证明
+// 完整遍历内历史不提前重置（每轮仍只验证 ≤5 条，网络/进程边界不变，无新增无界状态）。
+
+test('D12F2 真实 87 版本同 SID：24 次有界调用内触达并提升最旧健康变体，只读源零改动', async () => {
+  const f = guardSessionFixture();
+  try {
+    const ids = [];
+    for (let i = 0; i < 87; i += 1) ids.push(f.snapshot(fullSessionCookies('A', `scale-${i}`)).versionId);
+    const healthyId = ids[0];  // 最旧一条才健康；其余 86 条更新的同 SID 变体全部失效
+    const workBuf = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+    fs.writeFileSync(f.workPath, workBuf);  // 工作副本全程不变 → 指纹稳定，失败史跨调用延续
+    const loginCfg = { cookieSourceDir: f.roots.analyzerWorkDir };  // 同一稳定配置对象贯穿全部调用
+    const before = f.sourceState();
+    const seen = new Set();
+    let promoted = null;
+    let rounds = 0;
+    for (let round = 1; round <= 24 && promoted === null; round += 1) {
+      rounds = round;
+      const v = loginInvalidFor(`raw-archive:${healthyId}`);
+      const r = await f.restore(v.verify, { loginCfg });
+      assert.ok(v.calls.length <= RESTORE_MAX_CANDIDATES, `第 ${round} 轮首选窗口须 <= 5: ${v.calls.length}`);
+      for (const s of v.calls) {
+        assert.ok(!seen.has(s), `第 ${round} 轮重复验证已失败字节（历史被提前重置）: ${s}`);
+        seen.add(s);
+      }
+      if (r.ok) promoted = r;
+      else assert.deepStrictEqual(fs.readFileSync(f.workPath), workBuf, '未提升前工作副本字节不得变化');
+    }
+    assert.ok(promoted, `24 次有界调用内必须触达最旧健康变体（实际 ${rounds} 轮）`);
+    assert.strictEqual(promoted.source, `raw-archive:${healthyId}`);
+    assert.ok(rounds <= 24, `调用轮数必须有界: ${rounds}`);
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(f.workPath)), fullSessionCookies('A', 'scale-0'));
+    assert.deepStrictEqual(f.sourceState(), before, '归档/恢复/分析只读源 sha 与 mtime 全程不变');
+    assert.ok(!JSON.stringify(f.audit).includes('FAKE-'));
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D12F2 有界上界 206（200 归档 + 6 上游角色）：完整遍历不被提前重置，最终提升最旧健康变体', async () => {
+  const f = guardSessionFixture();
+  try {
+    const ids = [];
+    for (let i = 0; i < 200; i += 1) ids.push(f.snapshot(fullSessionCookies('A', `bulk-${i}`)).versionId);
+    const healthyId = ids[0];  // 第 206 个候选（最旧），只有它能通过验证
+    fs.writeFileSync(f.workPath, JSON.stringify(fullSessionCookies('A', 'work')));
+    fs.writeFileSync(path.join(f.roots.analyzerWorkDir, 'shopA.json'), JSON.stringify(fullSessionCookies('A', 'analysis')));
+    fs.writeFileSync(path.join(f.roots.recoveryDir, 'shopA.json'), JSON.stringify(fullSessionCookies('A', 'recovery')));
+    const vdir = path.join(f.roots.recoveryDir, 'shopA');
+    fs.mkdirSync(vdir);
+    for (let i = 0; i < 3; i += 1) fs.writeFileSync(path.join(vdir, `v${i}.json`), JSON.stringify(fullSessionCookies('A', `recovery-${i}`)));
+    const loginCfg = { cookieSourceDir: f.roots.analyzerWorkDir };
+    const before = f.sourceState();
+    const seen = new Set();
+    let promoted = null;
+    let rounds = 0;
+    for (let round = 1; round <= 45 && promoted === null; round += 1) {
+      rounds = round;
+      const v = loginInvalidFor(`raw-archive:${healthyId}`);
+      const r = await f.restore(v.verify, { loginCfg });
+      assert.ok(v.calls.length <= RESTORE_MAX_CANDIDATES, `每轮 <= 5 首选（本夹具无 legacy 窗口）: ${v.calls.length}`);
+      for (const s of v.calls) {
+        assert.ok(!seen.has(s), `第 ${round} 轮重复验证已失败字节（历史被提前重置）: ${s}`);
+        seen.add(s);
+      }
+      if (r.ok) promoted = r;
+    }
+    assert.ok(promoted, `206 个候选的有界遍历必须能走完（实际 ${rounds} 轮）`);
+    assert.strictEqual(promoted.source, `raw-archive:${healthyId}`);
+    assert.strictEqual(seen.size, 206, '失败史须覆盖全部 206 个候选 SHA，一次遍历内不提前重置');
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(f.workPath)), fullSessionCookies('A', 'bulk-0'));
+    assert.deepStrictEqual(f.sourceState(), before, '归档/恢复/分析只读源 sha 与 mtime 全程不变');
+    assert.ok(f.reads.length <= 200 * rounds, '归档字节读取次数不超过每轮 200 次的有界扫描');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});

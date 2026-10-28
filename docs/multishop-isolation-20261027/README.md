@@ -18,3 +18,7 @@
 补充复验：node --test docs/multishop-isolation-20261027/offline/guard/test/late-read-gate-settle.test.js docs/multishop-isolation-20261027/offline/guard/test/dian4-unknown-gate-ownership.test.js docs/multishop-isolation-20261027/offline/guard/test/enable-read-deadline.test.js
 
 归档截断修复 D10R/D11R（2026-10-28）：恢复选择优先覆盖不同会话，剩余名额保留同会话变体；仅恢复内部的本地只读归档扫描上限200，普通调用仍50，平台验证仍guard5+5/app4+3。既有SHA、店名、独立进程、关闭证明和并发文件比较保持。199项专项最终复跑通过；首次全量一次恢复用例未通过，单项及全量复跑通过，尚未定位偶发原因，记录保留本机test-first-failure-D11R.json摘要与复跑日志。真实只读文件选择从4组扩至7组；这不证明这些会话被平台接受，也不代表三店业务已完成验收。三个恢复源文件已按批准哈希加载，配置及两类只读Cookie未写入。
+
+跨轮候选覆盖修复 D12（2026-10-28）：同一登录配置、同店工作文件和未变化指纹下，只在内存记录明确login-invalid且无收尾阻断的失败；后续优先未试过的会话，再尝试同会话其他字节副本。瞬态/身份未核验/关闭不明确不按坏凭据缓存，成功、文件指纹变化、配置对象变化或本批耗尽后重置；没有持久游标、配置、计时器或UI。单次仍5+5验证、本地归档仍200。RAM失败记录256可覆盖最多206个有界候选，避免原64容量提前重置导致旧备份永久不可达。211项专项及独立87版本/206候选容量测试通过；曾退回失败版本及两处夹具错误，未将其加载生产。两个只读角色不写入。真实平台是否接受历史会话仍以运行回执验收，不凭测试宣称两店已恢复。
+
+独立验收：node --test docs/multishop-isolation-20261027/offline/guard/test/independent-history-acceptance.test.cjs

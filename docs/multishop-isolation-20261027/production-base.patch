@@ -771,3 +771,215 @@ index 55bb942733e20bc2756beac01ce1ea77ee00672e..65e666417f5d5792722aa64aaf7b757d
    const cands = [];
    for (const c of [workCand, analyzerCand, recoveryCand, ...recoveryVersionCands, ...archiveCands]) {
      if (c) cands.push(c);
+diff --git a/src/login/session.js b/src/login/session.js
+index 65e666417f5d5792722aa64aaf7b757d2edb9d91..d3427d5fdb5d84f6fc3313d81d561fa219e13c60 100644
+--- a/src/login/session.js
++++ b/src/login/session.js
+@@ -167,7 +167,7 @@ function backupGuardWorkFile(fsm, workPath, nowFn) {
+   return { ok: true, skipped: false, backupPath };
+ }
+ 
+-function listArchiveCandidatesGuard(shopSafeName, opts, fsm, limit = RESTORE_MAX_CANDIDATES) {
++function listArchiveCandidatesGuard(shopSafeName, opts, fsm, limit = RESTORE_MAX_CANDIDATES, history = null) {
+   let vaultMod = opts.vaultModule || null;
+   if (!vaultMod) {
+     try { vaultMod = require(DEFAULT_VAULT_MODULE_PATH); } catch (e) {
+@@ -194,6 +194,7 @@ function listArchiveCandidatesGuard(shopSafeName, opts, fsm, limit = RESTORE_MAX
+   const bounded = versions.versions.slice(0, recoveryScan ? 200 : 50);
+   for (const legacy of [false, true]) {
+     let window = [];
++    let spareWindow = [];
+     const seenSha = new Set();
+     const sessions = new Set();
+     for (const v of bounded) {
+@@ -207,11 +208,19 @@ function listArchiveCandidatesGuard(shopSafeName, opts, fsm, limit = RESTORE_MAX
+       if (seenSha.has(r.sha256)) continue;
+       seenSha.add(r.sha256);
+       const c = { source: `raw-archive:${v.versionId}`, buf: r.buf, sha256: r.sha256, path: v.versionPath, createdAtMs: Number(v.createdAtMs) || 0, origin };
+-      sessions.add(candidateSessionIdentityGuard(c) || `sha:${c.sha256}`);
++      const key = candidateSessionIdentityGuard(c) || `sha:${c.sha256}`;
++      // D12F：历史失败字节直接跳过；历史失败**会话**不占主窗口（否则归档层永远先截
++      // 前 5 组），但其新字节变体保留为有界备用窗口（同 SID 变体可能健康，绝不整会话丢弃）。
++      if (history && history.failedShas.has(r.sha256)) continue;
++      if (history && history.failedSessions.has(key)) {
++        if (!spareWindow.some((x) => x.sha256 === c.sha256)) spareWindow.push(c);
++        continue;
++      }
++      sessions.add(key);
+       window = sessionBreadthOrderGuard([...window, c]).slice(0, maxRead);
+-      if (sessions.size >= maxRead) break;
++      if (sessions.size >= maxRead && spareWindow.length >= maxRead) break;
+     }
+-    items.push(...window);
++    items.push(...window, ...spareWindow.slice(0, maxRead));
+   }
+   return { ok: true, items, manifestMissing: versions.manifestMissing === true, archiveRoot: roots.archiveRoot };
+ }
+@@ -451,12 +460,87 @@ function sessionBreadthOrderGuard(cands) {
+   return representatives.concat(variants);
+ }
+ 
++// ── D12F：跨调用失败候选进程内存史（最小修复，无持久化/定时器/新服务）──
++// 只记录默认验证语义下的**证明性登录失效**（classification === 'login-invalid' 且
++// stopChain !== true）；verify-error/identity-unverified/CAS 冲突等瞬态失败绝不缓存，
++// 不作为坏凭证拉黑。作用域：WeakMap 键 = 调用方 loginCfg 对象（配置对象更换即自然
++// 隔离）→ 每个工作副本一个小状态；冻结基线指纹（exists/sha）变化即整体重置（新扫码
++// 登录/提升成功/并发写入后首轮一律按全新凭证处理）。历史上限 RESTORE_HISTORY_MAX_FAILED，
++// 超限整体清空，保证有界；当一次调用在有历史的情况下零个新候选被验证（现有可用候选
++// 全部试尽）也整体清空，下一轮从头重试，绝不无限期拉黑任何 Cookie 字节。
++// 历史只影响候选排序/跳过（skipped-history-sha），不构成登录有效性证明——被跳过的
++// 候选从未放行，全部候选仍必须走统一结构校验 + 独立验证 + CAS 提升门禁。
++//
++// D12F2（容量上界修正，只改常数/注释，不改任何验证或扫描上限）：历史上限必须覆盖
++// **一次完整的有界候选遍历**，否则会在更旧候选被扫到之前清空历史，使下一轮从头重试
++// 同样字节、永远到不了更旧的健康候选（真实 87 版本同 SID 规模实测：24 次有界调用均
++// 未触达唯一健康的最旧变体，因第 65 个失败即整史清空）。单轮候选 SHA 上界有限可算：
++//   上游角色 6 = 值守工作副本 1 + 分析只读来源 1 + 恢复副本固定路径 1 + 恢复副本版本 3
++//   归档层 200 = 有界扫描上限（RESTORE_MAX_CANDIDATES 仍为 5：每窗口仍只验证 5 条）
++//   ⇒ 每轮最多 206 个不同 SHA。
++// 故取 256：>= 206（一次完整遍历内绝不提前重置），且仍是固定常数——RAM 上界约
++// 256 个 SHA 字符串 + ≤256 个会话键（数十 KB，与归档版本总数无关），无持久化、
++// 无定时器、不随归档增长；绝不抬高验证次数/归档 200 上限（网络/进程边界不变）。
++const RESTORE_HISTORY_MAX_FAILED = 256;
++const restoreFailedHistory = new WeakMap();
++
++function historyStoreGuard(loginCfg) {
++  if (!loginCfg || typeof loginCfg !== 'object') return null;
++  let perWork = restoreFailedHistory.get(loginCfg);
++  if (!perWork) {
++    perWork = new Map();
++    restoreFailedHistory.set(loginCfg, perWork);
++  }
++  return perWork;
++}
++
++function acquireRestoreHistoryGuard(loginCfg, workPath, frozenBaseline) {
++  const fingerprint = JSON.stringify([frozenBaseline.exists, frozenBaseline.sha256 || null]);
++  const store = historyStoreGuard(loginCfg);
++  if (!store) return { fingerprint, failedShas: new Set(), failedSessions: new Set(), volatile: true };
++  let st = store.get(workPath);
++  if (!st || st.fingerprint !== fingerprint) {
++    st = { fingerprint, failedShas: new Set(), failedSessions: new Set() };
++    store.set(workPath, st);
++  }
++  return st;
++}
++
++function discardRestoreHistoryGuard(loginCfg, workPath) {
++  const store = historyStoreGuard(loginCfg);
++  if (store) store.delete(workPath);
++}
++
++function recordLoginInvalidCandidateGuard(st, cand) {
++  if (!st) return;
++  st.failedShas.add(cand.sha256);
++  st.failedSessions.add(candidateSessionIdentityGuard(cand) || `sha:${cand.sha256}`);
++  if (st.failedShas.size > RESTORE_HISTORY_MAX_FAILED) {
++    st.failedShas.clear();
++    st.failedSessions.clear();
++  }
++}
++
++// 历史感知的广度排序：从未试过的不同会话代表优先；已失败会话的**新字节变体**降为备用
++// （绝不整会话丢弃——同 SID 变体可能健康）；已失败字节（SHA）排最后并在选择时跳过。
++function historyBreadthOrderGuard(window, history) {
++  const base = sessionBreadthOrderGuard(window);
++  if (!history) return base;
++  const tiers = [[], [], []];
++  for (const c of base) {
++    const tier = history.failedShas.has(c.sha256) ? 2
++      : (history.failedSessions.has(candidateSessionIdentityGuard(c) || `sha:${c.sha256}`) ? 1 : 0);
++    tiers[tier].push(c);
++  }
++  return tiers[0].concat(tiers[1], tiers[2]);
++}
++
+ function at0Bucket(kind, c) {
+   const at = archiveEpochMs(c);
+   return at > 0 ? `${kind}:${Math.floor(at / 60000)}` : null;
+ }
+ 
+-function rankRestoreCandidatesGuard(cands, limit = RESTORE_MAX_CANDIDATES) {
++function rankRestoreCandidatesGuard(cands, limit = RESTORE_MAX_CANDIDATES, history = null) {
+   const upper = cands.filter((c) => !String(c.source || '').startsWith('raw-archive:'));
+   const archives = cands.filter((c) => String(c.source || '').startsWith('raw-archive:'));
+   archives.sort((a, b) => (Number(isLegacyArchiveCandidate(a)) - Number(isLegacyArchiveCandidate(b)))
+@@ -472,7 +556,7 @@ function rankRestoreCandidatesGuard(cands, limit = RESTORE_MAX_CANDIDATES) {
+   for (const window of [preferred, legacy]) {
+     const fallback = window === legacy;
+     let taken = 0;
+-    for (const c of sessionBreadthOrderGuard(window)) {
++    for (const c of historyBreadthOrderGuard(window, history)) {
+       const isArchive = String(c.source || '').startsWith('raw-archive:');
+       const at = isArchive ? archiveEpochMs(c) : 0;
+       const entry = {
+@@ -486,6 +570,7 @@ function rankRestoreCandidatesGuard(cands, limit = RESTORE_MAX_CANDIDATES) {
+       // 完整会话身份优先；分钟桶仅保留不透明候选的旧行为，不能吞掉可验证的会话变体。
+       const bucket = isArchive && !candidateSessionIdentityGuard(c) ? at0Bucket(fallback ? 'legacy' : 'nonlegacy', c) : null;
+       if (seenSha.has(c.sha256)) entry.decision = 'skipped-dup-sha';
++      else if (history && history.failedShas.has(c.sha256)) entry.decision = 'skipped-history-sha';
+       else if (taken >= maxSlots) entry.decision = fallback ? 'beyond-limit-fallback' : 'beyond-limit';
+       else if (bucket !== null && seenMinute.has(bucket)) entry.decision = 'skipped-dup-minute';
+       else {
+@@ -557,6 +642,9 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
+   if (frozenBaseline.error) {
+     return { ok: false, reason: `无法冻结值守工作副本目标指纹（${frozenBaseline.error}）：拒绝恢复（fail-closed）`, attempts };
+   }
++  // D12F：跨调用失败候选史（进程内存；同一 loginCfg 对象 + 同一工作副本 + 冻结指纹
++  // 不变才延续）。指纹变化（新扫码/提升成功/并发写入）→ 首轮即重置，全新凭证优先。
++  const history = acquireRestoreHistoryGuard(loginCfg, workPath, frozenBaseline);
+ 
+   // 候选 1：值守工作副本当前字节（业务入口登录失效路径可排除：当前字节刚在真实
+   // 浏览器验证失败，重复验证无意义；文件损坏/未知调用方仍按完整候选链处理）
+@@ -604,7 +692,7 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
+     } catch (_) { /* 版本目录缺失：无版本化恢复副本，仅固定路径兼容层 */ }
+   }
+ 
+-  const arch = listArchiveCandidatesGuard(shopSafeName, opts, fsm, RESTORE_MAX_CANDIDATES);
++  const arch = listArchiveCandidatesGuard(shopSafeName, opts, fsm, RESTORE_MAX_CANDIDATES, history);
+   const archiveCands = [];
+   let archReal = null;
+   if (arch.ok) {
+@@ -632,7 +720,7 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
+   for (const c of [workCand, analyzerCand, recoveryCand, ...recoveryVersionCands, ...archiveCands]) {
+     if (c) cands.push(c);
+   }
+-  const ranked = rankRestoreCandidatesGuard(cands, RESTORE_MAX_CANDIDATES);
++  const ranked = rankRestoreCandidatesGuard(cands, RESTORE_MAX_CANDIDATES, history);
+   if (typeof opts.audit === 'function') {
+     try {
+       opts.audit({
+@@ -678,6 +766,11 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
+       // COOKIE-PROCESS-ISOLATION-20261026：候选专属浏览器进程关闭未获证明 → 立即
+       // 终止恢复链（不提升、不再启动下一候选进程；候选 N 收口前不得进入 N+1）。
+       if (vr && vr.stopChain === true) break;
++      // D12F：只有默认验证语义证明的 login-invalid（且非 stopChain 收口不确定）才进
++      // 跨调用史；verify-error/identity-unverified/CAS 冲突等瞬态失败绝不缓存。
++      if (vr && vr.classification === 'login-invalid' && vr.stopChain !== true) {
++        recordLoginInvalidCandidateGuard(history, cand);
++      }
+       continue;
+     }
+     // 第六轮 F1（根因修复）：只提升「验证 context 的最终已验证集合」的确定性序列化字节。
+@@ -745,6 +838,8 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
+       targetSha256: wr.sha256, backupPath: bk.backupPath ? path.basename(bk.backupPath) : null,
+     };
+     if (typeof opts.audit === 'function') { try { opts.audit(entry); } catch (_) { /* ignore */ } }
++    // 提升成功：丢弃该工作副本的失败史（新指纹下一轮也会自然重置，这里显式立即清理）。
++    discardRestoreHistoryGuard(loginCfg, workPath);
+     return {
+       ok: true, source: cand.source, sourceSha256: cand.sha256,
+       targetSha256: wr.sha256, backupPath: bk.backupPath || null, attempts,
+@@ -758,6 +853,12 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
+       });
+     } catch (_) { /* ignore */ }
+   }
++  // D12F：有历史但本轮零次新验证 = 现有可用候选已全部试尽（历史可能过期）→ 清空，
++  // 下一轮从头重试；失败史绝不无限期拉黑任何字节。
++  if (!history.volatile && history.failedShas.size > 0 && verifyCalls === 0) {
++    history.failedShas.clear();
++    history.failedSessions.clear();
++  }
+   return {
+     ok: false,
+     reason: `全部候选未通过验证或提升失败（验证调用 ${verifyCalls} 次）：保留工作副本现状，不盲覆盖（单次有界循环）`,

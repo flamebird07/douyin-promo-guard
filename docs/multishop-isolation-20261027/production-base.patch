@@ -1417,3 +1417,296 @@ index 3eb7f6360e46eff38f555db8bdf3cd95da127326..b3599275c97a04b054951e7d520f9739
      seen.add(browser);
      if (onResource) {
        const owned = browser;
+diff --git a/src/engine/monitor.js b/src/engine/monitor.js
+index 13d8a7a6f9124d3377c6c380e76c0c800eea3048..0e473c74f77d961d2440fb5e1df539ae6a948273 100644
+--- a/src/engine/monitor.js
++++ b/src/engine/monitor.js
+@@ -3475,9 +3475,14 @@ class Monitor {
+       const closes = [];
+       let session = null;
+       let timedOut = false;
++      // D22R 协作取消令牌：截止定时器触发时翻转，经 opener 参数透传到真实开启链
++      //（defaultChengfangOpener → openChengfangShop → openQianchuanHome），
++      // 让截止后不再启动新的店铺/候选浏览器进程，本次 work 尽快 settle，收口门可推进。
++      const cancelToken = { cancelled: false, reason: null };
+       const meta = {
+         steps,
+         closeWaitMs,
++        cancelToken,
+         onSession: (s) => {
+           session = s;
+           if (timedOut) {
+@@ -3496,7 +3501,7 @@ class Monitor {
+       try {
+         result = await Promise.race([
+           work,
+-          new Promise((resolve) => { timer = setTimeout(() => { timedOut = true; deadlineFired = true; resolve({ __readDeadline: true }); }, remaining); }),
++          new Promise((resolve) => { timer = setTimeout(() => { timedOut = true; deadlineFired = true; cancelToken.cancelled = true; cancelToken.reason = 'read-deadline'; resolve({ __readDeadline: true }); }, remaining); }),
+         ]);
+       } catch (e) {
+         clearTimeout(timer);
+@@ -3713,6 +3718,7 @@ class Monitor {
+       // audit 透传：只读状态开会话与批次开会话同链（默认开启器 → openChengfangShop/检查点）
+       session = await opener({
+         loginCfg, shopCfg, audit: (e) => this._audit(e), readOnlyStatus: true,
++        ...( (_meta && _meta.cancelToken) ? { cancelToken: _meta.cancelToken } : {} ),
+         // 所有权早登记（2026-10-23）：适配器必须在**创建资源之后、任何后续 await 之前**同步回调。
+         // 截止先于 opener 返回时，门里已经握着可核验的 close/isConnected 句柄。
+         // 句柄是闭包对象：绝不进返回值、日志或 JSON。
+diff --git a/src/engine/chengfang-runner.js b/src/engine/chengfang-runner.js
+index 56fd0444f049e1d9dfbae0f207e693e949fdceee..e1431d52d4cd31cbd9ee97347779af8186a802da 100644
+--- a/src/engine/chengfang-runner.js
++++ b/src/engine/chengfang-runner.js
+@@ -31,12 +31,16 @@ const { compactUrls, sanitize } = require('../lib/log');
+ const { perOrderDisplayText } = require('./rules');
+ 
+ /** 生产默认会话开启器：真实乘方管理页（openChengfangShop + 真实控制器）。 */
+-async function defaultChengfangOpener({ loginCfg, shopCfg, audit, onResource, readOnlyStatus }) {
++async function defaultChengfangOpener({ loginCfg, shopCfg, audit, onResource, readOnlyStatus, cancelToken }) {
+   const { openChengfangShop, createChengfangController, watchChengfangControlsForManualReview } = require('../adapters/chengfang-reader');
+   // audit 透传给 openChengfangShop（打开/检查点/浮窗审计）与 manual-review watch 包装器
+   //（控件失败恢复路径的浮窗审计）；调用方未传时下游各自 fail-safe 为无操作。
++  // cancelToken（D22R）：Monitor 回读截止的协作取消令牌；必须经本**真实生产开启器**
++  // 透传到 openChengfangShop → openQianchuanHome——只在测试注入的 opener 里生效不算传播。
+   const { browser, target, account, context, cookieSession, readOnlyEmpty } = await openChengfangShop({
+-    loginCfg, shopCfg, audit, onResource, ...(readOnlyStatus === true ? { readOnlyStatus: true } : {}),
++    loginCfg, shopCfg, audit, onResource,
++    ...(readOnlyStatus === true ? { readOnlyStatus: true } : {}),
++    ...(cancelToken ? { cancelToken } : {}),
+   });
+   if (readOnlyStatus === true && readOnlyEmpty) {
+     return { browser, page: target, account, context, cookieSession, readOnlyEmpty };
+diff --git a/src/adapters/qianchuan-reader.js b/src/adapters/qianchuan-reader.js
+index 82221f6a812ace9c4ee3bb0e792df766d8cb0b7e..0c4067f5fac4de63b215fc9d8b04b04ce037ef63 100644
+--- a/src/adapters/qianchuan-reader.js
++++ b/src/adapters/qianchuan-reader.js
+@@ -759,10 +759,25 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
+     if (!ok) browser = closing;
+     return ok;
+   };
++  // D22R 协作取消（回读截止透传）：Monitor 的 300s 读取 deadline 触发后，本函数绝不再
++  // 启动任何新的店铺/候选浏览器进程（恢复链每个候选都是一次全新 chromium.launch，5+5 个
++  // 候选可远超父 deadline）。截止后继续开进程只会让 work 长期不 settle、收口门永远无法
++  // 凭真实关闭证明推进。取消只阻断"新进程启动/新候选链"，不动任何既有等待与关闭语义；
++  // 抛出的 DataGuardError 走既有 catch 收口（browser 已创建时照常 close）。
++  const assertReadNotCancelled = () => {
++    const t = opts.cancelToken;
++    if (t && typeof t === 'object' && t.cancelled === true) {
++      throw new DataGuardError(`回读截止已到：会话开启被协作取消（${t.reason || 'read-deadline'}），不再启动新的浏览器/候选进程`);
++    }
++  };
+   // 候选专用浏览器工厂：每个恢复候选一份全新独立浏览器进程（显式注入优先；测试用
+   // browserFactory 包装并强制每次新实例；生产默认 Playwright chromium.launch，每次调用
+   // 即每次全新进程）。绝不把当前/历史店铺浏览器共享给候选验证（forbiddenBrowsers 拒绝）。
+-  const candidateBrowserFactory = typeof opts.restoreCandidateBrowserFactory === 'function'
++  // D22R 内层通用启动门：外壳的 assertReadNotCancelled 检查点不能阻止工厂内部的 INNER
++  // 新进程——无论显式注入的 restoreCandidateBrowserFactory 还是默认工厂，每次候选进程
++  // 启动前都在此处再查一次取消令牌（已取消 → 拒绝调用底层工厂，零新进程；不关闭任何
++  // 外来所有者的进程）。注入的恢复器（restoreRunner）拿到的正是这层包装后的工厂。
++  const baseCandidateBrowserFactory = typeof opts.restoreCandidateBrowserFactory === 'function'
+     ? opts.restoreCandidateBrowserFactory
+     : createCandidateBrowserFactory({
+       injectedFactory: typeof opts.browserFactory === 'function' ? opts.browserFactory : null,
+@@ -776,7 +791,12 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
+       },
+       onResource: typeof opts.onResource === 'function' ? opts.onResource : null,
+     });
++  const candidateBrowserFactory = async () => {
++    assertReadNotCancelled();
++    return baseCandidateBrowserFactory();
++  };
+   try {
++    assertReadNotCancelled();
+     const resolved = resolveCookieFile(loginCfg, shopCfg.cookieFile);
+     // 会话 Cookie 回写所需的元信息（2026-09-16 用户明确授权）：
+     // 记录**本次实际加载的精确文件路径**与会话开始时的指纹（size/mtime/sha256）。
+@@ -843,6 +863,9 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
+           recoveryDir: opts.restoreRecoveryDir,
+           nowFn: opts.nowFn,
+           audit: opts.audit,
++          // D22R：把本调用的取消令牌透传给恢复链（默认验证器/恢复循环据此停后续候选、
++          // 拒绝取消后的失败缓存与提升；缺令牌时行为与旧版完全一致）。
++          cancelToken: opts.cancelToken,
+         });
+       } catch (e) {
+         return { ok: false, reason: '恢复链异常（未回显可能含凭据的异常详情）' };
+@@ -856,11 +879,19 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
+       if (!browserClosed) {
+         throw new AuthError('登录失效后原店铺浏览器进程关闭未获证明：阻断四层恢复（绝不重叠会话/绝不带着旧 Cookie 进程继续）');
+       }
++      assertReadNotCancelled();
+       const restore = await runRestoreChain();
+       fail.restore = restore;
++      // D22R：恢复链自身被协作取消（restore.cancelled）≠ "全部候选登录无效"。不得包装成
++      // AuthError——那会把"读取被截止取消"伪装成需要重新扫码的登录失效证据。按既有
++      // DataGuardError + 取消原因如实外抛；已创建的店铺进程由既有 catch/finally 收口。
++      if (restore.cancelled === true) {
++        throw new DataGuardError(`回读截止已到：登录恢复链被协作取消（${(opts.cancelToken && opts.cancelToken.reason) || 'read-deadline'}）：不再继续启动浏览器/候选进程`);
++      }
+       if (restore.ok) {
+         // 恢复提升已更新工作副本：刷新会话指纹基线（提升后字节即新基线），并在**全新
+         // 店铺浏览器进程**上有界重试一次（旧进程已关闭，绝不复用旧 Cookie 进程重载）。
++        assertReadNotCancelled();
+         cookieSession.startFingerprint = fingerprintFile(resolved.path);
+         browser = await launchShopBrowser();
+         sess = await openFxgSession();
+@@ -892,6 +923,7 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
+     let reached = null;
+     let qcFailure = null;
+     for (let round = 0; round < 2; round += 1) {
++      assertReadNotCancelled();
+       reached = await reachQianchuanHome({
+         page: sess.pg, context: sess.ctx, shopCfg,
+         // 地址门复用 SSO 收敛已严格核验的首页地址（重试轮 goto 目标即该首页；点击时刻
+@@ -931,13 +963,21 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
+           qcFailure = new AuthError(`${e.message}；原店铺浏览器进程关闭未获证明：阻断四层恢复重开，绝不重叠会话`);
+           break;
+         }
++        assertReadNotCancelled();
+         const restore = await runRestoreChain();
++        // D22R：会话中段恢复链被协作取消 → 同样不得包装成 AuthError（取消不是登录失效
++        // 证据）；按 DataGuardError + 取消原因处理，已建进程仍由 finally/catch 收口。
++        if (restore.cancelled === true) {
++          qcFailure = new DataGuardError(`回读截止已到：会话中段恢复链被协作取消（${(opts.cancelToken && opts.cancelToken.reason) || 'read-deadline'}）：不再继续启动浏览器/候选进程`);
++          break;
++        }
+         if (!restore.ok) {
+           qcFailure = new AuthError(`${e.message}；四层恢复未取得可验证候选（${restore.reason || '未提升'}），工作副本现状未被盲覆盖`);
+           break;
+         }
+         // 恢复提升已更新工作副本：刷新指纹基线（提升后字节即新基线），启动全新店铺浏览器
+         // 进程重开干净上下文重走全链路（旧进程已关闭，绝不复用旧 Cookie 进程重载）。
++        assertReadNotCancelled();
+         cookieSession.startFingerprint = fingerprintFile(resolved.path);
+         browser = await launchShopBrowser();
+         sess = await openFxgSession();
+diff --git a/src/login/session.js b/src/login/session.js
+index 95b06ebe8f99d4d80567e1e20919d0eab922a8b9..5d011130b89eb0e2cd0f74ab5a86dcc83745adf0 100644
+--- a/src/login/session.js
++++ b/src/login/session.js
+@@ -478,6 +478,10 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
+     if (latchReason) {
+       return { ok: false, classification: 'verify-error', stopChain: true, reason: latchReason };
+     }
++    // D22R：候选启动前的协作取消门（回读截止已到 → 零工厂调用/零新资源/零 Cookie 注入）。
++    if (isCancelledToken(opts.cancelToken)) {
++      return { ok: false, classification: 'verify-error', stopChain: true, reason: '回读截止已到：候选验证被协作取消，不再启动候选专用浏览器进程（零新资源、零 Cookie 注入、不判登录失效、不提升）' };
++    }
+     let browser = null;
+     try {
+       browser = await factory();
+@@ -513,6 +517,25 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
+       return { ok: false, classification: 'verify-error', reason: '候选浏览器工厂返回不可用浏览器实例（每个候选必须是全新独立进程）：fail-closed 拒绝验证，不提升' };
+     }
+     usedBrowsers.add(browser);
++    // D22R：取消发生在工厂 await 期间 → 外来/已用/不可用所有权检查（D6/D21）已在上方
++    // 优先执行完毕；此处只收口**本候选新拥有**的进程（关闭需获证明），零 newContext/
++    // addCookies。取消绝不判 login-invalid（不写失败缓存）、绝不提升、停止恢复链；
++    // 也绝不因取消去关闭外来/已用实例（所有权在原所有者）。
++    if (isCancelledToken(opts.cancelToken)) {
++      let closeProven = false;
++      try { await browser.close(); closeProven = true; } catch (_) { closeProven = false; }
++      if (closeProven && typeof browser.isConnected === 'function') {
++        try { if (browser.isConnected() !== false) closeProven = false; } catch (_) { closeProven = false; }
++      }
++      if (!closeProven) {
++        latchReason = '取消后候选专用浏览器进程关闭未获证明（close 异常或仍连接）：已闩锁停止恢复链，不提升';
++        return { ok: false, classification: 'verify-error', stopChain: true, reason: latchReason };
++      }
++      return {
++        ok: false, classification: 'verify-error', stopChain: true,
++        reason: '回读截止已到：候选浏览器启动后验证被协作取消：已收口自有新进程（关闭获证明），零上下文/零 Cookie 注入，不判登录失效、不写失败缓存、不提升',
++      };
++    }
+     let ctx = null;
+     let outcome = null;
+     try {
+@@ -536,6 +559,7 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
+       // 失效、不写失败缓存、不提升、不在本候选收口前启动下一候选）。随后 context/浏览器
+       // 收口仍走下方统一清理，绝不提前 return 跳过。
+       const cancelledReason = () => {
++        if (isCancelledToken(opts.cancelToken)) return `回读截止已到（${opts.cancelToken.reason || 'read-deadline'}）：本次验证被协作取消`;
+         try {
+           if (typeof page.isClosed === 'function' && page.isClosed() === true) return '候选自有页面已被关闭（监控/超时取消本候选）';
+         } catch (_) { return '候选自有页面关闭状态不可判定（保守按取消处理）'; }
+@@ -599,6 +623,12 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
+           outcome = { ok: false, classification: 'verify-error', reason: '身份复验期间 Cookie 或页面变化：拒绝提升较早快照' };
+           break;
+         }
++        // D22R：正向提升前的最后一次取消检查（最终 Cookie 捕获/复验之后）——取消不得
++        // 产生任何正向提升；取消也不是登录失效证据（verify-error + stopChain）。
++        if (isCancelledToken(opts.cancelToken)) {
++          outcome = cancelOutcome('回读截止已到：最终 Cookie 捕获后检测到协作取消');
++          break;
++        }
+         outcome = { ok: true, finalCookies };
+         break;
+       }
+@@ -703,6 +733,11 @@ function sessionBreadthOrderGuard(cands) {
+ const RESTORE_HISTORY_MAX_FAILED = 256;
+ const restoreFailedHistory = new WeakMap();
+ 
++/** D22R：协作取消令牌判定（回读截止透传；缺令牌/未取消一律 false，行为与旧版完全一致）。 */
++function isCancelledToken(token) {
++  return !!(token && typeof token === 'object' && token.cancelled === true);
++}
++
+ function historyStoreGuard(loginCfg) {
+   if (!loginCfg || typeof loginCfg !== 'object') return null;
+   let perWork = restoreFailedHistory.get(loginCfg);
+@@ -1016,9 +1051,20 @@ async function restoreDutyWorkCopyOwned(loginCfg, cookieFile, opts = {}) {
+   }
+ 
+   const verify = opts.verify || createDefaultCandidateVerifier(loginCfg, opts);
++  // D22R：回读截止协作取消（缺令牌/未取消时全部检查为 false，行为与旧版逐字一致）。
++  // 取消只阻断"后续工作"：未启动的候选不再启动；已返回的验证结论不采信为 login-invalid
++  //（不写失败史）；任何候选不再提升。取消不中断既有 await，也不改任何既有失败语义。
++  const cancelToken = (opts.cancelToken && typeof opts.cancelToken === 'object') ? opts.cancelToken : null;
++  const cancelledNow = () => isCancelledToken(cancelToken);
++  let cancelledByToken = false;
+   const seen = new Set();
+   let verifyCalls = 0;
+   for (const cand of ranked.selected) {
++    if (cancelledNow()) {
++      cancelledByToken = true;
++      attempts.push({ source: cand.source, result: 'cancelled', stopChain: true, reason: '回读截止已到：恢复链被协作取消，不再验证/提升后续候选（未验证候选不构成登录失效证据）' });
++      break;
++    }
+     if (seen.has(cand.sha256)) {
+       attempts.push({ source: cand.source, result: 'dedup', sha256Prefix: String(cand.sha256).slice(0, 12) + '…' });
+       continue;
+@@ -1039,6 +1085,13 @@ async function restoreDutyWorkCopyOwned(loginCfg, cookieFile, opts = {}) {
+       // 注入验证器的外部异常同样可能含 Cookie/token：固定脱敏原因，绝不回显异常内容。
+       vr = { ok: false, reason: '验证器异常（异常详情可能含 Cookie/令牌等敏感值，已脱敏不回显）' };
+     }
++    // D22R：验证返回后立即检查取消——即便注入验证器在翻转令牌后仍返回 login-invalid，
++    // 该结论也不得写失败史/不得提升（取消后的分类不构成平台登录无效证据）。
++    if (cancelledNow()) {
++      cancelledByToken = true;
++      attempts.push({ source: cand.source, result: 'cancelled', stopChain: true, reason: '回读截止已到：候选验证返回后检测到协作取消：验证结论不采信为登录失效证据，不写失败缓存、不提升' });
++      break;
++    }
+     if (!vr || vr.ok !== true) {
+       attempts.push({
+         source: cand.source, result: 'verify-failed',
+@@ -1095,6 +1148,12 @@ async function restoreDutyWorkCopyOwned(loginCfg, cookieFile, opts = {}) {
+       attempts.push({ source: cand.source, result: 'promote-failed', conflict: true, reason: '候选验证期间值守工作副本被并发更新（如新扫码登录）：放弃提升，保留并发新文件（较新登录胜出，不覆盖）' });
+       continue;
+     }
++    // D22R：提升写入（备份/临时文件/CAS）前的取消门——取消后零写入、零提升。
++    if (cancelledNow()) {
++      cancelledByToken = true;
++      attempts.push({ source: cand.source, result: 'cancelled', stopChain: true, reason: '回读截止已到：提升前检测到协作取消：放弃提升（不写工作副本/备份）' });
++      break;
++    }
+     // 保留上一版（fail-closed）+ CAS（rename 前复验冻结基线）+ 回读比对
+     const bk = backupGuardWorkFile(fsm, workPath, nowFn);
+     if (!bk.ok) {
+@@ -1145,6 +1204,7 @@ async function restoreDutyWorkCopyOwned(loginCfg, cookieFile, opts = {}) {
+   return {
+     ok: false,
+     reason: `全部候选未通过验证或提升失败（验证调用 ${verifyCalls} 次）：保留工作副本现状，不盲覆盖（单次有界循环）`,
++    ...(cancelledByToken ? { cancelled: true } : {}),
+     attempts,
+   };
+ }

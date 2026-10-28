@@ -17,7 +17,7 @@
   {
     "id": "guard/src/adapters/qianchuan-reader.js",
     "beforeSha256": "7335d982caeece3f8a8afa1040b15328e32318cddbda4852485466e43e702549",
-    "afterSha256": "fff851d4eb1f11259a0c9854fab0a1c2d76805f0d8a56d9df51f40e71ca1589e"
+    "afterSha256": "96b542573bc0890e529abc706903b49ad03cd37a4815ce13db60992538c43238"
   },
   {
     "id": "guard/src/login/session-cookie-checkpoint.js",
@@ -27,12 +27,12 @@
   {
     "id": "guard/src/login/session.js",
     "beforeSha256": "2471de6a3f62fd80828420ae3735ce2bc091d71a1dedf6569a90008e8e69ec24",
-    "afterSha256": "8e2cf5021701e8f0e5b1467c6ee30dd838716785bfb3be34a175f021b34f9334"
+    "afterSha256": "3164948acbc26b87ae00909dfe347a431c1bb39a4ae7b6f9e504c9d3291c04cb"
   },
   {
     "id": "guard/src/engine/monitor.js",
     "beforeSha256": "c9bcdb29e30ae2d6bfeb3a71bbdaf6c2175557bb8cf705a467e252a448d8a777",
-    "afterSha256": "427fb0420d1c08569189577a8341230ebcaa1b31170a46dd9c70dd0a1fed207c"
+    "afterSha256": "6a23a358a622db4f65b4bc5946658e59baaca49199533aad640a16cd8f3a670d"
   },
   {
     "id": "app/cookie-vault.js",
@@ -53,5 +53,10 @@
     "id": "guard/src/login/candidate-browser.js",
     "beforeSha256": "3b72d59286ce87f386e6814b52db853bf6a6883c736ed658dc1c301f4f89323d",
     "afterSha256": "6da32d72ab2da5c3364b80e19b4ef4d612390c47d1a2ad04e74ca1964a013f6a"
+  },
+  {
+    "id": "guard/src/engine/chengfang-runner.js",
+    "beforeSha256": "0127fa1064df2f56c9b74b11152412cf5114565e478836354ab7b00bad89f62d",
+    "afterSha256": "352a1e8efce9d4638c292484adebd2a0d1463b5037c46619cac3bfb6aaeaaa3c"
   }
 ]

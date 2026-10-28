@@ -759,10 +759,25 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     if (!ok) browser = closing;
     return ok;
   };
+  // D22R 协作取消（回读截止透传）：Monitor 的 300s 读取 deadline 触发后，本函数绝不再
+  // 启动任何新的店铺/候选浏览器进程（恢复链每个候选都是一次全新 chromium.launch，5+5 个
+  // 候选可远超父 deadline）。截止后继续开进程只会让 work 长期不 settle、收口门永远无法
+  // 凭真实关闭证明推进。取消只阻断"新进程启动/新候选链"，不动任何既有等待与关闭语义；
+  // 抛出的 DataGuardError 走既有 catch 收口（browser 已创建时照常 close）。
+  const assertReadNotCancelled = () => {
+    const t = opts.cancelToken;
+    if (t && typeof t === 'object' && t.cancelled === true) {
+      throw new DataGuardError(`回读截止已到：会话开启被协作取消（${t.reason || 'read-deadline'}），不再启动新的浏览器/候选进程`);
+    }
+  };
   // 候选专用浏览器工厂：每个恢复候选一份全新独立浏览器进程（显式注入优先；测试用
   // browserFactory 包装并强制每次新实例；生产默认 Playwright chromium.launch，每次调用
   // 即每次全新进程）。绝不把当前/历史店铺浏览器共享给候选验证（forbiddenBrowsers 拒绝）。
-  const candidateBrowserFactory = typeof opts.restoreCandidateBrowserFactory === 'function'
+  // D22R 内层通用启动门：外壳的 assertReadNotCancelled 检查点不能阻止工厂内部的 INNER
+  // 新进程——无论显式注入的 restoreCandidateBrowserFactory 还是默认工厂，每次候选进程
+  // 启动前都在此处再查一次取消令牌（已取消 → 拒绝调用底层工厂，零新进程；不关闭任何
+  // 外来所有者的进程）。注入的恢复器（restoreRunner）拿到的正是这层包装后的工厂。
+  const baseCandidateBrowserFactory = typeof opts.restoreCandidateBrowserFactory === 'function'
     ? opts.restoreCandidateBrowserFactory
     : createCandidateBrowserFactory({
       injectedFactory: typeof opts.browserFactory === 'function' ? opts.browserFactory : null,
@@ -776,7 +791,12 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
       },
       onResource: typeof opts.onResource === 'function' ? opts.onResource : null,
     });
+  const candidateBrowserFactory = async () => {
+    assertReadNotCancelled();
+    return baseCandidateBrowserFactory();
+  };
   try {
+    assertReadNotCancelled();
     const resolved = resolveCookieFile(loginCfg, shopCfg.cookieFile);
     // 会话 Cookie 回写所需的元信息（2026-09-16 用户明确授权）：
     // 记录**本次实际加载的精确文件路径**与会话开始时的指纹（size/mtime/sha256）。
@@ -843,6 +863,9 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
           recoveryDir: opts.restoreRecoveryDir,
           nowFn: opts.nowFn,
           audit: opts.audit,
+          // D22R：把本调用的取消令牌透传给恢复链（默认验证器/恢复循环据此停后续候选、
+          // 拒绝取消后的失败缓存与提升；缺令牌时行为与旧版完全一致）。
+          cancelToken: opts.cancelToken,
         });
       } catch (e) {
         return { ok: false, reason: '恢复链异常（未回显可能含凭据的异常详情）' };
@@ -856,11 +879,19 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
       if (!browserClosed) {
         throw new AuthError('登录失效后原店铺浏览器进程关闭未获证明：阻断四层恢复（绝不重叠会话/绝不带着旧 Cookie 进程继续）');
       }
+      assertReadNotCancelled();
       const restore = await runRestoreChain();
       fail.restore = restore;
+      // D22R：恢复链自身被协作取消（restore.cancelled）≠ "全部候选登录无效"。不得包装成
+      // AuthError——那会把"读取被截止取消"伪装成需要重新扫码的登录失效证据。按既有
+      // DataGuardError + 取消原因如实外抛；已创建的店铺进程由既有 catch/finally 收口。
+      if (restore.cancelled === true) {
+        throw new DataGuardError(`回读截止已到：登录恢复链被协作取消（${(opts.cancelToken && opts.cancelToken.reason) || 'read-deadline'}）：不再继续启动浏览器/候选进程`);
+      }
       if (restore.ok) {
         // 恢复提升已更新工作副本：刷新会话指纹基线（提升后字节即新基线），并在**全新
         // 店铺浏览器进程**上有界重试一次（旧进程已关闭，绝不复用旧 Cookie 进程重载）。
+        assertReadNotCancelled();
         cookieSession.startFingerprint = fingerprintFile(resolved.path);
         browser = await launchShopBrowser();
         sess = await openFxgSession();
@@ -892,6 +923,7 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     let reached = null;
     let qcFailure = null;
     for (let round = 0; round < 2; round += 1) {
+      assertReadNotCancelled();
       reached = await reachQianchuanHome({
         page: sess.pg, context: sess.ctx, shopCfg,
         // 地址门复用 SSO 收敛已严格核验的首页地址（重试轮 goto 目标即该首页；点击时刻
@@ -931,13 +963,21 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
           qcFailure = new AuthError(`${e.message}；原店铺浏览器进程关闭未获证明：阻断四层恢复重开，绝不重叠会话`);
           break;
         }
+        assertReadNotCancelled();
         const restore = await runRestoreChain();
+        // D22R：会话中段恢复链被协作取消 → 同样不得包装成 AuthError（取消不是登录失效
+        // 证据）；按 DataGuardError + 取消原因处理，已建进程仍由 finally/catch 收口。
+        if (restore.cancelled === true) {
+          qcFailure = new DataGuardError(`回读截止已到：会话中段恢复链被协作取消（${(opts.cancelToken && opts.cancelToken.reason) || 'read-deadline'}）：不再继续启动浏览器/候选进程`);
+          break;
+        }
         if (!restore.ok) {
           qcFailure = new AuthError(`${e.message}；四层恢复未取得可验证候选（${restore.reason || '未提升'}），工作副本现状未被盲覆盖`);
           break;
         }
         // 恢复提升已更新工作副本：刷新指纹基线（提升后字节即新基线），启动全新店铺浏览器
         // 进程重开干净上下文重走全链路（旧进程已关闭，绝不复用旧 Cookie 进程重载）。
+        assertReadNotCancelled();
         cookieSession.startFingerprint = fingerprintFile(resolved.path);
         browser = await launchShopBrowser();
         sess = await openFxgSession();

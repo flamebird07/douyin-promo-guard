@@ -31,12 +31,16 @@ const { compactUrls, sanitize } = require('../lib/log');
 const { perOrderDisplayText } = require('./rules');
 
 /** 生产默认会话开启器：真实乘方管理页（openChengfangShop + 真实控制器）。 */
-async function defaultChengfangOpener({ loginCfg, shopCfg, audit, onResource, readOnlyStatus }) {
+async function defaultChengfangOpener({ loginCfg, shopCfg, audit, onResource, readOnlyStatus, cancelToken }) {
   const { openChengfangShop, createChengfangController, watchChengfangControlsForManualReview } = require('../adapters/chengfang-reader');
   // audit 透传给 openChengfangShop（打开/检查点/浮窗审计）与 manual-review watch 包装器
   //（控件失败恢复路径的浮窗审计）；调用方未传时下游各自 fail-safe 为无操作。
+  // cancelToken（D22R）：Monitor 回读截止的协作取消令牌；必须经本**真实生产开启器**
+  // 透传到 openChengfangShop → openQianchuanHome——只在测试注入的 opener 里生效不算传播。
   const { browser, target, account, context, cookieSession, readOnlyEmpty } = await openChengfangShop({
-    loginCfg, shopCfg, audit, onResource, ...(readOnlyStatus === true ? { readOnlyStatus: true } : {}),
+    loginCfg, shopCfg, audit, onResource,
+    ...(readOnlyStatus === true ? { readOnlyStatus: true } : {}),
+    ...(cancelToken ? { cancelToken } : {}),
   });
   if (readOnlyStatus === true && readOnlyEmpty) {
     return { browser, page: target, account, context, cookieSession, readOnlyEmpty };

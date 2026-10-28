@@ -478,6 +478,10 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
     if (latchReason) {
       return { ok: false, classification: 'verify-error', stopChain: true, reason: latchReason };
     }
+    // D22R：候选启动前的协作取消门（回读截止已到 → 零工厂调用/零新资源/零 Cookie 注入）。
+    if (isCancelledToken(opts.cancelToken)) {
+      return { ok: false, classification: 'verify-error', stopChain: true, reason: '回读截止已到：候选验证被协作取消，不再启动候选专用浏览器进程（零新资源、零 Cookie 注入、不判登录失效、不提升）' };
+    }
     let browser = null;
     try {
       browser = await factory();
@@ -513,6 +517,25 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
       return { ok: false, classification: 'verify-error', reason: '候选浏览器工厂返回不可用浏览器实例（每个候选必须是全新独立进程）：fail-closed 拒绝验证，不提升' };
     }
     usedBrowsers.add(browser);
+    // D22R：取消发生在工厂 await 期间 → 外来/已用/不可用所有权检查（D6/D21）已在上方
+    // 优先执行完毕；此处只收口**本候选新拥有**的进程（关闭需获证明），零 newContext/
+    // addCookies。取消绝不判 login-invalid（不写失败缓存）、绝不提升、停止恢复链；
+    // 也绝不因取消去关闭外来/已用实例（所有权在原所有者）。
+    if (isCancelledToken(opts.cancelToken)) {
+      let closeProven = false;
+      try { await browser.close(); closeProven = true; } catch (_) { closeProven = false; }
+      if (closeProven && typeof browser.isConnected === 'function') {
+        try { if (browser.isConnected() !== false) closeProven = false; } catch (_) { closeProven = false; }
+      }
+      if (!closeProven) {
+        latchReason = '取消后候选专用浏览器进程关闭未获证明（close 异常或仍连接）：已闩锁停止恢复链，不提升';
+        return { ok: false, classification: 'verify-error', stopChain: true, reason: latchReason };
+      }
+      return {
+        ok: false, classification: 'verify-error', stopChain: true,
+        reason: '回读截止已到：候选浏览器启动后验证被协作取消：已收口自有新进程（关闭获证明），零上下文/零 Cookie 注入，不判登录失效、不写失败缓存、不提升',
+      };
+    }
     let ctx = null;
     let outcome = null;
     try {
@@ -536,6 +559,7 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
       // 失效、不写失败缓存、不提升、不在本候选收口前启动下一候选）。随后 context/浏览器
       // 收口仍走下方统一清理，绝不提前 return 跳过。
       const cancelledReason = () => {
+        if (isCancelledToken(opts.cancelToken)) return `回读截止已到（${opts.cancelToken.reason || 'read-deadline'}）：本次验证被协作取消`;
         try {
           if (typeof page.isClosed === 'function' && page.isClosed() === true) return '候选自有页面已被关闭（监控/超时取消本候选）';
         } catch (_) { return '候选自有页面关闭状态不可判定（保守按取消处理）'; }
@@ -597,6 +621,12 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
         const finalCookies = await ctx.cookies();
         if (!sameCookieSet(back, finalCookies) || String(page.url()) !== url) {
           outcome = { ok: false, classification: 'verify-error', reason: '身份复验期间 Cookie 或页面变化：拒绝提升较早快照' };
+          break;
+        }
+        // D22R：正向提升前的最后一次取消检查（最终 Cookie 捕获/复验之后）——取消不得
+        // 产生任何正向提升；取消也不是登录失效证据（verify-error + stopChain）。
+        if (isCancelledToken(opts.cancelToken)) {
+          outcome = cancelOutcome('回读截止已到：最终 Cookie 捕获后检测到协作取消');
           break;
         }
         outcome = { ok: true, finalCookies };
@@ -702,6 +732,11 @@ function sessionBreadthOrderGuard(cands) {
 // 无定时器、不随归档增长；绝不抬高验证次数/归档 200 上限（网络/进程边界不变）。
 const RESTORE_HISTORY_MAX_FAILED = 256;
 const restoreFailedHistory = new WeakMap();
+
+/** D22R：协作取消令牌判定（回读截止透传；缺令牌/未取消一律 false，行为与旧版完全一致）。 */
+function isCancelledToken(token) {
+  return !!(token && typeof token === 'object' && token.cancelled === true);
+}
 
 function historyStoreGuard(loginCfg) {
   if (!loginCfg || typeof loginCfg !== 'object') return null;
@@ -1016,9 +1051,20 @@ async function restoreDutyWorkCopyOwned(loginCfg, cookieFile, opts = {}) {
   }
 
   const verify = opts.verify || createDefaultCandidateVerifier(loginCfg, opts);
+  // D22R：回读截止协作取消（缺令牌/未取消时全部检查为 false，行为与旧版逐字一致）。
+  // 取消只阻断"后续工作"：未启动的候选不再启动；已返回的验证结论不采信为 login-invalid
+  //（不写失败史）；任何候选不再提升。取消不中断既有 await，也不改任何既有失败语义。
+  const cancelToken = (opts.cancelToken && typeof opts.cancelToken === 'object') ? opts.cancelToken : null;
+  const cancelledNow = () => isCancelledToken(cancelToken);
+  let cancelledByToken = false;
   const seen = new Set();
   let verifyCalls = 0;
   for (const cand of ranked.selected) {
+    if (cancelledNow()) {
+      cancelledByToken = true;
+      attempts.push({ source: cand.source, result: 'cancelled', stopChain: true, reason: '回读截止已到：恢复链被协作取消，不再验证/提升后续候选（未验证候选不构成登录失效证据）' });
+      break;
+    }
     if (seen.has(cand.sha256)) {
       attempts.push({ source: cand.source, result: 'dedup', sha256Prefix: String(cand.sha256).slice(0, 12) + '…' });
       continue;
@@ -1038,6 +1084,13 @@ async function restoreDutyWorkCopyOwned(loginCfg, cookieFile, opts = {}) {
     } catch (_) {
       // 注入验证器的外部异常同样可能含 Cookie/token：固定脱敏原因，绝不回显异常内容。
       vr = { ok: false, reason: '验证器异常（异常详情可能含 Cookie/令牌等敏感值，已脱敏不回显）' };
+    }
+    // D22R：验证返回后立即检查取消——即便注入验证器在翻转令牌后仍返回 login-invalid，
+    // 该结论也不得写失败史/不得提升（取消后的分类不构成平台登录无效证据）。
+    if (cancelledNow()) {
+      cancelledByToken = true;
+      attempts.push({ source: cand.source, result: 'cancelled', stopChain: true, reason: '回读截止已到：候选验证返回后检测到协作取消：验证结论不采信为登录失效证据，不写失败缓存、不提升' });
+      break;
     }
     if (!vr || vr.ok !== true) {
       attempts.push({
@@ -1095,6 +1148,12 @@ async function restoreDutyWorkCopyOwned(loginCfg, cookieFile, opts = {}) {
       attempts.push({ source: cand.source, result: 'promote-failed', conflict: true, reason: '候选验证期间值守工作副本被并发更新（如新扫码登录）：放弃提升，保留并发新文件（较新登录胜出，不覆盖）' });
       continue;
     }
+    // D22R：提升写入（备份/临时文件/CAS）前的取消门——取消后零写入、零提升。
+    if (cancelledNow()) {
+      cancelledByToken = true;
+      attempts.push({ source: cand.source, result: 'cancelled', stopChain: true, reason: '回读截止已到：提升前检测到协作取消：放弃提升（不写工作副本/备份）' });
+      break;
+    }
     // 保留上一版（fail-closed）+ CAS（rename 前复验冻结基线）+ 回读比对
     const bk = backupGuardWorkFile(fsm, workPath, nowFn);
     if (!bk.ok) {
@@ -1145,6 +1204,7 @@ async function restoreDutyWorkCopyOwned(loginCfg, cookieFile, opts = {}) {
   return {
     ok: false,
     reason: `全部候选未通过验证或提升失败（验证调用 ${verifyCalls} 次）：保留工作副本现状，不盲覆盖（单次有界循环）`,
+    ...(cancelledByToken ? { cancelled: true } : {}),
     attempts,
   };
 }

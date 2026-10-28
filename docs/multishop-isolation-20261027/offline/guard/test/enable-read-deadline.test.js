@@ -17,6 +17,9 @@ const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
 const { Monitor } = require('../src/engine/monitor.js');
+const { openQianchuanHome } = require('../src/adapters/qianchuan-reader');
+const { createDefaultCandidateVerifier, restoreDutyWorkCopy } = require('../src/login/session');
+const { DataGuardError } = require('../src/lib/errors');
 const { makeTempDir, makeCfgResult } = require('./helpers.js');
 
 const CFG_TIMEOUT = 300;      // 总截止时间（ms）
@@ -432,4 +435,264 @@ test('N6 竞态复现：迟到会话 + 关闭永不完成 + 旧 work 先 settle 
   assert.equal(openerCalls, 1, '多次推进后仍不得启动新 opener');
   const evs = auditList(dataDir).filter((j) => j.kind === 'ad-state-read').map((j) => j.event);
   assert.ok(evs.includes('blocked'), JSON.stringify(evs));
+});
+
+// ── D22R 回读截止协作取消令牌（全离线：脚本化浏览器桩，零真实浏览器/网络/凭证）──────
+// 修复前缺陷（源码核实）：读取截止只是 Promise.race，真实生产开启链
+// （monitor → defaultChengfangOpener → openChengfangShop → openQianchuanHome → 恢复链
+// 逐候选全新浏览器进程）看不到任何取消信号：截止后仍继续启动新的店铺/候选进程
+// （5+5 候选可远超父窗口），work 长期不 settle → 收口门拿不到真实关闭证明 →
+// 店铺无限期 unknown（生产观测：回读截止（300000ms）已到：work 未 settle；最后步骤：session-open）。
+
+const CT_FXG_HOME = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
+const CT_LOGIN_URL = 'https://fxg.jinritemai.com/ffa/login/expired';
+const CT_SHOP = '取消店';
+
+function ctCookieBytes(tag) {
+  return Buffer.from(JSON.stringify([
+    { name: 'sessionid', value: `fake-${tag}-synthetic`, domain: '.jinritemai.com', path: '/', expires: 1893456000 },
+  ], null, 2), 'utf8');
+}
+
+function ctStubBrowserFactory({ url, counters, onWaitForTimeout }) {
+  return async () => {
+    counters.launches += 1;
+    const id = counters.launches;
+    const browser = { __id: id, __closed: false };
+    browser.newContext = async () => ({
+      addCookies: async () => { counters.addCookies += 1; },
+      newPage: async () => ({
+        url: () => url,
+        goto: async () => {},
+        // 可选测试钩子：未注入（undefined）时保持既有 async noop 行为不变；
+        // 注入时先同步回调再返回，供确定性编排「deadline 落在某次等待期间」。
+        waitForTimeout: async (ms) => { if (typeof onWaitForTimeout === 'function') onWaitForTimeout(ms); },
+        isClosed: () => false,
+        evaluate: async () => null,
+        close: async () => {},
+        getByText: () => ({ count: async () => 0, first: () => ({ waitFor: async () => { throw new Error('stub: not attached'); } }) }),
+        locator: () => ({ first: () => ({ textContent: async () => '', isVisible: async () => false, count: async () => 0 }) }),
+        waitForURL: () => Promise.resolve(null),
+        waitForFunction: async () => {},
+        screenshot: async () => {},
+        context: () => null,
+        on() {}, off() {},
+      }),
+      close: async () => {},
+      cookies: async () => [],
+      waitForEvent: () => Promise.resolve(null),
+      on() {}, off() {},
+    });
+    browser.close = async () => {
+      if (!browser.__closed) { browser.__closed = true; counters.browserCloses += 1; }
+    };
+    browser.isConnected = () => !browser.__closed;
+    return browser;
+  };
+}
+
+test('C1 monitor 透传：真实 opener 调用参数携带 cancelToken，截止触发时 cancelled=true', async () => {
+  const dataDir = makeTempDir('stage3b-cancel-token-');
+  let captured = null;
+  let release = null;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const opener = async (args) => {
+    captured = args;
+    await gate; // 模拟 session-open 长期不返回（生产观测场景）
+    return { close: async () => {}, browser: null, page: {}, controller: {} };
+  };
+  const monitor = buildMonitor({ dataDir, openerFn: opener, timeoutMs: 150, closeWaitMs: 100, settleWaitMs: 100 });
+  const r = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
+  assert.equal(r.state, 'unknown');
+  assert.equal(r.error.timeout, true);
+  assert.ok(captured && captured.cancelToken && typeof captured.cancelToken === 'object',
+    '真实 opener 调用参数必须携带 cancelToken 对象');
+  assert.equal(captured.cancelToken.cancelled, true, '截止触发后令牌必须翻转 cancelled=true');
+  assert.ok(/read-deadline/.test(String(captured.cancelToken.reason)));
+  release(); // 释放挂起的 opener：迟到会话（close 立即完成）由外壳收口
+  await new Promise((r2) => setTimeout(r2, 60));
+});
+
+test('C2 已取消令牌：openQianchuanHome 零浏览器启动、零 addCookies，如实抛 DataGuardError', async () => {
+  const dir = makeTempDir('stage3b-cancel-qc-');
+  fs.writeFileSync(path.join(dir, `${CT_SHOP}.json`), ctCookieBytes('workcopy'));
+  const counters = { launches: 0, addCookies: 0, browserCloses: 0 };
+  await assert.rejects(
+    () => openQianchuanHome(
+      { cookieWorkDir: dir, edgePath: null },
+      { id: 's1', name: CT_SHOP, compassShopName: CT_SHOP, cookieFile: CT_SHOP, accountId: 'a1' },
+      {
+        browserFactory: ctStubBrowserFactory({ url: CT_FXG_HOME, counters }),
+        settleTimeoutMs: 50, settleIntervalMs: 10,
+        readinessTimeoutMs: 50, readinessIntervalMs: 10,
+        nowFn: () => 20000,
+        cancelToken: { cancelled: true, reason: 'read-deadline' },
+      },
+    ),
+    (e) => {
+      assert.ok(e instanceof DataGuardError, `应为 DataGuardError：${e && e.message}`);
+      assert.ok(/协作取消/.test(String(e && e.message)), `错误须如实说明协作取消：${e && e.message}`);
+      return true;
+    },
+  );
+  assert.equal(counters.launches, 0, '取消后绝不允许再启动任何浏览器进程');
+  assert.equal(counters.addCookies, 0, '取消后零 Cookie 注入');
+});
+
+test('C3 交错：截止落在初始登录收敛期间 → 恢复链不启动（零候选进程/零恢复调用）', async () => {
+  const dir = makeTempDir('stage3b-cancel-interleave-');
+  fs.writeFileSync(path.join(dir, `${CT_SHOP}.json`), ctCookieBytes('expired'));
+  const counters = { launches: 0, addCookies: 0, browserCloses: 0 };
+  let restoreCalls = 0;
+  const cancelToken = { cancelled: false, reason: null };
+  let settleWaitTriggers = 0;
+  // deadline 确定性落在初始 SSO 收敛等待期间（settle 100ms/间隔 10ms）：
+  // waitForDoudianHomepageSettled 的每轮等待即 page.waitForTimeout(10)，
+  // 首次 ms===10 时一次性翻转令牌；初始打开的固定 5000ms 等待不得提前触发取消。
+  const onWaitForTimeout = (ms) => {
+    if (ms === 10 && cancelToken.cancelled !== true) {
+      settleWaitTriggers += 1;
+      cancelToken.cancelled = true;
+      cancelToken.reason = 'read-deadline';
+    }
+  };
+  await assert.rejects(
+    () => openQianchuanHome(
+      { cookieWorkDir: dir, edgePath: null },
+      { id: 's2', name: CT_SHOP, compassShopName: CT_SHOP, cookieFile: CT_SHOP, accountId: 'a2' },
+      {
+        browserFactory: ctStubBrowserFactory({ url: CT_LOGIN_URL, counters, onWaitForTimeout }),
+        settleTimeoutMs: 100, settleIntervalMs: 10,
+        readinessTimeoutMs: 50, readinessIntervalMs: 10,
+        restoreRunner: async () => { restoreCalls += 1; return { ok: false, reason: '桩不应被调用' }; },
+        nowFn: () => 20000,
+        cancelToken,
+      },
+    ),
+    (e) => {
+      assert.ok(/协作取消/.test(String(e && e.message)), `登录失效恢复前必须被协作取消截停：${e && e.message}`);
+      return true;
+    },
+  );
+  assert.equal(settleWaitTriggers, 1, '令牌应恰好在首次 SSO settle 间隔等待（ms===10）被翻转一次，且不被 5000ms 初始等待触发');
+  assert.equal(restoreCalls, 0, '截止后恢复链绝不允许启动');
+  assert.equal(counters.launches, 1, '只有截止前的初始店铺浏览器；零候选/重载进程');
+  assert.equal(counters.browserCloses, 1, '已创建的初始进程必须照常收口关闭');
+});
+
+test('C4 内层候选工厂通用取消门：令牌翻转后再次调用工厂必须拒绝启动（注入恢复器拿到的即被门卫包装的工厂）', async () => {
+  const dir = makeTempDir('stage3b-cancel-inner-factory-');
+  fs.writeFileSync(path.join(dir, `${CT_SHOP}.json`), ctCookieBytes('expired'));
+  const counters = { launches: 0, addCookies: 0, browserCloses: 0 };
+  const cancelToken = { cancelled: false, reason: null };
+  let guardedFactory = null;
+  let secondThrew = null;
+  const restoreRunner = async (_loginCfg, _cookieFile, ropts) => {
+    guardedFactory = ropts.candidateBrowserFactory;
+    const a = await guardedFactory(); await a.close();
+    cancelToken.cancelled = true; cancelToken.reason = 'read-deadline';
+    try { const b = await guardedFactory(); await b.close(); secondThrew = false; }
+    catch (e) { secondThrew = e; }
+    return { ok: false, reason: 'synthetic' };
+  };
+  await assert.rejects(
+    () => openQianchuanHome(
+      { cookieWorkDir: dir, edgePath: null },
+      { id: 's4', name: CT_SHOP, compassShopName: CT_SHOP, cookieFile: CT_SHOP, accountId: 'a4' },
+      {
+        browserFactory: ctStubBrowserFactory({ url: CT_LOGIN_URL, counters }),
+        settleTimeoutMs: 100, settleIntervalMs: 10,
+        readinessTimeoutMs: 50, readinessIntervalMs: 10,
+        restoreRunner,
+        nowFn: () => 20000,
+        cancelToken,
+      },
+    ),
+    () => true, // 恢复失败后既有语义抛 AuthError（登录失效）；本用例只关心内层工厂门
+  );
+  assert.ok(typeof guardedFactory === 'function', '注入恢复器必须收到候选浏览器工厂（被取消门卫包装）');
+  assert.ok(secondThrew instanceof DataGuardError, `取消后再次调用工厂必须抛 DataGuardError 而不是启动新进程：${secondThrew && secondThrew.message}`);
+  assert.equal(counters.launches, 2, '只有截止前的初始店铺浏览器 + 1 次候选进程；取消后零新进程');
+  assert.equal(counters.browserCloses, 2, '已创建进程照常收口（初始店铺进程 + 候选进程）');
+});
+
+test('C5 默认验证器：取消发生在工厂 await 期间 → verify-error + stopChain、零 addCookies、自有新进程收口一次', async () => {
+  const counters = { launches: 0, addCookies: 0, browserCloses: 0 };
+  const token = { cancelled: false, reason: null };
+  const base = ctStubBrowserFactory({ url: CT_FXG_HOME, counters });
+  const verifier = createDefaultCandidateVerifier({}, {
+    cancelToken: token,
+    candidateBrowserFactory: async () => { token.cancelled = true; token.reason = 'read-deadline'; return base(); },
+    verifySettleTimeoutMs: 3, verifySettleIntervalMs: 1,
+  });
+  const r = await verifier({
+    cookies: JSON.parse(ctCookieBytes('cand').toString('utf8')),
+    expectedShopNames: [CT_SHOP],
+    source: 'guard-recovery',
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.classification, 'verify-error', `取消不得被判成 login-invalid：${r.reason}`);
+  assert.equal(r.stopChain, true, '取消必须停止恢复链');
+  assert.equal(counters.launches, 1);
+  assert.equal(counters.addCookies, 0, '取消后零 Cookie 注入');
+  assert.equal(counters.browserCloses, 1, '自有新进程必须收口恰好一次');
+});
+
+test('C6 已取消令牌 + 工厂返回外来（禁止）实例：先按外来所有权拒绝，绝不因取消关闭外来进程', async () => {
+  const counters = { launches: 0, addCookies: 0, browserCloses: 0 };
+  const token = { cancelled: false, reason: null };
+  const base = ctStubBrowserFactory({ url: CT_FXG_HOME, counters });
+  const foreign = await base(); // 外来所有者实例（如主店铺浏览器），模拟仍在业务使用
+  const closesBefore = counters.browserCloses;
+  const verifier = createDefaultCandidateVerifier({}, {
+    cancelToken: token,
+    candidateBrowserFactory: async () => { token.cancelled = true; token.reason = 'read-deadline'; return foreign; },
+    forbiddenBrowsers: [foreign],
+    verifySettleTimeoutMs: 3, verifySettleIntervalMs: 1,
+  });
+  const r = await verifier({
+    cookies: JSON.parse(ctCookieBytes('foreign').toString('utf8')),
+    expectedShopNames: [CT_SHOP],
+    source: 'guard-recovery',
+  });
+  assert.equal(r.classification, 'verify-error');
+  assert.equal(r.stopChain, true);
+  assert.equal(counters.addCookies, 0);
+  assert.equal(counters.browserCloses, closesBefore, '绝不因取消关闭外来/禁止实例（所有权在原所有者）');
+  const r2 = await verifier({ cookies: [], expectedShopNames: [CT_SHOP] });
+  assert.equal(r2.stopChain, true, '外来实例拒绝后闩锁：后续候选不再启动');
+  await foreign.close(); // 测试自有桩资源收口
+});
+
+test('C7 恢复链注入验证器翻转取消令牌后返回 login-invalid：不写失败史、不提升；同一候选随后仍可被验证', async () => {
+  const dir = makeTempDir('stage3b-cancel-restore-history-');
+  fs.writeFileSync(path.join(dir, `${CT_SHOP}.json`), ctCookieBytes('hist'));
+  const loginCfg = {};
+  const shopCfg = { id: 'h1', name: CT_SHOP, compassShopName: CT_SHOP, cookieFile: CT_SHOP };
+  const token1 = { cancelled: false, reason: null };
+  const r1 = await restoreDutyWorkCopy(loginCfg, `${CT_SHOP}.json`, {
+    shopCfg,
+    workDir: dir,
+    cancelToken: token1,
+    verify: async () => {
+      token1.cancelled = true; token1.reason = 'read-deadline';
+      return { ok: false, classification: 'login-invalid', reason: 'stub-flip-after-cancel' };
+    },
+    nowFn: () => 20000,
+  });
+  assert.equal(r1.ok, false);
+  assert.equal(r1.cancelled, true, '恢复链必须如实标记被协作取消');
+  assert.ok((r1.attempts || []).some((a) => a.result === 'cancelled'), 'attempts 应记录 cancelled，而不是把取消伪装成登录失效');
+  // 第二次调用（新令牌、同一 loginCfg 对象、工作副本字节未变）：若取消路径的
+  // login-invalid 被写入失败史，同一候选会被历史跳过、验证器零调用。
+  let verifyCalls = 0;
+  const r2 = await restoreDutyWorkCopy(loginCfg, `${CT_SHOP}.json`, {
+    shopCfg,
+    workDir: dir,
+    cancelToken: { cancelled: false, reason: null },
+    verify: async () => { verifyCalls += 1; return { ok: false, classification: 'login-invalid', reason: 'stub-plain' }; },
+    nowFn: () => 20001,
+  });
+  assert.equal(r2.ok, false);
+  assert.ok(verifyCalls >= 1, `取消路径的 login-invalid 不得投毒失败史：同一候选随后仍必须被验证（calls=${verifyCalls}）`);
 });

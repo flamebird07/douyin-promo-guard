@@ -3475,9 +3475,14 @@ class Monitor {
       const closes = [];
       let session = null;
       let timedOut = false;
+      // D22R 协作取消令牌：截止定时器触发时翻转，经 opener 参数透传到真实开启链
+      //（defaultChengfangOpener → openChengfangShop → openQianchuanHome），
+      // 让截止后不再启动新的店铺/候选浏览器进程，本次 work 尽快 settle，收口门可推进。
+      const cancelToken = { cancelled: false, reason: null };
       const meta = {
         steps,
         closeWaitMs,
+        cancelToken,
         onSession: (s) => {
           session = s;
           if (timedOut) {
@@ -3496,7 +3501,7 @@ class Monitor {
       try {
         result = await Promise.race([
           work,
-          new Promise((resolve) => { timer = setTimeout(() => { timedOut = true; deadlineFired = true; resolve({ __readDeadline: true }); }, remaining); }),
+          new Promise((resolve) => { timer = setTimeout(() => { timedOut = true; deadlineFired = true; cancelToken.cancelled = true; cancelToken.reason = 'read-deadline'; resolve({ __readDeadline: true }); }, remaining); }),
         ]);
       } catch (e) {
         clearTimeout(timer);
@@ -3713,6 +3718,7 @@ class Monitor {
       // audit 透传：只读状态开会话与批次开会话同链（默认开启器 → openChengfangShop/检查点）
       session = await opener({
         loginCfg, shopCfg, audit: (e) => this._audit(e), readOnlyStatus: true,
+        ...( (_meta && _meta.cancelToken) ? { cancelToken: _meta.cancelToken } : {} ),
         // 所有权早登记（2026-10-23）：适配器必须在**创建资源之后、任何后续 await 之前**同步回调。
         // 截止先于 opener 返回时，门里已经握着可核验的 close/isConnected 句柄。
         // 句柄是闭包对象：绝不进返回值、日志或 JSON。

@@ -42,7 +42,7 @@
   {
     "id": "app/server.js",
     "beforeSha256": "823d5a5d25904d375d36bb9d67c0bf2a702469cbe083b3537fe4e015e6d89e94",
-    "afterSha256": "ac5ef49cfdcad0a1bbdbb48e94bbea2bf6cdc36be850947e7dda2cb7a96a2922"
+    "afterSha256": "225dee96b6f6217260f63028bd609eaf99578e8f1e67779fe36b3e9843760b16"
   },
   {
     "id": "app/analyzer-shop-target.js",

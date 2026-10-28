@@ -299,39 +299,7 @@ function isShopNameGarbled(name) {
 // 通过cookie文件名反向修复乱码的店铺名
 // 如果传入的shopName是乱码，尝试从cookies目录中找到匹配的正确文件名
 function repairShopName(garbledName) {
-    if (!isShopNameGarbled(garbledName)) return garbledName; // 不需要修复
-    try {
-        const files = fs.readdirSync(COOKIES_DIR).filter(f => f.endsWith('.json'));
-        if (files.length === 0) return garbledName;
-        // 如果只有一个cookie文件，直接使用
-        if (files.length === 1) {
-            const correctName = files[0].replace('.json', '');
-            shopLog(`[编码修复] 店铺名乱码 "${garbledName}" → 自动匹配唯一文件: ${correctName}`);
-            return correctName;
-        }
-        // 多个文件时，用模糊匹配
-        let bestMatch = null;
-        let bestScore = 0;
-        for (const file of files) {
-            const fileName = file.replace('.json', '');
-            // 计算字符集重叠度
-            const setA = new Set(garbledName);
-            const setB = new Set(fileName);
-            let common = 0;
-            for (const ch of setA) { if (setB.has(ch)) common++; }
-            const score = common / Math.max(setA.size, setB.size);
-            if (score > bestScore && score > 0.2) {
-                bestScore = score;
-                bestMatch = fileName;
-            }
-        }
-        if (bestMatch) {
-            shopLog(`[编码修复] 店铺名乱码 "${garbledName}" → 模糊匹配: ${bestMatch} (相似度: ${bestScore.toFixed(2)})`);
-            return bestMatch;
-        }
-    } catch (e) {
-        shopLog(`[编码修复] 修复失败: ${e.message}`);
-    }
+    // 店铺精确隔离：禁止通过 cookie 目录扫描/唯一文件/模糊匹配改写店铺身份
     return garbledName;
 }
 

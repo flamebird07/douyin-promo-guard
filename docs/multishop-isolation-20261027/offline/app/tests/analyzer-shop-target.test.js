@@ -185,6 +185,64 @@ test('功能：无显式 env（旧 CLI 直连）仍回退读 current_shop.txt', 
   }
 });
 
+// ---------------------------------------------------------------------------
+// D17：server 端 repairShopName 必须原样返回店名，禁止 cookie 目录扫描/唯一文件
+// /模糊字符重叠匹配改写店铺身份（否则在进程隔离建立之前就选错目标 Cookie）。
+// 从真实 server.js 源码中提取函数原文在 Node VM 中执行（不 require server，
+// 不启动服务、不读真实 Cookie、不联网）。旧实现会在这些用例上失败（红）。
+// ---------------------------------------------------------------------------
+
+const vm = require('vm');
+
+function extractRepairShopNameSource() {
+  const src = fs.readFileSync(path.join(APP_DIR, 'server.js'), 'utf8');
+  const start = src.indexOf('function isShopNameGarbled');
+  const fnStart = src.indexOf('function repairShopName');
+  const end = src.indexOf('// 删除店铺cookie');
+  assert.ok(start >= 0 && fnStart > start && end > fnStart, 'server.js 中应能定位 helper/repairShopName 源码段');
+  return src.slice(start, end);
+}
+
+function makeRepairShopName() {
+  const sandbox = {
+    fs: {
+      readdirSync() { sandbox.__readdirCalled = true; throw new Error('credential-dir-forbidden'); },
+    },
+    COOKIES_DIR: '/forbidden-cookies-dir',
+    shopLog() { sandbox.__shopLogCalled = true; },
+    __readdirCalled: false,
+    __shopLogCalled: false,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(extractRepairShopNameSource(), sandbox);
+  assert.equal(typeof sandbox.repairShopName, 'function', '提取出的源码应定义 repairShopName');
+  return sandbox;
+}
+
+test('D17：乱码店名 A 在仅有其他店 B 的 cookie 文件时必须保持 A，不得借用 B', () => {
+  const sb = makeRepairShopName();
+  const garbledA = 'åº—é“ºAä¸“è¥åº—';
+  assert.equal(sb.repairShopName(garbledA), garbledA, '乱码输入必须原样返回，不得换成唯一其他文件');
+  assert.equal(sb.__readdirCalled, false, '不得扫描 cookie 目录');
+});
+
+test('D17：多店共享字符/完全重叠时乱码 A 必须保持 A，不得模糊匹配最佳店', () => {
+  const sb = makeRepairShopName();
+  for (const garbledA of ['åº—é“ºAä¸“è¥åº—', 'Ã©â€”â€¦Ã©ÂºÂ¿A', '\ufffd\ufffd\u597d\u5e97A\ufffd']) {
+    assert.equal(sb.repairShopName(garbledA), garbledA, `输入 ${garbledA} 必须原样返回`);
+  }
+  assert.equal(sb.__readdirCalled, false, '不得扫描 cookie 目录');
+});
+
+test('D17：存在精确同名乱码文件与其他店文件时输入保持不变，正常店名原样通过', () => {
+  const sb = makeRepairShopName();
+  const exactGarbled = 'åº—é“ºAä¸“è¥åº—';
+  assert.equal(sb.repairShopName(exactGarbled), exactGarbled);
+  const normal = '甲店旗舰店';
+  assert.equal(sb.repairShopName(normal), normal, '正常店名不受影响');
+  assert.equal(sb.__readdirCalled, false, '不得扫描 cookie 目录');
+});
+
 test('接线（次要）：两个 server spawn 点都传入 helper env，分析器 main 使用 resolver', () => {
   assert.match(SERVER_SRC, /require\(['"]\.\/analyzer-shop-target['"]\)/);
   assert.equal(

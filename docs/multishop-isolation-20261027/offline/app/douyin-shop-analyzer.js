@@ -18,6 +18,7 @@ const {
   restoreAnalysisWorkCopy, assertAnalyzerWorkTarget,
 } = require('./analyzer-cookie-workcopy');
 const { saveAnalyzerSessionCheckpoint, saveAnalyzerCompassCheckpoint } = require('./analyzer-session-checkpoint');
+const { resolveAnalyzerShopTarget } = require('./analyzer-shop-target');
 
 const COOKIES_DIR = path.join(__dirname, 'cookies');
 
@@ -4677,21 +4678,23 @@ async function main() {
   console.log('===========================================\n');
 
   // 参数解析: argv[2]=targetCount, argv[3]=intervalMinutes, argv[4]='multi'
-  // shopName通过临时文件传递
+  // shopName：server 管理启动时由 env 冻结；直接 CLI 启动时回退旧临时文件
   const targetCount = parseInt(process.argv[2]) || 1;
   const intervalMinutes = parseInt(process.argv[3]) || 30;
   const isMultiMode = process.argv[4] === 'multi';
   const isFullRefresh = process.argv.includes('--full');
   const isHeadless = process.argv.includes('--headless');
 
-  // 从临时文件读取店铺名
-  let shopNameArg = '';
-  const shopNameFile = path.join(__dirname, 'current_shop.txt');
-  try {
-    if (fs.existsSync(shopNameFile)) {
-      shopNameArg = fs.readFileSync(shopNameFile, 'utf-8').trim();
-    }
-  } catch (e) {}
+  // 店铺目标（MULTISHOP-ISOLATION-20261027 D16）：server 每次 spawn 都在 env 中冻结
+  // 本任务店铺名；显式存在（含空串）只认该值，晚启动也不会读到另一任务随后写入的
+  // current_shop.txt。仅当变量完全缺失（直接 CLI 启动）才回退旧临时文件。
+  const shopTarget = resolveAnalyzerShopTarget({
+    env: process.env,
+    legacyShopFile: path.join(__dirname, 'current_shop.txt'),
+    readFile: fs.readFileSync,
+    exists: fs.existsSync,
+  });
+  let shopNameArg = shopTarget.shopName;
 
   // ========== MULTISHOP-ISOLATION-20261027（D2/D3）：店铺名只认精确文件 ==========
   // 旧的"乱码反向修复"会在店铺名含 U+FFFD 时按 mtime 取目录内最新 Cookie 文件顶替

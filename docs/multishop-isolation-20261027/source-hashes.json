@@ -7,7 +7,7 @@
   {
     "id": "app/douyin-shop-analyzer.js",
     "beforeSha256": "09e23424d5de869c1df67c965523eb96b0edf62fee1da96c006f76c0502eb450",
-    "afterSha256": "a85f3faac39bdfd16081abcf4284e4b7fdcc63714dd45f607e33a9d60500dcce"
+    "afterSha256": "5636d366191f2904d31edc5869d6a009c555d8e50a15ed88e087666fea50072b"
   },
   {
     "id": "guard/src/adapters/compass-order-reader.js",
@@ -38,5 +38,15 @@
     "id": "app/cookie-vault.js",
     "beforeSha256": "cb82ef9baa3a763ea6cfa267bdcf5235f4053fd21e82c3c9ca2692c382fa96ec",
     "afterSha256": "02a77f39c15bdb4b37d6dbcb4e9175744117d50af30fac7fe2876c3ce1651649"
+  },
+  {
+    "id": "app/server.js",
+    "beforeSha256": "823d5a5d25904d375d36bb9d67c0bf2a702469cbe083b3537fe4e015e6d89e94",
+    "afterSha256": "ac5ef49cfdcad0a1bbdbb48e94bbea2bf6cdc36be850947e7dda2cb7a96a2922"
+  },
+  {
+    "id": "app/analyzer-shop-target.js",
+    "beforeSha256": null,
+    "afterSha256": "45f7bf62c3e40b40c5de59360314f63d2828984c87ff64712c3eccba586f59f4"
   }
 ]

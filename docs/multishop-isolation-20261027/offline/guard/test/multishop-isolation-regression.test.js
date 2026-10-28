@@ -1613,3 +1613,208 @@ test('D14 同 SID 备份变体：跨调用历史换批，最终可达较旧健�
     assert.deepStrictEqual(backupFilesState(f, names), beforeBackups);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
+
+// ============ D18：login-invalid 路径的认证 Cookie 变化内部诊断（全合成，离线） ============
+// 只驱动真实 createDefaultCandidateVerifier：fake owned factory + 登录页始终打开（完整等待后
+// 仍为 login-invalid），断言审计事件只有布尔/安全标签、原判定与收口不变、绝不泄漏值/哈希/URL。
+
+function authEvidenceEvents(audit) {
+  return audit.filter((e) => e && e.kind === 'cookie-restore-auth-evidence');
+}
+
+async function runAuthEvidenceVerifier(options = {}) {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-auth-evidence-'));
+  const workPath = path.join(overlapWorkDir(tmpRoot), 'shopA.json');
+  const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'candidate')));
+  fs.writeFileSync(workPath, baseline);
+  const page = options.page || makeVerifierPage({ currentUrl: FXG_LOGIN_URL_FOR_TEST });
+  const made = makeVerifierBrowser(page, JSON.parse(baseline.toString('utf8')));
+  if (typeof options.ctxCookies === 'function') made.ctx.cookies = options.ctxCookies;
+  const audit = [];
+  const auditFn = options.auditThrowsOnEvidence
+    ? (e) => { audit.push(e); if (e && e.kind === 'cookie-restore-auth-evidence') throw new Error('合成审计异常'); }
+    : (e) => audit.push(e);
+  const run = await restoreDutyWorkCopy({}, 'shopA.json', overlapOpts(tmpRoot, undefined, {
+    candidateBrowserFactory: async () => made.browser,
+    verifySettleTimeoutMs: 30, verifySettleIntervalMs: 5, verifyMaxWaitMs: 20,
+    verifySleep: async () => {},
+    audit: auditFn,
+    ...(options.extra || {}),
+  }));
+  return { tmpRoot, workPath, baseline, browser: made.browser, ctx: made.ctx, audit, run };
+}
+
+function assertAuthEvidenceShapeOnly(e) {
+  assert.strictEqual(e.kind, 'cookie-restore-auth-evidence');
+  assert.strictEqual(e.classification, 'login-invalid');
+  assert.strictEqual(e.shop, 'shopA');
+  assert.strictEqual(e.source, 'guard-duty-work');
+  for (const v of Object.values(e)) {
+    assert.ok(v === null || ['string', 'boolean'].includes(typeof v), '审计事件只允许布尔/安全字符串/空值');
+  }
+  const ser = JSON.stringify(e);
+  for (const bad of ['FAKE-', 'https://', 'session:', '.jinritemai.com']) {
+    assert.ok(!ser.includes(bad), `审计不得含 Cookie 值/哈希/URL/域名: ${bad}`);
+  }
+}
+
+test('D18 诊断：login-invalid 且 context 认证 Cookie 已轮换 → authChanged=true，原判定与收口不变', async () => {
+  const h = await runAuthEvidenceVerifier({ ctxCookies: async () => fullSessionCookies('B', 'rotated') });
+  try {
+    assert.strictEqual(h.run.ok, false);
+    const att = h.run.attempts.find((a) => a.result === 'verify-failed');
+    assert.strictEqual(att.classification, 'login-invalid', '诊断绝不可改变既有登录失效判定');
+    assert.strictEqual(att.stopChain, undefined, '真实登录失效仍不擅自停链');
+    assert.strictEqual(h.ctx.closedCount, 1, '自有 context 仍必须关闭一次');
+    assert.strictEqual(h.browser.closedCount, 1, '自有浏览器仍必须关闭一次');
+    assert.deepStrictEqual(fs.readFileSync(h.workPath), h.baseline, '失败路径绝不提升/写入');
+    const events = authEvidenceEvents(h.audit);
+    assert.strictEqual(events.length, 1, '每个 login-invalid 候选只发一条诊断事件');
+    const e = events[0];
+    assertAuthEvidenceShapeOnly(e);
+    assert.strictEqual(e.candidateAuthPresent, true);
+    assert.strictEqual(e.finalAuthPresent, true);
+    assert.strictEqual(e.authChanged, true, '认证三键值变化必须标记为 true');
+    assert.strictEqual(e.cookieReadSucceeded, true);
+  } finally { fs.rmSync(h.tmpRoot, { recursive: true, force: true }); }
+});
+
+test('D18 诊断：仅追踪字段变化 → authChanged=false（不得误标认证轮换）', async () => {
+  const h = await runAuthEvidenceVerifier({ ctxCookies: async () => fullSessionCookies('A', 'final') });
+  try {
+    assert.strictEqual(h.run.ok, false);
+    const events = authEvidenceEvents(h.audit);
+    assert.strictEqual(events.length, 1);
+    const e = events[0];
+    assertAuthEvidenceShapeOnly(e);
+    assert.strictEqual(e.candidateAuthPresent, true);
+    assert.strictEqual(e.finalAuthPresent, true);
+    assert.strictEqual(e.authChanged, false, 'sid_guard/tracking 变化不得被误标为认证轮换');
+    assert.strictEqual(e.cookieReadSucceeded, true);
+    assert.strictEqual(h.ctx.closedCount, 1);
+    assert.strictEqual(h.browser.closedCount, 1);
+  } finally { fs.rmSync(h.tmpRoot, { recursive: true, force: true }); }
+});
+
+test('D18 诊断：最终 Cookie 读取抛错 → authChanged/finalAuthPresent=null，login-invalid 与收口不变', async () => {
+  const h = await runAuthEvidenceVerifier({ ctxCookies: async () => { throw new Error('合成读取异常'); } });
+  try {
+    assert.strictEqual(h.run.ok, false);
+    const att = h.run.attempts.find((a) => a.result === 'verify-failed');
+    assert.strictEqual(att.classification, 'login-invalid', '诊断读失败绝不可改写既有分类');
+    assert.strictEqual(h.ctx.closedCount, 1);
+    assert.strictEqual(h.browser.closedCount, 1);
+    const events = authEvidenceEvents(h.audit);
+    assert.strictEqual(events.length, 1);
+    const e = events[0];
+    assertAuthEvidenceShapeOnly(e);
+    assert.strictEqual(e.candidateAuthPresent, true);
+    assert.strictEqual(e.cookieReadSucceeded, false);
+    assert.strictEqual(e.finalAuthPresent, null, '未知最终状态必须为 null，绝不伪造 false');
+    assert.strictEqual(e.authChanged, null, '未知最终状态必须为 null，绝不伪造证据');
+    assert.ok(!JSON.stringify(e).includes('合成读取异常'), '异常文本绝不进入审计');
+  } finally { fs.rmSync(h.tmpRoot, { recursive: true, force: true }); }
+});
+
+test('D18 诊断：审计回调抛错 → 不影响 login-invalid 判定与 context/browser 收口', async () => {
+  const h = await runAuthEvidenceVerifier({ auditThrowsOnEvidence: true });
+  try {
+    assert.strictEqual(h.run.ok, false);
+    const att = h.run.attempts.find((a) => a.result === 'verify-failed');
+    assert.strictEqual(att.classification, 'login-invalid');
+    assert.strictEqual(att.stopChain, undefined);
+    assert.strictEqual(h.ctx.closedCount, 1, '审计异常不得跳过 context 清理');
+    assert.strictEqual(h.browser.closedCount, 1, '审计异常不得跳过浏览器收口');
+    assert.deepStrictEqual(fs.readFileSync(h.workPath), h.baseline);
+    assert.strictEqual(authEvidenceEvents(h.audit).length, 1);
+  } finally { fs.rmSync(h.tmpRoot, { recursive: true, force: true }); }
+});
+
+test('D18 诊断：自有页面被关闭仍为 verify-error+stopChain，且不产生认证轮换事件', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-auth-evidence-'));
+  try {
+    const workPath = path.join(overlapWorkDir(tmpRoot), 'shopA.json');
+    const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'candidate')));
+    fs.writeFileSync(workPath, baseline);
+    const page = makeVerifierPage({ currentUrl: FXG_HOME_URL_FOR_TEST });
+    const { browser, ctx } = makeVerifierBrowser(page, JSON.parse(baseline.toString('utf8')));
+    const audit = [];
+    let sleeps = 0;
+    const r = await restoreDutyWorkCopy({}, 'shopA.json', overlapOpts(tmpRoot, undefined, {
+      candidateBrowserFactory: async () => browser,
+      verifySettleTimeoutMs: 200, verifySettleIntervalMs: 5, verifyMaxWaitMs: 600000,
+      verifySleep: async () => { sleeps += 1; if (sleeps >= 3) page.closed = true; },
+      audit: (e) => audit.push(e),
+    }));
+    assert.strictEqual(r.ok, false);
+    const att = r.attempts.find((a) => a.result === 'verify-failed');
+    assert.strictEqual(att.classification, 'verify-error', '取消绝不归类 login-invalid');
+    assert.strictEqual(att.stopChain, true);
+    assert.strictEqual(browser.closedCount, 1);
+    assert.strictEqual(ctx.closedCount, 1);
+    assert.strictEqual(authEvidenceEvents(audit).length, 0, '非实际 login-invalid 不得产生认证诊断事件');
+    assert.deepStrictEqual(fs.readFileSync(workPath), baseline);
+  } finally { fs.rmSync(tmpRoot, { recursive: true, force: true }); }
+});
+
+// ============ D18R：诊断 Cookie 读取必须固定有界（绝不挂起自有 context 收口） ============
+
+test('D18R 诊断有界：ctx.cookies 永不 settle → 仍 login-invalid、只发一条未知字段事件、context/浏览器各关闭一次且远低于 1000ms', async () => {
+  const startedAt = Date.now();
+  const h = await runAuthEvidenceVerifier({ ctxCookies: () => new Promise(() => {}) });
+  const elapsedMs = Date.now() - startedAt;
+  try {
+    assert.strictEqual(h.run.ok, false);
+    const att = h.run.attempts.find((a) => a.result === 'verify-failed');
+    assert.strictEqual(att.classification, 'login-invalid', '诊断读取挂起绝不可改写既有登录失效判定');
+    assert.strictEqual(att.stopChain, undefined, '既有 login-invalid 语义不变（不擅自停链）');
+    assert.strictEqual(h.ctx.closedCount, 1, '自有 context 必须关闭（绝不因诊断挂起而跳过收口）');
+    assert.strictEqual(h.browser.closedCount, 1, '自有浏览器必须关闭一次');
+    assert.deepStrictEqual(fs.readFileSync(h.workPath), h.baseline, '失败路径绝不提升/写入');
+    const events = authEvidenceEvents(h.audit);
+    assert.strictEqual(events.length, 1, '读取未成功仍只发一条诊断事件（未知字段，不伪造证据）');
+    const e = events[0];
+    assertAuthEvidenceShapeOnly(e);
+    assert.strictEqual(e.candidateAuthPresent, true);
+    assert.strictEqual(e.cookieReadSucceeded, false, '挂起超时视为读取未成功');
+    assert.strictEqual(e.finalAuthPresent, null);
+    assert.strictEqual(e.authChanged, null);
+    assert.ok(elapsedMs < 1000, `有界读取必须远低于 1000ms（实际 ${elapsedMs}ms）`);
+  } finally { fs.rmSync(h.tmpRoot, { recursive: true, force: true }); }
+});
+
+test('D18R 诊断有界：超时后底层读取晚到 rejection 被消费，无 unhandledRejection 且不产生第二条事件', async () => {
+  let rejectRead = null;
+  let readCalls = 0;
+  const h = await runAuthEvidenceVerifier({
+    ctxCookies: () => { readCalls += 1; return new Promise((_, reject) => { rejectRead = reject; }); },
+  });
+  try {
+    assert.strictEqual(readCalls, 1, '诊断只对自有 context 发起一次读取');
+    const before = authEvidenceEvents(h.audit);
+    assert.strictEqual(before.length, 1);
+    assert.strictEqual(before[0].cookieReadSucceeded, false);
+    assert.strictEqual(before[0].authChanged, null);
+    assert.strictEqual(before[0].finalAuthPresent, null);
+
+    // 上限已过，再让底层 Promise 晚到失败：必须被消费，绝不冒泡为未处理拒绝。
+    const unhandled = [];
+    const onUnhandled = (reason) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      assert.strictEqual(typeof rejectRead, 'function');
+      rejectRead(new Error('合成晚到读取异常'));
+      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setImmediate(r));
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+    assert.strictEqual(unhandled.length, 0, '晚到 rejection 必须被消费（不得成为 unhandledRejection）');
+    const after = authEvidenceEvents(h.audit);
+    assert.strictEqual(after.length, 1, '晚到结算不得产生第二条诊断事件');
+    assert.strictEqual(after[0].classification, 'login-invalid', '晚到结算不得改写既有分类');
+    assert.strictEqual(h.ctx.closedCount, 1);
+    assert.strictEqual(h.browser.closedCount, 1);
+    assert.deepStrictEqual(fs.readFileSync(h.workPath), h.baseline);
+  } finally { fs.rmSync(h.tmpRoot, { recursive: true, force: true }); }
+});

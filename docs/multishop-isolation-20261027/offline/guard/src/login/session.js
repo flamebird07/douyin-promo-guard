@@ -313,6 +313,139 @@ function captureAnalyzerSourceCandidateGuard(fsm, loginCfg, name, workReal, recR
   return { source: 'analyzer-source', buf: cap.buf, sha256: cap.sha256, createdAtMs: cap.mtimeMs };
 }
 
+// ── D18：登录失效候选的「认证 Cookie 是否在 SSO 过程中变化」最小内部诊断 ──
+// 背景（当前仍有未知）：候选在完整 45s 有界等待后仍被判 login-invalid 时，可能是
+// (a) 浏览器内的认证 Cookie 自始至终未变（同一份已死令牌），也可能是
+// (b) SSO 过程中认证 Cookie 被轮换/丢弃（旧 Cookie 被平台换掉，但最终仍落到登录页）。
+// 今天失败路径从不读取自有 context 的 Cookie，因此两种解释都无法证伪。
+//
+// 本诊断只回答"读到的认证 Cookie 值是否在本次验证前后发生变化"，不改变任何判定：
+//  - 只在既有分类**已确定为 login-invalid**、且自有 context 尚未关闭时执行一次；
+//  - 只读候选自身 auth 三键（sessionid/sessionid_ss/sid_tt）的 name/domain/path+value，
+//    规范化为排序行后仅在内存中比较——绝不打印/返回 Cookie 值、哈希、输入数组、
+//    context/browser、URL 或异常文本；
+//  - 最终读取失败/未知 → authChanged:null、finalAuthPresent:null（绝不伪造 false 证据）；
+//  - 只读追踪字段（如 tracking）变化不得被误标为 authChanged:true；
+//  - 诊断/审计失败一律不改变验证结果与收口，也绝不提前 return 跳过 context/browser 清理。
+const AUTH_TRANSITION_COOKIE_NAMES = Object.freeze(['sessionid', 'sessionid_ss', 'sid_tt']);
+// D18R：诊断读取的固定内部上限。真实 CDP 的 ctx.cookies() 在页面/进程收口过程中可能
+// 永不 settle；诊断绝不能无界等待（否则本候选的 context/浏览器收口永远不到达）。
+// 该上限只约束内部诊断读取，不改变既有 45s 收敛等待 / 300s 监控读 / 60s 关闭语义。
+const AUTH_TRANSITION_READ_DEADLINE_MS = 250;
+
+/**
+ * best-effort 有界读取自有 context 的 Cookie 数组（D18R）。
+ * - 固定 AUTH_TRANSITION_READ_DEADLINE_MS 到点即返回 null（读取未成功，不伪造证据）；
+ * - 定时器在成功/超时/异常路径一律清除；
+ * - 底层 ctx.cookies() 的晚到 rejection 一律消费（绝不产生 unhandledRejection）；
+ *   晚到 resolve 因 race 已结算而被忽略——绝不触发第二次审计或改写任何分类。
+ * 返回非数组同样视为读取未成功（由调用方 cookieReadSucceeded=false 表达）。
+ */
+async function readContextCookiesBounded(ctx) {
+  let read = null;
+  try {
+    read = Promise.resolve(ctx.cookies());
+  } catch (_) {
+    return null;
+  }
+  // 只消费晚到结算；不影响 race 结果，也不产生任何副作用。
+  try { read.then(() => {}, () => {}); } catch (_) { /* Promise.then 不抛；保守兜底 */ }
+  let timer = null;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), AUTH_TRANSITION_READ_DEADLINE_MS);
+  });
+  try {
+    return await Promise.race([read, deadline]);
+  } finally {
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+  }
+}
+
+/** 认证三键的规范化内存快照（name/domain/path+value 排序）；无认证键 → null。 */
+function authCoreCookieSnapshot(cookies) {
+  if (!Array.isArray(cookies)) return null;
+  const rows = [];
+  for (const c of cookies) {
+    if (!c || typeof c !== 'object') continue;
+    if (!AUTH_TRANSITION_COOKIE_NAMES.includes(c.name)) continue;
+    const value = typeof c.value === 'string' ? c.value : '';
+    const domain = typeof c.domain === 'string' ? c.domain : '';
+    const cookiePath = typeof c.path === 'string' ? c.path : '';
+    rows.push(JSON.stringify([c.name, domain, cookiePath, value]));
+  }
+  if (rows.length === 0) return null;
+  return rows.sort().join('\n');
+}
+
+/** 审计用店铺标签：优先配置 id/name，其次首个预期店名；仅内部安全标签，不含 Cookie/URL。 */
+function authEvidenceShopLabel(opts, p) {
+  const cfg = (opts && opts.shopCfg) || null;
+  for (const v of [cfg && cfg.id, cfg && cfg.name]) {
+    if (v == null) continue;
+    const t = String(v).trim();
+    if (t) return t.slice(0, 80);
+  }
+  const names = p && Array.isArray(p.expectedShopNames) ? p.expectedShopNames : [];
+  for (const v of names) {
+    const t = String(v == null ? '' : v).trim();
+    if (t) return t.slice(0, 80);
+  }
+  return null;
+}
+
+/** 审计用来源标签：验证器既有内部来源名（如 guard-duty-work / raw-archive:<id>），非 URL。 */
+function authEvidenceSourceLabel(p) {
+  const s = p && typeof p.source === 'string' ? p.source : '';
+  return s.slice(0, 120) || null;
+}
+
+/**
+ * 登录失效路径的一次性只读诊断（best-effort）。只读自有 context 的 cookies()，
+ * 记录认证三键在候选与最终状态之间的布尔差异；任何异常都不上抛。
+ */
+async function recordAuthTransitionEvidence(opts, ctx, p, outcome) {
+  if (!outcome || outcome.classification !== 'login-invalid') return;
+  if (!ctx || typeof ctx.cookies !== 'function') return;
+  // 诊断证据唯一去向是审计回调；无回调时连读取都不做（最小化，且绝不产生无界的
+  // 底层 Cookie 读取）。有回调时的既有证据语义不变。
+  if (typeof opts.audit !== 'function') return;
+  let candidate = null;
+  try { candidate = authCoreCookieSnapshot(p && p.cookies); } catch (_) { candidate = null; }
+  const candidateAuthPresent = candidate !== null;
+  let finalCookies = null;
+  let cookieReadSucceeded = false;
+  try {
+    // D18R：固定内部上限读取；超时/抛错/非数组一律按“读取未成功”处理（未知，不伪造）。
+    finalCookies = await readContextCookiesBounded(ctx);
+    cookieReadSucceeded = Array.isArray(finalCookies);
+  } catch (_) {
+    finalCookies = null;
+    cookieReadSucceeded = false;
+  }
+  let finalRows = null;
+  if (cookieReadSucceeded) {
+    try { finalRows = authCoreCookieSnapshot(finalCookies); } catch (_) { finalRows = null; }
+  }
+  const finalAuthPresent = cookieReadSucceeded ? (finalRows !== null) : null;
+  // 只有"读取成功且前后都含认证键"才给出 true/false；其余一律 null（未知，不伪造证据）。
+  const authChanged = (cookieReadSucceeded && candidate !== null && finalRows !== null)
+    ? (candidate !== finalRows) : null;
+  if (typeof opts.audit === 'function') {
+    try {
+      opts.audit({
+        kind: 'cookie-restore-auth-evidence',
+        shop: authEvidenceShopLabel(opts, p),
+        source: authEvidenceSourceLabel(p),
+        classification: 'login-invalid',
+        candidateAuthPresent,
+        finalAuthPresent,
+        authChanged,
+        cookieReadSucceeded,
+      });
+    } catch (_) { /* 审计失败不改变验证结果与收口 */ }
+  }
+}
+
 /**
  * 默认候选验证器（生产实际接通；测试注入 verify 覆盖）：**每个候选**都通过显式提供的
  * candidateBrowserFactory 启动一份全新独立浏览器进程，在该进程内注入候选 Cookie、访问
@@ -485,6 +618,11 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
     } catch (_) {
       // 外部异常可能回显 Cookie 值/带 token 的 URL：只记录固定脱敏原因。验证异常绝不判"登录无效"。
       outcome = { ok: false, classification: 'verify-error', reason: '候选验证异常（异常详情可能含 Cookie/令牌等敏感值，已脱敏不回显）：拒绝验证/提升，待重试不要求扫码' };
+    }
+    // D18：仅既有分类确为 login-invalid 时，在自有 context/浏览器收口前做一次 best-effort
+    // Cookie 只读诊断（不改变 outcome，不改变 stopChain，不改变收口；异常一律内部吞掉）。
+    if (outcome && outcome.classification === 'login-invalid' && ctx) {
+      try { await recordAuthTransitionEvidence(opts, ctx, p, outcome); } catch (_) { /* 诊断绝不影响验证/收口 */ }
     }
     if (ctx) { try { await ctx.close(); } catch (_) { /* 关闭失败不掩盖结果 */ } }
     // 本候选专属浏览器进程用毕必须真正关闭：close 抛错或仍连接 → 绝不判成功，并停止恢复链。

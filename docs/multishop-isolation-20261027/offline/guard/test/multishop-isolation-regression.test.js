@@ -491,7 +491,7 @@ function guardSessionFixture() {
     shopCfg: { name: 'shopA' }, workDir: roots.guardWorkDir, recoveryDir: roots.recoveryDir,
     vaultRoots: roots, vaultModule, fsModule: fsm, verify, audit: (e) => audit.push(e), ...extra,
   });
-  return { root, roots, workPath, reads, byteReads, audit, snapshot, sourceState, restore };
+  return { root, roots, workPath, reads, byteReads, audit, snapshot, sourceState, restore, fsm };
 }
 
 function rankedSessionCandidate(source, cookies, at = 1) {
@@ -1021,5 +1021,595 @@ test('D12F2 有界上界 206（200 归档 + 6 上游角色）：完整遍历不�
     assert.deepStrictEqual(JSON.parse(fs.readFileSync(f.workPath)), fullSessionCookies('A', 'bulk-0'));
     assert.deepStrictEqual(f.sourceState(), before, '归档/恢复/分析只读源 sha 与 mtime 全程不变');
     assert.ok(f.reads.length <= 200 * rounds, '归档字节读取次数不超过每轮 200 次的有界扫描');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+// ============ D13R：同店同工作副本在飞恢复去重（生产真实证据：同一 8 候选被验证两次） ============
+// 2026-10-28 生产只读证据：普通只读刷新 09:25:34 起、日常广告读取 09:25:41 起、cookie-restore-ranking
+// 于 09:26:23.859 与 09:26:41.264 选出**完全相同**的 8 个候选来源与 SHA，其间没有任何已完成恢复：
+// 同一店铺/同一工作副本/同一 login 配置的并发恢复把同一份已保存候选验证了两遍（重复 SSO、重复耗时）。
+// 下列测试只用合成 verify/工厂（无真实浏览器、无网络），验证去重只作用于**同一目标**。
+
+function overlapWorkDir(tmpRoot) {
+  const workDir = path.join(tmpRoot, 'work');
+  fs.mkdirSync(workDir, { recursive: true });
+  return workDir;
+}
+
+function overlapOpts(tmpRoot, verify, extra = {}) {
+  return {
+    shopCfg: { name: 'shopA' },
+    workDir: path.join(tmpRoot, 'work'),
+    recoveryDir: path.join(tmpRoot, 'recovery-absent'),
+    vaultModule: makeFakeVault([]),
+    verify,
+    nowFn: () => Date.UTC(2026, 9, 28, 2, 0, 0),
+    ...extra,
+  };
+}
+
+test('D13R 在飞去重：同 cfg+同工作副本+同店名并发 → 只一条验证链，第二个调用复用同一结果', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-overlap-'));
+  try {
+    const workPath = path.join(overlapWorkDir(tmpRoot), 'shopA.json');
+    const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+    fs.writeFileSync(workPath, baseline);
+    const loginCfg = {};
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const calls = [];
+    const verify = async (p) => { calls.push(p.source); await gate; return { ok: true, finalCookies: p.cookies }; };
+    const p1 = restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, verify));
+    const p2 = restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, verify));
+    release();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    assert.strictEqual(calls.length, 1, '同一目标的并发恢复只允许一次验证（绝不重复 SSO）');
+    assert.strictEqual(r1.ok, true);
+    assert.strictEqual(r2.ok, true);
+    assert.strictEqual(r2.joinedInflight, true, '第二个调用必须复用首个结果，而不是另起验证链');
+    assert.strictEqual(r1.sourceSha256, r2.sourceSha256);
+    assert.strictEqual(r1.targetSha256, r2.targetSha256);
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(workPath)), fullSessionCookies('A', 'work'));
+    // 结算后条目必须按身份 CAS 删除：后续调用重新走自己的验证链（无永久锁、无无界 Map）
+    const later = [];
+    const r3 = await restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, async (p) => {
+      later.push(p.source); return { ok: true, finalCookies: p.cookies };
+    }));
+    assert.strictEqual(r3.ok, true);
+    assert.strictEqual(later.length, 1, '已结算的在飞条目不得残留成永久锁');
+    assert.strictEqual(r3.joinedInflight, undefined);
+  } finally { fs.rmSync(tmpRoot, { recursive: true, force: true }); }
+});
+
+test('D13R 在飞去重：首个 stopChain → 第二个调用不自行验证、不启动下一候选', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-overlap-'));
+  try {
+    overlapWorkDir(tmpRoot);
+    const loginCfg = {};
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const calls = [];
+    const verify = async (p) => {
+      calls.push(p.source); await gate;
+      return { ok: false, classification: 'verify-error', stopChain: true, reason: '合成：候选进程收口未获证明' };
+    };
+    const versions = [makeArchiveVersion('a1', 'verified-login', 1), makeArchiveVersion('a2', 'verified-login', 2)];
+    const p1 = restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, verify, { vaultModule: makeFakeVault(versions) }));
+    const p2 = restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, verify, { vaultModule: makeFakeVault(versions) }));
+    release();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    assert.strictEqual(calls.length, 1, 'stopChain 之后第二个调用绝不得自行验证或启动下一候选');
+    assert.strictEqual(r1.ok, false);
+    assert.strictEqual(r2.ok, false);
+    assert.strictEqual(r2.joinedInflight, true);
+    assert.ok(r1.attempts.some((a) => a.stopChain === true));
+    assert.ok(r2.attempts.some((a) => a.stopChain === true));
+    assert.ok(!fs.existsSync(path.join(tmpRoot, 'work', 'shopA.json')), '停止链绝不提升');
+  } finally { fs.rmSync(tmpRoot, { recursive: true, force: true }); }
+});
+
+test('D13R 在飞去重不改变异常语义：验证器抛错仍 verify-error，结算后条目释放可重试', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-overlap-'));
+  try {
+    const workPath = path.join(overlapWorkDir(tmpRoot), 'shopA.json');
+    fs.writeFileSync(workPath, JSON.stringify(fullSessionCookies('A', 'work')));
+    const loginCfg = {};
+    const r1 = await restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, async () => {
+      throw new Error('合成验证器异常');
+    }));
+    assert.strictEqual(r1.ok, false);
+    const att = r1.attempts.find((a) => a.result === 'verify-failed');
+    assert.ok(att, '验证器异常必须如实记为 verify-failed');
+    assert.strictEqual(att.classification, undefined);
+    assert.strictEqual(att.stopChain, undefined, '普通验证器异常不擅自停链（既有语义不变）');
+    assert.ok(att.reason.includes('验证器异常'));
+    // 外层失败结算后条目必须释放：后续调用仍能正常验证并提升（不是永久锁）
+    const r2 = await restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, async (p) => ({ ok: true, finalCookies: p.cookies })));
+    assert.strictEqual(r2.ok, true, '失败结算后同一目标必须可重新恢复');
+    assert.strictEqual(r2.joinedInflight, undefined);
+  } finally { fs.rmSync(tmpRoot, { recursive: true, force: true }); }
+});
+
+test('D13R 在飞去重不覆盖并发新扫码：在飞期间工作副本被更新 → 两调用均得冲突结果，新文件保留', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-overlap-'));
+  try {
+    const workPath = path.join(overlapWorkDir(tmpRoot), 'shopA.json');
+    const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+    const concurrent = Buffer.from(JSON.stringify(fullSessionCookies('C', 'concurrent')));
+    fs.writeFileSync(workPath, baseline);
+    const loginCfg = {};
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const calls = [];
+    const verify = async (p) => {
+      calls.push(p.source);
+      fs.writeFileSync(workPath, concurrent); // 首个候选验证期间并发新扫码写入
+      await gate;
+      return { ok: true, finalCookies: p.cookies };
+    };
+    const p1 = restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, verify));
+    const p2 = restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, verify));
+    release();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(r1.ok, false, 'CAS 冲突绝不覆盖并发新文件');
+    assert.ok(r1.attempts.some((a) => a.conflict === true));
+    assert.strictEqual(r2.ok, false, 'join 者拿到的是首个调用者的真实 CAS 判定，绝不提升过期字节');
+    assert.strictEqual(r2.joinedInflight, true);
+    assert.deepStrictEqual(fs.readFileSync(workPath), concurrent, '并发新扫码文件必须原样保留');
+  } finally { fs.rmSync(tmpRoot, { recursive: true, force: true }); }
+});
+
+test('D13R 在飞去重按店铺/路径隔离：同 cfg 两店并发各自验证提升，绝不串结果', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-overlap-'));
+  try {
+    const workA = path.join(tmpRoot, 'workA');
+    const workB = path.join(tmpRoot, 'workB');
+    fs.mkdirSync(workA); fs.mkdirSync(workB);
+    fs.writeFileSync(path.join(workA, 'shopA.json'), JSON.stringify(fullSessionCookies('A', 'work')));
+    fs.writeFileSync(path.join(workB, 'shopB.json'), JSON.stringify(fullSessionCookies('B', 'work')));
+    const loginCfg = {};
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const calls = [];
+    const verify = async (p) => { calls.push(p.source); await gate; return { ok: true, finalCookies: p.cookies }; };
+    const pA = restoreDutyWorkCopy(loginCfg, 'shopA.json', {
+      shopCfg: { name: 'shopA' }, workDir: workA, recoveryDir: path.join(tmpRoot, 'recovery-absent'),
+      vaultModule: makeFakeVault([]), verify, nowFn: () => Date.UTC(2026, 9, 28, 2, 0, 0),
+    });
+    const pB = restoreDutyWorkCopy(loginCfg, 'shopB.json', {
+      shopCfg: { name: 'shopB' }, workDir: workB, recoveryDir: path.join(tmpRoot, 'recovery-absent'),
+      vaultModule: makeFakeVault([]), verify, nowFn: () => Date.UTC(2026, 9, 28, 2, 0, 0),
+    });
+    release();
+    const [rA, rB] = await Promise.all([pA, pB]);
+    assert.strictEqual(calls.length, 2, '不同店铺必须各自验证，绝不全局串行/共享结论');
+    assert.strictEqual(rA.ok, true);
+    assert.strictEqual(rB.ok, true);
+    assert.strictEqual(rA.joinedInflight, undefined);
+    assert.strictEqual(rB.joinedInflight, undefined);
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(workA, 'shopA.json'))), fullSessionCookies('A', 'work'));
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(workB, 'shopB.json'))), fullSessionCookies('B', 'work'));
+  } finally { fs.rmSync(tmpRoot, { recursive: true, force: true }); }
+});
+
+test('D13R 在飞去重按预期店名契约隔离：同路径不同店名 → 错误契约绝不继承成功结果', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-overlap-'));
+  try {
+    const workPath = path.join(overlapWorkDir(tmpRoot), 'shopA.json');
+    fs.writeFileSync(workPath, JSON.stringify(fullSessionCookies('A', 'work')));
+    const loginCfg = {};
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const calls = [];
+    const verify = async (p) => {
+      calls.push(p.expectedShopNames.join(','));
+      await gate;
+      return p.expectedShopNames.includes('shopA')
+        ? { ok: true, finalCookies: p.cookies }
+        : { ok: false, reason: '合成：店名契约不匹配' };
+    };
+    const p1 = restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, verify));
+    const p2 = restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, verify, { shopCfg: { name: 'shopB' } }));
+    release();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    assert.strictEqual(calls.length, 2, '店名契约不同必须各自验证，绝不共享同一条链');
+    assert.strictEqual(r1.ok, true);
+    assert.strictEqual(r2.ok, false, '显式错误店名契约即便同路径也绝不继承他人成功结果');
+    assert.strictEqual(r2.joinedInflight, undefined);
+  } finally { fs.rmSync(tmpRoot, { recursive: true, force: true }); }
+});
+
+// ============ D13R：默认验证器把"自有候选被取消"从"平台登录无效"里分离 ============
+// 合成 page/context/browser：只驱动真实 createDefaultCandidateVerifier 分支，无 Playwright、无网络。
+
+const FXG_HOME_URL_FOR_TEST = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
+const FXG_LOGIN_URL_FOR_TEST = 'https://fxg.jinritemai.com/login/common';
+
+function makeVerifierPage({ currentUrl, loginUrl = FXG_LOGIN_URL_FOR_TEST, probe = null }) {
+  const page = {
+    closed: false,
+    async goto() {},
+    url() { return page.closed ? loginUrl : currentUrl; },
+    isClosed() { return page.closed === true; },
+    async evaluate() { return probe; },
+    async waitForLoadState() {},
+    async waitForTimeout() {},
+    async title() { return ''; },
+    on() {}, off() {}, once() {},
+  };
+  // D13T 夹具修正（仅测试夹具，不动生产源码）：绝不返回 Proxy 或为未知键编造方法。
+  // 旧夹具的 Proxy 对任意字符串键都返回 no-op 函数，**包括 `then`**；于是 page 变成
+  // thenable：ctx.newPage() 是 async 函数，其返回值被 Promise 同化时会调用 page.then(
+  // resolve, reject)，而伪造的 no-op 永不调用 resolve → `await ctx.newPage()` 永久挂起，
+  // 业务逻辑一行都没执行（挂起发生在 goto/收敛/身份分类之前）。真实 Playwright Page
+  // 不是 thenable。故只暴露验证分支实际使用的方法（goto/url/isClosed/evaluate 及等待类），
+  // 并显式断言 page 不是 thenable。
+  assert.strictEqual(
+    typeof page.then, 'undefined',
+    '合成 page 必须是普通对象（非 thenable）：否则 await ctx.newPage() 被 Promise 同化后永久挂起',
+  );
+  return page;
+}
+
+function makeVerifierBrowser(page, cookieList) {
+  const ctx = {
+    closedCount: 0,
+    added: null,
+    async addCookies(c) { ctx.added = c; },
+    async newPage() { return page; },
+    async cookies() { return cookieList.slice(); },
+    async close() { ctx.closedCount += 1; },
+  };
+  const browser = {
+    ctx, closedCount: 0, connected: true,
+    async newContext() { return ctx; },
+    async close() { browser.closedCount += 1; browser.connected = false; },
+    isConnected() { return browser.connected === true; },
+  };
+  return { browser, ctx };
+}
+
+test('D13R 默认验证器：候选页在等待期被关闭（URL 仍为登录页）→ verify-error+stopChain，不判登录失效、不提升、不写负缓存', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-overlap-'));
+  try {
+    const workPath = path.join(overlapWorkDir(tmpRoot), 'shopA.json');
+    const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+    fs.writeFileSync(workPath, baseline);
+    const loginCfg = {};
+    const page = makeVerifierPage({ currentUrl: FXG_HOME_URL_FOR_TEST });
+    const { browser, ctx } = makeVerifierBrowser(page, JSON.parse(baseline.toString('utf8')));
+    let sleeps = 0;
+    const r = await restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, undefined, {
+      candidateBrowserFactory: async () => browser,
+      verifySettleTimeoutMs: 200, verifySettleIntervalMs: 5, verifyMaxWaitMs: 600000,
+      verifySleep: async () => { sleeps += 1; if (sleeps >= 3) page.closed = true; },
+    }));
+    assert.strictEqual(r.ok, false);
+    const att = r.attempts.find((a) => a.result === 'verify-failed');
+    assert.ok(att, '必须以 verify-failed 记录');
+    assert.strictEqual(att.classification, 'verify-error', '自有候选被取消绝不归类 login-invalid');
+    assert.strictEqual(att.stopChain, true, '自有候选取消必须停链（不再启动下一候选）');
+    assert.strictEqual(browser.closedCount, 1, '自有浏览器必须且只能关闭一次');
+    assert.strictEqual(ctx.closedCount, 1, '自有 context 必须关闭');
+    assert.deepStrictEqual(fs.readFileSync(workPath), baseline, '取消绝不提升');
+    // 不写负缓存：同一 cfg 的下一轮仍重新验证同一候选（而不是 skipped-history-sha）
+    const later = [];
+    const r2 = await restoreDutyWorkCopy(loginCfg, 'shopA.json', overlapOpts(tmpRoot, async (p) => {
+      later.push(p.source); return { ok: true, finalCookies: p.cookies };
+    }));
+    assert.strictEqual(r2.ok, true);
+    assert.strictEqual(later.length, 1, '取消原因不得进入 login-invalid 负缓存');
+  } finally { fs.rmSync(tmpRoot, { recursive: true, force: true }); }
+});
+
+test('D13R 默认验证器：自有浏览器断开 → verify-error+stopChain，不判登录失效', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-overlap-'));
+  try {
+    const workPath = path.join(overlapWorkDir(tmpRoot), 'shopA.json');
+    const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+    fs.writeFileSync(workPath, baseline);
+    const page = makeVerifierPage({ currentUrl: FXG_HOME_URL_FOR_TEST });
+    const { browser } = makeVerifierBrowser(page, JSON.parse(baseline.toString('utf8')));
+    let sleeps = 0;
+    const r = await restoreDutyWorkCopy({}, 'shopA.json', overlapOpts(tmpRoot, undefined, {
+      candidateBrowserFactory: async () => browser,
+      verifySettleTimeoutMs: 200, verifySettleIntervalMs: 5, verifyMaxWaitMs: 600000,
+      verifySleep: async () => { sleeps += 1; if (sleeps >= 3) browser.connected = false; },
+    }));
+    assert.strictEqual(r.ok, false);
+    const att = r.attempts.find((a) => a.result === 'verify-failed');
+    assert.strictEqual(att.classification, 'verify-error');
+    assert.strictEqual(att.stopChain, true);
+    assert.strictEqual(browser.closedCount, 1);
+    assert.deepStrictEqual(fs.readFileSync(workPath), baseline);
+  } finally { fs.rmSync(tmpRoot, { recursive: true, force: true }); }
+});
+
+test('D13R 默认验证器：登录页在完整等待后仍打开 → 仍如实判 login-invalid（不误当取消）', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-overlap-'));
+  try {
+    const workPath = path.join(overlapWorkDir(tmpRoot), 'shopA.json');
+    const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+    fs.writeFileSync(workPath, baseline);
+    const page = makeVerifierPage({ currentUrl: FXG_LOGIN_URL_FOR_TEST });
+    const { browser } = makeVerifierBrowser(page, JSON.parse(baseline.toString('utf8')));
+    const r = await restoreDutyWorkCopy({}, 'shopA.json', overlapOpts(tmpRoot, undefined, {
+      candidateBrowserFactory: async () => browser,
+      verifySettleTimeoutMs: 30, verifySettleIntervalMs: 5, verifyMaxWaitMs: 20,
+      verifySleep: async () => {},
+    }));
+    assert.strictEqual(r.ok, false);
+    const att = r.attempts.find((a) => a.result === 'verify-failed');
+    assert.strictEqual(att.classification, 'login-invalid', '登录页始终打开仍是真实登录失效证据');
+    assert.strictEqual(att.stopChain, undefined, '真实登录失效不擅自停链');
+    assert.strictEqual(browser.closedCount, 1);
+    assert.deepStrictEqual(fs.readFileSync(workPath), baseline);
+  } finally { fs.rmSync(tmpRoot, { recursive: true, force: true }); }
+});
+
+// ============ D14：既有值守工作备份（.prev-*）只读恢复层（真实 restore + 真实临时文件） ============
+// 只测既有受管后缀：数字时间戳（backupGuardWorkFile 现行格式）与紧凑 UTC（历史保留文件）。
+// 全部使用合成 Cookie/注入 verify：无真实浏览器、无网络、无生产文件。
+
+function backupSuffixFor(index, format) {
+  const hex = (0xa1b2c3 + index).toString(16);
+  if (format === 'compact') {
+    const d = new Date(Date.UTC(2026, 9, 26, 16, 9, 7) - index * 60000);
+    const p = (n) => String(n).padStart(2, '0');
+    return `.prev-${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}T${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}Z-${hex}`;
+  }
+  return `.prev-${Date.UTC(2026, 9, 26, 16, 9, 7) - index * 60000}-${hex}`;
+}
+
+function writeWorkBackup(f, fileName, cookies, mtimeSec) {
+  const p = path.join(f.roots.guardWorkDir, fileName);
+  fs.writeFileSync(p, JSON.stringify(cookies));
+  if (mtimeSec !== undefined) fs.utimesSync(p, mtimeSec, mtimeSec);
+  return p;
+}
+
+function backupFilesState(f, onlyNames = null) {
+  const names = onlyNames || fs.readdirSync(f.roots.guardWorkDir).filter((n) => n !== 'shopA.json').sort();
+  return names.map((name) => {
+    const p = path.join(f.roots.guardWorkDir, name);
+    const st = fs.lstatSync(p);
+    return [name, st.isFile() ? sha256Of(fs.readFileSync(p)) : 'non-file', st.mtimeMs];
+  });
+}
+
+test('D14 恢复：分析/恢复层失效后，既有工作备份在首选 5 条内可达且只提升 finalCookies', async () => {
+  const f = guardSessionFixture();
+  try {
+    const healthySrc = fullSessionCookies('H', 'healthy');
+    const healthyFinal = fullSessionCookies('H', 'healthy-final');
+    const workBaseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+    fs.writeFileSync(f.workPath, workBaseline);
+    // 新鲜的“分析来源/恢复副本”为不同 SID 的失效字节：它们先试且失败，但不得挤掉备份层
+    fs.writeFileSync(path.join(f.roots.analyzerWorkDir, 'shopA.json'), JSON.stringify(fullSessionCookies('P', 'analysis')));
+    fs.writeFileSync(path.join(f.roots.recoveryDir, 'shopA.json'), JSON.stringify(fullSessionCookies('Q', 'recovery')));
+    const baseSec = Math.floor(Date.UTC(2026, 9, 27, 12, 0, 0) / 1000);
+    const badNames = [];
+    for (let i = 0; i < 12; i += 1) {
+      const fileName = `shopA.json${backupSuffixFor(i, i % 2 === 0 ? 'numeric' : 'compact')}`;
+      badNames.push(fileName);
+      writeWorkBackup(f, fileName, fullSessionCookies('A', `bad-${i}`), baseSec - i * 60);
+    }
+    const healthyName = `shopA.json${backupSuffixFor(12, 'compact')}`; // 第 13 新（最旧）
+    writeWorkBackup(f, healthyName, healthySrc, baseSec - 12 * 60);
+    const names = [...badNames, healthyName];
+    const beforeBackups = backupFilesState(f, names);
+    const beforeSources = f.sourceState();
+    const audit = [];
+    const calls = [];
+    const r = await f.restore(async (p) => {
+      calls.push(p.source);
+      if (JSON.stringify(p.cookies) !== JSON.stringify(healthySrc)) {
+        return { ok: false, classification: 'login-invalid', reason: '合成失效' };
+      }
+      return { ok: true, finalCookies: healthyFinal };
+    }, { excludeWorkCopy: true, audit: (e) => audit.push(e) });
+    assert.strictEqual(r.ok, true);
+    assert.ok(calls.length <= RESTORE_MAX_CANDIDATES, `健康备份必须在首选 5 条内可达：${calls.length}`);
+    assert.ok(String(r.source).startsWith('guard-work-backup:shopA.json.prev-'), `来源须为工作备份层: ${r.source}`);
+    assert.ok(String(r.source).endsWith(healthyName.slice('shopA.json'.length)));
+    // 提升的是验证 context 的 finalCookies，而非备份原始字节
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(f.workPath)), healthyFinal);
+    assert.notDeepStrictEqual(JSON.parse(fs.readFileSync(f.workPath)), healthySrc);
+    // 2RO 源与全部既有备份字节/mtime 不变
+    assert.deepStrictEqual(f.sourceState(), beforeSources);
+    assert.deepStrictEqual(backupFilesState(f, names), beforeBackups);
+    // 两种受管后缀均被枚举（数字 + 紧凑），审计只含文件名/短 SHA
+    const rankingAudit = JSON.stringify(audit.filter((e) => e.kind === 'cookie-restore-ranking'));
+    assert.ok(/shopA\.json\.prev-\d{13}-[0-9a-f]{6}/.test(rankingAudit), '数字时间戳受管后缀必须被枚举');
+    assert.ok(/shopA\.json\.prev-\d{8}T\d{6}Z-[0-9a-f]{6}/.test(rankingAudit), '紧凑 UTC 受管后缀必须被枚举');
+    assert.ok(!JSON.stringify(audit).includes('FAKE-'));
+    assert.ok(!JSON.stringify(audit).includes('session:'));
+    assert.ok(!JSON.stringify(r.attempts).includes('COOKIE_EXPIRED'));
+    assert.ok(!JSON.stringify(audit).includes('COOKIE_EXPIRED'));
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D14 收集：符号链接/目录/异店/畸形名一律忽略且绝不验证', async () => {
+  const f = guardSessionFixture();
+  try {
+    const healthySrc = fullSessionCookies('H', 'healthy');
+    const outside = path.join(f.root, 'outside-healthy.json');
+    fs.writeFileSync(outside, JSON.stringify(healthySrc));
+    fs.writeFileSync(f.workPath, JSON.stringify(fullSessionCookies('A', 'work')));
+
+    const linkName = `shopA.json${backupSuffixFor(0, 'numeric')}`;
+    let symlinkMade = false;
+    try { fs.symlinkSync(outside, path.join(f.roots.guardWorkDir, linkName), 'file'); symlinkMade = true; } catch (_) { symlinkMade = false; }
+    const dirName = `shopA.json${backupSuffixFor(1, 'compact')}`;
+    fs.mkdirSync(path.join(f.roots.guardWorkDir, dirName));
+    const malformed = [
+      'shopA.json.prev-123-abcdef',
+      'shopA.json.prev-20261026T160907Z-ABCDEF',
+      'shopA.json.prev-20261026T160907Z-a1b2c',
+      'shopA.json.prev-20261026T160907Z-a1b2c3.bak',
+      'shopA.json.bak',
+      'shopA-old.json.prev-1793030947000-a1b2c3',
+    ];
+    writeWorkBackup(f, `shopB.json${backupSuffixFor(2, 'numeric')}`, healthySrc, 2000000000);
+    for (const name of malformed) writeWorkBackup(f, name, healthySrc, 2000000000);
+
+    const names = fs.readdirSync(f.roots.guardWorkDir).filter((n) => n !== 'shopA.json');
+    const before = backupFilesState(f, names);
+    const outsideBefore = sha256Of(fs.readFileSync(outside));
+    const calls = [];
+    const r = await f.restore(async (p) => { calls.push(p.source); return { ok: true, finalCookies: p.cookies }; }, { excludeWorkCopy: true, loginCfg: {} });
+    assert.strictEqual(r.ok, false, '非法名字不得成为候选，也不得被提升');
+    assert.strictEqual(calls.length, 0, '符号链接/目录/异店/畸形名绝不进入验证器');
+    assert.deepStrictEqual(backupFilesState(f, names), before);
+    assert.strictEqual(sha256Of(fs.readFileSync(outside)), outsideBefore);
+    if (symlinkMade) assert.strictEqual(fs.lstatSync(path.join(f.roots.guardWorkDir, linkName)).isSymbolicLink(), true);
+    assert.ok(!fs.existsSync(path.join(f.roots.guardWorkDir, 'shopA.json.prev-1793030947000-a1b2c3')), '不得写出新文件');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D14 有界：1000 个备份仅 40 次字节捕获，SHA 重复不占首选名额', async () => {
+  const f = guardSessionFixture();
+  try {
+    const baseSec = Math.floor(Date.UTC(2026, 9, 27, 12, 0, 0) / 1000);
+    const names = [];
+    for (let i = 0; i < 1000; i += 1) {
+      const fileName = `shopA.json${backupSuffixFor(i, i % 2 === 0 ? 'numeric' : 'compact')}`;
+      names.push(fileName);
+      // 最新 10 个字节完全相同（同一 SHA）：不得因此多占首选名额
+      const cookies = i < 10 ? fullSessionCookies('A', 'duplicate') : fullSessionCookies('A', `bulk-${i}`);
+      writeWorkBackup(f, fileName, cookies, baseSec - i);
+    }
+    let backupByteReads = 0;
+    const origRead = f.fsm.readFileSync;
+    f.fsm.readFileSync = (p, ...args) => {
+      if (String(p).startsWith(f.workPath + '.prev-')) backupByteReads += 1;
+      return origRead.call(f.fsm, p, ...args);
+    };
+    const calls = [];
+    const r = await f.restore(async (p) => {
+      calls.push(JSON.stringify(p.cookies));
+      return { ok: false, classification: 'login-invalid', reason: '合成失效' };
+    }, { excludeWorkCopy: true, loginCfg: {} });
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(backupByteReads, 40, '1000 个备份元数据只允许 40 次字节捕获');
+    assert.strictEqual(calls.length, RESTORE_MAX_CANDIDATES, '每轮仍只验证首选 5 条');
+    assert.strictEqual(new Set(calls).size, calls.length, 'SHA 重复不得重复验证/占名额');
+    assert.ok(!JSON.stringify(r.attempts).includes('COOKIE_EXPIRED'));
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D14 上限不变：40 工作备份与归档 200 读取/首选5+回退5 并存时各守边界', async () => {
+  const f = guardSessionFixture();
+  try {
+    const baseSec = Math.floor(Date.UTC(2026, 9, 27, 12, 0, 0) / 1000);
+    for (let i = 0; i < 40; i += 1) {
+      writeWorkBackup(f, `shopA.json${backupSuffixFor(i, i % 2 === 0 ? 'numeric' : 'compact')}`, fullSessionCookies('A', `bk-${i}`), baseSec - i);
+    }
+    const versions = [];
+    for (let i = 0; i < 195; i += 1) {
+      const buf = Buffer.from(JSON.stringify(fullSessionCookies(`NL${i}`, `nl-${i}`)));
+      versions.push({ versionId: `nl${i}`, versionPath: path.join(f.roots.archiveRoot, 'shopA', `nl${i}.json`), buf, sha256: sha256Of(buf), origin: 'verified-login', createdAtMs: 5000 - i });
+    }
+    for (let i = 0; i < 5; i += 1) {
+      const buf = Buffer.from(JSON.stringify(fullSessionCookies(`LG${i}`, `lg-${i}`)));
+      versions.push({ versionId: `lg${i}`, versionPath: path.join(f.roots.archiveRoot, 'shopA', `lg${i}.json`), buf, sha256: sha256Of(buf), origin: 'legacy-unverified', createdAtMs: 100 - i });
+    }
+    const fake = makeFakeVault(versions);
+    let archiveReads = 0;
+    const calls = [];
+    const r = await f.restore(async (p) => { calls.push(p.source); return { ok: false, classification: 'login-invalid', reason: '合成失效' }; }, {
+      excludeWorkCopy: true, loginCfg: {},
+      vaultModule: {
+        ...fake, MAX_RECOVERY_VERSIONS_SCAN: 200,
+        readSnapshotVersion(p) { archiveReads += 1; return fake.readSnapshotVersion(p); },
+      },
+    });
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(archiveReads, 200, '归档层读取上界仍为 200（不因新增备份层抬高）');
+    assert.strictEqual(calls.length, 10, '首选 5 + 回退 5 的网络/进程边界不变');
+    const legacyCalls = calls.slice(5);
+    assert.ok(calls.slice(0, 5).every((s) => !s.startsWith('raw-archive:lg')));
+    assert.ok(legacyCalls.every((s) => s.startsWith('raw-archive:lg')));
+    assert.ok(calls.some((s) => s.startsWith('guard-work-backup:')));
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D14 全部失效与并发 CAS：2RO 与全部备份字节不变，工作副本只保留并发新文件', async () => {
+  const f = guardSessionFixture();
+  try {
+    const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+    const concurrent = Buffer.from(JSON.stringify(fullSessionCookies('C', 'concurrent')));
+    fs.writeFileSync(f.workPath, baseline);
+    fs.writeFileSync(path.join(f.roots.analyzerWorkDir, 'shopA.json'), JSON.stringify(fullSessionCookies('A', 'analysis')));
+    fs.writeFileSync(path.join(f.roots.recoveryDir, 'shopA.json'), JSON.stringify(fullSessionCookies('A', 'recovery')));
+    const names = [];
+    for (let i = 0; i < 3; i += 1) {
+      names.push(`shopA.json${backupSuffixFor(i, i % 2 === 0 ? 'numeric' : 'compact')}`);
+      writeWorkBackup(f, names[i], fullSessionCookies('A', `fail-${i}`), 1999999000 + i);
+    }
+    const beforeBackups = backupFilesState(f, names);
+    const beforeSources = f.sourceState();
+
+    const r1 = await f.restore(async () => ({ ok: false, classification: 'login-invalid', reason: '合成失效' }), { excludeWorkCopy: true, loginCfg: {} });
+    assert.strictEqual(r1.ok, false);
+    assert.deepStrictEqual(fs.readFileSync(f.workPath), baseline);
+    assert.deepStrictEqual(f.sourceState(), beforeSources);
+    assert.deepStrictEqual(backupFilesState(f, names), beforeBackups);
+
+    let injected = false;
+    const r2 = await f.restore(async (p) => {
+      if (!injected) { injected = true; fs.writeFileSync(f.workPath, concurrent); }
+      return { ok: true, finalCookies: p.cookies };
+    }, { excludeWorkCopy: true, loginCfg: {} });
+    assert.strictEqual(r2.ok, false, 'CAS 冲突绝不覆盖并发新文件');
+    assert.ok(r2.attempts.some((a) => a.conflict === true));
+    assert.deepStrictEqual(fs.readFileSync(f.workPath), concurrent, '并发新工作文件必须原样保留');
+    assert.deepStrictEqual(f.sourceState(), beforeSources, '2RO 源零改动');
+    assert.deepStrictEqual(backupFilesState(f, names), beforeBackups, '全部既有备份字节/mtime 零改动');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D14 同 SID 备份变体：跨调用历史换批，最终可达较旧健康变体（每轮 ≤5）', async () => {
+  const f = guardSessionFixture();
+  try {
+    const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+    fs.writeFileSync(f.workPath, baseline); // 指纹稳定 → 失败史跨调用延续
+    const healthySrc = fullSessionCookies('A', 'healthy');
+    const healthyFinal = fullSessionCookies('A', 'healthy-final');
+    const names = [];
+    for (let i = 0; i < 12; i += 1) {
+      names.push(`shopA.json${backupSuffixFor(i, i % 2 === 0 ? 'numeric' : 'compact')}`);
+      writeWorkBackup(f, names[i], fullSessionCookies('A', `same-sid-${i}`), 1999998000 - i);
+    }
+    const healthyName = `shopA.json${backupSuffixFor(12, 'compact')}`;
+    names.push(healthyName);
+    writeWorkBackup(f, healthyName, healthySrc, 1999998000 - 12);
+    const beforeBackups = backupFilesState(f, names);
+    const beforeSources = f.sourceState();
+    const loginCfg = {};
+    const seen = new Set();
+    let promoted = null;
+    let rounds = 0;
+    for (let round = 1; round <= 5 && promoted === null; round += 1) {
+      rounds = round;
+      const r = await f.restore(async (p) => {
+        assert.ok(!seen.has(p.source), `第 ${round} 轮重复验证已失败来源: ${p.source}`);
+        seen.add(p.source);
+        if (JSON.stringify(p.cookies) !== JSON.stringify(healthySrc)) {
+          return { ok: false, classification: 'login-invalid', reason: '合成失效' };
+        }
+        return { ok: true, finalCookies: healthyFinal };
+      }, { excludeWorkCopy: true, loginCfg });
+      if (round === 1) assert.ok(seen.size <= RESTORE_MAX_CANDIDATES, '每轮仍只验证首选 5 条');
+      if (r.ok) promoted = r;
+      else assert.deepStrictEqual(fs.readFileSync(f.workPath), baseline, '未提升前工作副本不变');
+    }
+    assert.ok(promoted, '较旧健康同 SID 变体必须在有界轮次内可达');
+    assert.ok(rounds >= 2 && rounds <= 5, `必须依赖跨调用历史换批（实际 ${rounds} 轮）`);
+    assert.ok(String(promoted.source).startsWith('guard-work-backup:'));
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(f.workPath)), healthyFinal);
+    assert.deepStrictEqual(f.sourceState(), beforeSources);
+    assert.deepStrictEqual(backupFilesState(f, names), beforeBackups);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });

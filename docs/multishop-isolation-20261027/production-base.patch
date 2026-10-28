@@ -983,3 +983,234 @@ index 65e666417f5d5792722aa64aaf7b757d2edb9d91..d3427d5fdb5d84f6fc3313d81d561fa2
    return {
      ok: false,
      reason: `全部候选未通过验证或提升失败（验证调用 ${verifyCalls} 次）：保留工作副本现状，不盲覆盖（单次有界循环）`,
+diff --git a/src/login/session.js b/src/login/session.js
+index d3427d5fdb5d84f6fc3313d81d561fa219e13c60..489f98a1464da03f6642efd776faf94682d73cf2 100644
+--- a/src/login/session.js
++++ b/src/login/session.js
+@@ -167,6 +167,57 @@ function backupGuardWorkFile(fsm, workPath, nowFn) {
+   return { ok: true, skipped: false, backupPath };
+ }
+ 
++// ── D14：既有「值守工作备份」只读候选层 ──
++// 提升前保留的 <店名>.json.prev-* 是**本工作根内既有可回退字节**（不是归档 manifest），
++// 旧恢复链从不回看它们，导致唯一健康的历史回退永远不可被验证。这里只做有界只读收集：
++//   - 仅扫描同一解析工作根目录（不读其他目录、不跟随符号链接、不读未匹配名字）；
++//   - 仅接受精确本店前缀 + 两种既有受管后缀（当前写入 helper 的数字时间戳格式，
++//     以及历史保留的紧凑 UTC 格式），不做模糊/其它扩展名/自定义路径匹配；
++//   - mtime 只用于候选**优先级**排序，绝不作为健康/放行依据（仍走原有结构校验 +
++//     独立验证 + 正确店名 + finalCookies + 冻结基线 CAS + 备份写入器）；
++//   - 最多读取 40 个文件字节（硬上限）；不写/删/移/chmod 任何备份，不补 manifest。
++const RESTORE_MAX_WORK_BACKUP_CAPTURES = 40;
++
++/** 精确本店前缀与既有两种受管备份后缀（含锚定，拒绝任意名字）。 */
++function workBackupSuffixPatternGuard(name) {
++  const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++  // 数字时间戳（backupGuardWorkFile 现行 helper）或紧凑 UTC 时间戳（历史保留文件）。
++  return new RegExp(`^${escaped}\\.prev-(?:\\d{13}|\\d{8}T\\d{6}Z)-[0-9a-f]{6}$`);
++}
++
++/**
++ * 有界只读收集本店既有工作备份候选。
++ * 枚举元数据用 lstat（符号链接/目录/非普通文件拒绝），按 mtime 新→旧仅作优先级，
++ * 最多捕获 RESTORE_MAX_WORK_BACKUP_CAPTURES 个字节（captureNormalFileGuard + SHA）。
++ * 永不写入/删除/移动/改权备份；不可读文件如实记入 attempts，不构成登录失效/过期信号。
++ */
++function listWorkBackupCandidatesGuard(fsm, workDir, name, attempts, limit = RESTORE_MAX_WORK_BACKUP_CAPTURES) {
++  let re;
++  try { re = workBackupSuffixPatternGuard(name); } catch (_) { return []; }
++  let entries;
++  try { entries = fsm.readdirSync(workDir); } catch (_) { return []; }
++  const eligible = [];
++  for (const f of entries) {
++    if (typeof f !== 'string' || !re.test(f)) continue;
++    let lst = null;
++    try { lst = fsm.lstatSync(path.join(workDir, f)); } catch (_) { continue; }
++    if (!lst || !lst.isFile()) continue; // 符号链接/目录/无法判定：绝不作为候选
++    eligible.push({ file: f, mtimeMs: Number(lst.mtimeMs) || 0 });
++  }
++  eligible.sort((a, b) => (b.mtimeMs - a.mtimeMs) || String(b.file).localeCompare(String(a.file)));
++  const maxRead = Math.max(1, Math.min(RESTORE_MAX_WORK_BACKUP_CAPTURES, Number(limit) || RESTORE_MAX_WORK_BACKUP_CAPTURES));
++  const out = [];
++  for (const e of eligible.slice(0, maxRead)) {
++    const cap = captureNormalFileGuard(fsm, path.join(workDir, e.file));
++    if (cap.ok) {
++      out.push({ source: `guard-work-backup:${e.file}`, buf: cap.buf, sha256: cap.sha256, createdAtMs: cap.mtimeMs });
++    } else if (Array.isArray(attempts)) {
++      attempts.push({ source: `guard-work-backup:${e.file}`, result: 'unreadable', reason: cap.reason });
++    }
++  }
++  return out;
++}
++
+ function listArchiveCandidatesGuard(shopSafeName, opts, fsm, limit = RESTORE_MAX_CANDIDATES, history = null) {
+   let vaultMod = opts.vaultModule || null;
+   if (!vaultMod) {
+@@ -344,6 +395,29 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
+       };
+       // 有界被动收敛（实测约 30s 落首页）：中转期绝不判失效；到上界仍非首页才如实分类。
+       const settled = await waitForDoudianHomepageSettled(page, settleOpts);
++      // D13R（真实代码路径缺陷）：自有候选页被关闭 / 自有浏览器断开 **不等于** 平台登录无效。
++      // 监控 300000ms 超时可能在本验证器等待期间关闭本候选；旧代码在 settle 返回
++      // {ok:false, reason:'settle-page-closed', url:'…/login/…'} 之后仍去读 page.url() 并置
++      // sawLoginEvidence=true，把"本次验证被取消"误判为 login-invalid，进而写入负缓存。
++      // 故在收敛之后、最终身份分类之前判定关闭/断开：verify-error + stopChain（不判登录
++      // 失效、不写失败缓存、不提升、不在本候选收口前启动下一候选）。随后 context/浏览器
++      // 收口仍走下方统一清理，绝不提前 return 跳过。
++      const cancelledReason = () => {
++        try {
++          if (typeof page.isClosed === 'function' && page.isClosed() === true) return '候选自有页面已被关闭（监控/超时取消本候选）';
++        } catch (_) { return '候选自有页面关闭状态不可判定（保守按取消处理）'; }
++        try {
++          if (typeof browser.isConnected === 'function' && browser.isConnected() === false) return '候选自有浏览器进程已断开';
++        } catch (_) { return '候选自有浏览器连接状态不可判定（保守按取消处理）'; }
++        return null;
++      };
++      const cancelOutcome = (why) => ({
++        ok: false, classification: 'verify-error', stopChain: true,
++        reason: `${why}：本次验证被取消，不构成平台登录无效证据（不判 login-invalid、不写失败缓存、不提升，停止恢复链）`,
++      });
++      if (settled && settled.ok !== true && /closed|disconnect/i.test(String(settled.reason || ''))) {
++        outcome = cancelOutcome(`候选在收敛阶段即被关闭（${String(settled.reason)}）`);
++      }
+       const pacing = settlePacing(settleOpts);
+       const identityMs = sanitizePositiveMs(opts.verifyMaxWaitMs, DEFAULT_VERIFY_IDENTITY_WAIT_MS);
+       // 已落在任一受信任身份页（首页收敛成功，或直接落在账户中心等受支持路径）才给
+@@ -353,11 +427,13 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
+       let sawLoginEvidence = false;
+       let reachedVerifiedIdentityUrl = false;
+       let lastIdentityReason = null;
+-      for (let i = 0; i < maxAttempts; i += 1) {
++      for (let i = 0; i < maxAttempts && !outcome; i += 1) {
+         if (i > 0) {
+           const sleep = opts.verifySleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+           await sleep(pacing.intervalMs);
+         }
++        const cancelled = cancelledReason();
++        if (cancelled) { outcome = cancelOutcome(cancelled); break; }
+         const url = String(page.url());
+         if (!isVerifiedDoudianIdentityUrl(url)) {
+           // 明确登录页/登录中转地址 = 登录无效正证据（与"身份未核实/错店"区分）。
+@@ -393,6 +469,10 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
+         outcome = { ok: true, finalCookies };
+         break;
+       }
++      if (!outcome) {
++        const cancelled = cancelledReason();
++        if (cancelled) outcome = cancelOutcome(cancelled);
++      }
+       if (!outcome) {
+         if (sawLoginEvidence) {
+           outcome = { ok: false, classification: 'login-invalid', reason: '候选在独立浏览器进程命中登录页地址或可见登录控件（登录无效，需重新扫码）' };
+@@ -477,8 +557,9 @@ function sessionBreadthOrderGuard(cands) {
+ // 未触达唯一健康的最旧变体，因第 65 个失败即整史清空）。单轮候选 SHA 上界有限可算：
+ //   上游角色 6 = 值守工作副本 1 + 分析只读来源 1 + 恢复副本固定路径 1 + 恢复副本版本 3
+ //   归档层 200 = 有界扫描上限（RESTORE_MAX_CANDIDATES 仍为 5：每窗口仍只验证 5 条）
+-//   ⇒ 每轮最多 206 个不同 SHA。
+-// 故取 256：>= 206（一次完整遍历内绝不提前重置），且仍是固定常数——RAM 上界约
++//   保留工作备份 40 = D14 只读字节捕获硬上限（RESTORE_MAX_WORK_BACKUP_CAPTURES）
++//   ⇒ 每轮最多 246 个不同 SHA。
++// 故取 256：>= 246（一次完整遍历内绝不提前重置），且仍是固定常数——RAM 上界约
+ // 256 个 SHA 字符串 + ≤256 个会话键（数十 KB，与归档版本总数无关），无持久化、
+ // 无定时器、不随归档增长；绝不抬高验证次数/归档 200 上限（网络/进程边界不变）。
+ const RESTORE_HISTORY_MAX_FAILED = 256;
+@@ -605,9 +686,65 @@ function archiveEpochMs(c) {
+   return Number.isFinite(t) ? t : 0;
+ }
+ 
++// ── D13R：同一配置所有者 + 同一精确工作副本 + 同一预期店名契约的**在飞恢复去重** ──
++// 真实生产只读证据（2026-10-28）：普通只读刷新 09:25:34 起、日常广告读取 09:25:41 起、
++// cookie-restore-ranking 于 09:26:23.859 与 09:26:41.264 两次选出**完全相同**的 8 个候选
++// 来源与 SHA，其间没有任何已完成恢复——同一店铺、同一工作副本、同一 login 配置的并发恢复
++// 在独立进程里把同一份已保存候选验证了两遍：重复 SSO、重复耗时。只读刷新路由只 join 正在
++// 运行的 readRecovery 阶段，并不串行化普通 compass 读取与广告读取；恢复函数此前无在飞去重。
++//
++// 语义（最小修复）：同一目标的并发恢复只保留**一条**验证链。首个调用者持有并执行完整恢复
++//（候选选择/独立验证/最终 Cookie 捕获/CAS 提升各一次），其余并发调用者等待并复用其结果，
++// 绝不另起验证、绝不在首个 stopChain 之后再自行启动下一候选。每个候选仍由验证器自行新建
++// 独立浏览器进程（绝不共享浏览器/context/会话/工厂实例），去重只共享"恢复结论"。
++//
++// 边界：键 = 调用方 loginCfg 对象（WeakMap，配置对象更换即自然隔离）+ 解析后的工作副本
++// 绝对路径 + 排序后的预期店名。不同店铺路径不同 → 并发互不影响、绝不跨店复用结论；
++// 显式错误的店名契约即便同路径也不同键 → 绝不继承他人的成功结果；在飞期间发生的新扫码
++// 写入仍由首个调用者的冻结基线 CAS 判定（join 者拿到的就是该判定结果，绝不提升过期字节）。
++// 条目在 promise 结算（resolve/reject）后按身份 CAS 删除，Map 空即从 WeakMap 移除：
++// 无持久锁、无文件、无游标、无定时器、无无界增长。
++const restoreInflight = new WeakMap();
++
++function restoreInflightKey(loginCfg, cookieFile, opts) {
++  try {
++    if (!loginCfg || typeof loginCfg !== 'object') return null;
++    const expectedNames = shopNamesOf(opts.shopCfg || {});
++    if (expectedNames.length === 0) return null;
++    const workPath = path.resolve(resolveWorkDir(loginCfg, opts), safeCookieBaseName(cookieFile));
++    return JSON.stringify([workPath, expectedNames.slice().sort()]);
++  } catch (_) {
++    // 目标解析失败（非法配置/测试上下文缺工作根）：不做去重，交由主流程按原语义抛错。
++    return null;
++  }
++}
++
++async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
++  const key = restoreInflightKey(loginCfg, cookieFile, opts);
++  if (key === null) return restoreDutyWorkCopyOwned(loginCfg, cookieFile, opts);
++  let perOwner = restoreInflight.get(loginCfg);
++  if (!perOwner) { perOwner = new Map(); restoreInflight.set(loginCfg, perOwner); }
++  const existing = perOwner.get(key);
++  if (existing) {
++    // 已有同一目标在飞：只等待其最终结果（成功/失败一致），不自行验证、不自行续链。
++    const shared = await existing.promise;
++    return { ...shared, joinedInflight: true };
++  }
++  const entry = { promise: null };
++  entry.promise = restoreDutyWorkCopyOwned(loginCfg, cookieFile, opts);
++  perOwner.set(key, entry);
++  try {
++    return await entry.promise;
++  } finally {
++    if (perOwner.get(key) === entry) perOwner.delete(key);
++    if (perOwner.size === 0 && restoreInflight.get(loginCfg) === perOwner) restoreInflight.delete(loginCfg);
++  }
++}
++
+ /**
+  * 值守工作副本恢复（AD-COOKIE-FOUR-TIER-20261019-F1）：仅在业务入口明确
+- * auth/登录失效失败后调用；候选链 = 值守工作副本 → 商品分析只读来源 → 恢复副本 →
++ * auth/登录失效失败后调用；候选链 = 值守工作副本 → 商品分析只读来源 → 恢复副本
++ * （含版本） → 同工作根既有保留备份（D14，只读、有界 40 字节捕获） →
+  * 匹配店铺最近原始快照（AD-COOKIE-SOURCE-RECOVERY 新增「分析来源」层：商品分析侧
+  * 扫码/刷新会更新该上游，通常比 stale 恢复/归档更新，故排在它们之前验证）。
+  * 每个候选：普通文件冻结捕获（符号链接拒绝）→ 结构校验 → sha 去重 → 独立验证
+@@ -616,6 +753,9 @@ function archiveEpochMs(c) {
+  * 不盲覆盖、不无限循环、不跨店猜文件；候选验证不写任何归档或来源；恢复副本与
+  * 归档只读（工作更新不得向上污染）。
+  *
++ * D13R：本函数是**单次自有执行体**（验证/提升各一次）；对外入口 restoreDutyWorkCopy
++ * 负责同一目标的在飞去重，同一时刻只让一个调用者进入这里，其余调用者复用其结果。
++ *
+  * @param {object} loginCfg 配置 login 段
+  * @param {string} cookieFile 精确店铺文件名（safeCookieBaseName 规则）
+  * @param {object} opts { shopCfg, verify?, candidateBrowserFactory?, forbiddenBrowsers?,
+@@ -624,7 +764,7 @@ function archiveEpochMs(c) {
+  * @returns {Promise<{ok:true, source:string, sourceSha256:string, targetSha256:string, backupPath:string|null, attempts:object[]}
+  *                   |{ok:false, reason:string, attempts:object[]}>}
+  */
+-async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
++async function restoreDutyWorkCopyOwned(loginCfg, cookieFile, opts = {}) {
+   const fsm = opts.fsModule || fs;
+   const nowFn = opts.nowFn || (() => Date.now());
+   const attempts = [];
+@@ -716,8 +856,13 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
+   // 候选必须是普通文件（符号链接/目录拒绝）；只读捕获，绝不向上游写入。
+   const analyzerCand = captureAnalyzerSourceCandidateGuard(fsm, loginCfg, name, workReal, recReal, archReal, attempts);
+ 
++  // D14：本工作根内既有「提升前保留备份」只读候选。排在当前工作/分析来源/恢复副本及
++  // 其版本之后、原始归档代表之前——唯一健康的历史回退因此可在既有 5 条首选窗口内被
++  // 独立验证；仍由下方统一的结构校验/独立验证/finalCookies/冻结基线 CAS/备份写入器放行。
++  const workBackupCands = listWorkBackupCandidatesGuard(fsm, workDir, name, attempts);
++
+   const cands = [];
+-  for (const c of [workCand, analyzerCand, recoveryCand, ...recoveryVersionCands, ...archiveCands]) {
++  for (const c of [workCand, analyzerCand, recoveryCand, ...recoveryVersionCands, ...workBackupCands, ...archiveCands]) {
+     if (c) cands.push(c);
+   }
+   const ranked = rankRestoreCandidatesGuard(cands, RESTORE_MAX_CANDIDATES, history);

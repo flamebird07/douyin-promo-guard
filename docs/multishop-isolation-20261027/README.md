@@ -16,3 +16,5 @@
 追加修复（2026-10-28）：有限收口探测耗尽后，底层任务迟到结束时，由一次性结束通知复用原关闭证明及身份检查释放阻断；不启动新读取、不开新页面、不增加计时轮询、不伪装健康。新及既有资源收尾/截止测试37项通过，连同最终隔离专项共160项通过。生产三店读取结果仍须独立实测，代码测试不等同于平台会话有效。
 
 补充复验：node --test docs/multishop-isolation-20261027/offline/guard/test/late-read-gate-settle.test.js docs/multishop-isolation-20261027/offline/guard/test/dian4-unknown-gate-ownership.test.js docs/multishop-isolation-20261027/offline/guard/test/enable-read-deadline.test.js
+
+归档截断修复 D10R/D11R（2026-10-28）：恢复选择优先覆盖不同会话，剩余名额保留同会话变体；仅恢复内部的本地只读归档扫描上限200，普通调用仍50，平台验证仍guard5+5/app4+3。既有SHA、店名、独立进程、关闭证明和并发文件比较保持。199项专项最终复跑通过；首次全量一次恢复用例未通过，单项及全量复跑通过，尚未定位偶发原因，记录保留本机test-first-failure-D11R.json摘要与复跑日志。真实只读文件选择从4组扩至7组；这不证明这些会话被平台接受，也不代表三店业务已完成验收。三个恢复源文件已按批准哈希加载，配置及两类只读Cookie未写入。

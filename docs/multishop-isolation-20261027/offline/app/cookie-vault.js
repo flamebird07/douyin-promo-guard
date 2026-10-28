@@ -49,6 +49,7 @@ const MANIFEST_NAME = 'manifest.json';
 const MANIFEST_VERSION = 1;
 /** 单店归档版本参与硬链接核查/列表的合理上界（防御异常目录，不构成业务上限）。 */
 const MAX_VERSIONS_SCAN = 50;
+const MAX_RECOVERY_VERSIONS_SCAN = 200;
 
 function sha256Of(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
@@ -408,6 +409,7 @@ function listSnapshotVersions(p) {
   const shopSeg = safeShopSegment(p.shopSafeName);
   const shopDir = path.join(p.rootDir || roots.archiveRoot, shopSeg);
   const manifestPath = path.join(shopDir, MANIFEST_NAME);
+  const scanLimit = p.internalRecoveryScan === true ? MAX_RECOVERY_VERSIONS_SCAN : MAX_VERSIONS_SCAN;
   let mst = null;
   try { mst = fsm.lstatSync(manifestPath); } catch (_) { mst = null; }
   const out = [];
@@ -424,7 +426,7 @@ function listSnapshotVersions(p) {
         .slice()
         .sort((a, b) => (Number(b.createdAtMs) || 0) - (Number(a.createdAtMs) || 0)
           || String(b.versionId).localeCompare(String(a.versionId)));
-      for (const v of ranked.slice(0, MAX_VERSIONS_SCAN)) {
+      for (const v of ranked.slice(0, scanLimit)) {
         const versionPath = path.join(shopDir, `${v.versionId}.json`);
         let st = null;
         try { st = fsm.lstatSync(versionPath); } catch (_) { st = null; }
@@ -447,7 +449,7 @@ function listSnapshotVersions(p) {
   // 回退分支同理：目录列举顺序不代表新旧，必须先按 versionId（字典序＝时间序）
   // 全量倒序再截断，否则 >上限的归档目录里只能看到最旧的一批。
   names.sort((a, b) => String(b).localeCompare(String(a)));
-  for (const f of names.slice(0, MAX_VERSIONS_SCAN)) {
+  for (const f of names.slice(0, scanLimit)) {
     const versionPath = path.join(shopDir, f);
     let st = null;
     try { st = fsm.lstatSync(versionPath); } catch (_) { st = null; }
@@ -635,6 +637,7 @@ module.exports = {
   RECOVERY_DIRNAME,
   MANIFEST_NAME,
   MAX_VERSIONS_SCAN,
+  MAX_RECOVERY_VERSIONS_SCAN,
   defaultRoots,
   safeShopSegment,
   sha256Of,

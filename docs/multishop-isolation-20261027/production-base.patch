@@ -503,3 +503,271 @@ index 569ead09de5e835c0cbd2a27f72f8356b4cd4f98..13d8a7a6f9124d3377c6c380e76c0c80
    /** 本店全部已知门（当前门 + 登记簿里被替换的旧 epoch 门），去重后按登记顺序。 */
    _allKnownGates() {
      const seen = new Set();
+diff --git a/src/login/session.js b/src/login/session.js
+index 55bb942733e20bc2756beac01ce1ea77ee00672e..65e666417f5d5792722aa64aaf7b757d2edb9d91 100644
+--- a/src/login/session.js
++++ b/src/login/session.js
+@@ -78,13 +78,7 @@ const GUARD_ROOT_DIR = path.resolve(__dirname, '..', '..');
+ const DEFAULT_RECOVERY_DIR = path.join(GUARD_ROOT_DIR, 'cookie-recovery');
+ const DEFAULT_VAULT_MODULE_PATH = path.resolve(GUARD_ROOT_DIR, '..', 'bill-manager', 'cookie-vault.js');
+ const DEFAULT_FXG_HOME_URL = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
+-/**
+- * 恢复链候选上限（值守工作 1 + 分析来源 1 + 恢复副本 1 + 归档不同检查点补足）：有界一次循环。
+- * AD-COOKIE-SOURCE-RECOVERY 新增「商品分析只读来源」一层（+1），不挤掉既有任一层；
+- * 归档读取窗口与本上限同宽（vault 侧已先全量倒序再有界截断），并由
+- * rankRestoreCandidatesGuard 按「不同 sha + 不同分钟桶」取额——重复入档不占额度，
+- * 故上限内拿到的是真实最新 + 更早的**不同**检查点，而不是同一次会话态的重复快照。
+- */
++// 本地扫描复用 vault 上限；平台验证仍各限首选/legacy 五条，不随会话变体数扩大。
+ const RESTORE_MAX_CANDIDATES = 5;
+ /** 收敛到首页之后，语义身份探针的有界等待（节拍复用主链收敛间隔；非中转等待）。 */
+ const DEFAULT_VERIFY_IDENTITY_WAIT_MS = 20000;
+@@ -173,13 +167,6 @@ function backupGuardWorkFile(fsm, workPath, nowFn) {
+   return { ok: true, skipped: false, backupPath };
+ }
+ 
+-/** 归档层候选（bill-manager/cookie-vault.js；模块缺失/读取失败 → 诚实 unavailable）。
+- *  读取窗口有界（默认 RESTORE_MAX_CANDIDATES）：vault 已按 createdAtMs/versionId 全量
+- *  倒序再有界截断，故这里取到的是**真实最新**的一批，不是 manifest 追加顺序的头部。
+- *  每个候选带 createdAtMs（归档入册时间）与 origin（来源类别），供上层按
+- *  来源类别 + 不同 SHA/时间桶排名。非 legacy 与 legacy 各占一个同宽读取窗口（D4），
+- *  类内保持 vault 的既有新→旧顺序：legacy 不得把已验证快照挤出首选窗口，但也不被
+- *  首选窗口挤为零（验证失败后仍有有界回退窗口可试）。 */
+ function listArchiveCandidatesGuard(shopSafeName, opts, fsm, limit = RESTORE_MAX_CANDIDATES) {
+   let vaultMod = opts.vaultModule || null;
+   if (!vaultMod) {
+@@ -190,10 +177,11 @@ function listArchiveCandidatesGuard(shopSafeName, opts, fsm, limit = RESTORE_MAX
+       return { ok: false, reason: '归档模块接口不完整：跳过归档层候选' };
+     }
+   }
++  const recoveryScan = vaultMod.MAX_RECOVERY_VERSIONS_SCAN === 200;
+   let versions;
+   try {
+     const roots = vaultMod.defaultRoots({ guardRoot: GUARD_ROOT_DIR, ...(opts.vaultRoots || {}) });
+-    versions = vaultMod.listSnapshotVersions({ shopSafeName, roots, fsModule: fsm });
++    versions = vaultMod.listSnapshotVersions({ shopSafeName, roots, fsModule: fsm, internalRecoveryScan: recoveryScan });
+   } catch (e) {
+     return { ok: false, reason: `归档列举异常（${(e && e.message) || e}）：跳过归档层候选` };
+   }
+@@ -203,22 +191,27 @@ function listArchiveCandidatesGuard(shopSafeName, opts, fsm, limit = RESTORE_MAX
+   const items = [];
+   const roots = vaultMod.defaultRoots({ guardRoot: GUARD_ROOT_DIR, ...(opts.vaultRoots || {}) });
+   const maxRead = Math.max(1, Math.min(RESTORE_MAX_CANDIDATES, Number(limit) || 1));
+-  // 来源优先（先划分再按既有硬上限截断）：非 legacy（含 unknown/verified-login）在前，
+-  // legacy-unverified 作为回退在后；两类内部保持 vault 已给出的新→旧顺序。
+-  const nonLegacyVersions = [];
+-  const legacyVersions = [];
+-  for (const v of versions.versions) {
+-    if (v && v.origin === 'legacy-unverified') legacyVersions.push(v);
+-    else nonLegacyVersions.push(v);
+-  }
+-  // STARVATION-FIX（MULTISHOP-ISOLATION-20261027 D4）：非 legacy 与 legacy 各取独立的
+-  // maxRead 读取窗口，不再拼接后统一截断——否则 5 条以上较新非 legacy 会把 legacy 回退
+-  // 永久挤出窗口，每次恢复都重复读同一批失效快照。优先级仍由排名层保证（非 legacy 先验）。
+-  for (const v of nonLegacyVersions.slice(0, maxRead).concat(legacyVersions.slice(0, maxRead))) {
+-    const origin = (v && v.origin) || 'unknown';
+-    const r = vaultMod.readSnapshotVersion({ versionPath: v.versionPath, expectedSha256: v.sha256 || undefined, fsModule: fsm });
+-    if (r.ok) items.push({ source: `raw-archive:${v.versionId}`, buf: r.buf, sha256: r.sha256, path: v.versionPath, createdAtMs: Number(v.createdAtMs) || 0, origin });
+-    else items.push({ source: `raw-archive:${v.versionId}`, error: r.reason, origin });
++  const bounded = versions.versions.slice(0, recoveryScan ? 200 : 50);
++  for (const legacy of [false, true]) {
++    let window = [];
++    const seenSha = new Set();
++    const sessions = new Set();
++    for (const v of bounded) {
++      const origin = (v && v.origin) || 'unknown';
++      if ((origin === 'legacy-unverified') !== legacy) continue;
++      const r = vaultMod.readSnapshotVersion({ versionPath: v.versionPath, expectedSha256: v.sha256 || undefined, fsModule: fsm });
++      if (!r.ok) {
++        items.push({ source: `raw-archive:${v.versionId}`, error: r.reason, origin });
++        continue;
++      }
++      if (seenSha.has(r.sha256)) continue;
++      seenSha.add(r.sha256);
++      const c = { source: `raw-archive:${v.versionId}`, buf: r.buf, sha256: r.sha256, path: v.versionPath, createdAtMs: Number(v.createdAtMs) || 0, origin };
++      sessions.add(candidateSessionIdentityGuard(c) || `sha:${c.sha256}`);
++      window = sessionBreadthOrderGuard([...window, c]).slice(0, maxRead);
++      if (sessions.size >= maxRead) break;
++    }
++    items.push(...window);
+   }
+   return { ok: true, items, manifestMissing: versions.manifestMissing === true, archiveRoot: roots.archiveRoot };
+ }
+@@ -419,25 +412,45 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
+   };
+ }
+ 
+-/**
+- * 恢复候选排名（硬上限内选「真实最新 + 更早的不同检查点」）：
+- *  - 三个上层候选（值守工作副本 / 商品分析来源 / 恢复副本）各至多一条，恒定保留（它们是
+- *    现存状态本身，不参与归档时间排名）；
+- *  - 归档候选先按来源类别（非 legacy 在前，legacy-unverified 回退在后；unknown/其他
+- *    来源按非 legacy 兼容），类内按 createdAtMs 全量倒序（缺失时回落 versionId 内嵌
+- *    UTC 时刻，绝不回落 manifest 追加顺序——那是最旧的一批）；
+- *  - **同 sha 去重不占额度**：字节完全相同就是同一个检查点，重复验证只会白耗额度；
+- *  - 归档层内**同一来源类别 + 同一分钟桶只占一个额度**：同一分钟的多次入档是同一
+- *    会话态的重复快照，保留其中较新的一条、跳过更早的且**不占额度**；不同来源类别
+- *    各自成桶，故较新的 legacy 不会遮蔽同分钟的已验证快照；
+- *  - 额度用尽后其余如实标 beyond-limit（本轮不验证；下次恢复窗口仍可入选）；
+- *  - D4 起 legacy-unverified 另有同宽的**回退窗口**（首选窗口之后按序验证，
+- *    全局 sha 去重）：首选 5 条全部失效时 legacy 回退仍会被试到，不再被首选
+- *    窗口永久挤出（排名审计 decision=selected-fallback / beyond-limit-fallback）。
+- * 排名审计只输出标识（层级 / sha 前缀 / 秒级时刻 / 判定），绝不输出 Cookie 值或完整 sha。
+- *
+- * @returns {{selected:object[], ranking:object[], taken:number, considered:number}}
+- */
++function candidateSessionIdentityGuard(cand) {
++  let cookies;
++  try { cookies = JSON.parse(cand.buf.toString('utf8')); } catch (_) { return null; }
++  if (!validateCookieArray(cookies).ok) return null;
++  const names = ['sessionid', 'sessionid_ss', 'sid_tt'];
++  const found = new Set();
++  const keys = new Set();
++  const rows = [];
++  for (const c of cookies) {
++    if (!names.includes(c.name)) continue;
++    if (!c.value.trim()) return null;
++    let partition = c.partitionKey ?? null;
++    if (partition && typeof partition === 'object' && !Array.isArray(partition)) {
++      const entries = Object.entries(partition).sort(([a], [b]) => a.localeCompare(b));
++      if (entries.some(([, v]) => v !== null && !['string', 'boolean', 'number'].includes(typeof v))) return null;
++      partition = entries;
++    } else if (partition !== null && typeof partition !== 'string') return null;
++    const key = JSON.stringify([c.name, c.domain, c.path, partition, c.hasCrossSiteAncestor ?? null]);
++    if (keys.has(key)) return null;
++    keys.add(key);
++    found.add(c.name);
++    rows.push(JSON.stringify([key, c.value]));
++  }
++  if (found.size !== names.length) return null;
++  return `session:${crypto.createHash('sha256').update(JSON.stringify(rows.sort())).digest('hex')}`;
++}
++
++function sessionBreadthOrderGuard(cands) {
++  const representatives = [];
++  const variants = [];
++  const seen = new Set();
++  for (const c of cands) {
++    const key = candidateSessionIdentityGuard(c) || `sha:${c.sha256}`;
++    (seen.has(key) ? variants : representatives).push(c);
++    seen.add(key);
++  }
++  return representatives.concat(variants);
++}
++
+ function at0Bucket(kind, c) {
+   const at = archiveEpochMs(c);
+   return at > 0 ? `${kind}:${Math.floor(at / 60000)}` : null;
+@@ -454,63 +467,36 @@ function rankRestoreCandidatesGuard(cands, limit = RESTORE_MAX_CANDIDATES) {
+   const ranking = [];
+   const seenSha = new Set();
+   const seenMinute = new Set();
+-  for (const c of upper) {
+-    selected.push(c);
+-    seenSha.add(c.sha256);
+-    ranking.push({ rank: ranking.length + 1, layer: c.source, sha256Prefix: String(c.sha256).slice(0, 12), decision: 'kept-layer' });
+-  }
+-  // STARVATION-FIX（D4）：两段有界窗口。首选窗口 = 上层候选 + 非 legacy 归档（合计
+-  // maxSlots，优先级不变：已验证/较新快照绝不被 stale legacy 顶替）；legacy 回退只在
+-  // 首选窗口之后另行选入（同样宽 maxSlots 的有界窗口，全局 sha 去重不重复验证）。
+-  // 首选窗口未耗尽额度时 legacy 也不再插进首选，而是统一排在回退窗口——调用方
+-  // 按顺序验证，行为等价（首选全失败后 legacy 必然被试到），排名审计保持"首选在前"。
+-  const legacyPending = [];
+-  const rankArchiveEntry = (c) => {
+-    const at = archiveEpochMs(c);
+-    return {
+-      rank: ranking.length + 1,
+-      layer: 'raw-archive',
+-      versionId: String(c.source).slice('raw-archive:'.length),
+-      atEpochSec: at > 0 ? Math.floor(at / 1000) : null,
+-      sha256Prefix: String(c.sha256).slice(0, 12),
+-      decision: null,
+-    };
+-  };
+-  for (const c of archives) {
+-    if (isLegacyArchiveCandidate(c)) { legacyPending.push(c); continue; }
+-    const entry = rankArchiveEntry(c);
+-    if (seenSha.has(c.sha256)) entry.decision = 'skipped-dup-sha';
+-    else if (selected.length >= maxSlots) entry.decision = 'beyond-limit';
+-    else {
+-      const bucket = at0Bucket('nonlegacy', c);
+-      if (bucket !== null && seenMinute.has(bucket)) entry.decision = 'skipped-dup-minute';
+-      else {
+-        entry.decision = 'selected';
+-        selected.push(c);
+-        seenSha.add(c.sha256);
+-        if (bucket !== null) seenMinute.add(bucket);
+-      }
+-    }
+-    ranking.push(entry);
+-  }
+-  let legacyTaken = 0;
+-  for (const c of legacyPending) {
+-    const entry = rankArchiveEntry(c);
+-    entry.window = 'legacy-fallback';
+-    if (seenSha.has(c.sha256)) entry.decision = 'skipped-dup-sha';
+-    else if (legacyTaken >= maxSlots) entry.decision = 'beyond-limit-fallback';
+-    else {
+-      const bucket = at0Bucket('legacy', c);
+-      if (bucket !== null && seenMinute.has(bucket)) entry.decision = 'skipped-dup-minute';
++  const preferred = upper.concat(archives.filter((c) => !isLegacyArchiveCandidate(c)));
++  const legacy = archives.filter(isLegacyArchiveCandidate);
++  for (const window of [preferred, legacy]) {
++    const fallback = window === legacy;
++    let taken = 0;
++    for (const c of sessionBreadthOrderGuard(window)) {
++      const isArchive = String(c.source || '').startsWith('raw-archive:');
++      const at = isArchive ? archiveEpochMs(c) : 0;
++      const entry = {
++        rank: ranking.length + 1,
++        layer: isArchive ? 'raw-archive' : c.source,
++        ...(isArchive ? { versionId: String(c.source).slice('raw-archive:'.length), atEpochSec: at > 0 ? Math.floor(at / 1000) : null } : {}),
++        sha256Prefix: String(c.sha256).slice(0, 12),
++        ...(fallback ? { window: 'legacy-fallback' } : {}),
++        decision: null,
++      };
++      // 完整会话身份优先；分钟桶仅保留不透明候选的旧行为，不能吞掉可验证的会话变体。
++      const bucket = isArchive && !candidateSessionIdentityGuard(c) ? at0Bucket(fallback ? 'legacy' : 'nonlegacy', c) : null;
++      if (seenSha.has(c.sha256)) entry.decision = 'skipped-dup-sha';
++      else if (taken >= maxSlots) entry.decision = fallback ? 'beyond-limit-fallback' : 'beyond-limit';
++      else if (bucket !== null && seenMinute.has(bucket)) entry.decision = 'skipped-dup-minute';
+       else {
+-        entry.decision = 'selected-fallback';
++        entry.decision = fallback ? 'selected-fallback' : (isArchive ? 'selected' : 'kept-layer');
+         selected.push(c);
+         seenSha.add(c.sha256);
+-        legacyTaken += 1;
+         if (bucket !== null) seenMinute.add(bucket);
++        taken += 1;
+       }
++      ranking.push(entry);
+     }
+-    ranking.push(entry);
+   }
+   return { selected, ranking, taken: selected.length, considered: cands.length };
+ }
+@@ -618,12 +604,6 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
+     } catch (_) { /* 版本目录缺失：无版本化恢复副本，仅固定路径兼容层 */ }
+   }
+ 
+-  // 候选 4..：匹配店铺的最近原始快照（bill-manager 归档；sha 与 manifest 记录核验）。
+-  // 读取窗口 = 硬上限（vault 已全量倒序再有界截断，故窗口内即真实最新的一批），
+-  // 之后由 rankRestoreCandidatesGuard 按「不同 sha + 不同分钟桶」排名取额，
+-  // 同 sha / 同分钟的重复入档不耗尽额度，保证上限内既拿到最新也拿到更早的不同检查点。
+-  // D4：归档读取层同时带回 legacy 回退窗口，排名层首选窗口之后按序补入（见
+-  // rankRestoreCandidatesGuard），首选全部失效时 legacy 候选仍会被验证。
+   const arch = listArchiveCandidatesGuard(shopSafeName, opts, fsm, RESTORE_MAX_CANDIDATES);
+   const archiveCands = [];
+   let archReal = null;
+@@ -648,11 +628,6 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
+   // 候选必须是普通文件（符号链接/目录拒绝）；只读捕获，绝不向上游写入。
+   const analyzerCand = captureAnalyzerSourceCandidateGuard(fsm, loginCfg, name, workReal, recReal, archReal, attempts);
+ 
+-  // 组装顺序：值守工作 → 分析来源（较新，先于 stale 恢复/归档）→ 恢复副本 → 归档；
+-  // 归档内部再按 createdAtMs 全量倒序 + 「不同 sha / 不同分钟桶」排名取额，
+-  // 重复入档（同 sha、或同分钟的更早一条）不占额度，硬上限内仍能同时覆盖最新与更早
+-  // 的不同检查点。排名审计（kind:cookie-restore-ranking）只含层级 / versionId /
+-  // sha 前缀 / 秒级时刻 / 判定，绝不含 Cookie 值。
+   const cands = [];
+   for (const c of [workCand, analyzerCand, recoveryCand, ...recoveryVersionCands, ...archiveCands]) {
+     if (c) cands.push(c);

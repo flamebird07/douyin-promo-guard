@@ -407,3 +407,365 @@ test('D4 恢复：含 legacy 在内全部失效 → 基线工作副本字节保�
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
+
+const sessionVault = require('../../app/cookie-vault');
+
+function fullSessionCookies(session, variant, scope = {}) {
+  return [
+    ...['sessionid', 'sessionid_ss', 'sid_tt'].map((name) => ({
+      name, value: `FAKE-${session}-${name}`, domain: '.jinritemai.com', path: '/', ...scope,
+    })),
+    { name: 'sid_guard', value: `FAKE-GUARD-${variant}`, domain: '.jinritemai.com', path: '/' },
+    { name: 'tracking', value: `FAKE-TRACK-${variant}`, domain: '.jinritemai.com', path: '/' },
+  ];
+}
+
+function sessionTree(root) {
+  const out = [];
+  for (const name of fs.readdirSync(root).sort()) {
+    const p = path.join(root, name);
+    const st = fs.lstatSync(p);
+    if (st.isDirectory()) out.push(...sessionTree(p));
+    else out.push([p, sha256Of(fs.readFileSync(p)), st.mtimeMs, st.mode]);
+  }
+  return out;
+}
+
+function guardSessionFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'guard-session-breadth-'));
+  const roots = sessionVault.defaultRoots({ appRoot: path.join(root, 'app'), guardRoot: path.join(root, 'guard') });
+  for (const dir of [roots.archiveRoot, roots.recoveryDir, roots.analyzerWorkDir, roots.guardWorkDir]) fs.mkdirSync(dir, { recursive: true });
+  const workPath = path.join(roots.guardWorkDir, 'shopA.json');
+  const reads = [];
+  const byteReads = [];
+  const audit = [];
+  const fsm = Object.create(fs);
+  fsm.readFileSync = (p, ...args) => {
+    if (String(p).startsWith(roots.archiveRoot + path.sep) && /^v.+\.json$/.test(path.basename(String(p)))) {
+      byteReads.push(p);
+      assert.strictEqual(path.dirname(p), path.join(roots.archiveRoot, 'shopA'));
+    }
+    return fs.readFileSync(p, ...args);
+  };
+  const readOnlyRoots = [roots.archiveRoot, roots.recoveryDir, roots.analyzerWorkDir];
+  const readOnlyWrites = [];
+  const assertWritable = (p) => {
+    if (typeof p !== 'string') return;
+    if (readOnlyRoots.some((dir) => p === dir || p.startsWith(dir + path.sep))) {
+      readOnlyWrites.push(p);
+      assert.fail('恢复不得写只读来源/其他角色');
+    }
+  };
+  fsm.openSync = (p, flags, ...args) => {
+    if (flags !== 'r') assertWritable(p);
+    return fs.openSync(p, flags, ...args);
+  };
+  for (const method of ['writeFileSync', 'appendFileSync', 'mkdirSync', 'unlinkSync', 'chmodSync', 'renameSync']) {
+    fsm[method] = (...args) => {
+      assertWritable(args[0]);
+      if (method === 'renameSync') assertWritable(args[1]);
+      return fs[method](...args);
+    };
+  }
+  let tick = Date.UTC(2026, 9, 28);
+  const snapshot = (cookies, legacy = false) => {
+    const args = { shopSafeName: 'shopA', roots, nowFn: () => ++tick };
+    const r = legacy
+      ? sessionVault.archiveLegacyBytes({ ...args, buf: Buffer.from(JSON.stringify(cookies)) })
+      : sessionVault.createRawSnapshot({ ...args, cookies });
+    assert.strictEqual(r.ok, true);
+    return r;
+  };
+  const vaultModule = {
+    ...sessionVault,
+    readSnapshotVersion(p) {
+      assert.strictEqual(path.dirname(p.versionPath), path.join(roots.archiveRoot, 'shopA'));
+      const r = sessionVault.readSnapshotVersion(p);
+      reads.push({ path: p.versionPath, ok: r.ok, expected: p.expectedSha256 });
+      if (r.ok) assert.strictEqual(r.sha256, p.expectedSha256);
+      return r;
+    },
+  };
+  const sourceState = () => [readOnlyWrites.slice(), ...readOnlyRoots.map(sessionTree)];
+  const restore = (verify, extra = {}) => restoreDutyWorkCopy({ cookieSourceDir: roots.analyzerWorkDir }, 'shopA.json', {
+    shopCfg: { name: 'shopA' }, workDir: roots.guardWorkDir, recoveryDir: roots.recoveryDir,
+    vaultRoots: roots, vaultModule, fsModule: fsm, verify, audit: (e) => audit.push(e), ...extra,
+  });
+  return { root, roots, workPath, reads, byteReads, audit, snapshot, sourceState, restore };
+}
+
+function rankedSessionCandidate(source, cookies, at = 1) {
+  const buf = Buffer.isBuffer(cookies) ? cookies : Buffer.from(JSON.stringify(cookies));
+  return { source, buf, sha256: sha256Of(buf), createdAtMs: at, origin: 'verified-login' };
+}
+
+test('D10R guard 排名：跨角色同会话让位不同会话，余位仍按角色优先保留变体', () => {
+  const cands = [
+    rankedSessionCandidate('guard-duty-work', fullSessionCookies('A', 'work')),
+    rankedSessionCandidate('analyzer-source', fullSessionCookies('A', 'analysis').reverse()),
+    rankedSessionCandidate('guard-recovery', fullSessionCookies('A', 'recovery')),
+    rankedSessionCandidate('raw-archive:new', fullSessionCookies('A', 'archive'), 20),
+    rankedSessionCandidate('raw-archive:old', fullSessionCookies('B', 'old'), 10),
+  ];
+  const r = rankRestoreCandidatesGuard(cands);
+  assert.deepStrictEqual(r.selected.map((c) => c.source), [
+    'guard-duty-work', 'raw-archive:old', 'analyzer-source', 'guard-recovery', 'raw-archive:new',
+  ]);
+  assert.ok(!JSON.stringify(r.ranking).includes('FAKE-'));
+  assert.ok(!JSON.stringify(r.ranking).includes('session:'));
+});
+
+test('D10R guard 排名：完整三键及域/路径/分区参与身份，不完整或不透明内容保留 SHA 规则', () => {
+  const base = fullSessionCookies('A', 'base');
+  const changedKey = fullSessionCookies('A', 'key');
+  changedKey[1].value = 'FAKE-DIFFERENT-SECOND-KEY';
+  for (const other of [
+    changedKey,
+    fullSessionCookies('A', 'domain', { domain: 'fxg.jinritemai.com' }),
+    fullSessionCookies('A', 'path', { path: '/other' }),
+    fullSessionCookies('A', 'partition', { partitionKey: 'https://partition.example' }),
+  ]) {
+    const cands = [base, fullSessionCookies('A', 'variant'), other].map((cookies, i) => rankedSessionCandidate(`upper-${i}`, cookies));
+    assert.deepStrictEqual(rankRestoreCandidatesGuard(cands, 2).selected.map((c) => c.source), ['upper-0', 'upper-2']);
+  }
+  const partitioned = [
+    fullSessionCookies('A', 'work', { partitionKey: { topLevelSite: 'https://partition.example', hasCrossSiteAncestor: false } }),
+    fullSessionCookies('A', 'variant', { partitionKey: { hasCrossSiteAncestor: false, topLevelSite: 'https://partition.example' } }).reverse(),
+    fullSessionCookies('B', 'other'),
+  ].map((cookies, i) => rankedSessionCandidate(`upper-${i}`, cookies));
+  assert.deepStrictEqual(rankRestoreCandidatesGuard(partitioned, 2).selected.map((c) => c.source), ['upper-0', 'upper-2']);
+  for (const bytes of [
+    Buffer.from('opaque'),
+    Buffer.from(JSON.stringify(fakeCookiesWithoutSession())),
+    Buffer.from(JSON.stringify(base.slice(1))),
+    Buffer.from(JSON.stringify(base.map((c) => c.name === 'sid_tt' ? { ...c, value: '' } : c))),
+  ]) {
+    const cands = [bytes, Buffer.concat([bytes, Buffer.from(' ')]), Buffer.from('other')]
+      .map((buf, i) => rankedSessionCandidate(`upper-${i}`, buf));
+    assert.deepStrictEqual(rankRestoreCandidatesGuard(cands, 2).selected.map((c) => c.source), ['upper-0', 'upper-1']);
+    assert.strictEqual(rankRestoreCandidatesGuard([cands[0], { ...cands[0], source: 'duplicate' }]).selected.length, 1);
+  }
+});
+
+function fakeCookiesWithoutSession() {
+  return [{ name: 'tracking', value: 'FAKE-ONLY-TRACKING', domain: '.jinritemai.com', path: '/' }];
+}
+
+test('D10R guard 恢复：七个同会话归档之前的不同历史会话可达，分析/恢复重复不耗尽首选', async () => {
+  const f = guardSessionFixture();
+  try {
+    const healthy = f.snapshot(fullSessionCookies('B', 'healthy'));
+    for (let i = 0; i < 7; i += 1) f.snapshot(fullSessionCookies('A', `archive-${i}`));
+    f.snapshot(fullSessionCookies('A', 'legacy'), true);
+    fs.writeFileSync(f.workPath, JSON.stringify(fullSessionCookies('A', 'work')));
+    fs.writeFileSync(path.join(f.roots.analyzerWorkDir, 'shopA.json'), JSON.stringify(fullSessionCookies('A', 'analysis')));
+    fs.writeFileSync(path.join(f.roots.recoveryDir, 'shopA.json'), JSON.stringify(fullSessionCookies('A', 'recovery')));
+    const vdir = path.join(f.roots.recoveryDir, 'shopA');
+    fs.mkdirSync(vdir);
+    for (let i = 0; i < 3; i += 1) fs.writeFileSync(path.join(vdir, `v${i}.json`), JSON.stringify(fullSessionCookies('A', `recovery-${i}`)));
+    sessionVault.createRawSnapshot({ shopSafeName: 'shopB', cookies: fullSessionCookies('OTHER', 'other'), roots: f.roots });
+    const before = f.sourceState();
+    const calls = [];
+    const r = await f.restore(async (p) => {
+      calls.push(p.source);
+      return p.source === `raw-archive:${healthy.versionId}` ? { ok: true, finalCookies: p.cookies } : { ok: false };
+    });
+    assert.strictEqual(r.ok, true);
+    assert.deepStrictEqual(calls, ['guard-duty-work', `raw-archive:${healthy.versionId}`]);
+    assert.ok(calls.length <= RESTORE_MAX_CANDIDATES);
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(f.workPath)), fullSessionCookies('B', 'healthy'));
+    assert.deepStrictEqual(f.sourceState(), before);
+    assert.ok(f.reads.length > RESTORE_MAX_CANDIDATES && f.reads.length <= sessionVault.MAX_VERSIONS_SCAN);
+    assert.ok(!JSON.stringify(f.audit).includes('FAKE-'));
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+for (const mode of ['preferred', 'legacy', 'variant', 'failure', 'stopChain', 'cas', 'final-missing']) {
+  test(`D10R guard 同会话变体：${mode}，首选5/回退5及只读源/CAS边界`, async () => {
+    const f = guardSessionFixture();
+    try {
+      for (let i = 0; i < 7; i += 1) f.snapshot(fullSessionCookies('A', `preferred-${i}`));
+      const legacyIds = [];
+      for (let i = 0; i < 7; i += 1) legacyIds.push(f.snapshot(fullSessionCookies('A', `legacy-${i}`), true).versionId);
+      const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+      const concurrent = Buffer.from(JSON.stringify(fullSessionCookies('C', 'concurrent')));
+      fs.writeFileSync(f.workPath, baseline);
+      const before = f.sourceState();
+      const calls = [];
+      const r = await f.restore(async (p) => {
+        calls.push(p.source);
+        const legacy = legacyIds.some((id) => p.source === `raw-archive:${id}`);
+        if (mode === 'stopChain') return { ok: false, stopChain: true };
+        if (mode === 'cas' && calls.length === 1) fs.writeFileSync(f.workPath, concurrent);
+        if (mode === 'final-missing') return { ok: true };
+        const ok = mode === 'preferred' || mode === 'cas' || (mode === 'legacy' && legacy) || (mode === 'variant' && calls.length === 2);
+        return ok ? { ok: true, finalCookies: p.cookies } : { ok: false };
+      });
+      const expectedCalls = { preferred: 1, legacy: 6, variant: 2, failure: 10, stopChain: 1, cas: 10, 'final-missing': 10 }[mode];
+      assert.strictEqual(calls.length, expectedCalls);
+      assert.strictEqual(r.ok, ['preferred', 'legacy', 'variant'].includes(mode));
+      assert.ok(calls.slice(0, 5).every((s) => !legacyIds.some((id) => s === `raw-archive:${id}`)));
+      assert.ok(calls.slice(5).every((s) => legacyIds.some((id) => s === `raw-archive:${id}`)));
+      if (!r.ok) assert.deepStrictEqual(fs.readFileSync(f.workPath), mode === 'cas' ? concurrent : baseline);
+      if (mode === 'cas') assert.ok(r.attempts.some((a) => a.conflict === true));
+      assert.deepStrictEqual(f.sourceState(), before);
+      assert.ok(f.reads.length <= sessionVault.MAX_VERSIONS_SCAN);
+    } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
+}
+
+test('D10R guard 收集：真实 vault 拒绝缺失/错误 manifest SHA，不把未核验字节交验证器', async () => {
+  const f = guardSessionFixture();
+  try {
+    const good = f.snapshot(fullSessionCookies('B', 'valid'));
+    const bad = f.snapshot(fullSessionCookies('A', 'bad-hash'));
+    const missing = f.snapshot(fullSessionCookies('A', 'missing-hash'));
+    const manifestPath = path.join(f.roots.archiveRoot, 'shopA', sessionVault.MANIFEST_NAME);
+    const manifest = JSON.parse(fs.readFileSync(manifestPath));
+    manifest.versions.find((v) => v.versionId === bad.versionId).sha256 = '0'.repeat(64);
+    manifest.versions.find((v) => v.versionId === missing.versionId).sha256 = null;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const before = f.sourceState();
+    const calls = [];
+    const r = await f.restore(async (p) => { calls.push(p.source); return { ok: false }; });
+    assert.strictEqual(r.ok, false);
+    assert.deepStrictEqual(calls, [`raw-archive:${good.versionId}`]);
+    assert.strictEqual(r.attempts.filter((a) => a.result === 'integrity-failed').length, 2);
+    assert.strictEqual(f.reads.filter((x) => x.ok).length, 1);
+    assert.deepStrictEqual(f.sourceState(), before);
+    assert.ok(!fs.existsSync(f.workPath));
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('D10R guard 收集：1000 条同会话记录只读 vault 上限，SHA 重复不重复验证', async () => {
+  const f = guardSessionFixture();
+  try {
+    const versions = Array.from({ length: 1000 }, (_, i) => {
+      const buf = Buffer.from(JSON.stringify(fullSessionCookies('A', `variant-${Math.floor(i / 2)}`)));
+      return { versionId: `v${i}`, versionPath: path.join(f.roots.archiveRoot, 'shopA', `v${i}.json`),
+        buf, sha256: sha256Of(buf), origin: 'verified-login', createdAtMs: 1000000 - i };
+    });
+    const fake = makeFakeVault(versions);
+    let reads = 0;
+    const calls = [];
+    const before = f.sourceState();
+    const r = await f.restore(async (p) => { calls.push(sha256Of(Buffer.from(JSON.stringify(p.cookies)))); return { ok: false }; }, {
+      vaultModule: { ...fake, MAX_VERSIONS_SCAN: sessionVault.MAX_VERSIONS_SCAN,
+        readSnapshotVersion(p) { reads += 1; return fake.readSnapshotVersion(p); } },
+    });
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(reads, sessionVault.MAX_VERSIONS_SCAN);
+    assert.strictEqual(calls.length, RESTORE_MAX_CANDIDATES);
+    assert.strictEqual(new Set(calls).size, calls.length);
+    assert.deepStrictEqual(f.sourceState(), before);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+for (const mode of ['healthy', 'legacy', 'same-sid-legacy', 'failure', 'invalid-sha']) {
+  test(`D11R guard 真实 manifest：B第61条/legacy第62条，${mode}`, async () => {
+    const f = guardSessionFixture();
+    try {
+      const legacy = f.snapshot(fullSessionCookies(mode === 'same-sid-legacy' ? 'A' : 'C', 'legacy'), true);
+      const healthy = f.snapshot(fullSessionCookies('B', 'healthy'));
+      const newer = [];
+      for (let i = 0; i < 60; i += 1) newer.push(f.snapshot(fullSessionCookies('A', `archive-${i}`)).versionId);
+      if (mode === 'invalid-sha') {
+        const manifestPath = path.join(f.roots.archiveRoot, 'shopA', sessionVault.MANIFEST_NAME);
+        const manifest = JSON.parse(fs.readFileSync(manifestPath));
+        manifest.versions.find((v) => v.versionId === healthy.versionId).sha256 = '0'.repeat(64);
+        fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+      }
+      const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+      fs.writeFileSync(f.workPath, baseline);
+      fs.writeFileSync(path.join(f.roots.analyzerWorkDir, 'shopA.json'), JSON.stringify(fullSessionCookies('A', 'analysis')));
+      fs.writeFileSync(path.join(f.roots.recoveryDir, 'shopA.json'), JSON.stringify(fullSessionCookies('A', 'recovery')));
+      const before = f.sourceState();
+      const args = { shopSafeName: 'shopA', roots: f.roots };
+      const normal = sessionVault.listSnapshotVersions(args);
+      assert.deepStrictEqual(normal.versions.map((v) => v.versionId), newer.slice().reverse().slice(0, 50));
+      const recovery = sessionVault.listSnapshotVersions({ ...args, internalRecoveryScan: true });
+      assert.strictEqual(recovery.versions.length, 62);
+      assert.strictEqual(recovery.versions[60].versionId, healthy.versionId);
+      assert.strictEqual(recovery.versions[61].versionId, legacy.versionId);
+      const calls = [];
+      const r = await f.restore(async (p) => {
+        assert.deepStrictEqual(p.expectedShopNames, ['shopA']);
+        calls.push(p.source);
+        const ok = (mode === 'healthy' && p.source === `raw-archive:${healthy.versionId}`)
+          || (['legacy', 'same-sid-legacy'].includes(mode) && p.source === `raw-archive:${legacy.versionId}`);
+        return ok ? { ok: true, finalCookies: p.cookies } : { ok: false };
+      });
+      assert.strictEqual(r.ok, ['healthy', 'legacy', 'same-sid-legacy'].includes(mode));
+      if (mode === 'healthy') {
+        assert.deepStrictEqual(calls, ['guard-duty-work', `raw-archive:${healthy.versionId}`]);
+        assert.strictEqual(r.source, `raw-archive:${healthy.versionId}`);
+        assert.ok(calls.length <= 5);
+      } else {
+        assert.strictEqual(calls.length, 6);
+        assert.strictEqual(calls[5], `raw-archive:${legacy.versionId}`);
+        if (r.ok) assert.strictEqual(r.source, `raw-archive:${legacy.versionId}`);
+        if (mode === 'invalid-sha') {
+          assert.ok(!calls.includes(`raw-archive:${healthy.versionId}`));
+          assert.ok(r.attempts.some((a) => a.source === `raw-archive:${healthy.versionId}` && a.result === 'integrity-failed'));
+        } else assert.strictEqual(calls[1], `raw-archive:${healthy.versionId}`);
+      }
+      if (r.ok) {
+        const expected = mode === 'healthy' ? fullSessionCookies('B', 'healthy')
+          : fullSessionCookies(mode === 'same-sid-legacy' ? 'A' : 'C', 'legacy');
+        assert.deepStrictEqual(JSON.parse(fs.readFileSync(f.workPath)), expected);
+      } else assert.deepStrictEqual(fs.readFileSync(f.workPath), baseline);
+      assert.strictEqual(f.byteReads.length, 62);
+      assert.ok(f.byteReads.includes(healthy.versionPath));
+      assert.ok(f.byteReads.includes(legacy.versionPath));
+      assert.ok(f.byteReads.length <= 200 && calls.length <= 10);
+      assert.deepStrictEqual(f.sourceState(), before);
+      assert.ok(!JSON.stringify(f.audit).includes('FAKE-'));
+    } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
+}
+
+for (const mode of ['manifest', 'missing-manifest']) {
+  test(`D11R guard 1001个真实归档文件：${mode}，最多200次字节读取/10次验证`, async () => {
+    const f = guardSessionFixture();
+    try {
+      const shopDir = path.join(f.roots.archiveRoot, 'shopA');
+      fs.mkdirSync(shopDir);
+      const versions = [];
+      for (let i = 0; i < 1001; i += 1) {
+        const versionId = `v${String(1001 - i).padStart(4, '0')}`;
+        const buf = Buffer.from(JSON.stringify(fullSessionCookies('A', `archive-${i}`)));
+        const versionPath = path.join(shopDir, `${versionId}.json`);
+        fs.writeFileSync(versionPath, buf, { flag: 'wx' });
+        fs.chmodSync(versionPath, 0o444);
+        versions.push({ versionId, sha256: sha256Of(buf), createdAtMs: Date.UTC(2026, 9, 28) - i,
+          origin: i >= 60 && i < 65 ? 'legacy-unverified' : 'verified-login', structureValid: true });
+      }
+      if (mode === 'manifest') fs.writeFileSync(path.join(shopDir, sessionVault.MANIFEST_NAME), JSON.stringify({ version: 1, shop: 'shopA', versions: versions.slice().reverse() }));
+      const baseline = Buffer.from(JSON.stringify(fullSessionCookies('A', 'work')));
+      fs.writeFileSync(f.workPath, baseline);
+      const before = f.sourceState();
+      const args = { shopSafeName: 'shopA', roots: f.roots };
+      const normal = sessionVault.listSnapshotVersions(args);
+      const recovery = sessionVault.listSnapshotVersions({ ...args, internalRecoveryScan: true });
+      assert.strictEqual(normal.versions.length, 50);
+      assert.strictEqual(recovery.versions.length, 200);
+      if (mode === 'manifest') {
+        assert.deepStrictEqual(normal.versions.map((v) => v.versionId), versions.slice(0, 50).map((v) => v.versionId));
+        assert.deepStrictEqual(recovery.versions.map((v) => v.versionId), versions.slice(0, 200).map((v) => v.versionId));
+      } else assert.ok(recovery.versions.every((v) => v.sha256 === null));
+      const calls = [];
+      const r = await f.restore(async (p) => { calls.push(p.source); return { ok: false }; });
+      assert.strictEqual(r.ok, false);
+      assert.strictEqual(f.reads.length, 200);
+      assert.strictEqual(f.byteReads.length, mode === 'manifest' ? 200 : 0);
+      assert.strictEqual(calls.length, mode === 'manifest' ? 10 : 1);
+      if (mode === 'manifest') {
+        const legacySources = versions.slice(60, 65).map((v) => `raw-archive:${v.versionId}`);
+        assert.ok(calls.slice(0, 5).every((s) => !legacySources.includes(s)));
+        assert.deepStrictEqual(calls.slice(5), legacySources);
+      } else assert.strictEqual(r.attempts.filter((a) => a.result === 'integrity-failed').length, 200);
+      assert.deepStrictEqual(fs.readFileSync(f.workPath), baseline);
+      assert.deepStrictEqual(f.sourceState(), before);
+    } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+  });
+}

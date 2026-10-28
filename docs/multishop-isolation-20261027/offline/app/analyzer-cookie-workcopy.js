@@ -224,6 +224,45 @@ function createAnalyzerDefaultVerifier(opts = {}) {
   };
 }
 
+function candidateSessionIdentity(cand) {
+  let cookies;
+  try { cookies = JSON.parse(cand.buf.toString('utf8')); } catch (_) { return null; }
+  if (!vault.validateCookieStructure(cookies).ok) return null;
+  const names = ['sessionid', 'sessionid_ss', 'sid_tt'];
+  const found = new Set();
+  const keys = new Set();
+  const rows = [];
+  for (const c of cookies) {
+    if (!names.includes(c.name)) continue;
+    if (!c.value.trim()) return null;
+    let partition = c.partitionKey ?? null;
+    if (partition && typeof partition === 'object' && !Array.isArray(partition)) {
+      const entries = Object.entries(partition).sort(([a], [b]) => a.localeCompare(b));
+      if (entries.some(([, v]) => v !== null && !['string', 'boolean', 'number'].includes(typeof v))) return null;
+      partition = entries;
+    } else if (partition !== null && typeof partition !== 'string') return null;
+    const key = JSON.stringify([c.name, c.domain, c.path, partition, c.hasCrossSiteAncestor ?? null]);
+    if (keys.has(key)) return null;
+    keys.add(key);
+    found.add(c.name);
+    rows.push(JSON.stringify([key, c.value]));
+  }
+  if (found.size !== names.length) return null;
+  return `session:${vault.sha256Of(JSON.stringify(rows.sort()))}`;
+}
+
+function sessionBreadthOrder(cands) {
+  const representatives = [];
+  const variants = [];
+  const seen = new Set();
+  for (const c of cands) {
+    const key = candidateSessionIdentity(c) || `sha:${c.sha256}`;
+    (seen.has(key) ? variants : representatives).push(c);
+    seen.add(key);
+  }
+  return representatives.concat(variants);
+}
+
 /**
  * 分析工作副本恢复链（登录验证失败/候选损坏时调用；一次有界循环）。
  * @param {object} opts
@@ -267,28 +306,42 @@ async function restoreAnalysisWorkCopy(opts = {}) {
   } else {
     attempts.push({ source: 'analyzer-work', result: 'unreadable', reason: wst.error || '工作副本缺失' });
   }
-  // 候选 2..：匹配店铺的最近原始快照（新→旧，最多 3 个；sha 与 manifest 记录核验）
+  // 本地恢复扫描可更深；平台验证仍使用既有首选/legacy 窗口。
+  const recoveryScan = vault.MAX_RECOVERY_VERSIONS_SCAN === 200;
   let listed;
-  try { listed = vault.listSnapshotVersions({ shopSafeName: shopSeg, roots, fsModule: fsm }); } catch (e) {
+  try { listed = vault.listSnapshotVersions({ shopSafeName: shopSeg, roots, fsModule: fsm, internalRecoveryScan: recoveryScan }); } catch (e) {
     listed = { ok: false, reason: (e && e.message) || String(e) };
   }
   if (listed.ok) {
     if (listed.manifestMissing) {
       attempts.push({ source: 'raw-archive', result: 'manifest-missing', reason: '归档 manifest 缺失/损坏：按目录列举回退（读取时仍核验 sha）' });
     }
-    // 来源优先 + 两个同宽有界窗口（STARVATION-FIX，MULTISHOP-ISOLATION-20261027 D4）：
-    // 非 legacy（含 unknown/verified-login）先占首选窗口（工作副本 1 + 非 legacy 至多 3），
-    // legacy-unverified 另占同宽 3 条回退窗口，不再拼接后统一截断——否则 3 条以上较新
-    // 非 legacy 会把 legacy 回退永久挤为零，每次恢复都重复验证同一批失效快照。优先级
-    // 仍由顺序保证（非 legacy 先验）；全局 sha 去重在下方统一循环内完成，登录有效性
-    // 仍由下方统一验证器判定。
     const archWindow = MAX_RESTORE_CANDIDATES - 1;
-    const nonLegacyVersions = listed.versions.filter((v) => !v || v.origin !== 'legacy-unverified');
-    const legacyVersions = listed.versions.filter((v) => v && v.origin === 'legacy-unverified');
-    for (const v of nonLegacyVersions.slice(0, archWindow).concat(legacyVersions.slice(0, archWindow))) {
-      const r = vault.readSnapshotVersion({ versionPath: v.versionPath, expectedSha256: v.sha256 || undefined, fsModule: fsm });
-      if (r.ok) cands.push({ source: `raw-archive:${v.versionId}`, buf: r.buf, sha256: r.sha256 });
-      else attempts.push({ source: `raw-archive:${v.versionId}`, result: 'integrity-failed', reason: r.reason });
+    const bounded = listed.versions.slice(0, recoveryScan ? 200 : 50);
+    for (const legacy of [false, true]) {
+      let window = legacy ? [] : cands.slice();
+      const windowLimit = archWindow + window.length;
+      const seenSha = new Set(cands.map((c) => c.sha256));
+      const sessions = new Set(window.map((c) => candidateSessionIdentity(c) || `sha:${c.sha256}`));
+      for (const v of bounded) {
+        if ((v.origin === 'legacy-unverified') !== legacy) continue;
+        const r = vault.readSnapshotVersion({ versionPath: v.versionPath, expectedSha256: v.sha256 || undefined, fsModule: fsm });
+        if (!r.ok) {
+          attempts.push({ source: `raw-archive:${v.versionId}`, result: 'integrity-failed', reason: r.reason });
+          continue;
+        }
+        if (seenSha.has(r.sha256)) {
+          attempts.push({ source: `raw-archive:${v.versionId}`, result: 'dedup', sha256Prefix: vault.shortSha(r.sha256) });
+          continue;
+        }
+        seenSha.add(r.sha256);
+        const c = { source: `raw-archive:${v.versionId}`, buf: r.buf, sha256: r.sha256 };
+        sessions.add(candidateSessionIdentity(c) || `sha:${c.sha256}`);
+        window = sessionBreadthOrder([...window, c]).slice(0, windowLimit);
+        if (sessions.size >= windowLimit) break;
+      }
+      if (legacy) cands.push(...window);
+      else cands.splice(0, cands.length, ...window);
     }
   } else {
     attempts.push({ source: 'raw-archive', result: 'unavailable', reason: listed.reason });

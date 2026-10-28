@@ -1,0 +1,446 @@
+diff --git a/src/adapters/compass-order-reader.js b/src/adapters/compass-order-reader.js
+index 04b7b3273cfa68c0d3e8328c2de0ddebd98a7b3a..9b234c188abc048a962a59565aa05e26f0e285ee 100644
+--- a/src/adapters/compass-order-reader.js
++++ b/src/adapters/compass-order-reader.js
+@@ -563,6 +563,10 @@ function createCompassOrderReader(p) {
+           target: sessionTarget,
+           shopCfg,
+           audit: p.audit,
++          // D5G：写前候选验证必须经候选专用独立浏览器工厂（每个候选全新进程），
++          // 且本次全部店铺浏览器身份禁止被工厂返回——绝不借用主业务浏览器。
++          candidateBrowserFactory,
++          forbiddenBrowsers: shopBrowserIdentities.slice(),
+         });
+       } catch (_) { /* 收尾保存失败不得阻止关闭，也不改变已确认的业务结果 */ }
+       // 恢复失败路径中浏览器可能已因候选切换被证明关闭并置空：不为 null 才需要收口。
+diff --git a/src/adapters/qianchuan-reader.js b/src/adapters/qianchuan-reader.js
+index 0577aad6fd1aea935ea60b6aaa1a1382eebcb91c..82221f6a812ace9c4ee3bb0e792df766d8cb0b7e 100644
+--- a/src/adapters/qianchuan-reader.js
++++ b/src/adapters/qianchuan-reader.js
+@@ -985,7 +985,18 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
+     try {
+       const runFinalize = opts.sessionCheckpoint || checkpointQianchuanSessionCookies;
+       browserFinalizers.set(browser, {
+-        finalize: () => runFinalize({ context, cookieSession, target, shopCfg, audit: opts.audit }),
++        // D5G：收尾检查点的写前候选验证必须经**候选专用独立浏览器工厂**（每个候选
++        // 全新进程），并把本次全部店铺浏览器身份列为禁止返回实例——绝不借用本次
++        // 主业务浏览器/context.browser() 做检查点验证，也绝不关闭外部健康主浏览器。
++        finalize: () => runFinalize({
++          context,
++          cookieSession,
++          target,
++          shopCfg,
++          audit: opts.audit,
++          candidateBrowserFactory,
++          forbiddenBrowsers: shopBrowserIdentities.slice(),
++        }),
+       });
+     } catch (_) { /* 登记失败不改变打开结果 */ }
+     return { browser, context, page, target, cookieSession, navMode: reached.mode, cookieCheckpoint };
+diff --git a/src/login/session-cookie-checkpoint.js b/src/login/session-cookie-checkpoint.js
+index 84dc04370410a4b8540263c700b97393fd1ca254..4b632d202b37cc2ac56083073ba2b6d9e88ad2b4 100644
+--- a/src/login/session-cookie-checkpoint.js
++++ b/src/login/session-cookie-checkpoint.js
+@@ -42,6 +42,8 @@ const {
+   writebackSessionCookies, fingerprintFile,
+   protectedAuthCookies, cookieIdentityKey, isExpiredCookie, sha256Of, sameCookieSet,
+ } = require('./cookie-writeback');
++// D5G：候选专用独立浏览器进程的关闭证明（叶子模块，无循环依赖）。
++const { closeBrowserProven } = require('./candidate-browser');
+ // 独立候选验证复用主链**同一份**有界被动收敛语义（45s/3s/严格首页判定/双保险限次），
+ // 避免中转期误判登录失效；语义本体在 lib/settle-policy（叶子模块，qianchuan-reader 也引用）。
+ const {
+@@ -339,20 +341,43 @@ async function discoverUnknownShopAccountId({ context, identityPage, target, sho
+ }
+ 
+ /**
+- * 生产默认候选验证器（AD-COOKIE-FOUR-TIER 第 5 轮）：对**拟写入的同一冻结字节**在独立
+- * 新上下文注入，访问抖店首页，要求受信 FXG 首页 + 语义店铺名唯一且与期望严格匹配 +
+- * 无可见登录控件；并回读新上下文 Cookie，确认原集合中仍有效的关键认证 Cookie 未被
+- * 丢失/置空/改过期。无可用浏览器（browser 或 context.browser()）→ fail-closed，绝不
+- * 自启真实浏览器，也绝不因"无法验证"而放行写入。
++ * 生产默认候选验证器（D5G 检查点进程隔离）：对**拟写入的同一冻结字节**在**每次调用
++ * 经显式 candidateBrowserFactory 启动的全新独立浏览器进程**中注入，访问抖店首页，
++ * 要求受信 FXG 首页 + 语义店铺名唯一且与期望严格匹配 + 无可见登录控件；并回读该
++ * 独立上下文 Cookie，确认原集合中仍有效的关键认证 Cookie 未被丢失/置空/改过期。
+  *
+- * @param {object} p { context, browser?, expectedNames:string[], maxWaitMs?, sleep?, homeUrl? }
+- * @returns {(cand:{cookies:object[],serialized:string,buf:Buffer,sha256:string})=>Promise<{ok:boolean,name?:string,reason?:string}>}
++ * COOKIE-PROCESS-ISOLATION / D5G：绝不接收/借用调用方的 p.browser 或 p.context.browser()
++ * （在业务浏览器同进程开 context 不满足"每份 Cookie 独立浏览器进程"）；未显式提供工厂
++ * → fail-closed 拒绝验证（绝不自启真实浏览器，绝不因"无法验证"而放行写入）。工厂返回
++ * 重复（同一实例第二次）/被禁止（forbiddenBrowsers，如主业务浏览器）的实例 → 保守关闭
++ * 该实例（需获证明）后拒绝验证，绝不关闭任何外部健康主浏览器。每次验证结束都必须
++ * 关闭**本候选专属** context 与浏览器进程并给出关闭证明；关闭未获证明 → 本轮绝不判
++ * 成功并 stopChain（不启动下一候选）。工厂抛错后闩锁：后续调用一律直接拒绝（工厂
++ * 异常可能已创建未返回的资源，收口状态不确定）。
++ *
++ * @param {object} p { candidateBrowserFactory?, forbiddenBrowsers?, expectedNames:string[],
++ *                     maxWaitMs?, sleep?, homeUrl? }
++ * @returns {(cand:{cookies:object[],serialized:string,buf:Buffer,sha256:string})=>Promise<{ok:boolean,name?:string,reason?:string,classification?:string,stopChain?:boolean,finalCookies?:object[]}>}
+  */
+ function createCheckpointCandidateVerifier(p = {}) {
+   const expectedNames = (Array.isArray(p.expectedNames) ? p.expectedNames : [])
+     .map((n) => String(n == null ? '' : n).trim())
+     .filter((n) => n.length > 0);
+   const sleepFn = typeof p.sleep === 'function' ? p.sleep : ((ms) => new Promise((r) => setTimeout(r, ms)));
++  const factory = typeof p.candidateBrowserFactory === 'function' ? p.candidateBrowserFactory : null;
++  const forbidden = Array.isArray(p.forbiddenBrowsers)
++    ? p.forbiddenBrowsers.filter((b) => b && typeof b === 'object') : [];
++  if (!factory) {
++    return async function verifyCandidate() {
++      return {
++        ok: false,
++        classification: 'verify-error',
++        reason: '未提供候选专用浏览器工厂（candidateBrowserFactory）：无法独立验证候选（fail-closed，拒绝借用业务浏览器/上下文，拒绝自启真实浏览器，不写入）',
++      };
++    };
++  }
++  const usedBrowsers = new Set();
++  let latchReason = null;
+   return async function verifyCandidate(cand) {
+     if (!cand || !Buffer.isBuffer(cand.buf)) {
+       return { ok: false, reason: '候选冻结字节缺失：拒绝验证/写入' };
+@@ -374,14 +399,25 @@ function createCheckpointCandidateVerifier(p = {}) {
+     if (expectedNames.length === 0) {
+       return { ok: false, reason: '缺少期望店铺名：无法验证正确店铺（fail-closed，拒绝写入）' };
+     }
+-    let browser = p.browser || null;
+-    if (!browser && p.context && typeof p.context.browser === 'function') {
+-      try { browser = p.context.browser(); } catch (_) { browser = null; }
++    if (latchReason) {
++      return { ok: false, classification: 'verify-error', stopChain: true, reason: latchReason };
++    }
++    let browser = null;
++    try {
++      browser = await factory();
++    } catch (_) {
++      latchReason = '候选专用浏览器启动失败且资源收口状态不确定（工厂异常可能已创建未返回的进程）：已闩锁，后续候选一律拒绝启动（fail-closed，不写入；异常详情可能含敏感环境信息，已脱敏不回显）';
++      return { ok: false, classification: 'verify-error', stopChain: true, reason: '候选专用浏览器启动失败（工厂异常后资源状态不确定）：停止并闩锁后续候选，不写入（异常详情可能含敏感环境信息，已脱敏不回显）' };
+     }
+-    if (!browser || typeof browser.newContext !== 'function') {
+-      return { ok: false, reason: '无可用浏览器实例：无法独立验证候选（fail-closed，拒绝写入，绝不自启真实浏览器）' };
++    if (!browser || typeof browser.newContext !== 'function' || usedBrowsers.has(browser) || forbidden.includes(browser)) {
++      // 工厂返回不可用/重复/共享实例（含主业务浏览器）= 工厂契约破坏：fail-closed 停链并闩锁，
++      // 后续候选不再调用工厂。绝不关闭该实例——非本轮新启的浏览器不属于本验证器，绝不触碰。
++      latchReason = '候选浏览器工厂返回不可用或重复/共享/外部（主业务）浏览器实例（每个候选必须是全新独立进程，绝不关闭非本轮新启实例）：已闩锁，后续候选一律拒绝启动（fail-closed，不写入）';
++      return { ok: false, classification: 'verify-error', stopChain: true, reason: '候选浏览器工厂返回不可用或重复/共享/外部（主业务）浏览器实例（每个候选必须是全新独立进程）：绝不关闭非本轮新启实例，停止并闩锁后续候选，不写入' };
+     }
++    usedBrowsers.add(browser);
+     let ctx = null;
++    let outcome = null;
+     let sawLoginEvidence = false;
+     let reachedVerifiedIdentityUrl = false;
+     let lastIdentityReason = null;
+@@ -426,7 +462,8 @@ function createCheckpointCandidateVerifier(p = {}) {
+         let back = null;
+         try { back = await ctx.cookies(); } catch (_) { back = null; }
+         if (!Array.isArray(back) || back.length === 0) {
+-          return { ok: false, classification: 'verify-error', reason: '独立验证上下文未返回非空最终 Cookie 集合（读取异常或空）：fail-closed 拒绝验证/写入（待重试，不要求扫码）' };
++          outcome = { ok: false, classification: 'verify-error', reason: '独立验证上下文未返回非空最终 Cookie 集合（读取异常或空）：fail-closed 拒绝验证/写入（待重试，不要求扫码）' };
++          break;
+         }
+         const byKey = new Map();
+         for (const c of back) {
+@@ -439,38 +476,49 @@ function createCheckpointCandidateVerifier(p = {}) {
+           if (!arr || arr.length !== 1
+             || typeof arr[0].value !== 'string' || arr[0].value.length === 0
+             || isExpiredCookie(arr[0])) {
+-            return { ok: false, classification: 'auth-lost', reason: `候选在独立新上下文丢失/改坏关键登录 Cookie ${pc.name}：拒绝写入` };
++            outcome = { ok: false, classification: 'auth-lost', reason: `候选在独立新上下文丢失/改坏关键登录 Cookie ${pc.name}：拒绝写入` };
++            break;
+           }
+         }
++        if (outcome) break;
+         const afterCapture = await page.evaluate(probeDoudianShopIdentityInPage);
+         const finalIdentity = decideDoudianIdentity({ url: String(page.url()), expectedNames, observed: afterCapture });
+         if (!finalIdentity.ok || String(page.url()) !== url || finalIdentity.name !== rd.name) {
+-          return { ok: false, classification: 'identity-unverified', reason: 'Cookie 捕获期间页面或身份漂移：拒绝写入' };
++          outcome = { ok: false, classification: 'identity-unverified', reason: 'Cookie 捕获期间页面或身份漂移：拒绝写入' };
++          break;
+         }
+         const finalCookies = await ctx.cookies();
+         if (!sameCookieSet(back, finalCookies) || String(page.url()) !== url) {
+-          return { ok: false, classification: 'verify-error', reason: '身份复验期间 Cookie 或页面变化：拒绝提交较早快照' };
++          outcome = { ok: false, classification: 'verify-error', reason: '身份复验期间 Cookie 或页面变化：拒绝提交较早快照' };
++          break;
+         }
+-        await ctx.close();
+-        ctx = null;
+-        return { ok: true, name: rd.name, finalCookies };
++        outcome = { ok: true, name: rd.name, finalCookies };
++        break;
+       }
+       // 未通过：区分「明确登录页/登录控件（登录无效）」与「身份探针未取得唯一店名/错店（需核实/重试）」，
+       // 不把两者都误写成要求重新扫码。
+-      if (sawLoginEvidence) {
+-        return { ok: false, classification: 'login-invalid', reason: '候选在独立新上下文命中登录页地址或可见登录控件（登录无效，需重新扫码）' };
+-      }
+-      if (reachedVerifiedIdentityUrl) {
+-        return { ok: false, classification: 'identity-unverified', reason: `候选在独立新上下文到达受信抖店首页但未取得唯一本店语义身份/疑错店（${lastIdentityReason || '身份未核实'}）：待核实/重试，不要求扫码` };
++      if (!outcome) {
++        if (sawLoginEvidence) {
++          outcome = { ok: false, classification: 'login-invalid', reason: '候选在独立浏览器进程命中登录页地址或可见登录控件（登录无效，需重新扫码）' };
++        } else if (reachedVerifiedIdentityUrl) {
++          outcome = { ok: false, classification: 'identity-unverified', reason: `候选在独立浏览器进程到达受信抖店首页但未取得唯一本店语义身份/疑错店（${lastIdentityReason || '身份未核实'}）：待核实/重试，不要求扫码` };
++        } else {
++          outcome = { ok: false, classification: 'identity-unverified', reason: '候选未在独立浏览器进程到达受信抖店首页取得唯一本店语义身份（登录无效/错店/待核实，不要求扫码）' };
++        }
+       }
+-      return { ok: false, classification: 'identity-unverified', reason: '候选未在独立新上下文到达受信抖店首页取得唯一本店语义身份（登录无效/错店/待核实，不要求扫码）' };
+     } catch (_) {
+       // 外部异常（浏览器/页面驱动）可能回显 Cookie 值或带 token 的完整 URL：
+       // 只记录固定脱敏原因，绝不拼接 e.message / String(e）。验证异常绝不判为"登录无效"。
+-      return { ok: false, classification: 'verify-error', reason: '候选验证异常（异常详情可能含 Cookie/令牌等敏感值，已脱敏不回显）：拒绝验证/写入，待重试不要求扫码' };
+-    } finally {
+-      if (ctx) { try { await ctx.close(); } catch (_) { /* 关闭失败不掩盖结果 */ } }
++      outcome = { ok: false, classification: 'verify-error', reason: '候选验证异常（异常详情可能含 Cookie/令牌等敏感值，已脱敏不回显）：拒绝验证/写入，待重试不要求扫码' };
++    }
++    if (ctx) { try { await ctx.close(); } catch (_) { /* 关闭失败不掩盖结果 */ } }
++    // 本候选专属浏览器进程用毕必须真正关闭：close 抛错或仍连接 → 绝不判成功并停止链条。
++    const browserClosed = await closeBrowserProven(browser);
++    if (!browserClosed) {
++      latchReason = '候选专用浏览器进程关闭未获证明（close 异常或仍连接）：停止链条，不写入、不进入下一候选';
++      return { ok: false, classification: 'verify-error', stopChain: true, reason: latchReason };
+     }
++    return outcome;
+   };
+ }
+ 
+@@ -488,6 +536,9 @@ function createCheckpointCandidateVerifier(p = {}) {
+  *                                  回退 cookieSession.identityPage）
+  * @param {object} p.shopCfg        店铺配置（accountId 已知 → 严格匹配；未知 → 仅可经
+  *                                  name/compassShopName 严格正证据自动发现；shopId 仅日志归属）
++ * @param {Function} [p.candidateBrowserFactory] 候选专用独立浏览器工厂（D5G：默认验证器
++ *                                  必需；每次调用返回全新独立浏览器进程，缺省 fail-closed 零写）
++ * @param {object[]} [p.forbiddenBrowsers] 禁止被候选工厂返回的浏览器身份（主业务浏览器）
+  * @param {(e:object)=>void} [p.audit] 审计回调（透传写入器，内容不含 Cookie 值）
+  * @returns {Promise<{saved:boolean, skipped?:boolean, fingerprintAdvanced?:boolean,
+  *                    reason?:string|null, count?:number, bytes?:number}>}
+@@ -643,16 +694,22 @@ async function checkpointQianchuanSessionCookies(p) {
+     const t = String(n == null ? '' : n).trim();
+     if (t && !expectedNames.includes(t)) expectedNames.push(t);
+   }
+-  // 默认恒构造生产验证器：无 browser 时由验证器自身 fail-closed（绝不自启真实浏览器，
+-  // 也绝不让生产路径因缺 browser 而静默跳过写前验证）。测试只可注入 precommitVerify 或
+-  // 经 candidateVerifyOptions 注入 sleep/maxWaitMs，不得绕过验证。
++  // 默认恒构造生产验证器：D5G 起验证器**必须**拿到调用方显式提供的候选专用独立浏览器
++  // 工厂（candidateBrowserFactory，含 forbiddenBrowsers 主业务浏览器身份）；缺工厂时由
++  // 验证器自身 fail-closed（绝不借用业务浏览器/context.browser()，绝不自启真实浏览器，
++  // 也绝不让生产路径因缺工厂而静默跳过写前验证）。测试只可注入 precommitVerify 或
++  // 经 candidateVerifyOptions 注入 sleep/maxWaitMs/工厂，不得绕过验证。
+   let precommitVerify = null;
+   if (typeof p.precommitVerify === 'function') {
+     precommitVerify = p.precommitVerify;
+   } else {
+     precommitVerify = createCheckpointCandidateVerifier(Object.assign(
+       {}, (p && p.candidateVerifyOptions) || {},
+-      { context, expectedNames, browser: p.browser },
++      {
++        expectedNames,
++        candidateBrowserFactory: p.candidateBrowserFactory,
++        forbiddenBrowsers: p.forbiddenBrowsers,
++      },
+     ));
+   }
+ 
+@@ -859,6 +916,9 @@ async function propagateCommittedCheckpoint(p = {}) {
+  * @param {object} p.cookieSession  {filePath, startFingerprint}（加载前捕获）
+  * @param {object} p.target         当前罗盘页（须支持 url()/evaluate()）
+  * @param {object} p.shopCfg        店铺配置（compassShopName/name 严格匹配；shopId 仅日志归属）
++ * @param {Function} [p.candidateBrowserFactory] 候选专用独立浏览器工厂（D5G：默认验证器
++ *                                  必需；每次调用返回全新独立浏览器进程，缺省 fail-closed 零写）
++ * @param {object[]} [p.forbiddenBrowsers] 禁止被候选工厂返回的浏览器身份（主业务浏览器）
+  * @param {(e:object)=>void} [p.audit] 审计回调（内容不含 Cookie 值）
+  * @returns {Promise<{saved:boolean, skipped?:boolean, fingerprintAdvanced?:boolean,
+  *                    reason?:string|null, count?:number, bytes?:number, shopName?:string}>}
+@@ -974,14 +1034,19 @@ async function checkpointCompassSessionCookies(p) {
+     },
+   });
+ 
+-  // 写前独立候选验证（同千川口径；默认恒构造，无 browser 时验证器自身 fail-closed）
++  // 写前独立候选验证（同千川口径；默认恒构造，且必须显式提供候选专用独立浏览器工厂，
++  // 缺工厂时验证器自身 fail-closed，绝不借用业务浏览器/context.browser()）
+   let precommitVerify = null;
+   if (typeof p.precommitVerify === 'function') {
+     precommitVerify = p.precommitVerify;
+   } else {
+     precommitVerify = createCheckpointCandidateVerifier(Object.assign(
+       {}, (p && p.candidateVerifyOptions) || {},
+-      { context, expectedNames, browser: p.browser },
++      {
++        expectedNames,
++        candidateBrowserFactory: p.candidateBrowserFactory,
++        forbiddenBrowsers: p.forbiddenBrowsers,
++      },
+     ));
+   }
+ 
+diff --git a/src/login/session.js b/src/login/session.js
+index 2f3f3450bf2bb969d3386037b41738c16d727cd7..55bb942733e20bc2756beac01ce1ea77ee00672e 100644
+--- a/src/login/session.js
++++ b/src/login/session.js
+@@ -177,8 +177,9 @@ function backupGuardWorkFile(fsm, workPath, nowFn) {
+  *  读取窗口有界（默认 RESTORE_MAX_CANDIDATES）：vault 已按 createdAtMs/versionId 全量
+  *  倒序再有界截断，故这里取到的是**真实最新**的一批，不是 manifest 追加顺序的头部。
+  *  每个候选带 createdAtMs（归档入册时间）与 origin（来源类别），供上层按
+- *  来源类别 + 不同 SHA/时间桶排名。读取窗口内**先非 legacy 后 legacy-unverified**，
+- *  类内保持 vault 的既有新→旧顺序：较新的 legacy 不得把已验证快照挤出有界窗口。 */
++ *  来源类别 + 不同 SHA/时间桶排名。非 legacy 与 legacy 各占一个同宽读取窗口（D4），
++ *  类内保持 vault 的既有新→旧顺序：legacy 不得把已验证快照挤出首选窗口，但也不被
++ *  首选窗口挤为零（验证失败后仍有有界回退窗口可试）。 */
+ function listArchiveCandidatesGuard(shopSafeName, opts, fsm, limit = RESTORE_MAX_CANDIDATES) {
+   let vaultMod = opts.vaultModule || null;
+   if (!vaultMod) {
+@@ -210,7 +211,10 @@ function listArchiveCandidatesGuard(shopSafeName, opts, fsm, limit = RESTORE_MAX
+     if (v && v.origin === 'legacy-unverified') legacyVersions.push(v);
+     else nonLegacyVersions.push(v);
+   }
+-  for (const v of nonLegacyVersions.concat(legacyVersions).slice(0, maxRead)) {
++  // STARVATION-FIX（MULTISHOP-ISOLATION-20261027 D4）：非 legacy 与 legacy 各取独立的
++  // maxRead 读取窗口，不再拼接后统一截断——否则 5 条以上较新非 legacy 会把 legacy 回退
++  // 永久挤出窗口，每次恢复都重复读同一批失效快照。优先级仍由排名层保证（非 legacy 先验）。
++  for (const v of nonLegacyVersions.slice(0, maxRead).concat(legacyVersions.slice(0, maxRead))) {
+     const origin = (v && v.origin) || 'unknown';
+     const r = vaultMod.readSnapshotVersion({ versionPath: v.versionPath, expectedSha256: v.sha256 || undefined, fsModule: fsm });
+     if (r.ok) items.push({ source: `raw-archive:${v.versionId}`, buf: r.buf, sha256: r.sha256, path: v.versionPath, createdAtMs: Number(v.createdAtMs) || 0, origin });
+@@ -264,8 +268,9 @@ function captureAnalyzerSourceCandidateGuard(fsm, loginCfg, name, workReal, recR
+  *（probeDoudianShopIdentityInPage + decideDoudianIdentity 同口径）。绝不凭 mtime/结构
+  * 放行。COOKIE-PROCESS-ISOLATION-20261026：不再接收/复用调用方共享的 opts.browser
+  *（同进程开 context 不满足"每份 Cookie 独立浏览器进程"）；工厂返回重复/被禁止的实例
+- *（如主店铺浏览器）→ fail-closed 拒绝验证。验证结束后 context 与**本候选专属浏览器
+- * 进程**都必须关闭；关闭未获证明（close 抛错或仍连接）→ 本次验证绝不判成功，并以
++ *（如主店铺浏览器或上一候选已用实例）→ 在 newContext/addCookies 之前 fail-closed 拒绝
++ * 并闩锁停链，且**绝不由本验证器关闭外来/已用实例**（所有权在原所有者）。验证结束后
++ * context 与**本候选专属浏览器进程**都必须关闭；关闭未获证明（close 抛错或仍连接）→ 本次验证绝不判成功，并以
+  * stopChain 要求恢复链立即停止（候选 N 未收口前不得启动候选 N+1，也不得提升）。
+  * 未显式提供工厂时 fail-closed 拒绝验证（绝不静默自启真实浏览器——离线测试
+  * 与无浏览器环境一律不提升候选，防真实浏览器/网络副作用）。
+@@ -294,8 +299,20 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
+       latchReason = '候选专用浏览器启动失败且资源收口状态不确定（工厂异常可能已创建未返回的进程）：已闩锁停止恢复链，后续候选一律拒绝启动（fail-closed，不提升；异常详情可能含敏感环境信息，已脱敏不回显）';
+       return { ok: false, classification: 'verify-error', stopChain: true, reason: '候选专用浏览器启动失败（工厂异常后资源状态不确定）：停止恢复链并闩锁后续候选，不提升（异常详情可能含敏感环境信息，已脱敏不回显）' };
+     }
+-    if (!browser || typeof browser.newContext !== 'function' || usedBrowsers.has(browser) || forbidden.includes(browser)) {
+-      // 拒绝实例必须保守关闭且**关闭需获证明**：未获证明不得让下一候选启动（不确定收口）。
++    // D6E 所有权分离：被禁止的实例（如主店铺浏览器）与上一候选已使用过的实例都不归本
++    // 候选所有。必须在 newContext/addCookies 之前拒绝；外来进程由原所有者收口——主店铺
++    // 浏览器仍在业务使用，上一候选已在自己的 finally 关闭——本验证器绝不代关（不重复
++    // close、不把主店浏览器关掉）。拒绝后闩锁，后续验证一律不再调用工厂。
++    if (browser && (usedBrowsers.has(browser) || forbidden.includes(browser))) {
++      latchReason = '候选浏览器工厂返回被禁止或重复/共享的浏览器实例（主店铺或上一候选已拥有并自行收口）：已闩锁停止恢复链，本候选绝不关闭外来进程，不提升';
++      return {
++        ok: false, classification: 'verify-error', stopChain: true,
++        reason: '候选浏览器工厂返回重复/共享的浏览器实例（forbiddenBrowsers 或上一候选已使用；每个候选必须是全新独立进程）：fail-closed 拒绝验证，停止恢复链，不提升',
++      };
++    }
++    // 不可用实例（null/非浏览器对象）：不属于任何外来所有者，保守关闭且**关闭需获证明**；
++    // 未获证明（不确定收口）不得让下一候选启动。
++    if (!browser || typeof browser.newContext !== 'function') {
+       let closeProven = false;
+       if (browser && typeof browser.close === 'function') {
+         try { await browser.close(); closeProven = true; } catch (_) { closeProven = false; }
+@@ -305,9 +322,9 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
+       }
+       if (!closeProven) {
+         latchReason = '被拒绝的候选浏览器实例关闭未获证明（close 异常或仍连接）：已闩锁停止恢复链，绝不带不确定收口进入下一候选';
+-        return { ok: false, classification: 'verify-error', stopChain: true, reason: '候选浏览器工厂返回不可用或重复/共享的浏览器实例（每个候选必须是全新独立进程），且该实例关闭未获证明：停止恢复链，不提升' };
++        return { ok: false, classification: 'verify-error', stopChain: true, reason: '候选浏览器工厂返回不可用浏览器实例（每个候选必须是全新独立进程），且该实例关闭未获证明：停止恢复链，不提升' };
+       }
+-      return { ok: false, classification: 'verify-error', reason: '候选浏览器工厂返回不可用或重复/共享的浏览器实例（每个候选必须是全新独立进程）：fail-closed 拒绝验证，不提升' };
++      return { ok: false, classification: 'verify-error', reason: '候选浏览器工厂返回不可用浏览器实例（每个候选必须是全新独立进程）：fail-closed 拒绝验证，不提升' };
+     }
+     usedBrowsers.add(browser);
+     let ctx = null;
+@@ -413,11 +430,19 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
+  *  - 归档层内**同一来源类别 + 同一分钟桶只占一个额度**：同一分钟的多次入档是同一
+  *    会话态的重复快照，保留其中较新的一条、跳过更早的且**不占额度**；不同来源类别
+  *    各自成桶，故较新的 legacy 不会遮蔽同分钟的已验证快照；
+- *  - 额度用尽后其余如实标 beyond-limit（本轮不验证；下次恢复窗口仍可入选）。
++ *  - 额度用尽后其余如实标 beyond-limit（本轮不验证；下次恢复窗口仍可入选）；
++ *  - D4 起 legacy-unverified 另有同宽的**回退窗口**（首选窗口之后按序验证，
++ *    全局 sha 去重）：首选 5 条全部失效时 legacy 回退仍会被试到，不再被首选
++ *    窗口永久挤出（排名审计 decision=selected-fallback / beyond-limit-fallback）。
+  * 排名审计只输出标识（层级 / sha 前缀 / 秒级时刻 / 判定），绝不输出 Cookie 值或完整 sha。
+  *
+  * @returns {{selected:object[], ranking:object[], taken:number, considered:number}}
+  */
++function at0Bucket(kind, c) {
++  const at = archiveEpochMs(c);
++  return at > 0 ? `${kind}:${Math.floor(at / 60000)}` : null;
++}
++
+ function rankRestoreCandidatesGuard(cands, limit = RESTORE_MAX_CANDIDATES) {
+   const upper = cands.filter((c) => !String(c.source || '').startsWith('raw-archive:'));
+   const archives = cands.filter((c) => String(c.source || '').startsWith('raw-archive:'));
+@@ -434,9 +459,15 @@ function rankRestoreCandidatesGuard(cands, limit = RESTORE_MAX_CANDIDATES) {
+     seenSha.add(c.sha256);
+     ranking.push({ rank: ranking.length + 1, layer: c.source, sha256Prefix: String(c.sha256).slice(0, 12), decision: 'kept-layer' });
+   }
+-  for (const c of archives) {
++  // STARVATION-FIX（D4）：两段有界窗口。首选窗口 = 上层候选 + 非 legacy 归档（合计
++  // maxSlots，优先级不变：已验证/较新快照绝不被 stale legacy 顶替）；legacy 回退只在
++  // 首选窗口之后另行选入（同样宽 maxSlots 的有界窗口，全局 sha 去重不重复验证）。
++  // 首选窗口未耗尽额度时 legacy 也不再插进首选，而是统一排在回退窗口——调用方
++  // 按顺序验证，行为等价（首选全失败后 legacy 必然被试到），排名审计保持"首选在前"。
++  const legacyPending = [];
++  const rankArchiveEntry = (c) => {
+     const at = archiveEpochMs(c);
+-    const entry = {
++    return {
+       rank: ranking.length + 1,
+       layer: 'raw-archive',
+       versionId: String(c.source).slice('raw-archive:'.length),
+@@ -444,13 +475,14 @@ function rankRestoreCandidatesGuard(cands, limit = RESTORE_MAX_CANDIDATES) {
+       sha256Prefix: String(c.sha256).slice(0, 12),
+       decision: null,
+     };
++  };
++  for (const c of archives) {
++    if (isLegacyArchiveCandidate(c)) { legacyPending.push(c); continue; }
++    const entry = rankArchiveEntry(c);
+     if (seenSha.has(c.sha256)) entry.decision = 'skipped-dup-sha';
+     else if (selected.length >= maxSlots) entry.decision = 'beyond-limit';
+     else {
+-      // 分钟桶带来源类别：仅同类同分钟去重；legacy 与已验证快照各自成桶。
+-      const bucket = at > 0
+-        ? `${isLegacyArchiveCandidate(c) ? 'legacy' : 'nonlegacy'}:${Math.floor(at / 60000)}`
+-        : null;
++      const bucket = at0Bucket('nonlegacy', c);
+       if (bucket !== null && seenMinute.has(bucket)) entry.decision = 'skipped-dup-minute';
+       else {
+         entry.decision = 'selected';
+@@ -461,6 +493,25 @@ function rankRestoreCandidatesGuard(cands, limit = RESTORE_MAX_CANDIDATES) {
+     }
+     ranking.push(entry);
+   }
++  let legacyTaken = 0;
++  for (const c of legacyPending) {
++    const entry = rankArchiveEntry(c);
++    entry.window = 'legacy-fallback';
++    if (seenSha.has(c.sha256)) entry.decision = 'skipped-dup-sha';
++    else if (legacyTaken >= maxSlots) entry.decision = 'beyond-limit-fallback';
++    else {
++      const bucket = at0Bucket('legacy', c);
++      if (bucket !== null && seenMinute.has(bucket)) entry.decision = 'skipped-dup-minute';
++      else {
++        entry.decision = 'selected-fallback';
++        selected.push(c);
++        seenSha.add(c.sha256);
++        legacyTaken += 1;
++        if (bucket !== null) seenMinute.add(bucket);
++      }
++    }
++    ranking.push(entry);
++  }
+   return { selected, ranking, taken: selected.length, considered: cands.length };
+ }
+ 
+@@ -571,6 +622,8 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
+   // 读取窗口 = 硬上限（vault 已全量倒序再有界截断，故窗口内即真实最新的一批），
+   // 之后由 rankRestoreCandidatesGuard 按「不同 sha + 不同分钟桶」排名取额，
+   // 同 sha / 同分钟的重复入档不耗尽额度，保证上限内既拿到最新也拿到更早的不同检查点。
++  // D4：归档读取层同时带回 legacy 回退窗口，排名层首选窗口之后按序补入（见
++  // rankRestoreCandidatesGuard），首选全部失效时 legacy 候选仍会被验证。
+   const arch = listArchiveCandidatesGuard(shopSafeName, opts, fsm, RESTORE_MAX_CANDIDATES);
+   const archiveCands = [];
+   let archReal = null;

@@ -1,0 +1,32 @@
+[
+  {
+    "id": "app/analyzer-cookie-workcopy.js",
+    "beforeSha256": "5218c30d5ee64cce26b94164ef19761d443e96c5e061c5a43111e2197adcdfb7",
+    "afterSha256": "3a04cabdd538a79491d5a9a3088078cb100d83ff437a36af9ffb6482851cd578"
+  },
+  {
+    "id": "app/douyin-shop-analyzer.js",
+    "beforeSha256": "09e23424d5de869c1df67c965523eb96b0edf62fee1da96c006f76c0502eb450",
+    "afterSha256": "a85f3faac39bdfd16081abcf4284e4b7fdcc63714dd45f607e33a9d60500dcce"
+  },
+  {
+    "id": "guard/src/adapters/compass-order-reader.js",
+    "beforeSha256": "9d9179da30ea595b843a1ada5616d49313d24f27d771b4584c9cbd37625f17ff",
+    "afterSha256": "8b7c0e7a8ad6881afe5bf95365e3878b9868d7e748c3c3d775e241886b26149d"
+  },
+  {
+    "id": "guard/src/adapters/qianchuan-reader.js",
+    "beforeSha256": "7335d982caeece3f8a8afa1040b15328e32318cddbda4852485466e43e702549",
+    "afterSha256": "fff851d4eb1f11259a0c9854fab0a1c2d76805f0d8a56d9df51f40e71ca1589e"
+  },
+  {
+    "id": "guard/src/login/session-cookie-checkpoint.js",
+    "beforeSha256": "ef93f569c585741f8efcbe2e5a315396ca92e93c024b915fe7035d061603f700",
+    "afterSha256": "f0945da51bf970e1d07df4ba84ba6941c2203f9124f6863a32c34be8fc271469"
+  },
+  {
+    "id": "guard/src/login/session.js",
+    "beforeSha256": "2471de6a3f62fd80828420ae3735ce2bc091d71a1dedf6569a90008e8e69ec24",
+    "afterSha256": "36a33012dcfc4841d016250a4939d958b8e9dda2c89e033fef953d571157c40a"
+  }
+]

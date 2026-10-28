@@ -15,6 +15,9 @@
  *     外来实例由原所有者收口（本验证器零关闭，主店浏览器保持连接）；
  *  8) 千川入口：恢复成功后重载发生在全新店铺浏览器进程；每次启动都早登记 onResource；
  *  9) 罗盘入口：恢复成功后重载发生在全新店铺浏览器进程（非初始进程）。
+ *  13-15) D21 跨所有者工厂回归（直接使用实际导出的 createCandidateBrowserFactory）：
+ *     重复拒绝零关闭/零二次登记、原所有者保持连接并后来恰好关闭一次、后续全新实例 C
+ *     保持独立；并发交错获取；不可用首返仍保守关闭（清理语义未被弱化）。
  * 运行：node --test douyin-promo-guard/test/cookie-process-isolation.test.js（主脑执行）。
  */
 
@@ -29,6 +32,7 @@ const session = require('../src/login/session');
 const { AuthError, DataGuardError } = require('../src/lib/errors');
 const { openQianchuanHome, closeBrowser: closeQianchuanBrowser } = require('../src/adapters/qianchuan-reader');
 const { createCompassOrderReader } = require('../src/adapters/compass-order-reader');
+const { createCandidateBrowserFactory } = require('../src/login/candidate-browser');
 
 const FXG_HOME = 'https://fxg.jinritemai.com/ffa/mshop/homepage/index';
 const LOGIN_URL = 'https://fxg.jinritemai.com/ffa/login/expired';
@@ -559,7 +563,8 @@ test('9) 罗盘入口：恢复成功后重载在全新浏览器进程（非初�
 });
 
 test('10) 恢复后注入工厂返回同一个旧浏览器对象 → 重载在 addCookies 之前被拒（千川与罗盘）', async () => {
-  // 千川入口：恢复成功后重载时工厂复用旧店铺浏览器对象 → 必须在 addCookies 前拒绝并收口
+  // 千川入口：恢复成功后重载时工厂复用旧店铺浏览器对象 → 必须在 addCookies 前拒绝；
+  // 旧进程由原所有者（入口在重载前的 closeShopBrowserProven）关闭，重复拒绝路径零额外关闭。
   {
     const d = mkDirs();
     const file = '千川复用店.json';
@@ -606,7 +611,7 @@ test('10) 恢复后注入工厂返回同一个旧浏览器对象 → 重载在 a
     );
     assert.strictEqual(counters.contexts, 1, '复用被拒：除旧进程上下文外零新上下文');
     assert.strictEqual(counters.addedCookieSets, 1, '第二次 addCookies 绝不发生（复用旧进程必须先被拒）');
-    assert.strictEqual(shared.__closed, true, '被拒的复用实例必须被关闭');
+    assert.strictEqual(shared.__closed, true, '旧进程已由原所有者（入口）在重载前关闭；重复拒绝路径零额外关闭');
   }
   // 罗盘入口：同语义
   {
@@ -661,8 +666,107 @@ test('10) 恢复后注入工厂返回同一个旧浏览器对象 → 重载在 a
     );
     assert.strictEqual(counters.contexts, 1, '复用被拒：除旧进程上下文外零新上下文');
     assert.strictEqual(counters.addedCookieSets, 1, '第二次 addCookies 绝不发生（复用旧进程必须先被拒）');
-    assert.strictEqual(shared.__closed, true, '被拒的复用实例必须被关闭');
+    assert.strictEqual(shared.__closed, true, '旧进程已由原所有者（入口）在重载前关闭；重复拒绝路径零额外关闭');
   }
+});
+
+// ── D21 跨所有者工厂回归：直接使用实际导出的 createCandidateBrowserFactory ──────────
+
+/** 最小浏览器桩：每次 close 计数并置 __closed；isConnected 反映真实关闭状态。 */
+function makeOwnedBrowserStub(id, counters) {
+  const b = {
+    __id: id,
+    __closed: false,
+    newContext: async () => ({}),
+    close: async () => { counters.closes += 1; b.__closed = true; },
+    isConnected: () => !b.__closed,
+  };
+  return b;
+}
+
+test('13) D21 跨所有者：A 持有活浏览器时重复获取同一对象 → 拒绝且零关闭、零二次登记；C 独立；A 恰好关闭一次', async () => {
+  const countersA = { closes: 0 };
+  const countersC = { closes: 0 };
+  const browserA = makeOwnedBrowserStub(1, countersA);
+  const browserC = makeOwnedBrowserStub(3, countersC);
+  const script = [browserA, browserA, browserC];
+  let calls = 0;
+  const resources = [];
+  const factory = createCandidateBrowserFactory({
+    injectedFactory: async () => { calls += 1; return script[calls - 1]; },
+    onResource: (h) => resources.push(h),
+  });
+
+  const ownerA = await factory(); // A 首次获取成功并登记
+  assert.strictEqual(ownerA, browserA);
+  assert.strictEqual(resources.length, 1, 'A 成功获取恰好登记一个 onResource 收口句柄');
+  assert.strictEqual(browserA.isConnected(), true);
+
+  // 第二次获取返回同一对象（A 仍在使用中）→ 必须拒绝且绝不销毁 A 拥有的资源
+  await assert.rejects(() => factory(), (e) => {
+    assert.ok(e instanceof Error);
+    assert.match(e.message, /重复/);
+    return true;
+  });
+  assert.strictEqual(countersA.closes, 0, '重复拒绝路径绝不关闭原所有者仍持有的活浏览器');
+  assert.strictEqual(browserA.isConnected(), true, 'A 的活浏览器必须保持连接');
+  assert.strictEqual(resources.length, 1, '重复拒绝路径绝不再登记 onResource 句柄');
+
+  // C：同一序列后续的全新实例仍可独立获取（工厂合同允许拒绝后继续新调用；非闩锁）
+  const ownerC = await factory();
+  assert.strictEqual(ownerC, browserC);
+  assert.notStrictEqual(ownerC, ownerA);
+  assert.strictEqual(resources.length, 2);
+  assert.strictEqual(browserC.isConnected(), true, 'C 与 A 完全独立');
+
+  // 原所有者 A 后来在自己的收口处恰好关闭一次；绝不影响 C
+  await ownerA.close();
+  assert.strictEqual(countersA.closes, 1, 'A 恰好关闭一次');
+  assert.strictEqual(browserA.isConnected(), false);
+  assert.strictEqual(browserC.isConnected(), true, 'A 的关闭绝不影响独立的 C');
+  assert.strictEqual(countersC.closes, 0);
+});
+
+test('14) D21 并发交错获取：两次并发调用底层返回同一对象 → 恰好一方成功；拒绝方零关闭、零登记', async () => {
+  const counters = { closes: 0 };
+  const shared = makeOwnedBrowserStub(7, counters);
+  const resources = [];
+  const factory = createCandidateBrowserFactory({
+    injectedFactory: async () => shared,
+    onResource: (h) => resources.push(h),
+  });
+  const [r1, r2] = await Promise.allSettled([factory(), factory()]);
+  const fulfilled = [r1, r2].filter((r) => r.status === 'fulfilled');
+  const rejected = [r1, r2].filter((r) => r.status === 'rejected');
+  assert.strictEqual(fulfilled.length, 1, '并发重复获取恰好一方成功（先完成 seen 登记者）');
+  assert.strictEqual(rejected.length, 1);
+  assert.match(rejected[0].reason.message, /重复/);
+  assert.strictEqual(fulfilled[0].value, shared);
+  assert.strictEqual(counters.closes, 0, '拒绝方绝不关闭成功方拥有的浏览器');
+  assert.strictEqual(shared.isConnected(), true);
+  assert.strictEqual(resources.length, 1, '只有成功方登记收口句柄');
+});
+
+test('15) 不可用首返仍保守关闭并如实报告（所有权修复不弱化 unusable 清理语义）', async () => {
+  // a) null：无可关对象，直接拒绝
+  const f1 = createCandidateBrowserFactory({ injectedFactory: async () => null });
+  await assert.rejects(() => f1(), /未返回可用浏览器实例/);
+
+  // b) 缺 newContext 但可关闭：拒绝前保守关闭且关闭获证明
+  let closes = 0;
+  const broken = { close: async () => { closes += 1; }, isConnected: () => false };
+  const f2 = createCandidateBrowserFactory({ injectedFactory: async () => broken });
+  await assert.rejects(() => f2(), (e) => {
+    assert.match(e.message, /未返回可用浏览器实例/);
+    assert.ok(!/关闭未获证明/.test(e.message), '关闭已获证明时不得虚报未证明');
+    return true;
+  });
+  assert.strictEqual(closes, 1, '不可用首返（非任何获取方拥有）仍必须保守关闭');
+
+  // c) 缺 newContext 且 close 抛错：关闭未获证明必须如实带出（停止链条）
+  const stuck = { close: async () => { throw new Error('stub: refused'); }, isConnected: () => true };
+  const f3 = createCandidateBrowserFactory({ injectedFactory: async () => stuck });
+  await assert.rejects(() => f3(), /关闭未获证明/);
 });
 
 // ── 千川用最小 vm DOM 页面（与 qianchuan-mid-session-restore.test.js 同协议的精简版）──

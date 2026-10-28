@@ -1370,3 +1370,50 @@ index 489f98a1464da03f6642efd776faf94682d73cf2..95b06ebe8f99d4d80567e1e20919d0ea
      if (ctx) { try { await ctx.close(); } catch (_) { /* 关闭失败不掩盖结果 */ } }
      // 本候选专属浏览器进程用毕必须真正关闭：close 抛错或仍连接 → 绝不判成功，并停止恢复链。
      let browserClosed = true;
+diff --git a/src/login/candidate-browser.js b/src/login/candidate-browser.js
+index 3eb7f6360e46eff38f555db8bdf3cd95da127326..b3599275c97a04b054951e7d520f9739638d7d90 100644
+--- a/src/login/candidate-browser.js
++++ b/src/login/candidate-browser.js
+@@ -7,9 +7,11 @@
+  * 接收调用方共享的 opts.browser、在同一进程内为每个候选开新 context，不满足该要求；
+  * 本模块提供两个最小助手：
+  *  - createCandidateBrowserFactory：包装显式注入的 browserFactory（离线测试）或默认
+- *    Playwright 启动参数（生产），**每次调用必须返回全新浏览器对象**；工厂返回重复
+- *    实例（同一对象复用）或不可用对象 → 立即关闭并抛错（fail-closed，绝不把共享
+- *    进程当独立候选进程）。每次成功启动都同步登记 onResource 收口句柄（与店铺浏览器
++ *    Playwright 启动参数（生产），**每次调用必须返回全新浏览器对象**；工厂返回不可用
++ *    对象（null/缺 newContext）→ 拒绝前保守关闭并抛错（fail-closed）；返回重复实例
++ *    （同一对象复用）→ 只抛错拒绝，**绝不关闭、绝不再登记**——该实例所有权仍在此前
++ *    成功获取的一方（可能正被其他任务使用），由原所有者恰好关闭一次（失败获取绝不
++ *    销毁他人已拥有的资源）。每次成功启动都同步登记 onResource 收口句柄（与店铺浏览器
+  *    同一早期所有权协议）。
+  *  - closeBrowserProven：关闭并核验（close 未抛错且 isConnected()===false 才算证明）。
+  *    读取异常一律按"未关闭"处理：宁可阻断，绝不伪造已关闭。
+@@ -35,17 +37,20 @@ function createCandidateBrowserFactory(opts = {}) {
+   const seen = new WeakSet();
+   return async function launchCandidateBrowser() {
+     const browser = await launch();
+-    const unusable = !browser || typeof browser.newContext !== 'function';
+-    const duplicate = !unusable && seen.has(browser);
+-    if (unusable || duplicate) {
+-      // 拒绝前保守关闭；关闭未获证明必须如实带出——调用方据此停止链条，绝不静默重试。
++    if (!browser || typeof browser.newContext !== 'function') {
++      // 不可用首返（本次获取尚未成功拥有的对象）：拒绝前保守关闭；关闭未获证明必须
++      // 如实带出——调用方据此停止链条，绝不静默重试。
+       let closeProven = false;
+       if (browser && typeof browser.close === 'function') closeProven = await closeBrowserProven(browser);
+-      throw new Error((duplicate
+-        ? '候选浏览器工厂返回了重复的浏览器实例：每个候选必须使用全新独立浏览器进程'
+-        : '候选浏览器工厂未返回可用浏览器实例（缺少 newContext）：拒绝验证')
++      throw new Error('候选浏览器工厂未返回可用浏览器实例（缺少 newContext）：拒绝验证'
+         + (closeProven ? '' : '；且拒绝实例关闭未获证明：停止链条，不盲目重试'));
+     }
++    if (seen.has(browser)) {
++      // 跨所有者边界：重复实例的所有权仍在此前成功获取的一方（可能正在使用中）。
++      // 本次失败获取只抛错拒绝：绝不 close、绝不再登记 onResource、绝不声称
++      // 已关闭/关闭证明——原所有者保留活浏览器并在自己的收口处恰好关闭一次。
++      throw new Error('候选浏览器工厂返回了重复的浏览器实例：每个候选必须使用全新独立浏览器进程（拒绝方零关闭：实例所有权仍在原获取方）');
++    }
+     seen.add(browser);
+     if (onResource) {
+       const owned = browser;

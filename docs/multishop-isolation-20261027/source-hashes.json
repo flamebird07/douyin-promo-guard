@@ -48,5 +48,10 @@
     "id": "app/analyzer-shop-target.js",
     "beforeSha256": null,
     "afterSha256": "45f7bf62c3e40b40c5de59360314f63d2828984c87ff64712c3eccba586f59f4"
+  },
+  {
+    "id": "guard/src/login/candidate-browser.js",
+    "beforeSha256": "3b72d59286ce87f386e6814b52db853bf6a6883c736ed658dc1c301f4f89323d",
+    "afterSha256": "6da32d72ab2da5c3364b80e19b4ef4d612390c47d1a2ad04e74ca1964a013f6a"
   }
 ]

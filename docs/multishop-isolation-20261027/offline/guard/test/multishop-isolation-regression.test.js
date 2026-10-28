@@ -85,7 +85,7 @@ test('候选浏览器工厂：A/B/C 实例独立，关 A 绝不关 B/C', async (
   assert.strictEqual(c.isConnected(), true);
 });
 
-test('候选浏览器工厂：返回重复实例 = 违反进程隔离，拒绝并只收口该实例', async () => {
+test('候选浏览器工厂：返回重复实例 = 违反进程隔离，拒绝且零关闭——所有权仍在首个获取方', async () => {
   const shared = new FakeBrowser('shared');
   let calls = 0;
   const factory = createCandidateBrowserFactory({
@@ -98,7 +98,14 @@ test('候选浏览器工厂：返回重复实例 = 违反进程隔离，拒绝�
     return true;
   });
   assert.strictEqual(calls, 2);
-  assert.strictEqual(shared.closedCount, 1, '被拒绝的重复实例必须被保守关闭');
+  // 拒绝方零关闭：借用者不拥有该实例，绝不代替原所有者释放（跨所有者隔离）
+  assert.strictEqual(shared.closedCount, 0, '被拒绝的重复实例绝不得被借用方关闭');
+  assert.strictEqual(first.isConnected(), true, '原所有者手中的活实例必须仍然在线可用');
+  // 原所有者恰好关闭一次并获证明
+  const closeProven = await closeBrowserProven(first);
+  assert.strictEqual(closeProven, true);
+  assert.strictEqual(shared.closedCount, 1);
+  assert.strictEqual(first.isConnected(), false);
 });
 
 test('context 存储分离：三店交错装载，各自 context 只收到本店 Cookie', async () => {

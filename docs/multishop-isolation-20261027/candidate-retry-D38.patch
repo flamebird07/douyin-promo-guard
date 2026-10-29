@@ -1,0 +1,145 @@
+--- a/publisher/run-plans.cjs
++++ b/publisher/run-plans.cjs
+@@ -1117,7 +1117,106 @@
+     && p.manualUnresolved === 0 && p.plansContainsNumber === false && p.confirmationConsumptionsRecorded === false;
+ }
+ 
+-// Durable, data-preserving close: re-loads BOTH files fresh (absence/corruption = refuse),// re-proves zero consumption under the caller's lock, appends one bounded
++// D38: scoped eligibility release + reachable-browse-position descriptor for the NEXT
++// scheduled tick of the SAME day/plan after a PROVEN zero-publication preparation stop.
++//
++// Why the per-day `attempted` set is the release source (not only `lastSelected`):
++// selectCard marks an id attempted BEFORE it is selected, so a stopped preparation seals
++// every candidate it merely TOUCHED. Live evidence (2026-10-29, plan 2): 504→516 attempted,
++// of which 30 were published by the earlier successful plan and 483 were never published;
++// each failed tick's `lastSelected` shrank (29 → 12) because the next tick re-browsed from
++// the terminal page, so a lastSelected-only release strands the older ids for the whole day.
++// Under the PROVEN six-zero closure below, every non-published attempted id is provably
++// unpublished by this day/plan; actual availability is re-evaluated on the live DOM next run,
++// and the global published store still removes anything published by any plan.
++//
++// Durable facts used (all already present; no new store, no reset):
++//   * active.status === 'preparation-stopped' for THIS businessDate/planNumber with NO
++//     frozen/CID/manifest/planId/nonce (never a possibly-published run);
++//   * a matching preparationClosureFacts entry from a scheduled run origin with the
++//     strict six-zero proof (never an unknown/manual/in-progress consumption);
++//   * dayState.attempted — per-day marks only; the released subset must carry a durable
++//     hint object, must not be genuinely rejected (hint.reviewFailed === true) and must
++//     not be in the global published store;
++//   * publishedIds — the global cross-day/cross-plan never-reuse store — always wins.
++//
++// The returned `rewind` descriptor is a REACHABLE position (first category, page 1, empty
++// seen set), because the durable cursor is at the exhausted boundary (live: page 62) and
++// browseProducts restores straight to it. The caller applies it only when this proof
++// succeeded AND something was released; without a release the honest stop is preserved.
++// This is not a daily reset and not a state hand-edit: it fires only from a proven
++// same-day/plan six-zero preparation closure. Pure: the input state is never mutated.
++function preparationRetryReleaseIds(stateRaw, businessDate, planNumber, accountId, publishedIds) {
++  const st = stateRaw && typeof stateRaw === 'object' && !Array.isArray(stateRaw) ? stateRaw : null;
++  if (!st) return { ok: false, reason: 'state-malformed', ids: [] };
++  const date = String(businessDate || '');
++  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { ok: false, reason: 'date-invalid', ids: [] };
++  const plan = Number(planNumber);
++  if (!Number.isInteger(plan) || plan < 1) return { ok: false, reason: 'plan-invalid', ids: [] };
++  const acct = accountId == null ? '' : String(accountId);
++  if (acct === '') return { ok: false, reason: 'account-missing', ids: [] };
++  if (st.unknown === true || st.pending === true) return { ok: false, reason: 'day-state-unresolved-flag-present', ids: [] };
++  if (String(st.businessDate || '') !== date) return { ok: false, reason: 'state-business-date-mismatch', ids: [] };
++  const a = st.active;
++  if (!a || typeof a !== 'object' || Array.isArray(a)) return { ok: false, reason: 'not-preparation-stopped', ids: [] };
++  if (String(a.status || '') !== 'preparation-stopped') return { ok: false, reason: 'not-preparation-stopped', ids: [] };
++  if (Number(a.planNumber) !== plan) return { ok: false, reason: 'active-plan-mismatch', ids: [] };
++  if (String(a.businessDate || '') !== date) return { ok: false, reason: 'active-business-date-mismatch', ids: [] };
++  if (a.frozen || a.confirmationId != null || a.manifestHash != null || a.planId != null || a.nonce != null) {
++    return { ok: false, reason: 'confirmation-artifacts-present', ids: [] };
++  }
++  const facts = Array.isArray(st.preparationClosureFacts) ? st.preparationClosureFacts : [];
++  const fact = facts.slice().reverse().find(f => {
++    if (!f || typeof f !== 'object' || Array.isArray(f)) return false;
++    if (f.status !== 'preparationClosed') return false;
++    if (String(f.businessDate || '') !== date) return false;
++    if (Number(f.planNumber) !== plan) return false;
++    if (String(f.accountId || '') !== acct) return false;
++    const origin = SCHEDULED_RUN_ORIGIN_RE.exec(String(f.runId || ''));
++    if (!origin || origin[1] !== date) return false; // origin date must match the fact's own business day
++    return strictZeroConsumptionProof(f.zeroConsumptionProof);
++  });
++  if (!fact) return { ok: false, reason: 'preparation-closure-not-proven', ids: [] };
++  if (String(a.runId || '') !== String(fact.runId)) return { ok: false, reason: 'active-closure-run-mismatch', ids: [] };
++  // Fail closed on any state that contradicts the same-day/plan "never published" premise.
++  if (!Array.isArray(st.plans)) return { ok: false, reason: 'plans-list-unreadable', ids: [] };
++  if (st.plans.some(p => p && Number(p.planNumber) === plan)) return { ok: false, reason: 'plan-number-already-recorded', ids: [] };
++  if (!Array.isArray(st.confirmationConsumptions)) return { ok: false, reason: 'confirmation-consumptions-unreadable', ids: [] };
++  if (st.confirmationConsumptions.some(r => r && (String(r.runId || '') === String(fact.runId)
++    || (String(r.businessDate || '') === date && Number(r.planNumber) === plan)))) {
++    return { ok: false, reason: 'confirmation-consumption-recorded', ids: [] };
++  }
++  if (st.manualUiPublicationFacts !== undefined && !Array.isArray(st.manualUiPublicationFacts)) {
++    return { ok: false, reason: 'manual-publication-facts-unreadable', ids: [] };
++  }
++  if (Array.isArray(st.manualUiPublicationFacts)
++    && st.manualUiPublicationFacts.some(r => r && (String(r.runId || '') === String(fact.runId)
++      || (String(r.businessDate || '') === date && Number(r.planNumber) === plan)))) {
++    return { ok: false, reason: 'manual-publication-recorded', ids: [] };
++  }
++  const attemptedOrder = Array.isArray(st.attempted) ? st.attempted.map(String) : [];
++  const hints = st.hints && typeof st.hints === 'object' && !Array.isArray(st.hints) ? st.hints : {};
++  const published = publishedIds instanceof Set ? publishedIds : new Set((Array.isArray(publishedIds) ? publishedIds : []).map(String));
++  const ids = [];
++  for (const id of new Set(attemptedOrder)) {
++    if (!/^\d{15,20}$/.test(id)) continue;
++    if (published.has(id)) continue; // published history always wins
++    const h = hints[id];
++    if (!h || typeof h !== 'object' || Array.isArray(h)) continue; // unknown card => fail closed
++    if (h.reviewFailed === true) continue; // genuine rejection stays excluded
++    ids.push(id);
++  }
++  return {
++    ok: true, ids,
++    // Reachable browse position for the retry: first category, page 1, empty seen set.
++    // Never applied by this pure helper — the caller rewinds only on a proven release.
++    rewind: { category: wf.CATEGORY_TAB_ORDER[0], page: 1, seenProductIds: [] },
++    fact: { runId: String(fact.runId), planNumber: plan, businessDate: date },
++  };
++}
++
++// Durable, data-preserving close: re-loads BOTH files fresh (absence/corruption = refuse),
++// re-proves zero consumption under the caller's lock, appends one bounded
+ // preparationClosureFacts record and flips active preparing → preparation-stopped.
+ // Nothing else is touched: plans / lastSelected / attempted / cursor / hints / history and the
+ // attempts store are all preserved verbatim. Idempotent by runId + businessDate.
+@@ -8337,6 +8436,26 @@
+       return result('blocked', 'daily-plan-limit-reached', { planNumber: null, succeededToday: consumedToday.length, noAction: true });
+     }
+     let dayState = { ...dayStateInitial, runId, businessDate, active: null, lastSelected: [], plans: [...(dayStateInitial.plans || [])] };
++    // D38: a PROVEN zero-publication preparation stop must not seal its merely-touched batch
++    // behind the per-day attempted blacklist, and a release is useless while the durable cursor
++    // still points at the exhausted boundary. Read the RAW state file (loadDayState's same-day
++    // normalizer keeps only the browse fields, so the closure-fact ledger is only visible on the
++    // raw parse). Release every attempted id that is neither published (global store) nor
++    // genuinely rejected (durable reviewFailed hint) nor hint-less, then restore a REACHABLE
++    // browse position (first category, page 1, empty seen set) so the very next browse can
++    // re-evaluate those goods on the live DOM. Neither step fires without the six-zero closure.
++    // No base-selection replay, no published-store write, no plan/ledger/attempts-store reset.
++    const retryRelease = preparationRetryReleaseIds(stateRaw, businessDate, planNumber, business.accountId, publishedIds);
++    if (retryRelease.ok && retryRelease.ids.length) {
++      const released = new Set(retryRelease.ids.map(String));
++      dayState.attempted = (Array.isArray(dayStateInitial.attempted) ? dayStateInitial.attempted : []).filter(id => !released.has(String(id)));
++      dayState.cursor = { category: retryRelease.rewind.category, page: retryRelease.rewind.page, seenProductIds: [] };
++      dayState.category = retryRelease.rewind.category;
++      dayState.page = retryRelease.rewind.page;
++      try { log('info', 'scheduled-preparation-retry-release count=' + released.size + ' plan=' + planNumber + ' run=' + retryRelease.fact.runId + ' rewind=' + retryRelease.rewind.category + ':1'); } catch (_) { /* logging never alters flow */ }
++    } else if (!retryRelease.ok) {
++      try { log('info', 'scheduled-preparation-retry-release skipped ' + retryRelease.reason); } catch (_) { /* logging never alters flow */ }
++    }
+     const persist = next => { Object.assign(dayState, next); wf.persistDayState(STATE_FILE, dayState); };
+     const attemptedSet = new Set(dayState.attempted || []);
+     const hints = { ...(dayState.hints || {}) };
+@@ -9656,6 +9775,6 @@
+   }
+ }
+ 
+-module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,bindingPanelSettled,accountDrawerCancelConfirmInPage,managementObstructionActionInPage,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,resolvePublisherStatePaths,provePreInitialPolicyCancelState,applyProvenPreInitialPolicyCancelClose,recoverLocalPreparationClose,reproveDurablePreparationStoppedClose,recoverFirstPreparingByNoPublicationProof,EXPLICIT_NP_CLOSE_SOURCE,readWriterSchemaAttemptsStore,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,bindingRowTooltipInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,sanitizeGuidanceDiagnostic,restrictLateGuideDiagnostic,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,buildScheduledPreparationDiagnostic,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,resumeScheduledKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,closeExpiredScheduledKnownFinalUnsubmitted,main};
++module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,bindingPanelSettled,accountDrawerCancelConfirmInPage,managementObstructionActionInPage,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,resolvePublisherStatePaths,provePreInitialPolicyCancelState,applyProvenPreInitialPolicyCancelClose,preparationRetryReleaseIds,recoverLocalPreparationClose,reproveDurablePreparationStoppedClose,recoverFirstPreparingByNoPublicationProof,EXPLICIT_NP_CLOSE_SOURCE,readWriterSchemaAttemptsStore,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,bindingRowTooltipInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,sanitizeGuidanceDiagnostic,restrictLateGuideDiagnostic,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,buildScheduledPreparationDiagnostic,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,resumeScheduledKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,closeExpiredScheduledKnownFinalUnsubmitted,main};
+ 
+ if(require.main===module)main();

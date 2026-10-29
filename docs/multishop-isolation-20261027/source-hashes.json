@@ -78,5 +78,10 @@
     "id": "publisher/plan-workflow.cjs",
     "beforeSha256": "7e5eb41c153cf15d356987b9fce695b009bfb723d6265595477217500eac06ed",
     "afterSha256": "78343fa924ee01fd9b8cb4bbe549f38460a8059667f3e0cdbced40d9fcc56234"
+  },
+  {
+    "id": "publisher/run-plans.cjs",
+    "beforeSha256": "c2ed5aa90fc0535b64f8f061e9e7331a2ceb71f68d01e8c2a56a4b44109af720",
+    "afterSha256": "4a462b5c7d326fd1a361d24e3ba7f01479eff09fa10148782a7031d7d5823d0b"
   }
 ]

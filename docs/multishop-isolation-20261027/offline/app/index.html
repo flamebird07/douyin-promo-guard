@@ -1243,14 +1243,6 @@
           // 注入行内（避免 shopRowHtml 依赖外层快照变量，保持可被 VM 独立抽取测试）。
           var joinProg = r.loginJoin || r._liveLoginJoin || null;
           var joinProcessing = !!(joinProg && joinProg.status === 'processing');
-          // 2026-10-18 F1 续：显示优先级（真实生产反例：off+23:40 登录验证失败仍显示「暂停」；
-          // 另一店 on 旧观测 10:47、数据时间 23:39 仍显示「当前开启」）。优先级：
-          //  1) 结构化登录正证据（requiresLogin/readFailure.requiresLogin/readErrorKind='auth'）
-          //     → 登录验证未通过，无论 ad.on/off；错误字符串提及"登录"不臆断为登录失效；
-          //  2) on/off 但存在当前 readFailure/readErrorKind/readErrorReason/lastError → 读取受阻；
-          //  3) 无错误但广告证据时间缺失/非法/超过 35 分钟 → 待核实（上次开启/暂停），不显示绿色当前成功；
-          //     证据时间只认 ad.confirmedAt/observedAt/at（费用 lastDataAt 是数据时间，不混用）；
-          //  4) 新鲜且无错误的 on/off 保留原显示；mixed/unknown 原逻辑不变。
           var hasReadErr = !!(failView || r.readErrorKind || r.readErrorReason || r.lastError);
           var onOff = (adState === 'on' || ad.on === true) ? 'on' : ((adState === 'off' || ad.on === false) ? 'off' : null);
           var shortText, shortColor;
@@ -1271,15 +1263,8 @@
           else if (needLogin) { shortText = '登录验证未通过'; shortColor = '#b91c1c'; }
           else if (onOff && hasReadErr) { shortText = '读取受阻'; shortColor = '#b91c1c'; }
           else if (onOff) {
-            var evIso = ad.confirmedAt || ad.observedAt || ad.at || null;
-            var evMs = evIso ? Date.parse(evIso) : NaN;
-            if (isFinite(evMs) && (Date.now() - evMs) <= 35 * 60 * 1000) {
-              shortText = onOff === 'on' ? '开启' : '暂停';
-              shortColor = onOff === 'on' ? '#16a34a' : '#b45309';
-            } else {
-              shortText = '待核实（上次' + (onOff === 'on' ? '开启' : '暂停') + '）';
-              shortColor = '#94a3b8';
-            }
+            shortText = onOff === 'on' ? '开启' : '暂停';
+            shortColor = onOff === 'on' ? '#16a34a' : '#b45309';
           } else if (adState === 'unknown') {
             var recProg = r.readRecovery;
             if (recProg && recProg.text) shortText = '未知（' + recProg.text + '）';

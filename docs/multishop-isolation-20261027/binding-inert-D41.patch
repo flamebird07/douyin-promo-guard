@@ -1,0 +1,73 @@
+--- a/publisher/run-plans.cjs
++++ b/publisher/run-plans.cjs
+@@ -5711,6 +5711,38 @@
+     // the first panel (or the legacy shops) exposed another set.
+     const matchTargets=ids=>{const t=resolvedTargets;return !t||ids.every(id=>t.includes(id));};
+     const boundedAccounts=s=>!!s&&s.ok===true&&Array.isArray(s.rows)&&s.rows.length>=1&&s.rows.length<=10&&s.rows.every(r=>Array.isArray(r.ids)&&r.ids.length===1)&&new Set(s.rows.flatMap(r=>r.ids).map(String)).size===s.rows.length&&matchTargets(s.rows.flatMap(r=>r.ids).map(String));
++    // POST-BIND READ-BACK identity (read-only only). After a batch the platform can show
++    // OTHER shop accounts in the same panel that are provably INERT — definitely unchecked
++    // AND label-disabled (无权限 / 投放限制 grey rows). Such rows are display facts, not a
++    // binding outcome: they must not invalidate a correctly selected target account, and
++    // they may never be selected either. This predicate is used ONLY by read-only result
++    // validation and follow-up reads. Every ACTION gate (header select-all, anchor reuse,
++    // batch apply/modal, drawer commit, discovery freeze) keeps the STRICT boundedAccounts
++    // membership above, so no foreign row can ever be selected or authorized.
++    // Fail-closed: a checked foreign row, an enabled/unknown foreign row (even unchecked),
++    // an unknown checkbox/disabled state, a duplicate or malformed id, an empty/oversized
++    // row set, or a panel with no target row at all is never accepted.
++    const boundedAccountsReadBack=s=>{
++      if(!s||s.ok!==true||!Array.isArray(s.rows)||s.rows.length<1||s.rows.length>10)return false;
++      const seen=new Set();
++      for(const r of s.rows){
++        if(!r||!Array.isArray(r.ids)||r.ids.length!==1)return false;
++        const id=String(r.ids[0]);
++        if(!/^[0-9A-Za-z_-]{4,32}$/.test(id)||seen.has(id))return false;
++        seen.add(id);
++        if(r.checked!==true&&r.checked!==false)return false;
++        if(r.labelDisabled!==true&&r.labelDisabled!==false)return false;
++      }
++      const isTarget=id=>!resolvedTargets||resolvedTargets.includes(id);
++      let hasTargetRow=false;
++      for(const r of s.rows){
++        const id=String(r.ids[0]);
++        if(isTarget(id))hasTargetRow=true;
++        if(r.checked===true){ if(!isTarget(id))return false; }
++        else if(!isTarget(id)&&r.labelDisabled!==true)return false;
++      }
++      return hasTargetRow;
++    };
+     // Freeze the shop's OWN bindable accounts ONCE. R134: the ONLY discovery freeze
+     // authority is the COMPLETED whole-batch union scan (scanDiscoveryUnion) — the union
+     // of every one of the exact 30 identity-proven panels, never the first product's
+@@ -6094,13 +6126,27 @@
+       const partial=mode==='partial';
+       const panelIds=[...new Set(ids.map(String))];
+       if(panelIds.length!==30) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
+-      const provesTarget=(s,pid)=>!!s&&s.ok===true&&boundedAccounts(s)&&consistentSelectionState(s)&&s.totalCount===30
++      // Read-only post-bind proof: a later panel may expose provably INERT foreign rows
++      // (unchecked + label-disabled) beside the selected targets. boundedAccountsReadBack
++      // accepts exactly that shape and rejects every actionable/unknown/foreign-selected
++      // variant; the ACTION gates before/after this probe still use strict boundedAccounts.
++      const provesTarget=(s,pid)=>!!s&&s.ok===true&&boundedAccountsReadBack(s)&&consistentSelectionState(s)&&s.totalCount===30
+         &&Array.isArray(s.rows)&&s.rows.some(r=>r.checked===true)&&s.rows.every(r=>r.checked===true||r.checked===false)&&panelSetEqualsIds(s)&&provePanelSet(s)===String(pid);
+-      // 严格 partial 口径：一个商品的**明确 0** 只有在同一 30-panel 身份、唯一 active=该商品、账号行仍是
+-      // 本店已发现的 1-2 个目标账号且全部未选、页脚恰为 0/30 时才算成立。缺行/页脚冲突/账号漂移/读不回
++      // 严格 partial 口径：一个商品的**明确 0** 只有在同一 30-panel 身份、唯一 active=该商品、账号行仍含
++      // 本店已发现的授权目标账号且全部未选、页脚恰为 0/30 时才算成立（未选中的灰色外来行只作展示，
++      // 不改变 0 的事实，但也不得是勾选/可用/未知状态）。缺行/页脚冲突/账号漂移/读不回
+       // 一律不算 0（算 unknown，直接停），绝不把"没结果/一直在加载"当成 0。
+-      const provesZero=(s,pid)=>!!s&&s.ok===true&&boundedAccounts(s)&&consistentSelectionState(s)&&s.totalCount===30&&s.selectedCount===0
++      const provesZero=(s,pid)=>!!s&&s.ok===true&&boundedAccountsReadBack(s)&&consistentSelectionState(s)&&s.totalCount===30&&s.selectedCount===0
+         &&Array.isArray(s.rows)&&s.rows.length>=1&&s.rows.every(r=>r.checked===false)&&panelSetEqualsIds(s)&&provePanelSet(s)===String(pid);
++      // D41: every read below is judged ONLY on its OWN fresh contents. There is deliberately
++      // NO cross-read persistence requirement for inert foreign rows: a panel may render
++      // [target,target,foreign…] on the identity read and [target,target] on the follow-up
++      // read (or re-render the grey rows) — that is ordinary rendering, not identity drift,
++      // and it must not fail a correctly selected target. Each read is still FULLY
++      // re-validated (boundedAccountsReadBack + footer/checked counts + exact 30-panel set +
++      // unique active === target), so a checked / enabled / unknown / malformed / duplicate
++      // foreign row, a missing target row or a footer conflict still stops fail-closed; only
++      // the disappearance of an already-inert grey row is no longer treated as an anomaly.
+       const proves=(s,pid)=>partial?(provesTarget(s,pid)||provesZero(s,pid)):provesTarget(s,pid);
+       const zeroIds=[],boundIds=[];
+       const noBlocking=async()=>{ const ov=await page.evaluate(bindingOverlaySnapshotInPage).catch(()=>null); return !!ov&&ov.accountDrawerCount===1&&ov.blockingOverlayPresent===false; };

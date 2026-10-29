@@ -1,0 +1,47 @@
+diff --git a/src/adapters/chengfang-reader.js b/src/adapters/chengfang-reader.js
+index 83cb60a0a6d4f2ba3661cdd01be37012c070a883..4bf75066b68291382a4cb59b8d3c67a1133a9f4b 100644
+--- a/src/adapters/chengfang-reader.js
++++ b/src/adapters/chengfang-reader.js
+@@ -2612,12 +2612,18 @@ async function openChengfangShop(p) {
+     // 只有「商品自选/全店托管」子标签真实出现才继续。
+     const deadlineTab = readOnlyTabDeadline === null ? Date.now() + 15000 : readOnlyTabDeadline - 40000;
+     let hasTabs = false;
++    let tabOverlay = null;
+     while (!readOnlyEmpty && Date.now() < deadlineTab) {
+       // 浮窗关闭与 tab 导航严格分离：先关白名单浮窗，再做只读导航。
+       // 已到达乘方管理页，探针必须可信且安全；未知/危险/未消失即阻断，不继续 tab 导航。
+-      const tabOverlay = await dismissKnownChengfangOverlays({
++      tabOverlay = await dismissKnownChengfangOverlays({
+         page: target, audit, shopId: p.shopCfg && p.shopCfg.id, maxRounds: 1,
+       });
++      // 管理页快照可能早于迟到导航；不可信期间只消耗现有等待预算，不导航。
++      if (tabOverlay.state === 'untrusted') {
++        await target.waitForTimeout(Math.max(0, Math.min(2000, deadlineTab - Date.now())));
++        continue;
++      }
+       assertChengfangOverlaySafe(tabOverlay, { phase: '乘方管理页-子标签等待', allowUntrusted: false });
+       await target.evaluate(navigateChengfangPlanViewInPage).catch(() => {});
+       await target.waitForTimeout(readOnlyTabDeadline === null ? 2000 : Math.max(0, Math.min(2000, deadlineTab - Date.now())));
+@@ -2628,9 +2634,13 @@ async function openChengfangShop(p) {
+       // 子标签（商品自选/全店托管）异步渲染，轮询等待（最长 40s）
+       const deadline = readOnlyTabDeadline === null ? Date.now() + 40000 : readOnlyTabDeadline;
+       while (Date.now() < deadline) {
+-        const tabOverlay = await dismissKnownChengfangOverlays({
++        tabOverlay = await dismissKnownChengfangOverlays({
+           page: target, audit, shopId: p.shopCfg && p.shopCfg.id, maxRounds: 1,
+         });
++        if (tabOverlay.state === 'untrusted') {
++          await target.waitForTimeout(Math.max(0, Math.min(2000, deadline - Date.now())));
++          continue;
++        }
+         assertChengfangOverlaySafe(tabOverlay, { phase: '乘方管理页-子标签长等待', allowUntrusted: false });
+         await target.evaluate(navigateChengfangPlanViewInPage).catch(() => {});
+         await target.waitForTimeout(readOnlyTabDeadline === null ? 2000 : Math.max(0, Math.min(2000, deadline - Date.now())));
+@@ -2639,6 +2649,7 @@ async function openChengfangShop(p) {
+       }
+     }
+     if (!hasTabs && !readOnlyEmpty) {
++      if (tabOverlay) assertChengfangOverlaySafe(tabOverlay, { phase: '乘方管理页-子标签等待超时', allowUntrusted: false });
+       if (p.readOnlyStatus === true) throw new DataGuardError('乘方只读页面范围无法确认，拒绝判定关闭');
+       throw new DataGuardError('乘方页未找到"商品自选/全店托管"子标签（尝试进入"商品→计划视图"后仍未出现），拒绝继续');
+     }

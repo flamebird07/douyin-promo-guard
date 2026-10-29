@@ -67,7 +67,7 @@
   {
     "id": "guard/src/adapters/chengfang-reader.js",
     "beforeSha256": "b26a81fa900e96319e15f2f0a1988ba564f30205c78ea0f02e8fd43d2e3e07c7",
-    "afterSha256": "0ed46bd3532e466d63a0b07dff174b4d6de9830642029d59c0ccf72e3f97a86a"
+    "afterSha256": "0d46dbda06594a80951097525804aa107f58c215c3687a99babee5b9a4353d03"
   },
   {
     "id": "app/index.html",

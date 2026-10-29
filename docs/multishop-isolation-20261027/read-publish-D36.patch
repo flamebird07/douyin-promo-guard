@@ -1,0 +1,64 @@
+--- a/app/watch-drill.js
++++ b/app/watch-drill.js
+@@ -2763,7 +2763,7 @@
+       clear(); // 注入的假子进程：无事件句柄时立即让位（测试/无等待语义）
+     }
+     pushLog('info',
+-      `巡查周期完成，已触发当日计划补发检查（cycle ${info.cycleNo != null ? info.cycleNo : '—'}；隐藏子进程异步执行，不阻塞值守）`);
++      `${info.trigger === 'readonly-refresh' ? '值守中只读刷新成功' : '巡查周期完成'}，已触发当日计划补发检查（cycle ${info.cycleNo != null ? info.cycleNo : '—'}；隐藏子进程异步执行，不阻塞值守）`);
+     return { ok: true, spawned: true, cycleNo: info.cycleNo != null ? info.cycleNo : null };
+   }
+   function ensurePlanScheduler() {
+@@ -4098,7 +4098,20 @@
+         const shopId = body && body.shopId;
+         if (!shopId) return send(400, { ok: false, error: '缺少 shopId' });
+         const m2 = ensureMonitor();
++        const before = (m2.config.shops || []).filter((s) => s && String(s.id) === String(shopId));
++        const target = before.length === 1 ? { ...before[0] } : null;
++        const patrolActive = m2.running === true && target && target.enabled !== false && target.deleted !== true;
+         const r = await m2.refreshShopData(String(shopId));
++        const current = (m2.config.shops || []).filter((s) => s && String(s.id) === String(shopId));
++        const sameTarget = target && current.length === 1
++          && ['id', 'name', 'platform', 'accountId', 'cookieFile', 'compassShopName'].every((key) => current[0][key] === target[key]);
++        if (patrolActive && drill._monitor === m2 && m2.running === true && sameTarget
++          && current[0].enabled !== false && current[0].deleted !== true
++          && r.ok === true && r.readOnly === true && !r.blocked && String(r.shopId) === String(shopId)
++          && r.data && r.data.businessDate === shanghaiDate(drill._now())) {
++          // A fresh read is not a completed poll cycle; retain in-flight/ledger dedup without consuming its cycle number.
++          try { triggerPatrolPlanRefill({ trigger: 'readonly-refresh' }); } catch (_) { /* 补发失败不改变读取结果 */ }
++        }
+         syncFromMonitor();
+         pushLog(r.ok ? 'info' : 'warn', `单店立即更新（只读）${r.ok ? '完成' : '失败'}：${shopId}${r.reason ? ' · ' + r.reason : ''}`);
+         return send(r.ok ? 200 : 400, { ...r, state: snapshot() });
+--- a/publisher/plan-workflow.cjs
++++ b/publisher/plan-workflow.cjs
+@@ -1066,13 +1066,13 @@
+ }
+ const BINDING_DIAG_PHASE_ENUM = new Set([
+   'initial-auto-drawer', 'reopened-anchor', 'panel-candidate', 'pre-header',
+-  'panel-navigation', 'before-header',
++  'panel-navigation', 'before-header', 'discovery-union',
+ ]);
+ function sanitizeBindingDiagnostic(diag) {
+   if (!diag || typeof diag !== 'object') return null;
+   const numOr = v => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+   const phase = typeof diag.phase === 'string' && BINDING_DIAG_PHASE_ENUM.has(diag.phase) ? diag.phase : null;
+-  return {
++  const result = {
+     phase,
+     rowCount: numOr(diag.rowCount),
+     knownCheckedCount: numOr(diag.knownCheckedCount),
+@@ -1080,6 +1080,13 @@
+     selectedCount: numOr(diag.selectedCount),
+     totalCount: numOr(diag.totalCount),
+   };
++  for (const key of ['expectedSelectedCount', 'expectedTotalCount', 'spinnerCount', 'panelCount', 'expectedPanelCount', 'activeCount', 'malformedIdCount']) {
++    if (Object.prototype.hasOwnProperty.call(diag, key)) result[key] = numOr(diag[key]);
++  }
++  for (const key of ['panelSetExactMatch', 'activeTargetMatch', 'uniqueRowCount', 'footerMatchesChecked']) {
++    if (Object.prototype.hasOwnProperty.call(diag, key)) result[key] = sanitizeSettingsScalar(diag[key], 'bool');
++  }
++  return result;
+ }
+ function readinessSummary(readiness, phase, round) {
+   if (!readiness || typeof readiness !== 'object') return null;

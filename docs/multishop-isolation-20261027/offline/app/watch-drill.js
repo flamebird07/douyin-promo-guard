@@ -2763,7 +2763,7 @@ function createWatchDrill(opts = {}) {
       clear(); // 注入的假子进程：无事件句柄时立即让位（测试/无等待语义）
     }
     pushLog('info',
-      `巡查周期完成，已触发当日计划补发检查（cycle ${info.cycleNo != null ? info.cycleNo : '—'}；隐藏子进程异步执行，不阻塞值守）`);
+      `${info.trigger === 'readonly-refresh' ? '值守中只读刷新成功' : '巡查周期完成'}，已触发当日计划补发检查（cycle ${info.cycleNo != null ? info.cycleNo : '—'}；隐藏子进程异步执行，不阻塞值守）`);
     return { ok: true, spawned: true, cycleNo: info.cycleNo != null ? info.cycleNo : null };
   }
   function ensurePlanScheduler() {
@@ -4098,7 +4098,20 @@ function createWatchDrill(opts = {}) {
         const shopId = body && body.shopId;
         if (!shopId) return send(400, { ok: false, error: '缺少 shopId' });
         const m2 = ensureMonitor();
+        const before = (m2.config.shops || []).filter((s) => s && String(s.id) === String(shopId));
+        const target = before.length === 1 ? { ...before[0] } : null;
+        const patrolActive = m2.running === true && target && target.enabled !== false && target.deleted !== true;
         const r = await m2.refreshShopData(String(shopId));
+        const current = (m2.config.shops || []).filter((s) => s && String(s.id) === String(shopId));
+        const sameTarget = target && current.length === 1
+          && ['id', 'name', 'platform', 'accountId', 'cookieFile', 'compassShopName'].every((key) => current[0][key] === target[key]);
+        if (patrolActive && drill._monitor === m2 && m2.running === true && sameTarget
+          && current[0].enabled !== false && current[0].deleted !== true
+          && r.ok === true && r.readOnly === true && !r.blocked && String(r.shopId) === String(shopId)
+          && r.data && r.data.businessDate === shanghaiDate(drill._now())) {
+          // A fresh read is not a completed poll cycle; retain in-flight/ledger dedup without consuming its cycle number.
+          try { triggerPatrolPlanRefill({ trigger: 'readonly-refresh' }); } catch (_) { /* 补发失败不改变读取结果 */ }
+        }
         syncFromMonitor();
         pushLog(r.ok ? 'info' : 'warn', `单店立即更新（只读）${r.ok ? '完成' : '失败'}：${shopId}${r.reason ? ' · ' + r.reason : ''}`);
         return send(r.ok ? 200 : 400, { ...r, state: snapshot() });

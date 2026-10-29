@@ -62,11 +62,16 @@
   {
     "id": "app/watch-drill.js",
     "beforeSha256": "48412b1817882e556e3f3b47940f77a7381a91b85b75d4ba28c0d27079d20ec8",
-    "afterSha256": "c09a990257b25b448ab2de38b19043425ef71ec8be726a4bcad28be42ecdfd50"
+    "afterSha256": "591e961823d006ee7be005b507de15b212649f7a8b49f01a32924301a5da0037"
   },
   {
     "id": "guard/src/adapters/chengfang-reader.js",
     "beforeSha256": "b26a81fa900e96319e15f2f0a1988ba564f30205c78ea0f02e8fd43d2e3e07c7",
-    "afterSha256": "e48a2507b65f36e6e2a621df6879ac23467a58d3882bc2aaf4a002c7c453c59b"
+    "afterSha256": "0ed46bd3532e466d63a0b07dff174b4d6de9830642029d59c0ccf72e3f97a86a"
+  },
+  {
+    "id": "app/index.html",
+    "beforeSha256": "657af65e7f72735561fe37e7ca9ed63e2c3e86113d933d8dc32835ab94a074b8",
+    "afterSha256": "10ee684dbaa0bac14daf5273553ab0d7d19ed05c235ffccdbac685e236440443"
   }
 ]

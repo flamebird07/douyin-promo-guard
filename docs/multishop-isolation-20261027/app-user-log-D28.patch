@@ -1,0 +1,257 @@
+diff --git a/watch-drill.js b/watch-drill.js
+index c83de8c94e69dd22e00c13427a84a7ec92336827..cc3ebd9d4f2d85ca7cb841f55430d9e3521a5b8c 100644
+--- a/watch-drill.js
++++ b/watch-drill.js
+@@ -2952,78 +2952,88 @@ function createWatchDrill(opts = {}) {
+     return `失败原因：${scrub(String(e.error))}${e.code ? ` [${scrub(String(e.code))}]` : ''}${e.scope ? `（${scrub(String(e.scope))}）` : ''}`;
+   }
+ 
+-  /**
+-   * 过程事件转译（2026-09-15 修复第 1 项，第二轮）。
+-   *
+-   * 这些事件来自 runner/executor 的 `_audit`（原仅写审计文件），现已双写进事件流。
+-   * 按**明确 event 名**转译，覆盖用户点名的「重试 / 回读 / 暂停 / 开启相位」：
+-   *   - retry            → 重试
+-   *   - paused / plan    → 暂停（含回读确认结果）
+-   *   - view / readback  → 回读核验
+-   *   - identity         → 身份核验
+-   *   - abort / done     → 停止 / 完成
+-   *   - step / *enable*  → 开启相位
+-   * 未识别的 event 名按原样透出（绝不臆造语义、绝不静默丢弃）。
+-   */
+   const PROCESS_LABEL = {
+     retry: { label: '重试', level: 'warn' },
+     paused: { label: '暂停', level: 'info' },
+     view: { label: '回读核验', level: 'info' },
+     readback: { label: '回读核验', level: 'info' },
+-    identity: { label: '身份核验', level: 'info' },
+     abort: { label: '已停止', level: 'warn' },
+-    done: { label: '批次完成', level: 'info' },
+-    step: { label: '执行步骤', level: 'info' },
++    done: { label: '批次结束', level: 'info' },
+     enable: { label: '开启相位', level: 'info' },
+     enable_phase: { label: '开启相位', level: 'info' },
+-    enable_done: { label: '开启相位完成', level: 'info' },
++    enable_done: { label: '开启相位结束', level: 'info' },
+   };
+-  // 独立每日开启调度器的审计事件（kind='enable-scheduler'，按 kind 精确分派）
+   const ENABLE_SCHEDULER_LABEL = {
+     registered: { label: '每日开启任务登记', level: 'info' },
+     stopped: { label: '每日开启任务停止', level: 'warn' },
+     window_missed: { label: '每日开启错过窗口', level: 'warn' },
+   };
++  function processFailed(p) {
++    return p.failed === true || !!p.error || p.ok === false || p.success === false || !!p.blocked
++      || ['error', 'warn', 'fatal'].includes(p.level)
++      || (typeof p.reason === 'string' && /失败|错误|异常|超时|受阻|阻断|未确认|未通过|error|fail(?:ed|ure)?|timeout|blocked/i.test(p.reason))
++      || [p.event, p.kind, p.step, p.status, p.result, p.outcome].some((v) => typeof v === 'string'
++        && /(?:^|[-_])(fail(?:ed|ure)?|error|abort|blocked|unknown|timeout|unproven|partial|rejected)(?:$|[-_])/i.test(v));
++  }
++  function processLevel(p) {
++    if (processFailed(p)) return p.error || p.failed === true || p.ok === false || p.success === false ? 'error' : 'warn';
++    const meta = p.kind === 'enable-scheduler' ? ENABLE_SCHEDULER_LABEL[p.event] : PROCESS_LABEL[p.event];
++    return meta ? meta.level : 'info';
++  }
+   function describeProcess(p) {
+-    // 2026-09-16 修复：event='plan' 同时来自暂停和开启执行器；旧 PROCESS_LABEL.plan
+-    // 写死"暂停计划" → 开启事件也被翻译成暂停。改为按 kind 区分（kind 后缀 -enable=开启）。
++    const failed = processFailed(p);
++    const ev = p.event || p.kind;
++    let meta = p.kind === 'enable-scheduler' ? ENABLE_SCHEDULER_LABEL[p.event] : PROCESS_LABEL[p.event];
++    let name = meta ? meta.label : null;
+     if (p.event === 'plan') {
+-      const isEnable = String(p.kind || '').endsWith('-enable');
+-      const label = isEnable ? '将开启目标' : '暂停计划';
+-      const bits = [];
+-      if (p.view) bits.push(`视图 ${p.view}`);
+-      if (p.mode) bits.push(`模式 ${p.mode}`);
+-      const tCount = Array.isArray(p.targets) ? p.targets.length : p.targets;
+-      if (tCount !== undefined) bits.push(`${tCount} 个目标`);
+-      if (p.note) bits.push(String(p.note));
+-      return `过程：${label}${bits.length ? `（${bits.join('，')}）` : ''}`;
+-    }
+-    if (p.kind === 'enable-scheduler' && p.event) {
+-      const em = ENABLE_SCHEDULER_LABEL[p.event] || null;
+-      const en = em ? em.label : `每日开启任务事件（${p.event}）`;
+-      const eb = [];
+-      if (p.nextRunAt) eb.push(`下次 ${p.nextRunAt}`);
+-      if (p.date) eb.push(`日期 ${p.date}`);
+-      if (p.reason) eb.push(p.reason);
+-      if (p.byUser !== undefined) eb.push(p.byUser ? '用户独立停用' : '非用户操作');
+-      return `过程：${en}${eb.length ? `（${eb.join('，')}）` : ''}` + (em ? '' : '；未识别事件名，按原样透出');
++      name = p.kind === 'chengfang-enable' ? '将开启目标'
++        : (p.kind === 'chengfang' ? '将暂停目标' : '待处理目标');
+     }
+-    const ev = String(p.event || p.kind || 'unknown');
+-    // "*enable*" 家族一律归入开启相位（不逐字枚举）
+-    const meta = PROCESS_LABEL[ev] || (/enable/i.test(ev) ? { label: '开启相位', level: 'info' } : null);
+-    const name = meta ? meta.label : `过程事件（${ev}）`;
++    if (p.step === 'batch-start' && p.kind === 'chengfang-batch') name = '开始暂停批次';
++    if (failed) name = p.kind === 'chengfang-overlay' ? '浮窗处理受阻' : (name ? `${name}未通过` : '处理异常');
++    const routineSuccess = p.ok === true || p.success === true || ['ok', 'success', 'ready', 'dismissed'].includes(p.result || p.status);
++    if (!name && (!p.reason || routineSuccess)) return null;
++    if (!name) name = '处理说明';
+     const bits = [];
+     if (p.view) bits.push(`视图 ${p.view}`);
+     if (p.attempt !== undefined) bits.push(`第 ${p.attempt} 次`);
+-    if (p.confirmed !== undefined) {
+-      const c = Array.isArray(p.confirmed) ? p.confirmed.map((x) => (x && typeof x === 'object' ? (x.planId || x.adId || '') : x)).filter(Boolean) : p.confirmed;
+-      bits.push(`已确认 ${Array.isArray(c) ? c.length : c}`);
+-    }
++    if (p.confirmed !== undefined) bits.push(`已确认 ${Array.isArray(p.confirmed) ? p.confirmed.length : p.confirmed}`);
++    if (p.event === 'plan' && p.targets !== undefined) bits.push(`${Array.isArray(p.targets) ? p.targets.length : p.targets} 个目标`);
++    if (p.mode === 'dry-run' || p.dryRun === true) bits.push('演练，不点击');
++    if (p.nextRunAt) bits.push(`下次 ${p.nextRunAt}`);
+     if (p.note) bits.push(String(p.note));
+     if (p.reason) bits.push(`说明：${p.reason}`);
+-    if (p.error) bits.push(`失败原因：${p.error}`);
+-    const level = p.failed === true || p.error ? 'error' : (meta ? meta.level : 'info');
+-    return `过程：${name}${bits.length ? `（${bits.join('，')}）` : ''}` + (meta ? '' : '；未识别事件名，按原样透出');
++    if (p.error) bits.push(`失败原因：${p.error.message || p.error.reason || String(p.error)}`);
++    if (failed && !p.reason && !p.error) bits.push(`未通过：${p.status || p.result || p.outcome || ev || '原因未提供'}`);
++    return `${name}${bits.length ? `（${bits.join('，')}）` : ''}`;
++  }
++
++  function eventShopPrefix(evt) {
++    if (evt.shopId != null && String(evt.shopId) !== '') {
++      const id = String(evt.shopId);
++      const shops = ((drill._monitor && drill._monitor.config) || drill._config || {}).shops || [];
++      const shop = shops.find((s) => s && String(s.id) === id);
++      return `[店铺：${scrub(String((shop && (shop.displayName || shop.name)) || id))}] `;
++    }
++    if (evt.shopName) return `[店铺：${scrub(String(evt.shopName))}] `;
++    return evt.kind === 'enable-scheduler' ? '[每日开启任务] ' : '[店铺未标明] ';
++  }
++
++  function processingShops() {
++    const m = drill._monitor;
++    if (!m || !m._shopProcessing) return [];
++    return Array.from(m._shopProcessing, (id) => {
++      const shop = (m.config.shops || []).find((s) => s && s.id === id);
++      return { id, name: scrub(String((shop && (shop.displayName || shop.name)) || id)) };
++    });
++  }
++
++  function userLogs() {
++    return drill._logs.filter((e) => {
++      if (e.level !== 'info') return true;
++      const legacy = /^过程：过程事件（([^）]+)）；未识别事件名，按原样透出$/.exec(e.msg);
++      return !legacy || processFailed({ event: legacy[1] });
++    }).map((e) => ({ ...e, msg: scrub(e.msg) }));
+   }
+ 
+   /**
+@@ -3205,7 +3215,7 @@ function createWatchDrill(opts = {}) {
+           if (isJudgement) {
+             // 每个完整周期一条；超出缓存后仍能继续接收（evtSeq 游标）
+             // 只有「>50 且严格超标」的 ROI 提示才升为 warn；50 元保护区内的费比超标不是数据故障
+-            pushLog(evt.roiTooLow === true ? 'warn' : 'info', describeJudgement(evt));
++            pushLog(evt.roiTooLow === true ? 'warn' : 'info', eventShopPrefix(evt) + describeJudgement(evt));
+             // 飞书通知：同一轮只推一次（cycleNo 幂等），失败只记日志不影响值守
+             notifyJudgement(evt).catch(() => {});
+           } else if (isBatch) {
+@@ -3213,14 +3223,16 @@ function createWatchDrill(opts = {}) {
+             const kind = actionKindOf(evt);
+             const ok = evt.allClosedConfirmed === true || evt.allPausedConfirmed === true
+               || evt.allEnabledConfirmed === true || evt.outcome === 'ok';
+-            pushLog(ok ? 'info' : 'warn', describeBatch(evt, kind));
++            pushLog(ok ? 'info' : 'warn', eventShopPrefix(evt) + describeBatch(evt, kind));
+           } else if (isTrigger) {
+-            pushLog(evt.failed ? 'error' : (evt.mode === 'dry' ? 'info' : 'warn'), describeTrigger(evt));
++            pushLog(evt.failed ? 'error' : (evt.mode === 'dry' ? 'info' : 'warn'), eventShopPrefix(evt) + describeTrigger(evt));
+           } else if (isProcess) {
+-            // 真实过程事件（runner/executor 的 retry/paused/view/identity/abort/done/step…）
+-            pushLog((evt.failed === true || evt.error) ? 'error' : 'info', describeProcess(evt));
++            const message = describeProcess(evt);
++            if (message) pushLog(processLevel(evt), eventShopPrefix(evt) + message);
+           } else if (isError) {
+-            pushLog('error', describeError(evt));
++            pushLog('error', eventShopPrefix(evt) + describeError(evt));
++          } else if (processFailed(evt)) {
++            pushLog(processLevel(evt), eventShopPrefix(evt) + describeProcess(evt));
+           }
+           drill._lastEvtSeq = evt.evtSeq;
+         }
+@@ -3242,7 +3254,7 @@ function createWatchDrill(opts = {}) {
+         drill._lastEnableSeen[item.shopId] = key;
+         const label = { in_progress: '开启执行中', success: '开启成功', failed: '开启失败', unknown: '开启结果未知（需回读）', dry_done: '开启（演练，未点击）' }[rec.status] || rec.status;
+         const lvl = rec.status === 'success' ? 'info' : (rec.status === 'failed' ? 'error' : (rec.status === 'unknown' ? 'warn' : 'info'));
+-        pushLog(lvl, `每日开启相位：${label}（店铺 ${item.shopId}，日期 ${rec.date || '—'}${rec.phase ? `，阶段 ${rec.phase}` : ''}）`
++        pushLog(lvl, eventShopPrefix(item) + `每日开启相位：${label}（日期 ${rec.date || '—'}${rec.phase ? `，阶段 ${rec.phase}` : ''}）`
+           + (rec.reason ? `；说明：${rec.reason}` : ''));
+       }
+     } catch (e) {
+@@ -3262,7 +3274,7 @@ function createWatchDrill(opts = {}) {
+     const trig = _harvest(status.triggers);
+     for (let i = drill._lastTriggersSeenLegacy || 0; i < trig.length; i += 1) {
+       const t = trig[i];
+-      if (t) pushLog(t.failed ? 'error' : (t.mode === 'dry' ? 'info' : 'warn'), describeTrigger(t));
++      if (t) pushLog(t.failed ? 'error' : (t.mode === 'dry' ? 'info' : 'warn'), eventShopPrefix(t) + describeTrigger(t));
+     }
+     drill._lastTriggersSeenLegacy = trig.length;
+     const acts = _harvest(status.actions);
+@@ -3271,13 +3283,13 @@ function createWatchDrill(opts = {}) {
+       if (!a) continue;
+       const kind = actionKindOf(a);
+       const ok = a.allClosedConfirmed === true || a.allPausedConfirmed === true || a.allEnabledConfirmed === true;
+-      pushLog(ok ? 'info' : 'warn', describeBatch(a, kind));
++      pushLog(ok ? 'info' : 'warn', eventShopPrefix(a) + describeBatch(a, kind));
+     }
+     drill._lastActionsSeenLegacy = acts.length;
+     const errs = _harvest(status.recentErrors);
+     for (let i = drill._lastErrorSeenLegacy || 0; i < errs.length; i += 1) {
+       const e = errs[i];
+-      if (e) pushLog('error', describeError(e));
++      if (e) pushLog('error', eventShopPrefix(e) + describeError(e));
+     }
+     drill._lastErrorSeenLegacy = errs.length;
+     pushLog('warn', '当前 Monitor 未提供事件流（evtSeq）；已退化为按有界数组消费，可能漏事件。');
+@@ -3922,6 +3934,7 @@ function createWatchDrill(opts = {}) {
+       status: st.status,
+       // engine 真实执行标志（权威，非时间猜测）：界面据此区分「检查中」/「值守中」
+       cycleRunning: st.cycleRunning === true,
++      processingShops: processingShops(),
+       statusText: STATUS_TEXT[st.status] || st.status,
+       roundNo: st.roundNo,
+       cycleNo: m ? (m.cycleNo || 0) : 0,
+@@ -4332,7 +4345,7 @@ function createWatchDrill(opts = {}) {
+       if (p === '/api/watch-drill/logs' && req.method === 'GET') {
+         syncFromMonitor();
+         const since = parseInt(url.searchParams.get('since') || '0', 10) || 0;
+-        const logs = drill._logs.filter((l) => l.seq > since);
++        const logs = userLogs().filter((l) => l.seq > since);
+         const gap = latestGap();
+         return send(200, {
+           ok: true,
+@@ -4372,7 +4385,7 @@ function createWatchDrill(opts = {}) {
+     /** 事件流游标（排障/测试用）。 */
+     get cursor() { return { evtSeq: drill._lastEvtSeq, cycleNo: drill._lastCycleNo }; },
+     get state() { return drill.state; },
+-    get logs() { return drill._logs.slice(); },
++    get logs() { return userLogs(); },
+     confirmDialogs: CONFIRM_DIALOG_MEASURED,
+     _internal: drill,
+     translateSwitchResult,
+diff --git a/index.html b/index.html
+index dcce2b2c2f2de5c753597bed02bac08cfbefdf63..741036d77b67d5b298a361ec32c55c6e528460bf 100644
+--- a/index.html
++++ b/index.html
+@@ -1468,7 +1468,8 @@
+           listEl.textContent = '';
+         }
+         var badge = $('wdStatusBadge');
+-        badge.textContent = st.text;
++        var processing = Array.isArray(s.processingShops) ? s.processingShops : [];
++        badge.textContent = st.text + (processing.length ? ' · 正在处理：' + processing.map(function (shop) { return shop.name || shop.id; }).join('、') : '');
+         badge.className = 'wd-badge ' + st.cls;
+         var btn = $('wdToggleBtn');
+         if (s.running) {
+@@ -1772,7 +1773,7 @@
+           t.textContent = fmtTime(e.t);
+           var m = document.createElement('span');
+           m.className = 'lvl-' + (e.level || 'info');
+-          m.textContent = esc(compactUrls(e.msg));
++          m.textContent = compactUrls(e.msg);
+           line.appendChild(t); line.appendChild(m);
+           box.appendChild(line);
+         });

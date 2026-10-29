@@ -42,7 +42,7 @@
   {
     "id": "app/server.js",
     "beforeSha256": "823d5a5d25904d375d36bb9d67c0bf2a702469cbe083b3537fe4e015e6d89e94",
-    "afterSha256": "225dee96b6f6217260f63028bd609eaf99578e8f1e67779fe36b3e9843760b16"
+    "afterSha256": "650f4abdf4518792150d39df0de6f47a0b66dec0ab4cfe8f4afadb22472dfab1"
   },
   {
     "id": "app/analyzer-shop-target.js",
@@ -58,5 +58,15 @@
     "id": "guard/src/engine/chengfang-runner.js",
     "beforeSha256": "0127fa1064df2f56c9b74b11152412cf5114565e478836354ab7b00bad89f62d",
     "afterSha256": "352a1e8efce9d4638c292484adebd2a0d1463b5037c46619cac3bfb6aaeaaa3c"
+  },
+  {
+    "id": "app/watch-drill.js",
+    "beforeSha256": "48412b1817882e556e3f3b47940f77a7381a91b85b75d4ba28c0d27079d20ec8",
+    "afterSha256": "c09a990257b25b448ab2de38b19043425ef71ec8be726a4bcad28be42ecdfd50"
+  },
+  {
+    "id": "guard/src/adapters/chengfang-reader.js",
+    "beforeSha256": "b26a81fa900e96319e15f2f0a1988ba564f30205c78ea0f02e8fd43d2e3e07c7",
+    "afterSha256": "e48a2507b65f36e6e2a621df6879ac23467a58d3882bc2aaf4a002c7c453c59b"
   }
 ]

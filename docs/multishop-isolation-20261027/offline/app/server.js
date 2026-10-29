@@ -147,9 +147,9 @@ const COOKIES_DIR = path.join(__dirname, 'cookies');
 // 「推广值守」实例（2026-09-15 接入真实操作模式）：复用推广控制 Monitor 的调度与乘方链路。
 // 是否真实操作广告仍由推广控制 config.json 的 fail-closed 门槛决定
 // （execution.realMode + monitor.chengfang.pauseEnabled/enableEnabled）；本实例不提供绕过入口。
-// 2026-10-09 客户要求：watchDrill.boot() 现在自动启动推广值守（超额暂停巡查）一次；
-// 页面打开/关闭/刷新只读，不改变后台值守状态；本次运行中人工停止后页面重开不恢复，下一次服务启动再次自动启动。
+// 2026-10-29 用户在逻辑修复期间明确停止巡查，服务重载不得自动恢复。
 const watchDrill = createWatchDrill({
+    autostartOnBoot: false,
     persistFile: path.join(WORKSPACE, 'watch-drill-logs.jsonl'),
     // 飞书/Hermes 消息推送已于 2026-10-07 按用户要求整体取消：不再装配任何通知参数，
     // watch-drill 模块内也无发送代码路径（即便旧环境变量 WATCH_NOTIFY_ENABLED=1 也不会恢复发送）。

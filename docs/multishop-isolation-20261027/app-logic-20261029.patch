@@ -1,0 +1,110 @@
+diff --git a/watch-drill.js b/watch-drill.js
+index 6aadd9a076166604aa071ea132b2f71b920026bf..c83de8c94e69dd22e00c13427a84a7ec92336827 100644
+--- a/watch-drill.js
++++ b/watch-drill.js
+@@ -3034,7 +3034,7 @@ function createWatchDrill(opts = {}) {
+    *   - 若在两次轮询之间发生了超出缓存的裁剪（丢了事件），依据 `dropped`
+    *     记录一条**明确的日志缺口**，并继续同步，而不是永久漏日志或静默错位。
+    */
+-  function syncFromMonitor() {
++  function syncFromMonitor(discoverShops = true) {
+     const m = drill._monitor;
+     if (!m) return;
+     const st = drill.state;
+@@ -3045,7 +3045,7 @@ function createWatchDrill(opts = {}) {
+       // 删除不删除店铺（合并规则见 shop-discovery）。仅读目录+合并配置，无页面/广告动作。
+       // 第 13 阶段补验证：发现结果（含落盘是否成功/是否待重试）如实进入 /state.shopDiscovery，
+       // 集成层不得在落盘失败时声称"持久化成功"；节流命中不覆盖上次结果。
+-      if (typeof m.requestShopDiscovery === 'function') {
++      if (discoverShops && typeof m.requestShopDiscovery === 'function') {
+         try {
+           const disc = m.requestShopDiscovery();
+           if (disc && disc.throttled !== true) {
+@@ -3446,12 +3446,55 @@ function createWatchDrill(opts = {}) {
+     drill.state.lastLoginJoin = joinState;
+     drill.state.loginJoins = drill.state.loginJoins || {};
+     drill.state.loginJoins[shopCfg.id] = joinState;
++    const shopId = shopCfg.id;
++    const identity = ['id', 'name', 'cookieFile', 'platform', 'accountId', 'compassShopName']
++      .map((key) => [key, shopCfg[key]]);
++    const targetUnavailableReason = () => {
++      if (drill._monitor !== m) return '值守实例已变更，取消登录后只读刷新';
++      const matches = (m.config.shops || []).filter((s) => s && (s.id === shopId
++        || s.id === shopName || s.name === shopName
++        || (s.cookieFile && String(s.cookieFile).replace(/\.json$/i, '').trim() === shopName)));
++      if (matches.length !== 1) return '目标店铺不存在或身份不唯一，取消登录后只读刷新';
++      if (matches[0].deleted === true) return '店铺已删除，取消登录后只读刷新';
++      if (identity.some(([key, value]) => matches[0][key] !== value)) {
++        return '目标店铺身份已变更，取消登录后只读刷新';
++      }
++      return null;
++    };
++    // 沿用 joinShopNow 的等待上限与节奏，不改变实际读取或鉴权超时。
++    const waitMs = Math.max(2 * 60 * 1000, ((m.config.schedule || {}).intervalMinutes || 30) * 60 * 1000);
++    const deadline = drill._now() + waitMs;
++    const delay = opts.delayFn || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+     const entry = { promise: null };
+-    drill._loginJoins.set(shopCfg.id, entry);
++    drill._loginJoins.set(shopId, entry);
+     const completion = (async () => {
+       let readBack;
+       try {
+-        const rb = await m.refreshShopData(shopCfg.id);
++        let rb;
++        let remainingWaitMs = waitMs;
++        while (true) {
++          const unavailable = targetUnavailableReason();
++          if (unavailable) {
++            rb = { ok: false, reason: unavailable };
++            break;
++          }
++          if (rb && (remainingWaitMs <= 0 || drill._now() >= deadline)) {
++            rb = { ...rb, ok: false, reason: `等待既有处理/资源收口超时，未执行登录后只读刷新（${rb.blocked}）` };
++            break;
++          }
++          rb = await m.refreshShopData(shopId);
++          const changed = targetUnavailableReason();
++          if (changed) {
++            rb = { ok: false, reason: changed };
++            break;
++          }
++          if (!rb || !['shop_busy', 'cycle_busy', 'recovery_inflight'].includes(rb.blocked)) break;
++          joinState.reason = `登录后只读刷新等待既有处理/资源收口（${rb.blocked}）；尚未读取新数据`;
++          const pauseMs = Math.min(200, remainingWaitMs, Math.max(0, deadline - drill._now()));
++          if (pauseMs > 0) await delay(pauseMs);
++          // 同时扣减等待预算，时钟回拨也不能无限保留 processing。
++          remainingWaitMs -= pauseMs;
++        }
+         readBack = {
+           ok: rb && rb.ok === true && !rb.blocked,
+           blocked: rb && rb.blocked ? scrub(String(rb.blocked)) : null,
+@@ -3474,10 +3517,10 @@ function createWatchDrill(opts = {}) {
+         pushLog('warn', `[值守接管] 店铺「${shopName}」${joinState.reason}`);
+       }
+       joinState.finishedAt = new Date(drill._now()).toISOString();
+-      drill._loginJoins.delete(shopCfg.id);
+-      syncFromMonitor();
++      if (drill._loginJoins.get(shopId) === entry) drill._loginJoins.delete(shopId);
++      syncFromMonitor(false);
+       return {
+-        shopId: shopCfg.id, shopName, action: 'readonly-refresh',
++        shopId, shopName, action: 'readonly-refresh',
+         readBack, reason: joinState.reason,
+       };
+     })();
+diff --git a/server.js b/server.js
+index 65629457e8bd597a9755aeb59915f14bff064a1e..e2ff967f34ffc778f25a6e0ea52dd7735b3386f8 100644
+--- a/server.js
++++ b/server.js
+@@ -147,9 +147,9 @@ const COOKIES_DIR = path.join(__dirname, 'cookies');
+ // 「推广值守」实例（2026-09-15 接入真实操作模式）：复用推广控制 Monitor 的调度与乘方链路。
+ // 是否真实操作广告仍由推广控制 config.json 的 fail-closed 门槛决定
+ // （execution.realMode + monitor.chengfang.pauseEnabled/enableEnabled）；本实例不提供绕过入口。
+-// 2026-10-09 客户要求：watchDrill.boot() 现在自动启动推广值守（超额暂停巡查）一次；
+-// 页面打开/关闭/刷新只读，不改变后台值守状态；本次运行中人工停止后页面重开不恢复，下一次服务启动再次自动启动。
++// 2026-10-29 用户在逻辑修复期间明确停止巡查，服务重载不得自动恢复。
+ const watchDrill = createWatchDrill({
++    autostartOnBoot: false,
+     persistFile: path.join(WORKSPACE, 'watch-drill-logs.jsonl'),
+     // 飞书/Hermes 消息推送已于 2026-10-07 按用户要求整体取消：不再装配任何通知参数，
+     // watch-drill 模块内也无发送代码路径（即便旧环境变量 WATCH_NOTIFY_ENABLED=1 也不会恢复发送）。

@@ -1,0 +1,103 @@
+diff --git a/src/adapters/chengfang-reader.js b/src/adapters/chengfang-reader.js
+index 26ecc814167920483aeab0742555e5a36361e8b9..dbfb040263e9539ed1e284f1c47236bb571caabd 100644
+--- a/src/adapters/chengfang-reader.js
++++ b/src/adapters/chengfang-reader.js
+@@ -1777,13 +1777,93 @@ function handleChengfangOverlayInPage(options) {
+   if (dangerDiag.length) out.dangerDiag = dangerDiag;
+   if (foreign.length > 0) {
+     out.blockers.push(`unknown-overlay:${foreign.length}`);
+-    // 有界 unknown 候选结构摘要（供既有 audit 定位）：仅标签/类名/role，严格截断、上限 5 条；
+-    // 绝不含正文/outerHTML/URL/账户ID/Cookie。只加证据，不放宽任何 unknown/danger 门禁。
+-    out.unknownDiag = foreign.slice(0, 5).map((el) => ({
+-      tag: String(el.tagName || '').toLowerCase(),
++    const structure = (el) => ({
++      tag: String(el.tagName || '').toLowerCase().slice(0, 24),
+       cls: String((el.getAttribute && el.getAttribute('class')) || '').slice(0, 60),
+       role: String((el.getAttribute && el.getAttribute('role')) || '').slice(0, 24),
+-    }));
++    });
++    out.unknownDiag = foreign.slice(0, 5).map((el) => {
++      const diag = {};
++      try {
++        Object.assign(diag, structure(el));
++        const rect = el.getBoundingClientRect();
++        diag.rect = {};
++        for (const key of ['left', 'top', 'width', 'height']) {
++          diag.rect[key] = Number.isFinite(rect[key]) ? rect[key] : null;
++        }
++        const children = el.children || [];
++        diag.directChildren = children.length;
++        diag.visibleDirectChildren = 0;
++        diag.directChildrenTruncated = children.length > 200;
++        diag.children = [];
++        for (let i = 0; i < Math.min(children.length, 200); i++) {
++          const childVisible = visible(children[i]);
++          if (childVisible) diag.visibleDirectChildren += 1;
++          if (i < 5) diag.children.push({ ...structure(children[i]), visible: childVisible });
++        }
++        diag.containedIntroRoots = introRoots.filter((root) => el.contains(root)).length;
++        diag.containedGuideRoots = guideRoots.filter((root) => el.contains(root)).length;
++        diag.rawChars = 0;
++        diag.visChars = 0;
++        diag.visibleDescendants = 0;
++        diag.scannedNodes = 0;
++        diag.closeControls = [];
++        diag.visibleCloseControls = 0;
++        const stack = [{ nodes: [el], index: 0, rendered: true }];
++        // 截断时文本长度与可见后代计数仅为下界；不递归、不扩展到候选外。
++        while (stack.length && diag.scannedNodes < 200) {
++          const frame = stack[stack.length - 1];
++          if (frame.index >= frame.nodes.length) { stack.pop(); continue; }
++          const node = frame.nodes[frame.index++];
++          diag.scannedNodes += 1;
++          if (node.nodeType === 3 || node.nodeType === 4) {
++            const chars = String(node.textContent || '').length;
++            diag.rawChars += chars;
++            if (frame.rendered) diag.visChars += chars;
++            continue;
++          }
++          if (node.nodeType !== 1 && !node.tagName) continue;
++          const tag = String(node.tagName || '').toLowerCase();
++          const rendered = frame.rendered && visible(node)
++            && !['script', 'style', 'noscript', 'template'].includes(tag);
++          if (typeof node.ownText === 'string') {
++            diag.rawChars += node.ownText.length;
++            if (rendered) diag.visChars += node.ownText.length;
++          }
++          if (rendered && node !== el) {
++            diag.visibleDescendants += 1;
++            const legacyClose = node.matches('.tools-vmok-plugin-modal__close-icon');
++            const v2CloseButton = node.matches('button.close-button[aria-label="关闭"][type="button"]');
++            let closeText = null;
++            if (node.matches('button, a, [role="button"], span')) {
++              const text = String(node.textContent || '');
++              const compact = text.length <= 1200 ? text.replace(/\s+/g, '') : '';
++              if (compact === '跳过') closeText = 'skip';
++              else if (compact === '跳过引导') closeText = 'skip-guide';
++              else if (compact === '我知道了') closeText = 'acknowledge';
++            }
++            if (legacyClose || v2CloseButton || closeText) {
++              diag.visibleCloseControls += 1;
++              if (diag.closeControls.length < 5) {
++                diag.closeControls.push({
++                  ...structure(node), legacyClose, v2CloseButton, closeText,
++                  ariaClose: node.getAttribute('aria-label') === '关闭',
++                });
++              }
++            }
++          }
++          const nodes = node.childNodes || node.children || [];
++          if (nodes.length) stack.push({ nodes, index: 0, rendered });
++        }
++        while (stack.length && stack[stack.length - 1].index >= stack[stack.length - 1].nodes.length) stack.pop();
++        diag.scanTruncated = stack.length > 0;
++        diag.closeControlsTruncated = diag.visibleCloseControls > 5;
++      } catch (_) {
++        // 诊断失败不能替换原有 unknown 阻断，异常原文也不得进入审计。
++        diag.incomplete = true;
++      }
++      return diag;
++    });
+   }
+   if (introRoots.length > 1) out.blockers.push(`multiple-intro:${introRoots.length}`);
+   if (guideRoots.length > 1) out.blockers.push(`multiple-guide:${guideRoots.length}`);

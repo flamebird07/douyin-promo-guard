@@ -1,0 +1,68 @@
+diff --git a/index.html b/index.html
+index 741036d77b67d5b298a361ec32c55c6e528460bf..80495d080cb1463a3c484dff4b632cbcf5f8083b 100644
+--- a/index.html
++++ b/index.html
+@@ -1765,15 +1765,17 @@
+         if (!logs || !logs.length) return;
+         var box = $('wdLog');
+         var first = !box.querySelector('.t');
+-        if (first) box.innerHTML = ''; // 移除“尚未有日志”占位
+         logs.forEach(function (e) {
++          var message = projectUserLog(e);
++          if (message === null) return;
++          if (first) { box.textContent = ''; first = false; }
+           var line = document.createElement('div');
+           var t = document.createElement('span');
+           t.className = 't';
+           t.textContent = fmtTime(e.t);
+           var m = document.createElement('span');
+           m.className = 'lvl-' + (e.level || 'info');
+-          m.textContent = compactUrls(e.msg);
++          m.textContent = compactUrls(message);
+           line.appendChild(t); line.appendChild(m);
+           box.appendChild(line);
+         });
+@@ -1782,6 +1784,43 @@
+         box.scrollTop = box.scrollHeight;
+       }
+ 
++      function projectUserLog(e) {
++        var msg = String(e.msg == null ? '' : e.msg);
++        var checkpointFailure = /^候选未通过独立复用\/身份验证：(?:未提供候选专用浏览器工厂（candidateBrowserFactory）：无法独立验证候选（fail-closed，拒绝借用业务浏览器\/上下文，拒绝自启真实浏览器，不写入）|身份复验期间 Cookie 或页面变化：拒绝提交较早快照)（保留现有工作副本，未写入）$/;
++        var legacy = /^((?:\[[^\]\r\n]*\]\s*)?)过程：过程事件（([^（）]+)）([\s\S]*)；未识别事件名，按原样透出\s*$/.exec(msg);
++        if (!legacy) {
++          var failure = /^\[店铺：[^\]\r\n]+\]\s*处理异常（说明：([\s\S]*)）\s*$/.exec(msg);
++          return failure && checkpointFailure.test(failure[1]) ? null : msg;
++        }
++        var raw = legacy[3].trim(), parts = [], depth = 0, start = 0;
++        for (var i = 0; i < raw.length; i++) {
++          if (raw[i] === '（') {
++            if (depth++ === 0) start = i + 1;
++          } else if (raw[i] === '）') {
++            if (!depth) return msg;
++            if (--depth === 0) parts.push(raw.slice(start, i).trim());
++          } else if (!depth && !/\s/.test(raw[i])) {
++            return msg;
++          }
++        }
++        if (depth) return msg;
++        var kind = legacy[2];
++        var details = parts.map(function (part) { return part.replace(/^(?:说明|失败原因)：\s*/, ''); });
++        if (/^(?:cookie-writeback|session-cookie-writeback|checkpoint-propagate)$/.test(kind)
++          && details.length && details.every(function (detail) { return checkpointFailure.test(detail); })) return null;
++        var internal = /^(?:start|poll|cookie-writeback|session-cookie-writeback|checkpoint-propagate|doudian-arrival|chengfang-entry|chengfang-overlay)$/.test(kind);
++        // Only exact informational patterns are disposable; unfamiliar details may be business failures.
++        var telemetry = details.every(function (detail) {
++          return !detail || /^第\s*\d+\s*次$/.test(detail)
++            || (kind === 'poll' && /^(?:shop-processing-busy|serial-other-shop-busy)$/.test(detail))
++            || (kind === 'cookie-writeback' && /^候选未通过独立复用\/身份验证：未提供候选专用浏览器工厂（candidateBrowserFactory）[.。…]*$/.test(detail));
++        });
++        if ((e.level || 'info') === 'info' && internal && telemetry) return null;
++        var explanation = details.join('；').replace(/unknown-overlay:(\d+)/g, '检测到未识别浮窗（$1 个）');
++        if (kind === 'chengfang-overlay' && explanation) explanation = '浮窗处理受阻：' + explanation;
++        return legacy[1] + (explanation || '值守记录：原记录未提供详细说明');
++      }
++
+       async function loadStateAndLogs() {
+         var d, ld;
+         var readVersion = ++stateReadVersion;

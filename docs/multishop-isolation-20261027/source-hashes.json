@@ -32,7 +32,7 @@
   {
     "id": "guard/src/engine/monitor.js",
     "beforeSha256": "c9bcdb29e30ae2d6bfeb3a71bbdaf6c2175557bb8cf705a467e252a448d8a777",
-    "afterSha256": "6a23a358a622db4f65b4bc5946658e59baaca49199533aad640a16cd8f3a670d"
+    "afterSha256": "3d6b3029035cc59eb3b084c84bd8de24598a97b9cc53400dd4eb169515b4f9f0"
   },
   {
     "id": "app/cookie-vault.js",

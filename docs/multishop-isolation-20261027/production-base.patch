@@ -1710,3 +1710,268 @@ index 95b06ebe8f99d4d80567e1e20919d0eab922a8b9..5d011130b89eb0e2cd0f74ab5a86dcc8
      attempts,
    };
  }
+diff --git a/src/engine/monitor.js b/src/engine/monitor.js
+index 0e473c74f77d961d2440fb5e1df539ae6a948273..6c57b547da680678f7a8780bbf7ad3c0a62f3bbb 100644
+--- a/src/engine/monitor.js
++++ b/src/engine/monitor.js
+@@ -115,8 +115,11 @@ class Monitor {
+     this._coordinators = new Map(); // shopId -> WholeShopCloseCoordinator（跨周期保留在途请求登记）
+     this._chengfangRunners = new Map(); // shopId -> ChengfangRunner（乘方主链路）
+     this._chengfangOpener = opts.chengfangOpener || null; // 测试注入：本地 DOM fixture 会话开启器
+-    // 每店回读收口门（2026-10-18 状态未知修复）：会话未严格关闭时只阻断本店，
+-    // 不得让一店的未收口读取阻塞其他店。旧属性 _pendingReadGate 仅保留兼容别名。
++    // 每店回读收口门（2026-10-18 状态未知修复）：读取许可按店隔离（他店门不拦本店新读取）。
++    // D24S（2026-10-29 用户一次一家店要求，主脑否决 D24R 跨周期豁免）：只要有**任何**他店的
++    // 真实资源收口未证明，就不启动下一家店（见 _cycleNewCleanupBlocker）——登记簿/门是
++    // 唯一事实源，与门的登记周期新旧无关；不得为"防饿死"虚构清理或提前放行。
++    // 旧属性 _pendingReadGate 仅保留兼容别名。
+     this._pendingReadGates = new Map();
+     this._pendingReadGate = null;
+     this._readGateSeq = 0; // gateId 单调递增：清门只做身份 CAS，迟到 epoch 不得清掉新门
+@@ -1069,14 +1072,14 @@ class Monitor {
+     const cycleNo = this.cycleNo;
+     this._currentCycle = { cycleNo, trigger, startedAt: this.nowFn() };
+     try {
+-      // 同轮跨店最多 2 家有界并行（2026-09-28 客户目标：第二家不无谓等待第一家整套采集/开启/回读）。
+-      // 同一家店的读取/决策/动作/回读仍串行（每店只占一个槽，由串行门保证开关不并发）。
++      // 同轮跨店严格串行（D24 2026-10-29 用户最新要求，取代 2026-09-28 两店有界并行）：
++      // 店铺按配置顺序一家处理完（读取/决策/动作/回读收口）再启动下一家，
++      // 与商品分析批处理的逐店 Playwright 生命周期（开页→处理→finally browser.close）对齐。
++      // 同一家店仍由每店处理互斥 + 串行门保证开关不并发。
+       // 结果仍按配置顺序归集；停止后不再启动队列中的店；单店失败不影响另一店。
+       // 不使用 Promise.race 假装取消在途页面读取——已启动的 _pollShop 自然结束。
+       const shops = this._activeShops();
+       const results = new Array(shops.length);
+-      const PARALLEL_LIMIT = 2;
+-      let nextIndex = 0;
+ 
+       const runOne = async (shopCfg, idx) => {
+         // 启动前复核：停止/软删除店不得进入处理
+@@ -1088,6 +1091,19 @@ class Monitor {
+           results[idx] = { shopId: shopCfg.id, status: 'skipped', reason: '店铺已删除，跳过值守/轮询' };
+           return;
+         }
++        // D24S 跨店串行启动门：任何他店的真实资源（浏览器/会话）收口未证明 →
++        // 本店不启动，如实 skipped 顺延；实际关闭证明后由后续周期正常处理，绝不伪造完成。
++        // 登记簿与门是唯一事实源，与登记周期新旧无关（跨周期遗留门同样阻断）。
++        const cleanupBlocker = this._cycleNewCleanupBlocker(shopCfg.id);
++        if (cleanupBlocker) {
++          results[idx] = {
++            shopId: shopCfg.id,
++            status: 'skipped',
++            reason: `店 ${cleanupBlocker} 的真实资源收口未证明，本轮顺延不并发启动；待实际关闭证明后下一周期处理`,
++          };
++          this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'skipped', reason: 'serial-cleanup-blocked', blockedBy: cleanupBlocker });
++          return;
++        }
+         // 同店处理互斥（WD-NEW-1 并发收口）：该店正被登录接管/每日开启/手动验证处理 → 本轮跳过
+         // （零派发、如实记录；不阻塞其他店铺；该店由在途处理负责，下一轮常规巡查再核）
+         if (this._shopBusy(shopCfg.id)) {
+@@ -1099,6 +1115,20 @@ class Monitor {
+           results[idx] = { shopId: shopCfg.id, status: 'skipped', reason: '同店处理互斥获取失败（并发防御），本轮跳过' };
+           return;
+         }
++        // D24T 跨入口一次一家店：任何他店已在处理在途（_shopProcessing，如手动验证/只读
++        // 刷新/登录接管在周期外取得的每店锁）→ 本店不启动，如实 skipped 顺延；待其处理
++        // 结束后下一周期处理。只拦新业务启动：收口探测/恢复链关闭自有资源不经此门，照常推进。
++        const otherBusy = this._otherBusyOrUnprovenShop(shopCfg.id);
++        if (otherBusy) {
++          this._releaseShop(shopCfg.id);
++          results[idx] = {
++            shopId: shopCfg.id,
++            status: 'skipped',
++            reason: `店 ${otherBusy} 处理在途（一次一家店，跨店串行），本轮顺延不并发启动；待其处理结束后下一周期处理`,
++          };
++          this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'skipped', reason: 'serial-other-shop-busy', blockedBy: otherBusy });
++          return;
++        }
+         try {
+           results[idx] = { shopId: shopCfg.id, ...(await this._pollShop(shopCfg, token, trigger)) };
+         } catch (e) {
+@@ -1114,19 +1144,8 @@ class Monitor {
+         }
+       };
+ 
+-      const worker = async () => {
+-        while (true) {
+-          const idx = nextIndex;
+-          nextIndex += 1;
+-          if (idx >= shops.length) return;
+-          await runOne(shops[idx], idx);
+-        }
+-      };
+-
+-      const workers = [];
+-      const n = Math.min(PARALLEL_LIMIT, shops.length);
+-      for (let i = 0; i < n; i += 1) workers.push(worker());
+-      await Promise.all(workers);
++      // 严格串行：上一家 _pollShop（含其内部读取/动作/回读与 finally 收口）完成后才启动下一家
++      for (let i = 0; i < shops.length; i += 1) await runOne(shops[i], i);
+ 
+       // 防御：极端情况下若有空槽，按配置顺序补齐 skipped（不伪造成功）
+       for (let i = 0; i < results.length; i += 1) {
+@@ -1598,6 +1617,37 @@ class Monitor {
+     }
+     // 用户手动更新可重置恢复事件：先取消旧链的等待 timer，再按本次真实读取重新开始。
+     this._clearReadRecovery(shopId, 'manual-refresh');
++    // D24R 跨入口串行：巡查/每日开启周期进行中时，即使目标店不同也不叠加并发处理
++    // （同店在途仍走下方 shop_busy 既有语义，返回真实进度）。如实 blocked，稍后可重试。
++    if (this._cycleRunning && !this._shopBusy(shopId)) {
++      return {
++        ok: true, readOnly: true, shopId, adState: 'unknown',
++        blocked: 'cycle_busy',
++        reason: '巡查/每日开启周期进行中（跨店串行），本次手动更新未执行，稍后可重试',
++        zeroClick: true,
++      };
++    }
++    // D24S 周期外同样串行：他店仍在处理在途或真实资源收口未证明 → 复用既有 busy 响应，
++    // 不叠加新的并发处理；待在途处理结束/收口实际证明后可重试。同店在途仍走下方 shop_busy。
++    const otherBusy = this._otherBusyOrUnprovenShop(shopId);
++    if (otherBusy && !this._shopBusy(shopId)) {
++      return {
++        ok: true, readOnly: true, shopId, adState: 'unknown',
++        blocked: 'shop_busy',
++        reason: `店 ${otherBusy} 处理在途/真实资源收口未证明（一次一家店，跨店串行），本次手动更新未执行，稍后可重试`,
++        zeroClick: true,
++      };
++    }
++    // D24 逐店串行（跨入口收口）：目标店正被巡查周期/每日开启/登录接管在途处理时，
++    // 本只读刷新不叠加并发同店处理，如实返回可稍后重试（复用既有每店处理互斥，不另造锁）。
++    if (!this._tryAcquireShop(shopId)) {
++      return {
++        ok: true, readOnly: true, shopId, adState: 'unknown',
++        blocked: 'shop_busy',
++        reason: '该店已有处理在途（巡查/每日开启/登录接管/恢复链），本次手动更新未叠加新读取',
++        zeroClick: true,
++      };
++    }
+     const rt = this._runtime(shopId);
+     try {
+       const coord = this._getCoordinator(shopCfg);
+@@ -1684,6 +1734,8 @@ class Monitor {
+       this._memPush(this.recentErrors, { scope: `shop:${shopId}`, error: reason }, undefined, 'error');
+       this._audit({ kind: 'shop-refresh', shopId, ok: false, reason, blocked, zeroClick: true });
+       return { ok: false, reason, zeroClick: true };
++    } finally {
++      this._releaseShop(shopId);
+     }
+   }
+ 
+@@ -1747,6 +1799,17 @@ class Monitor {
+     }
+     // 明确新会话/用户登录接管可重置恢复事件：取消旧链等待 timer，避免与本次接管叠加。
+     this._clearReadRecovery(shopId, 'login-takeover');
++    // D24R 跨入口串行：巡查/每日开启周期进行中时，即使目标店不同也不叠加并发处理；
++    // 同店在途保留下方既有有界等待语义。如实 skipped（零动作），常规巡查稍后处理该店。
++    if (this._cycleRunning && !this._shopBusy(shopId)) {
++      return { ok: false, status: 'skipped', reason: '巡查/每日开启周期进行中（跨店串行），本次立即处理未派发；常规巡查会处理该店' };
++    }
++    // D24S 周期外同样串行：他店仍在处理在途或真实资源收口未证明 → 如实 skipped（零动作），
++    // 复用既有跨店 busy 语义；待在途处理结束/收口实际证明后常规巡查会处理该店。
++    const otherBusy = this._otherBusyOrUnprovenShop(shopId);
++    if (otherBusy && !this._shopBusy(shopId)) {
++      return { ok: false, status: 'skipped', reason: `店 ${otherBusy} 处理在途/真实资源收口未证明（一次一家店，跨店串行），本次立即处理未派发；常规巡查会处理该店` };
++    }
+     // 同店处理互斥：目标店正在被处理 → 有界等待释放；等待结束后先复核 running，再取得资格
+     if (this._shopBusy(shopId)) {
+       const sch = this.config.schedule || {};
+@@ -1761,6 +1824,15 @@ class Monitor {
+         return { ok: false, status: 'skipped', reason: '目标店处理长时间未释放，本次立即处理未派发（店铺已在列表，常规巡查会处理）' };
+       }
+     }
++    // D24T 等待期间复核：有界等待本店释放的 await 间隙里，他店入口可能已取得处理权
++    //（或周期已启动）。取得资格前重查跨店串行门，绝不让两个入口同时各持一家店。
++    if (this._cycleRunning && !this._shopBusy(shopId)) {
++      return { ok: false, status: 'skipped', reason: '巡查/每日开启周期进行中（跨店串行），本次立即处理未派发；常规巡查会处理该店' };
++    }
++    const otherBusyNow = this._otherBusyOrUnprovenShop(shopId);
++    if (otherBusyNow && !this._shopBusy(shopId)) {
++      return { ok: false, status: 'skipped', reason: `店 ${otherBusyNow} 处理在途/真实资源收口未证明（一次一家店，跨店串行），本次立即处理未派发；常规巡查会处理该店` };
++    }
+     if (!this._tryAcquireShop(shopId)) {
+       return { ok: false, status: 'skipped', reason: '该店已有处理在途（并发去重）' };
+     }
+@@ -2089,6 +2161,43 @@ class Monitor {
+     return this._pendingCleanupsFor(shopId).length > 0;
+   }
+ 
++  // ── D24S 跨店串行启动门（2026-10-29 用户一次一家店要求，主脑否决 D24R 跨周期豁免）──
++  // _pendingReadGates/_cleanupRegistry 是"真实资源尚未证明收口"的唯一事实源。
++  // 只要任何他店仍有未证明收口的真实资源，下一家店就不得启动（如实 skipped 顺延，
++  // 待实际关闭证明后由后续周期正常处理，绝不伪造完成、绝不提前放行）。
++  // 门的登记周期新旧不影响判定：跨周期遗留门同样阻断（等待收口是不可避免的真实等待，
++  // 不得用"防饿死"豁免换算成跨店并发）。
++
++  /** 仍有未证明收口资源的店铺 ID 集合（当前门 + 收口登记簿）。 */
++  _unprovenCleanupShopIds() {
++    const ids = new Set();
++    if (this._cleanupRegistry) for (const k of this._cleanupRegistry.keys()) ids.add(k);
++    if (this._pendingReadGates) for (const k of this._pendingReadGates.keys()) ids.add(k);
++    if (this._pendingReadGate && this._pendingReadGate.shopId) ids.add(String(this._pendingReadGate.shopId));
++    return ids;
++  }
++
++  /** 他店中首个"处理在途或真实资源收口未证明"的店铺 ID（无则 null）。
++   *  本店自身不算（同店在途/收口由既有每店互斥与读取许可门负责）。 */
++  _otherBusyOrUnprovenShop(shopId) {
++    const self = String(shopId);
++    if (this._shopProcessing) {
++      for (const k of this._shopProcessing.keys()) if (k !== self) return k;
++    }
++    for (const id of this._unprovenCleanupShopIds()) if (id !== self) return id;
++    return null;
++  }
++
++  /** 阻断启动下一家店的店铺（返回其 id），无阻断返回 null。
++   *  本店自身的门不算（同店阻断由既有读取许可/门逻辑负责）。 */
++  _cycleNewCleanupBlocker(shopId) {
++    for (const id of this._unprovenCleanupShopIds()) {
++      if (id === String(shopId)) continue;
++      return id;
++    }
++    return null;
++  }
++
+   /** 门在登记簿中的位置：-1 = 已注销（收口已证明）。 */
+   _cleanupRegistryIndexOf(gate) {
+     if (!gate) return -1;
+@@ -4584,6 +4693,9 @@ class Monitor {
+     this._activeTokens.add(token);
+     this._cycleRunning = true;
+     const today = businessDate || shanghaiDate(this.nowFn());
++    // D24S/D24T：开启相位同样遵守跨店串行启动门（登记簿/门是唯一事实源，
++    // 跨周期遗留的未收口门同样阻断他店启动；他店处理在途同样顺延）。
++    const preExistingCleanup = this._unprovenCleanupShopIds();
+     try {
+       for (const shopCfg of this._activeShops()) {
+         if (schedScope) {
+@@ -4595,6 +4707,17 @@ class Monitor {
+         // 删除后调度器再次检查活动列表
+         if (!this._isShopActive(shopCfg.id)) continue;
+         if (this._enablePhaseDone(shopCfg.id, today)) continue;
++        const cleanupBlocker = this._cycleNewCleanupBlocker(shopCfg.id, preExistingCleanup);
++        if (cleanupBlocker) {
++          this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-serial-cleanup', trigger: scope, blockedBy: cleanupBlocker });
++          continue; // 不标记当日完成：窗口内按既有节奏有界重试
++        }
++        // D24T 跨入口一次一家店：他店处理在途（周期外取得的每店锁）→ 本店开启相位顺延。
++        const otherBusy = this._otherBusyOrUnprovenShop(shopCfg.id);
++        if (otherBusy) {
++          this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-serial-other-busy', trigger: scope, blockedBy: otherBusy });
++          continue; // 不标记当日完成：窗口内按既有节奏有界重试
++        }
+         await this._runShopEnablePhase(shopCfg, token, today);
+       }
+     } finally {
+@@ -4627,6 +4750,11 @@ class Monitor {
+       // WD-NEW-1 并发收口：登录接管等单店处理在途时，同店手动验证拒绝（不会设置 _cycleRunning，需单查）
+       return { ok: false, error: '该店已有处理在途（登录接管等），本轮拒绝手动验证', code: 'shop_busy' };
+     }
++    // D24T 跨入口一次一家店：他店处理在途/收口未证明（周期外取得的每店锁）→ 同样拒绝，零动作。
++    const otherBusy = this._otherBusyOrUnprovenShop(shopId);
++    if (otherBusy) {
++      return { ok: false, error: `店 ${otherBusy} 处理在途/真实资源收口未证明（一次一家店，跨店串行），本轮拒绝手动验证`, code: 'shop_busy' };
++    }
+     const today = shanghaiDate(this.nowFn());
+     if (this._enablePhaseDone(shopId, today)) {
+       return { ok: false, error: `该店 ${today} 每日开启已成功（当日去重，不再重复执行）`, code: 'already_done_today', alreadyDone: true };

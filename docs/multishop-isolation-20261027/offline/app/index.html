@@ -1786,12 +1786,14 @@
 
       function projectUserLog(e) {
         var msg = String(e.msg == null ? '' : e.msg);
-        var checkpointFailure = /^候选未通过独立复用\/身份验证：(?:未提供候选专用浏览器工厂（candidateBrowserFactory）：无法独立验证候选（fail-closed，拒绝借用业务浏览器\/上下文，拒绝自启真实浏览器，不写入）|身份复验期间 Cookie 或页面变化：拒绝提交较早快照)（保留现有工作副本，未写入）$/;
+        var checkpointFailure = /^(?:候选未通过独立复用\/身份验证：(?:未提供候选专用浏览器工厂（candidateBrowserFactory）：无法独立验证候选（fail-closed，拒绝借用业务浏览器\/上下文，拒绝自启真实浏览器，不写入）|身份复验期间 Cookie 或页面变化：拒绝提交较早快照)（保留现有工作副本，未写入）|源上下文在独立验证期间已推进 Cookie：不提交过时候选、不回灌、不合并)$/;
         var legacy = /^((?:\[[^\]\r\n]*\]\s*)?)过程：过程事件（([^（）]+)）([\s\S]*)；未识别事件名，按原样透出\s*$/.exec(msg);
         if (!legacy) {
           var failure = /^\[店铺：[^\]\r\n]+\]\s*处理异常（说明：([\s\S]*)）\s*$/.exec(msg);
           return failure && checkpointFailure.test(failure[1]) ? null : msg;
         }
+        var kind = legacy[2];
+        if (['cookie-writeback', 'session-cookie-writeback', 'checkpoint-propagate'].includes(kind)) return null;
         var raw = legacy[3].trim(), parts = [], depth = 0, start = 0;
         for (var i = 0; i < raw.length; i++) {
           if (raw[i] === '（') {
@@ -1804,16 +1806,12 @@
           }
         }
         if (depth) return msg;
-        var kind = legacy[2];
         var details = parts.map(function (part) { return part.replace(/^(?:说明|失败原因)：\s*/, ''); });
-        if (/^(?:cookie-writeback|session-cookie-writeback|checkpoint-propagate)$/.test(kind)
-          && details.length && details.every(function (detail) { return checkpointFailure.test(detail); })) return null;
-        var internal = /^(?:start|poll|cookie-writeback|session-cookie-writeback|checkpoint-propagate|doudian-arrival|chengfang-entry|chengfang-overlay)$/.test(kind);
+        var internal = /^(?:start|poll|doudian-arrival|chengfang-entry|chengfang-overlay)$/.test(kind);
         // Only exact informational patterns are disposable; unfamiliar details may be business failures.
         var telemetry = details.every(function (detail) {
           return !detail || /^第\s*\d+\s*次$/.test(detail)
-            || (kind === 'poll' && /^(?:shop-processing-busy|serial-other-shop-busy)$/.test(detail))
-            || (kind === 'cookie-writeback' && /^候选未通过独立复用\/身份验证：未提供候选专用浏览器工厂（candidateBrowserFactory）[.。…]*$/.test(detail));
+            || (kind === 'poll' && /^(?:shop-processing-busy|serial-other-shop-busy)$/.test(detail));
         });
         if ((e.level || 'info') === 'info' && internal && telemetry) return null;
         var explanation = details.join('；').replace(/unknown-overlay:(\d+)/g, '检测到未识别浮窗（$1 个）');

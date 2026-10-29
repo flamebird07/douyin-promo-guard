@@ -98,6 +98,42 @@ test('normal internal process telemetry is hidden while the raw stream and curso
   assert.equal((await f.logs()).logs.length, 0);
 });
 
+test('INTERNAL process categories suppress every failure form without changing raw events or cursor', async () => {
+  const f = fixture();
+  const samples = [
+    { ok: true, reason: '回写失败' },
+    { failed: true, reason: '内部步骤文案已改变' },
+    { error: '登录凭据保存失败' },
+    { ok: false, reason: '源上下文在独立验证期间已推进 Cookie：不提交过时候选、不回灌、不合并' },
+    { success: false, reason: '读取通道暂时不可用' },
+    { blocked: true },
+    { status: 'read_failed' },
+    { result: 'blocked' },
+    { outcome: 'partial' },
+    { event: 'retry', attempt: 2 },
+    { event: 'readback', confirmed: 0 },
+    ...['info', 'warn', 'warning', 'error', 'fatal'].map((level) => ({ level, reason: '不同的内部诊断' })),
+  ];
+  for (const evtType of ['process', 'future-event-type']) {
+    for (const kind of ['cookie-writeback', 'session-cookie-writeback', 'checkpoint-propagate']) {
+      for (const entry of samples) f.emit({ evtType, kind, shopId: 'shop-a', ...entry });
+    }
+  }
+  const original = JSON.stringify(f.events);
+  const result = await f.logs();
+  assert.equal(result.logs.length, 0);
+  assert.equal(result.consumedEvtSeq, f.events.length);
+  assert.equal(result.droppedCount, 0);
+  assert.equal(JSON.stringify(f.events), original);
+  assert.equal(f.writes.length, 0);
+  assert.equal((await f.logs()).logs.length, 0);
+  f.emit({ evtType: 'error', shopId: 'shop-b', error: '读取失败：Cookie 无效' });
+  const next = await f.logs(result.seq);
+  assert.equal(next.logs.length, 1);
+  assert.match(next.logs[0].msg, /^\[店铺：乙店\].*读取失败：Cookie 无效/);
+  assert.equal(next.consumedEvtSeq, f.events.length);
+});
+
 test('judgements, pause/enable, retries, readback and results remain shop-scoped business logs', async () => {
   const f = fixture();
   f.emit({ evtType: 'judgement', kind: 'judgement', shopId: 'shop-a', cycleNo: 1, costCents: 12000, orders: 50, thresholdCents: 100, over: true, decision: 'should_pause' });
@@ -126,10 +162,17 @@ test('unrecognized real failures survive regardless of event name or success fla
     { event: 'new-event', result: 'blocked' },
     { event: 'new-event', failed: true },
     { event: 'new-event', outcome: 'partial' },
-    { kind: 'session-cookie-writeback', ok: true, reason: '回写失败' },
+    { kind: 'future-business', ok: true, reason: '回写失败' },
     { event: 'new-event', reason: '读取通道暂时不可用' },
     { evtType: 'error', error: '主读取错误' },
     { evtType: 'future-event-type', event: 'new-event', error: '新事件类型的真实错误' },
+    ...['cookie-writeback', 'session-cookie-writeback', 'checkpoint-propagate'].map((kind) => ({
+      evtType: 'error', kind, error: '读取失败：Cookie 无效',
+    })),
+    ...['poll', 'login', 'cookie-writeback-other', 'session-cookie-writeback-other', 'checkpoint-propagate-other'].map((kind) => ({
+      kind, ok: false, reason: '源上下文在独立验证期间已推进 Cookie：不提交过时候选、不回灌、不合并',
+    })),
+    { kind: 'poll', event: 'cookie-writeback', error: '读取失败：Cookie 无效' },
     { kind: 'chengfang-overlay', result: 'blocked', reason: 'unknown-overlay:1' },
   ];
   for (const entry of samples) f.emit({ shopId: 'shop-b', ...entry });
@@ -222,6 +265,37 @@ test('legacy telemetry is hidden only in the user projection; persisted errors a
   assert.equal(f.files.get('memory-log'), original);
   assert.equal(f.writes.length, 0);
   assert.equal(f.drill.logs.length, 2);
+  assert.equal((await f.logs(result.seq)).logs.length, 0);
+});
+
+test('legacy INTERNAL categories are projection-only at every severity and preserve persisted sequence', async () => {
+  const raw = [], visible = [];
+  function append(level, msg, hidden) {
+    raw.push(Object.freeze({ seq: raw.length + 1, t: '2026-10-29T06:00:00Z', level, msg }));
+    if (!hidden) visible.push(raw.length);
+  }
+  for (const level of ['info', 'warn', 'warning', 'error', 'fatal']) {
+    for (const kind of ['cookie-writeback', 'session-cookie-writeback', 'checkpoint-propagate']) {
+      for (const prefix of ['', '[店铺：甲店] ']) {
+        for (const detail of ['', '（说明：回写失败）', '（失败原因：读取失败：Cookie 无效）', '（说明：全新内部文案（详情））']) {
+          append(level, prefix + '过程：过程事件（' + kind + '）' + detail + '；未识别事件名，按原样透出', true);
+        }
+      }
+    }
+    for (const kind of ['poll', 'login', 'chengfang-overlay', 'future-event', 'cookie-writeback-other', 'session-cookie-writeback-other', 'checkpoint-propagate-other']) {
+      append(level, '[店铺：乙店] 过程：过程事件（' + kind + '）（失败原因：读取失败：Cookie 无效）；未识别事件名，按原样透出', false);
+    }
+    append(level, '[店铺：乙店] 失败原因：cookie-writeback 读取失败：Cookie 无效', false);
+  }
+  const f = fixture(raw);
+  const original = f.files.get('memory-log');
+  const result = await f.logs();
+  assert.deepEqual(result.logs.map((e) => e.seq), visible);
+  assert.equal(result.seq, raw.length);
+  assert.equal(f.drill._internal._logs.length, raw.length);
+  assert.equal(f.drill.logs.length, visible.length);
+  assert.equal(f.files.get('memory-log'), original);
+  assert.equal(f.writes.length, 0);
   assert.equal((await f.logs(result.seq)).logs.length, 0);
 });
 

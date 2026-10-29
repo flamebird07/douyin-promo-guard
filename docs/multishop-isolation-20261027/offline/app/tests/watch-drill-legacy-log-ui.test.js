@@ -56,6 +56,7 @@ function fixture() {
 const checkpointSaveReasons = Object.freeze([
   '候选未通过独立复用/身份验证：未提供候选专用浏览器工厂（candidateBrowserFactory）：无法独立验证候选（fail-closed，拒绝借用业务浏览器/上下文，拒绝自启真实浏览器，不写入）（保留现有工作副本，未写入）',
   '候选未通过独立复用/身份验证：身份复验期间 Cookie 或页面变化：拒绝提交较早快照（保留现有工作副本，未写入）',
+  '源上下文在独立验证期间已推进 Cookie：不提交过时候选、不回灌、不合并',
 ]);
 const checkpointKinds = Object.freeze(['cookie-writeback', 'session-cookie-writeback', 'checkpoint-propagate']);
 const checkpointDiagnostics = Object.freeze(['info', 'warn', 'warning', 'error'].flatMap((level) =>
@@ -66,6 +67,16 @@ const checkpointDiagnostics = Object.freeze(['info', 'warn', 'warning', 'error']
     ]),
     Object.freeze({ t: 'fixture-time', level, msg: '[店铺：瑾漂亮潮流服饰] 处理异常（说明：' + reason + '）' }),
   ])));
+const internalCategories = Object.freeze(['info', 'warn', 'warning', 'error', 'fatal'].flatMap((level) =>
+  checkpointKinds.flatMap((kind) => [
+    '',
+    '（说明：回写失败）',
+    '（失败原因：登录凭据保存失败）',
+    '（说明：读取通道暂时不可用）',
+    '（说明：候选未通过独立复用/身份验证：未提供候选专用浏览器工厂（candidateBrowserFactory）；读取失败）',
+    '（说明：新内部诊断（改变的详情））（失败原因：读取失败：Cookie 无效）',
+    '改变的内部文案',
+  ].map((detail) => legacy(kind, detail, level, '[店铺：甲店] ')))));
 const internal = Object.freeze([
   legacy('start', '（第 1 次）'),
   legacy('poll', '（说明：shop-processing-busy）'),
@@ -75,9 +86,10 @@ const internal = Object.freeze([
   legacy('checkpoint-propagate'),
   legacy('doudian-arrival'),
   ...checkpointDiagnostics,
+  ...internalCategories,
 ]);
 
-test('legacy telemetry and full checkpoint-save diagnostics stay hidden without clearing the placeholder or input history', () => {
+test('legacy INTERNAL categories and exact flattened diagnostics stay hidden without clearing the placeholder or input history', () => {
   const f = fixture();
   const before = JSON.stringify(internal);
   for (const entry of internal) assert.equal(f.project(entry), null, entry.msg);
@@ -99,11 +111,11 @@ test('login, reading and overlay failures survive legacy info with complete bala
     [legacy('poll', '（说明：登录失效：需要重新登录）'), '登录失效：需要重新登录'],
     [legacy('poll', '（第 2 次）（失败原因：读取失败（页面异常（详情未就绪）），停止自动操作）', 'info', '[店铺：甲店] '),
       '[店铺：甲店] 第 2 次；读取失败（页面异常（详情未就绪）），停止自动操作'],
-    [legacy('cookie-writeback', '（失败原因：登录凭据保存失败）'), '登录凭据保存失败'],
+    [legacy('login', '（失败原因：登录凭据保存失败）'), '登录凭据保存失败'],
     [legacy('start', '（说明：登录失效）'), '登录失效'],
-    [legacy('checkpoint-propagate', '（说明：读取通道暂时不可用）'), '读取通道暂时不可用'],
+    [legacy('poll', '（说明：读取通道暂时不可用）'), '读取通道暂时不可用'],
     [legacy('poll', '（说明：shop-processing-busy；读取失败）'), 'shop-processing-busy；读取失败'],
-    [legacy('cookie-writeback', '（说明：候选未通过独立复用/身份验证：未提供候选专用浏览器工厂（candidateBrowserFactory）；读取失败）'),
+    [legacy('poll', '（说明：候选未通过独立复用/身份验证：未提供候选专用浏览器工厂（candidateBrowserFactory）；读取失败）'),
       '候选未通过独立复用/身份验证：未提供候选专用浏览器工厂（candidateBrowserFactory）；读取失败'],
   ];
   for (const [entry, expected] of samples) {
@@ -114,7 +126,7 @@ test('login, reading and overlay failures survive legacy info with complete bala
   assert.deepEqual(f.messages(), samples.map(([, expected]) => expected));
 });
 
-test('unknown messages and warning/error levels are never discarded by an internal event name', () => {
+test('unknown and business categories retain warning/error messages', () => {
   const f = fixture();
   for (const level of ['warn', 'warning', 'error']) {
     assert.equal(f.project(legacy('poll', '（说明：shop-processing-busy）', level)), 'shop-processing-busy');
@@ -146,16 +158,12 @@ test('business login/read failures retain full checkpoint vocabulary at every le
         prefix + '处理异常（说明：' + reason + '）；登录失效',
         '读取失败：' + prefix + '处理异常（说明：' + reason + '）',
       ]) samples.push([Object.freeze({ t: 'fixture', level, msg }), msg]);
-      for (const kind of ['poll', ...checkpointKinds, 'future-event']) {
+      for (const kind of ['poll', 'login', 'future-event']) {
         for (const detail of ['登录失效：Cookie 无效；' + reason, '读取失败：' + reason, reason + '；读取失败']) {
           samples.push([legacy(kind, '（说明：' + detail + '）', level, prefix), prefix + detail]);
         }
       }
-      for (const kind of checkpointKinds) {
-        samples.push([legacy(kind, '（说明：' + reason + '）（失败原因：读取失败：Cookie 无效）', level, prefix),
-          prefix + reason + '；读取失败：Cookie 无效']);
-      }
-      for (const kind of ['poll', 'future-event', 'cookie-writeback-other']) {
+      for (const kind of ['poll', 'future-event', 'cookie-writeback-other', 'session-cookie-writeback-other', 'checkpoint-propagate-other']) {
         samples.push([legacy(kind, '（说明：' + reason + '）', level, prefix), prefix + reason]);
       }
       samples.push([legacy('poll', '（说明：' + reason + '；unknown-overlay:1）', level, prefix),
@@ -169,21 +177,31 @@ test('business login/read failures retain full checkpoint vocabulary at every le
   assert.deepEqual(f.messages(), samples.map(([, expected]) => expected));
 });
 
-test('checkpoint-save suppression requires the complete known reason and no-write ending', () => {
+test('flattened checkpoint suppression requires a complete proven reason and exact wrapper', () => {
   const f = fixture();
+  const changedReasons = [
+    ...checkpointSaveReasons.slice(0, 2).flatMap((reason) => [
+      reason.replace('（保留现有工作副本，未写入）', ''),
+      reason.replace('（保留现有工作副本，未写入）', '（保留现有工作副本，已写入）'),
+    ]),
+    '候选未通过独立复用/身份验证：未知错误（保留现有工作副本，未写入）',
+    checkpointSaveReasons[2].replace('、不合并', ''),
+    checkpointSaveReasons[2].replace('不提交过时候选', '提交候选失败'),
+    checkpointSaveReasons[2] + '；读取失败',
+  ];
   for (const level of ['info', 'warn', 'warning', 'error']) {
+    for (const detail of changedReasons) {
+      const msg = '[店铺：甲店] 处理异常（说明：' + detail + '）';
+      assert.equal(f.project(Object.freeze({ level, msg })), msg);
+    }
     for (const reason of checkpointSaveReasons) {
-      for (const detail of [
-        reason.replace('（保留现有工作副本，未写入）', ''),
-        reason.replace('（保留现有工作副本，未写入）', '（保留现有工作副本，已写入）'),
-        '候选未通过独立复用/身份验证：未知错误（保留现有工作副本，未写入）',
-      ]) {
-        for (const kind of checkpointKinds) {
-          assert.equal(f.project(legacy(kind, '（说明：' + detail + '）', level)), detail);
-        }
-        const msg = '[店铺：甲店] 处理异常（说明：' + detail + '）';
-        assert.equal(f.project(Object.freeze({ level, msg })), msg);
-      }
+      for (const msg of [
+        reason,
+        '处理异常（说明：' + reason + '）',
+        '[店铺未标明] 处理异常（说明：' + reason + '）',
+        '[店铺：甲店] 处理异常（失败原因：' + reason + '）',
+        '失败原因：过程：过程事件（cookie-writeback）（说明：' + reason + '）' + fallback,
+      ]) assert.equal(f.project(Object.freeze({ level, msg })), msg);
     }
   }
 });

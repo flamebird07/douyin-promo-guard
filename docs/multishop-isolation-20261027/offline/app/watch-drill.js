@@ -2968,6 +2968,9 @@ function createWatchDrill(opts = {}) {
     stopped: { label: '每日开启任务停止', level: 'warn' },
     window_missed: { label: '每日开启错过窗口', level: 'warn' },
   };
+  function isInternalProcessKind(kind) {
+    return ['cookie-writeback', 'session-cookie-writeback', 'checkpoint-propagate'].includes(kind);
+  }
   function processFailed(p) {
     return p.failed === true || !!p.error || p.ok === false || p.success === false || !!p.blocked
       || ['error', 'warn', 'fatal'].includes(p.level)
@@ -2981,6 +2984,7 @@ function createWatchDrill(opts = {}) {
     return meta ? meta.level : 'info';
   }
   function describeProcess(p) {
+    if (isInternalProcessKind(p.kind)) return null;
     const failed = processFailed(p);
     const ev = p.event || p.kind;
     let meta = p.kind === 'enable-scheduler' ? ENABLE_SCHEDULER_LABEL[p.event] : PROCESS_LABEL[p.event];
@@ -3030,6 +3034,8 @@ function createWatchDrill(opts = {}) {
 
   function userLogs() {
     return drill._logs.filter((e) => {
+      const category = /^(?:\[[^\]\r\n]*\]\s*)?过程：过程事件（([^（）]+)）[\s\S]*；未识别事件名，按原样透出\s*$/.exec(e.msg);
+      if (category && isInternalProcessKind(category[1])) return false;
       if (e.level !== 'info') return true;
       const legacy = /^过程：过程事件（([^）]+)）；未识别事件名，按原样透出$/.exec(e.msg);
       return !legacy || processFailed({ event: legacy[1] });
@@ -3232,7 +3238,8 @@ function createWatchDrill(opts = {}) {
           } else if (isError) {
             pushLog('error', eventShopPrefix(evt) + describeError(evt));
           } else if (processFailed(evt)) {
-            pushLog(processLevel(evt), eventShopPrefix(evt) + describeProcess(evt));
+            const message = describeProcess(evt);
+            if (message) pushLog(processLevel(evt), eventShopPrefix(evt) + message);
           }
           drill._lastEvtSeq = evt.evtSeq;
         }

@@ -1,0 +1,14 @@
+{
+  "name": "promo-watch-d52-d53-offline-regression",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "test": "node --test test/cookie-checkpoint-wiring-d52.test.js test/enable-stop-pause-d53.test.js test/root-phase-guard-probe.test.js"
+  },
+  "dependencies": {
+    "playwright": "^1.62.1"
+  }
+}

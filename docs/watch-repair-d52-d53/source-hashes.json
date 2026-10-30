@@ -1,0 +1,14 @@
+{
+  "src/adapters/qianchuan-reader.js": {
+    "before": "96b542573bc0890e529abc706903b49ad03cd37a4815ce13db60992538c43238",
+    "after": "2ffb22ddd459fa9bc6b4323b08dd211d7429e1ed9be0163519ddcb02c3a0a986"
+  },
+  "src/adapters/chengfang-reader.js": {
+    "before": "0d46dbda06594a80951097525804aa107f58c215c3687a99babee5b9a4353d03",
+    "after": "4e975b0d6900562b5d31eb1ff8ee3aaba86ccdc9c2881b2bb260e3b2a299c514"
+  },
+  "src/engine/monitor.js": {
+    "before": "3d6b3029035cc59eb3b084c84bd8de24598a97b9cc53400dd4eb169515b4f9f0",
+    "after": "e637469a9d0ef4b9a7d1aa291148c9b39f297b60f3d6ffbff2f788431c29e383"
+  }
+}

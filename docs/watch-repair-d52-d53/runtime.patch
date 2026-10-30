@@ -1,0 +1,85 @@
+--- a/src/adapters/qianchuan-reader.js
++++ b/src/adapters/qianchuan-reader.js
+@@ -1016,6 +1016,19 @@
+     // JSON 序列化，不改变既有返回字段；检查点缺失该引用时按原有约定跳过，零写入。
+     Object.defineProperty(cookieSession, 'identityPage', {
+       value: page, enumerable: false, configurable: true, writable: true,
++    });
++    // D52：把本次可信 open 的候选验证能力（候选专用独立浏览器工厂 + 本次全部店铺浏览器
++    // 身份禁止列表）以**非枚举临时引用**挂到本次 cookieSession 上（与 R73 identityPage
++    // 同口径：不进 JSON 序列化、不改变既有返回字段、只随同一会话进入后续 Cookie 检查点）。
++    // 供乘方链路（openChengfangShop）的 manager-ready/错误收尾检查点取得同一能力；缺失
++    // 该引用时检查点维持自身 fail-closed（绝不借用业务浏览器/上下文，绝不自启真实浏览器）。
++    // 工厂闭包绑定本次 open 的取消门与 shopBrowserIdentities，不跨店/跨 open 串用。
++    Object.defineProperty(cookieSession, 'candidateVerifyCapability', {
++      value: {
++        candidateBrowserFactory,
++        forbiddenBrowsers: () => shopBrowserIdentities.slice(),
++      },
++      enumerable: false, configurable: true, writable: true,
+     });
+     const cookieCheckpoint = { saved: false, skipped: true, reason: '检查点延迟到关闭前：不在首次业务读取前创建并行验证会话' };
+     // R87 关闭前收尾检查点登记：把同一检查点实现登记到以本次 owned browser 为键的 WeakMap，
+--- a/src/adapters/chengfang-reader.js
++++ b/src/adapters/chengfang-reader.js
+@@ -2410,6 +2410,22 @@
+     pageUrl: url.origin + url.pathname, accountIdOptional: false };
+ }
+ 
++/**
++ * D52：从本次可信 open（openQianchuanHome）附着在 cookieSession 上的非枚举临时引用
++ * （candidateVerifyCapability）取出 manager-ready/错误收尾 Cookie 检查点所需的候选验证
++ * 能力。只有候选专用工厂与禁止列表**同时**可得才透传（fail-closed：任一缺失保持原样
++ * 不传，由检查点自身拒绝——绝不借用业务浏览器/上下文，绝不自启真实浏览器）；禁止列表
++ * 在调用时刻取新鲜快照。能力只随本次 cookieSession 存在，不序列化、不跨店/跨 open 串用。
++ */
++function chengfangCheckpointVerifyArgs(cookieSession) {
++  const cap = cookieSession && cookieSession.candidateVerifyCapability;
++  return (cap
++    && typeof cap.candidateBrowserFactory === 'function'
++    && typeof cap.forbiddenBrowsers === 'function')
++    ? { candidateBrowserFactory: cap.candidateBrowserFactory, forbiddenBrowsers: cap.forbiddenBrowsers() }
++    : {};
++}
++
+ async function openChengfangShop(p) {
+   const audit = typeof p.audit === 'function' ? p.audit : () => {};
+   if (hasChengfangManualReview(p.shopCfg)) {
+@@ -2664,7 +2680,10 @@
+     let cookieCheckpoint;
+     try {
+       const runCheckpoint = p.sessionCheckpoint || checkpointQianchuanSessionCookies;
+-      cookieCheckpoint = await runCheckpoint({ context, cookieSession, target, shopCfg: p.shopCfg, audit: p.audit });
++      // D52：本次会话来自可信 openHome——把附着在 cookieSession 上的候选验证能力接到
++      // manager-ready 检查点（缺能力时检查点自身 fail-closed，行为与旧版一致）。
++      cookieCheckpoint = await runCheckpoint({ context, cookieSession, target, shopCfg: p.shopCfg, audit: p.audit,
++        ...chengfangCheckpointVerifyArgs(cookieSession) });
+     } catch (e) {
+       cookieCheckpoint = { saved: false, skipped: true, reason: `会话检查点异常（不影响本次打开结果）: ${(e && e.message) || e}` };
+     }
+@@ -2682,10 +2701,12 @@
+     });
+     // R58 失败路径检查点：关闭浏览器前再尝试一次——仅当当前时刻地址/身份仍是
+     // 新鲜的同账户千川正证据才会写（登录页/foreign/身份缺失由检查点自身跳过）。
++    // D52：同样接上本次可信 open 的候选验证能力（同 manager-ready 口径，fail-closed）。
+     // 结果只丢弃不传播：原始错误原样抛出，绝不掩盖或改写。
+     try {
+       await (p.sessionCheckpoint || checkpointQianchuanSessionCookies)({
+         context, cookieSession, target, shopCfg: p.shopCfg, audit: p.audit,
++        ...chengfangCheckpointVerifyArgs(cookieSession),
+       });
+     } catch (_) { /* 检查点失败不得影响原始错误的如实传播 */ }
+     // 关闭仍走 closeBrowser（保留其 Cookie 收尾语义）；它吞掉 browser.close 的拒绝，
+--- a/src/engine/monitor.js
++++ b/src/engine/monitor.js
+@@ -4395,7 +4395,9 @@
+       // （客户：未知/失败/未确认动作必须先核验，不能通过费比路径绕过首查安全门禁）；
+       // 首查已完成（success）则直接放行费比暂停（不再等 dailyStartHour）。
+       // 调度器未启用时（如纯费比测试）保留旧 dailyStartHour 门禁。
+-      const enableWindowCfg = this._enableSchedulerConfigured();
++      // D53（2026-10-30）：门禁以**实际生效**的调度器判定为准（enableSchedulerShouldRun）——
++      // 独立停用每日开启只停开启任务，绝不连带停费比暂停巡查；停用后走原 dailyStartHour 门禁。
++      const enableWindowCfg = this.enableSchedulerShouldRun();
+       const todayDate = shanghaiDate(this.nowFn());
+       if (data.evaluation.pauseEligible === true) {
+         if (enableWindowCfg && !this._enablePhaseDone(shopCfg.id, todayDate)) {

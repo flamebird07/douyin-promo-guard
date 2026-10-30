@@ -1,8 +1,8 @@
 {
-  "README.md": "e13d6b93554577a05bfefbf207866d3d061ab5911f8eeea6312cd36486f63a63",
+  "README.md": "11d0e169f092f77a94f092f6ff015c6157007a13d6ad945323ab2693c969f0c5",
   "runtime.patch": "94eef26cf4a6c335fa14e8e9c0f6da134ad4bd14ff3044ed6b671210d429ee56",
   "source-hashes.json": "90cf5ada2903332728794095941321e8e96e458f9c4a9a991170bd12c6dd6973",
-  "validation.json": "6d6614da09713c9f6dcde3d33e988fa34fb403c2fa181b1474dd975ac508ab16",
+  "validation.json": "8fee9c6d251f22c6d7dcd48e47ad9998ac934139cdf24d9c67969e97205b4a8d",
   "offline/bill-manager/analyzer-cookie-workcopy.js": "40692112296096fc37d23cca55d7497dafe9d29b10c2d4c2812d2c561437aa38",
   "offline/bill-manager/cookie-vault.js": "02a77f39c15bdb4b37d6dbcb4e9175744117d50af30fac7fe2876c3ce1651649",
   "offline/bill-manager/login-cookie-copies.js": "6f990dc041c8f8397c5150276bea8d689dede69b93bba3339cd78f11c4d2b091",

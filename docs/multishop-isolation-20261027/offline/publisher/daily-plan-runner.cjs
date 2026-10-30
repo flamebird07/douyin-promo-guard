@@ -178,6 +178,30 @@ const R13_EXPLICIT_NP_EXCEPTION_REASON = 'scheduled-run-exception:numeric-leaf-s
 // unknown reason（含 management-identity-hydrate-failed）都不进入本支路、仍走既有严格拒绝。
 const R16_READBACK_CONVERGENCE_REASON = 'management-identity-hydrate-timeout';
 
+// D51：唯一被允许进入「前日零发布槽位」窄恢复支路的精确 unknown reason（主脑 2026-10-30 实录：
+// 当日首份 runPlan 以 blocked/read-only-recovery-required 终态返回、entries 恰 1 条且从未进入
+// 当日发布；publisher state 仍停在前一日 P 的可信耐久准备收口）。整串逐字比对；其它任何
+// unknown reason 不进入本支路，仍走既有 canonical F1 / R16 等严格拒绝，绝不放宽 no-replay。
+const D51_ZERO_RELEASE_REASON = 'read-only-recovery-required';
+// 本支路写入条目的「明确未发布恢复来源」标记与既有来源命名同风格；重复调用按此标记幂等 no-op。
+const D51_ZERO_RELEASE_RECOVERED_BY = 'prior-day-zero-release-recovery';
+// 可信前日耐久收口的唯一 source（原 recoverLocalPreparationClose 导出生成）；其它收口来源
+// （显式 NP、值守等）不进入本支路。
+const D51_TRUSTED_CLOSE_SOURCE = 'local-preparation-recovery';
+
+// Asia/Shanghai 民事日（固定 +08:00，无夏令时）：ISO 时刻 → 'YYYY-MM-DD'；非法/缺失 → null。
+function shanghaiDateOfIso(iso) {
+  const ms = Date.parse(String(iso == null ? '' : iso));
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+// 民事日锚点整日加减（UTC 锚 + 整 24h，无时区/夏令时漂移）：'YYYY-MM-DD' → 前一日；非法 → null。
+function shanghaiPrevDate(date) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || ''))) return null;
+  return new Date(Date.parse(String(date) + 'T00:00:00Z') - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
 function sha256Hex(text) {
   return crypto.createHash('sha256').update(String(text == null ? '' : text)).digest('hex');
 }
@@ -1301,6 +1325,345 @@ function createDailyRunner(o = {}) {
         };
       } finally {
         try { if (typeof schedulerModule.releaseProcessLock === 'function') schedulerModule.releaseProcessLock(rbLockFile, rbLock.token); } catch (_) { /* 释放失败交陈旧锁回收 */ }
+      }
+    }
+
+    // ── 形状 2c（D51）：前日可信准备收口后，当日首份零发布槽位的窄恢复 ──────────────
+    // 精确形状（主脑 2026-10-30 实录）：当前日 D 账本本店恰 1 条 entry、status unknown、
+    // reason 逐字 read-only-recovery-required、at 为 D 当日合法 ISO、无 startedAt/runId/
+    // CID/frozen/nonce（原生 blocked 结果 schema，绝不凭空补造原 run）；publisher state 仍为
+    // 前一日 P（恰为 D 的上海日历前一天），active = preparation-stopped 且与唯一六零耐久收口
+    // 事实逐字对应（原 recoverLocalPreparationClose 生成，source 逐字 local-preparation-recovery，
+    // 并用既有 reproveDurablePreparationStoppedClose 只读重证复核）；attempts 全部行都是严格
+    // 早于 D 的历史终态（缺日期/当前或未来/非终态/身份冲突一律拒绝；可选 reopen/final 表缺失
+    // 按原生 writer「从未使用」理解，显式畸形仍拒绝）；published/identity/seed 全部早于 D 且
+    // 身份一致。全部成立才在排程锁内把该条标为明确未发布恢复来源（附前日事实/源 hash 证据，
+    // 普通 tick 覆盖条目后仍可由 rec.retryHistory 追溯），rec.plans 按真实 success 计数、记录
+    // 回 pending 并清旧 error/partial，使原 scheduler 只开始当前第 1 份。绝不按 count==0 或
+    // rec.plans==0 放行普遍 unknown、绝不重放初始/最终发布、绝不把前日 run/CID 改装成当前日
+    // 原 run、publisher 三面（state/attempts/published）字节与 mtime 零改动。真实新 tick 进入
+    // 当日 prepared/published 后条目被覆盖，本支路按形状不再适用；D49 后续路由/F1/R16 全保留。
+    const zeroReleaseKeys = Object.keys((rec0 && rec0.entries) || {}).filter((k) => {
+      const e = rec0.entries[k];
+      return !!e && e.status === 'unknown' && String(e.reason || '') === D51_ZERO_RELEASE_REASON;
+    });
+    if (zeroReleaseKeys.length === 1 && Object.keys((rec0 && rec0.entries) || {}).length === 1) {
+      const zeroKey = zeroReleaseKeys[0];
+      const entry0 = rec0.entries[zeroKey];
+      const zeroPlanNo = Number(entry0.planNumber != null ? entry0.planNumber : zeroKey);
+      const refuse = (reason) => fail('recovery-zero-release-' + reason);
+      // 严格幂等（D51 R6）：带本来源标记的条目只有在**完整自洽**时才只读 no-op——记录必须恰为
+      // 本支路写出形状（pending、plans=0、error 清空、无任何工件/在途），条目必须保留精确
+      // unknown+reason、recoveredAt/priorDayClosure/retryHistory 证明逐字自洽，且当前 publisher
+      // 源字节哈希与恢复时记录的 sourceHash 逐字相等（源已改为当日新消费/发布或任何漂移一律
+      // 诚实拒绝，绝不盲报 already recovered）。no-op 零写账本、零改 mtime；能力不可用同样拒绝。
+      if (entry0.recoveredBy === D51_ZERO_RELEASE_RECOVERED_BY) {
+        if (String(rec0.status) !== 'pending') return refuse('idempotent-record-status:' + String(rec0.status));
+        if (rec0.error != null && String(rec0.error) !== '') return refuse('idempotent-record-error-present');
+        if (typeof schedulerModule.countSuccessEntries !== 'function') return refuse('idempotent-capability-unavailable');
+        if (Number(rec0.plans) !== 0 || schedulerModule.countSuccessEntries(rec0) !== 0) return refuse('idempotent-record-plans-not-zero');
+        if (rec0.frozen != null || rec0.nonce != null || rec0.confirmationId != null) return refuse('idempotent-record-artifacts-present');
+        if (typeof schedulerModule.hasInProgress === 'function' && schedulerModule.hasInProgress(rec0)) return refuse('idempotent-in-progress-present');
+        if (zeroKey !== String(zeroPlanNo) || !Number.isInteger(zeroPlanNo) || zeroPlanNo !== 1) return refuse('idempotent-entry-slot-mismatch');
+        if (shanghaiDateOfIso(entry0.at) !== String(businessDate)) return refuse('idempotent-entry-at-not-request-day');
+        for (const k of ['startedAt', 'runId', 'confirmationId', 'planId', 'manifestHash', 'nonce']) {
+          if (entry0[k] != null) return refuse('idempotent-entry-artifacts-present:' + k);
+        }
+        if (entry0.frozen) return refuse('idempotent-entry-artifacts-present:frozen');
+        if (entry0.shop != null && String(entry0.shop) !== String(shop.name)) return refuse('idempotent-identity-conflict');
+        if (typeof entry0.recoveredAt !== 'string' || !Number.isFinite(Date.parse(entry0.recoveredAt))) return refuse('idempotent-recovered-at-invalid');
+        const idempPriorDay = shanghaiPrevDate(businessDate);
+        if (idempPriorDay == null) return refuse('request-date-invalid');
+        const pc = entry0.priorDayClosure;
+        if (!pc || typeof pc !== 'object' || Array.isArray(pc)) return refuse('idempotent-prior-proof-missing');
+        if (String(pc.businessDate || '') !== idempPriorDay) return refuse('idempotent-prior-date-mismatch');
+        const pcRun = String(pc.runId || '');
+        const pcOrigin = SCHEDULED_RUN_ORIGIN_RE.exec(pcRun);
+        if (!pcOrigin || pcOrigin[1] !== idempPriorDay) return refuse('idempotent-prior-run-origin-invalid');
+        if (typeof pc.closedAt !== 'string' || !Number.isFinite(Date.parse(pc.closedAt))) return refuse('idempotent-prior-closed-at-invalid');
+        if (!/^[0-9a-f]{64}$/.test(String(pc.sourceHash || ''))) return refuse('idempotent-prior-source-hash-invalid');
+        const idempEvents = Array.isArray(rec0.retryHistory) ? rec0.retryHistory : [];
+        const idempEvent = idempEvents[idempEvents.length - 1];
+        if (!idempEvent || !idempEvent.proof || String(idempEvent.proof.method || '') !== D51_ZERO_RELEASE_RECOVERED_BY
+          || String(idempEvent.proof.priorBusinessDate || '') !== idempPriorDay
+          || String(idempEvent.proof.priorRunId || '') !== pcRun
+          || String(idempEvent.proof.sourceHash || '') !== String(pc.sourceHash)) return refuse('idempotent-retry-history-inconsistent');
+        if (typeof deps.resolvePublisherPaths !== 'function' || typeof deps.currentSourceHash !== 'function') return refuse('idempotent-capability-unavailable');
+        let idempRes = null;
+        try { idempRes = deps.resolvePublisherPaths(shopLike, stateRoot || undefined); }
+        catch (e) { return refuse('idempotent-path-resolution-threw:' + ((e && e.message) || e)); }
+        if (!idempRes || idempRes.ok !== true || !idempRes.paths
+          || !idempRes.paths.stateFile || !idempRes.paths.attemptsFile || !idempRes.paths.publishedFile) {
+          return refuse('idempotent-state-paths-unavailable');
+        }
+        const idempAccount = cfgAccount !== null ? cfgAccount
+          : (idempRes.accountId != null && String(idempRes.accountId) !== '' ? String(idempRes.accountId) : null);
+        if (!/^\d{6,24}$/.test(String(idempAccount || ''))) return refuse('idempotent-account-identity-unavailable');
+        if (cfgAccount !== null && String(idempAccount) !== String(cfgAccount)) return refuse('idempotent-account-conflict');
+        let idempHash = null;
+        try {
+          idempHash = deps.currentSourceHash(idempRes.paths.stateFile, idempRes.paths.attemptsFile,
+            Array.isArray(idempRes.sourceExtraFiles) ? idempRes.sourceExtraFiles.slice() : []);
+        } catch (_) { idempHash = null; }
+        if (typeof idempHash !== 'string' || idempHash !== String(pc.sourceHash)) return refuse('idempotent-source-drift');
+        return { ok: true, released: false, idempotent: true, planNumber: zeroPlanNo, reason: 'already-recovered-pending' };
+      }
+      // 记录形状：unknown + 精确 error 组合、计数与真实 success 一致、无任何发布工件/在途。
+      if (String(rec0.status) !== 'unknown') return refuse('record-status-not-unknown:' + String(rec0.status));
+      if (String(rec0.error == null ? '' : rec0.error) !== 'unknown:' + D51_ZERO_RELEASE_REASON) {
+        return refuse('record-error-not-exact:' + String(rec0.error == null ? '' : rec0.error));
+      }
+      if (rec0.plans !== schedulerModule.countSuccessEntries(rec0)) return refuse('record-plans-count-mismatch');
+      if (rec0.frozen != null || rec0.nonce != null || rec0.confirmationId != null) return refuse('record-artifacts-present');
+      if (typeof schedulerModule.hasInProgress === 'function' && schedulerModule.hasInProgress(rec0)) return refuse('in-progress-present');
+      // 条目形状：键/份号一致且恰为当日第 1 份槽位；at 合法且按 Asia/Shanghai 属于请求日；
+      // 原生 blocked schema 不携带 startedAt/runId 等字段 —— 出现即拒绝（绝不补造原 run）。
+      if (zeroKey !== String(zeroPlanNo)) return refuse('entry-key-plan-mismatch');
+      if (!Number.isInteger(zeroPlanNo) || zeroPlanNo !== 1) return refuse('entry-not-first-slot:' + zeroPlanNo);
+      if (shanghaiDateOfIso(entry0.at) !== String(businessDate)) return refuse('entry-at-not-request-day');
+      for (const k of ['startedAt', 'runId', 'confirmationId', 'planId', 'manifestHash', 'nonce']) {
+        if (entry0[k] != null) return refuse('entry-artifacts-present:' + k);
+      }
+      if (entry0.frozen) return refuse('entry-artifacts-present:frozen');
+      if (entry0.shop != null && String(entry0.shop) !== String(shop.name)) return refuse('identity-conflict');
+      // 能力：路径派生 + 只读重证 + 源 CAS + 排程锁/账本（缺任一诚实拒绝，绝不伪造）。
+      if (typeof deps.resolvePublisherPaths !== 'function' || typeof deps.reproveDurablePreparationStopped !== 'function'
+        || typeof deps.currentSourceHash !== 'function'
+        || typeof schedulerModule.acquireProcessLock !== 'function' || typeof schedulerModule.releaseProcessLock !== 'function'
+        || typeof schedulerModule.saveLedger !== 'function' || typeof schedulerModule.countSuccessEntries !== 'function') {
+        return refuse('capability-unavailable');
+      }
+      let pathsRes = null;
+      try { pathsRes = deps.resolvePublisherPaths(shopLike, stateRoot || undefined); }
+      catch (e) { return refuse('path-resolution-threw:' + ((e && e.message) || e)); }
+      if (!pathsRes || pathsRes.ok !== true || !pathsRes.paths
+        || !pathsRes.paths.stateFile || !pathsRes.paths.attemptsFile || !pathsRes.paths.publishedFile) {
+        return refuse('state-paths-unavailable:' + ((pathsRes && pathsRes.reason) || 'unknown'));
+      }
+      // 账号绑定：配置账号优先；未配置时只接受 publisher 自身可证明 identity，空值绝不放行。
+      const zeroAccount = cfgAccount !== null ? cfgAccount
+        : (pathsRes.accountId != null && String(pathsRes.accountId) !== '' ? String(pathsRes.accountId) : null);
+      if (!/^\d{6,24}$/.test(String(zeroAccount || ''))) return refuse('account-identity-unavailable');
+      if (cfgAccount !== null && String(zeroAccount) !== String(cfgAccount)) return refuse('account-conflict');
+      const zeroPaths = pathsRes.paths;
+      // P 必须恰为请求日的上海日历前一天，且与 state.businessDate 逐字一致。
+      const priorDay = shanghaiPrevDate(businessDate);
+      if (priorDay == null) return refuse('request-date-invalid');
+      // D51 R6：源字节 CAS 基线必须在**读取任何待证明面之前**取得——state + attempts +
+      // published/identity/seed（含缺文件 absent sentinel）全部锁定到同一基线；此后所有解析
+      // 验证与旧日重证都绑定该基线，任何读后/重证间/锁内漂移都会令后续逐字比对失败而零写拒绝。
+      const zeroExtras = Array.isArray(pathsRes.sourceExtraFiles) ? pathsRes.sourceExtraFiles.slice() : [];
+      const zeroCas = () => {
+        try { return deps.currentSourceHash(zeroPaths.stateFile, zeroPaths.attemptsFile, zeroExtras); }
+        catch (_) { return null; }
+      };
+      const zeroHash = zeroCas();
+      if (!/^[0-9a-f]{64}$/.test(String(zeroHash || ''))) return refuse('source-unreadable');
+      let stateRaw = null;
+      try { stateRaw = JSON.parse(fs.readFileSync(zeroPaths.stateFile, 'utf8')); }
+      catch (e) { return refuse('state-unreadable:' + ((e && e.message) || e)); }
+      if (!stateRaw || typeof stateRaw !== 'object' || Array.isArray(stateRaw)) return refuse('state-malformed');
+      if (String(stateRaw.businessDate || '') !== priorDay) {
+        return refuse('state-date-not-prior-day:' + String(stateRaw.businessDate || ''));
+      }
+      const zeroAgrees = (r) => !!r && typeof r === 'object' && !Array.isArray(r)
+        && (r.shop == null || String(r.shop) === String(shop.name))
+        && (r.accountId == null || String(r.accountId) === String(zeroAccount))
+        && (r.account_id == null || String(r.account_id) === String(zeroAccount));
+      if (!zeroAgrees(stateRaw) || !zeroAgrees(entry0)) return refuse('identity-conflict');
+      if (stateRaw.unknown === true || stateRaw.pending === true) return refuse('state-unresolved-flag-present');
+      // 旧 active：preparation-stopped、排程 origin 内嵌 P、与 state.runId 同源、trusted 收口来源、
+      // 无任何发布工件。
+      const active = stateRaw.active;
+      if (!active || typeof active !== 'object' || Array.isArray(active)) return refuse('state-active-missing');
+      if (String(active.status || '') !== 'preparation-stopped') {
+        return refuse('state-active-not-preparation-stopped:' + String(active.status || ''));
+      }
+      const priorRunId = String(active.runId || '');
+      const priorOrigin = SCHEDULED_RUN_ORIGIN_RE.exec(priorRunId);
+      if (!priorOrigin || priorOrigin[1] !== priorDay) return refuse('state-active-run-origin-invalid');
+      const activePlan = Number(active.planNumber);
+      if (!Number.isInteger(activePlan) || activePlan < 1 || activePlan > 10) return refuse('state-active-plan-invalid');
+      if (String(active.businessDate || '') !== priorDay) return refuse('state-active-date-mismatch');
+      if (String(active.originalPhase || '') !== 'preparing') return refuse('state-active-phase-mismatch');
+      if (stateRaw.runId != null && String(stateRaw.runId) !== priorRunId) return refuse('state-run-conflict');
+      for (const k of ['frozen', 'confirmationId', 'manifestHash', 'planId', 'nonce']) {
+        if (active[k] != null) return refuse('state-active-artifacts-present:' + k);
+      }
+      if (typeof active.reason !== 'string' || active.reason.trim() === '' || active.reason.length > 1024) return refuse('state-active-reason-invalid');
+      if (typeof active.closedAt !== 'string' || !Number.isFinite(Date.parse(active.closedAt))) return refuse('state-active-closed-at-invalid');
+      if (String(active.source || '') !== D51_TRUSTED_CLOSE_SOURCE) {
+        return refuse('state-active-source-not-trusted-close:' + String(active.source || ''));
+      }
+      // 旧日成功记录：全部 success、份号唯一合法、恰为旧 active 份号的前缀；身份一致。
+      if (!Array.isArray(stateRaw.plans)) return refuse('state-plans-unreadable');
+      const seenPriorPlans = new Set();
+      for (const p of stateRaw.plans) {
+        if (!p || typeof p !== 'object' || Array.isArray(p)) return refuse('state-plan-malformed');
+        const n = Number(p.planNumber);
+        if (!Number.isInteger(n) || n < 1 || n > 10 || seenPriorPlans.has(n)) return refuse('state-plan-number-invalid');
+        seenPriorPlans.add(n);
+        if (String(p.status || '') !== 'success') return refuse('state-plan-not-success:' + n);
+        if (!zeroAgrees(p)) return refuse('state-plan-identity-conflict');
+      }
+      if (seenPriorPlans.size !== activePlan - 1 || seenPriorPlans.has(activePlan)) return refuse('state-plans-not-active-prefix');
+      // 当前/未来 state 消费、手动事实一律拒绝（两数组必须真实存在且为空）。
+      if (!Array.isArray(stateRaw.confirmationConsumptions) || stateRaw.confirmationConsumptions.length !== 0) {
+        return refuse('state-confirmation-consumptions-present');
+      }
+      if (!Array.isArray(stateRaw.manualUiPublicationFacts) || stateRaw.manualUiPublicationFacts.length !== 0) {
+        return refuse('state-manual-facts-present');
+      }
+      // attempts：consumed 必填对象；finalConsumed/reopenConsumed 为原生可选表（缺失 = 从未
+      // 使用；显式非对象仍拒绝）。任何行缺日期 / 日期 >= 请求日 / 非终态 / 身份冲突一律拒绝；
+      // 历史终态（success/failed）原样保留 —— 绝不要求历史全 success，也绝不要求 reopen 全空。
+      let attemptsRaw = null;
+      try { attemptsRaw = JSON.parse(fs.readFileSync(zeroPaths.attemptsFile, 'utf8')); }
+      catch (e) { return refuse('attempts-unreadable:' + ((e && e.message) || e)); }
+      if (!attemptsRaw || typeof attemptsRaw !== 'object' || Array.isArray(attemptsRaw)) return refuse('attempts-malformed');
+      if (!attemptsRaw.consumed || typeof attemptsRaw.consumed !== 'object' || Array.isArray(attemptsRaw.consumed)) {
+        return refuse('attempts-consumed-malformed');
+      }
+      const zeroTables = {
+        consumed: attemptsRaw.consumed,
+        finalConsumed: attemptsRaw.finalConsumed === undefined ? {} : attemptsRaw.finalConsumed,
+        reopenConsumed: attemptsRaw.reopenConsumed === undefined ? {} : attemptsRaw.reopenConsumed,
+      };
+      for (const name of ['finalConsumed', 'reopenConsumed']) {
+        if (!zeroTables[name] || typeof zeroTables[name] !== 'object' || Array.isArray(zeroTables[name])) {
+          return refuse('attempts-' + name + '-malformed');
+        }
+      }
+      for (const [tableName, table] of Object.entries(zeroTables)) {
+        for (const [cid, row] of Object.entries(table)) {
+          if (!row || typeof row !== 'object' || Array.isArray(row)) return refuse('attempts-row-malformed:' + tableName);
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(String(row.businessDate || '')) || String(row.businessDate) >= String(businessDate)) {
+            return refuse('consumption-scope-current-future-or-missing:' + tableName);
+          }
+          if (row.status !== 'success' && row.status !== 'failed') return refuse('consumption-non-terminal:' + tableName);
+          if (!zeroAgrees(row)) return refuse('consumption-identity-conflict:' + tableName + ':' + cid);
+          if (row.runId != null && (typeof row.runId !== 'string' || row.runId === '')) return refuse('consumption-run-id-invalid:' + tableName);
+        }
+      }
+      // 独立发布面：所有 plan 必须携带合法日期且严格早于请求日（缺日期/非法日期 = 无法归因，
+      // 绝不当历史）；当前日计划 = 已有当日发布 → 拒绝。历史 seed 商品集/计划日期只按账户
+      // 身份验证并纳入 CAS，绝不当作当日计划映射。
+      let publishedRaw = null;
+      try { publishedRaw = JSON.parse(fs.readFileSync(zeroPaths.publishedFile, 'utf8')); }
+      catch (e) { return refuse('published-unreadable:' + ((e && e.message) || e)); }
+      if (!publishedRaw || typeof publishedRaw !== 'object' || Array.isArray(publishedRaw)) return refuse('published-malformed');
+      if (!Array.isArray(publishedRaw.publishedIds)) return refuse('published-ids-malformed');
+      if (!publishedRaw.publishedIds.every((id) => typeof id === 'string' && id !== '')) return refuse('published-ids-malformed');
+      if (new Set(publishedRaw.publishedIds).size !== publishedRaw.publishedIds.length) return refuse('published-ids-duplicate');
+      if (!Array.isArray(publishedRaw.plans)) return refuse('published-plans-malformed');
+      for (const p of publishedRaw.plans) {
+        if (!p || typeof p !== 'object' || Array.isArray(p)) return refuse('published-plan-malformed');
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(String(p.date || '')) || String(p.date) >= String(businessDate)) {
+          return refuse('published-plan-date-current-future-or-missing');
+        }
+        if (p.businessDate != null && String(p.businessDate) !== String(p.date)) return refuse('published-plan-date-conflict');
+        if (!zeroAgrees(p)) return refuse('published-plan-identity-conflict');
+        if (p.planId != null && !/^\d{12,20}$/.test(String(p.planId))) return refuse('published-plan-id-invalid');
+      }
+      // identity / seed：按账户身份验证（携带字段必须与解析身份一致；schema 显式畸形拒绝）。
+      // legacy 默认根没有 shop-identity.json（身份=冻结 profile），文件缺失合法；own 店的
+      // identity 文件在路径派生时已强制存在，缺失会先在解析处拒绝，字节漂移由 CAS 兜底。
+      const zeroDocAgrees = (doc) => !!doc && typeof doc === 'object' && !Array.isArray(doc)
+        && (doc.shop == null || String(doc.shop) === String(shop.name))
+        && (doc.accountId == null || String(doc.accountId) === String(zeroAccount))
+        && (doc.account_id == null || String(doc.account_id) === String(zeroAccount));
+      if (pathsRes.identityFile && fs.existsSync(pathsRes.identityFile)) {
+        let identityDoc = null;
+        try { identityDoc = JSON.parse(fs.readFileSync(pathsRes.identityFile, 'utf8')); }
+        catch (e) { return refuse('identity-unreadable:' + ((e && e.message) || e)); }
+        if (!zeroDocAgrees(identityDoc)) return refuse('identity-file-conflict');
+      }
+      if (zeroPaths.seedFile && fs.existsSync(zeroPaths.seedFile)) {
+        let seedDoc = null;
+        try { seedDoc = JSON.parse(fs.readFileSync(zeroPaths.seedFile, 'utf8')); }
+        catch (e) { return refuse('seed-unreadable:' + ((e && e.message) || e)); }
+        if (!zeroDocAgrees(seedDoc)) return refuse('seed-identity-conflict');
+        if (seedDoc.productIds != null) {
+          if (!Array.isArray(seedDoc.productIds) || new Set(seedDoc.productIds).size !== seedDoc.productIds.length
+            || seedDoc.productIds.some((id) => typeof id !== 'string' || !/^\d{15,20}$/.test(id))) {
+            return refuse('seed-products-invalid');
+          }
+          if (seedDoc.productIds.length && String(seedDoc.accountId == null ? '' : seedDoc.accountId) !== String(zeroAccount)) {
+            return refuse('seed-account-conflict');
+          }
+        }
+        if (seedDoc.plans != null && (!Array.isArray(seedDoc.plans) || seedDoc.plans.some((p) => !p || typeof p !== 'object' || Array.isArray(p)
+          || !/^\d{12,20}$/.test(String(p.planId || ''))
+          || (p.date != null && !/^\d{4}-\d{2}-\d{2}$/.test(String(p.date)))))) {
+          return refuse('seed-plans-invalid');
+        }
+        if (seedDoc.capturedAt != null && !Number.isFinite(Date.parse(String(seedDoc.capturedAt)))) return refuse('seed-captured-at-invalid');
+      }
+      // publisher 真实互斥锁忙 → 不抢、不杀、不等待假释放，诚实拒绝。
+      if (fs.existsSync(zeroPaths.lockFile) || fs.existsSync(zeroPaths.lockFile + '.recovery')) return refuse('publisher-lock-busy');
+      // 旧 active 精确对应唯一可信已收口事实：用既有只读重证能力按**前日 P** 复核（它内部
+      // 校验唯一事实 + writer-schema attempts + 新鲜零消费/独立发布面 + 源字节 CAS）。
+      const reproof = await deps.reproveDurablePreparationStopped(shopLike, priorDay, { ...stateOverride, planNumber: activePlan });
+      if (!reproof || reproof.ok !== true || reproof.status !== 'preparationClosed' || !reproof.preparationClosure) {
+        return refuse('prior-day-closure-reprove-refused:' + ((reproof && (reproof.status + ':' + reproof.reason)) || 'unknown'));
+      }
+      const zeroFact = reproof.preparationClosure;
+      if (reproof.sourceStateFile != null && String(reproof.sourceStateFile) !== String(zeroPaths.stateFile)) return refuse('prior-day-reproof-path-mismatch');
+      if (reproof.sourceAttemptsFile != null && String(reproof.sourceAttemptsFile) !== String(zeroPaths.attemptsFile)) return refuse('prior-day-reproof-attempts-path-mismatch');
+      const rpExtras = Array.isArray(reproof.sourceExtraFiles) ? reproof.sourceExtraFiles : [];
+      if (rpExtras.length !== zeroExtras.length || rpExtras.some((x, i) => String(x) !== String(zeroExtras[i]))) return refuse('prior-day-reproof-extra-surfaces-mismatch');
+      // 重证必须绑定**同一 CAS 基线**：旧日重证只证明旧日关闭，不检查全当前日无消费；
+      // 若重证读到的源字节与基线不同（重证间任何面漂移），零写拒绝。
+      if (typeof reproof.sourceHash !== 'string' || reproof.sourceHash !== String(zeroHash)) return refuse('prior-day-reproof-source-hash-mismatch');
+      if (String(zeroFact.runId || '') !== priorRunId || Number(zeroFact.planNumber) !== activePlan
+        || String(zeroFact.businessDate || '') !== priorDay) return refuse('prior-day-fact-binding-mismatch');
+      if (String(zeroFact.shop || '') !== String(shop.name) || String(zeroFact.accountId || '') !== String(zeroAccount)) return refuse('prior-day-fact-identity-mismatch');
+      if (String(zeroFact.phase || '') !== String(active.originalPhase || '')) return refuse('prior-day-fact-phase-mismatch');
+      if (String(zeroFact.reason || '') !== String(active.reason)) return refuse('prior-day-fact-reason-mismatch');
+      if (String(zeroFact.source || '') !== String(active.source)) return refuse('prior-day-fact-source-mismatch');
+      if (String(zeroFact.closedAt || '') !== String(active.closedAt)) return refuse('prior-day-fact-closed-at-mismatch');
+      if (!strictZeroConsumptionProof(zeroFact.zeroConsumptionProof)) return refuse('prior-day-fact-proof-not-strict');
+      // 持锁前复核：账本记录零漂移 + 源字节零漂移。
+      const recPre = recOf(schedulerModule.loadLedger(ledgerFile));
+      if (!recPre || JSON.stringify(recPre) !== JSON.stringify(rec0)) return refuse('record-drift');
+      if (zeroCas() !== String(zeroHash)) return refuse('source-drift');
+      // 排程持久锁内：fresh 整账本重读 + 记录字节复核 + publisher 锁 + 源字节复核，才改本目标。
+      const zeroLockFile = ledgerFile + '.lock';
+      const zeroLock = schedulerModule.acquireProcessLock(zeroLockFile, nowMs, 30 * 60 * 1000);
+      if (!zeroLock || zeroLock.held !== true) return refuse('scheduler-lock-busy');
+      try {
+        const ledger = schedulerModule.loadLedger(ledgerFile);
+        const rec = recOf(ledger);
+        if (!rec || JSON.stringify(rec) !== JSON.stringify(rec0)) return refuse('record-drift-under-lock');
+        if (fs.existsSync(zeroPaths.lockFile) || fs.existsSync(zeroPaths.lockFile + '.recovery')) return refuse('publisher-lock-busy-under-lock');
+        if (zeroCas() !== String(zeroHash)) return refuse('source-drift-under-lock');
+        const target = rec.entries && rec.entries[zeroKey];
+        if (!target || target.status !== 'unknown' || String(target.reason || '') !== D51_ZERO_RELEASE_REASON) {
+          return refuse('entry-not-applicable-under-lock');
+        }
+        const atIso = new Date(nowMs()).toISOString();
+        // 明确未发布恢复来源 + 前日事实/源 hash 证据（条目被普通 tick 覆盖后仍可由 retryHistory 追溯）。
+        target.recoveredBy = D51_ZERO_RELEASE_RECOVERED_BY;
+        target.recoveredAt = atIso;
+        target.priorDayClosure = {
+          businessDate: priorDay, runId: priorRunId,
+          closedAt: String(active.closedAt), sourceHash: String(zeroHash),
+        };
+        rec.retryHistory = Array.isArray(rec.retryHistory) ? rec.retryHistory.slice(-9) : [];
+        rec.retryHistory.push({
+          at: atIso, planNumber: zeroPlanNo, reason: D51_ZERO_RELEASE_REASON,
+          proof: { method: D51_ZERO_RELEASE_RECOVERED_BY, priorBusinessDate: priorDay,
+            priorRunId, priorClosedAt: String(active.closedAt), sourceHash: String(zeroHash) },
+        });
+        rec.plans = schedulerModule.countSuccessEntries(rec);
+        delete rec.partial;
+        rec.status = 'pending';
+        rec.error = null;
+        rec.lastAt = atIso;
+        schedulerModule.saveLedger(ledgerFile, ledger);
+        return { ok: true, released: true, planNumber: zeroPlanNo, priorDay, priorRunId, method: D51_ZERO_RELEASE_RECOVERED_BY };
+      } finally {
+        try { if (typeof schedulerModule.releaseProcessLock === 'function') schedulerModule.releaseProcessLock(zeroLockFile, zeroLock.token); } catch (_) { /* 释放失败交陈旧锁回收 */ }
       }
     }
 

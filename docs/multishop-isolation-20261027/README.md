@@ -163,3 +163,8 @@ See [D47 recovery proof, limits and validation](D47-crash-success-recovery.md). 
 ## D48 baseline and D50 automatic refill
 
 [D48 test repair and D50 live results](D48-baseline-and-D50-autofill.md): 672/672 combined independent verification; runtime unchanged. User enabled all three independent shops; first batch Minmin 4/4, Jianshang 3/3, Jinpiaoliang 0/3 remains unknown pending D51. This supersedes earlier operational snapshots saying activation was pending.
+
+
+## D51 prior-day zero recovery and ongoing automatic refill
+
+[D51 recovery, independent counterexamples and final live results](D51-prior-day-zero-release.md): final runner 48d04b9c, 481/481 independent tests, rejected source has 18 failures under the same new regressions. User enabled all three independent automatic-shop switches. Minmin 4/4 and Jianshang 3/3 are verified; Jinpiaoliang is still processing its first plan. This is an in-progress business snapshot, not a claim of completed three-shop refill. The trusted local recovery and deployed runner supersede the earlier Jinpiaoliang-unknown block.

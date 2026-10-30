@@ -92,9 +92,9 @@
   {
     "id": "publisher/daily-plan-runner.cjs",
     "beforeSha256": "39d428f38e775ab8d73d727f24f015ed3cacb1d187b06ddd6836fe4c548b0e70",
-    "afterSha256": "039552fa1cc8a76124ade4082cc88a119a260e3654f0c63b01419505fa3a16b9",
+    "afterSha256": "48d04b9c164692690152af09a141c2a94431f07610c309395edf62d6f62adc72",
     "role": "D47 runtime change",
-    "latestStage": "D49"
+    "latestStage": "D51"
   },
   {
     "id": "publisher/crash-success-recovery.test.cjs",
@@ -259,5 +259,12 @@
     "afterSha256": "0317e94df2ed5ac6bf23bb176000c59d6960cb3a9b9263ae887f4680f8494960",
     "role": "portable regression dependency",
     "latestStage": "D48"
+  },
+  {
+    "id": "publisher/prior-day-zero-release.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "051faa9908b29abeacf64f8cccc11cb0caafe5eb8323aa6ae13e237ca1932112",
+    "role": "synthetic recovery regression",
+    "latestStage": "D51"
   }
 ]

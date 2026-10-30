@@ -158,3 +158,8 @@ See [D47 recovery proof, limits and validation](D47-crash-success-recovery.md). 
 ## D49 recovery routing continuation
 
 [D49 routing correction and evidence](D49-recovery-continuation.md) prevents historical success markers from intercepting later recovery. Original 323 tests retained, final 368/368; original F1/R16 proof rules remain. Production runner 039552fa; no new publication or automatic switch activation.
+
+
+## D48 baseline and D50 automatic refill
+
+[D48 test repair and D50 live results](D48-baseline-and-D50-autofill.md): 672/672 combined independent verification; runtime unchanged. User enabled all three independent shops; first batch Minmin 4/4, Jianshang 3/3, Jinpiaoliang 0/3 remains unknown pending D51. This supersedes earlier operational snapshots saying activation was pending.

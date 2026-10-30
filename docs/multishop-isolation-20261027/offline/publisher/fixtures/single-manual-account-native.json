@@ -1,0 +1,591 @@
+{
+  "description": "Native single manual account layout observed in all 30 Minmin product rows. Manual and auto-pull are separate DOM subtrees.",
+  "productId": "3845667181236977848",
+  "dom": {
+    "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+    "children": [
+      {
+        "tag": "DIV",
+        "class": "aweme-entry",
+        "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "DIV",
+        "class": "aweme-info-container",
+        "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "DIV",
+        "class": "media-group-popover-wrapper",
+        "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "DIV",
+        "class": "oc-promotion-media-group-wrapper",
+        "text": "",
+        "alt": null,
+        "title": null,
+        "data-auto-id": "promotion-media-group"
+      },
+      {
+        "tag": "DIV",
+        "class": "oc-promotion-media-group-detail",
+        "text": "",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "DIV",
+        "class": "oc-media-wrapper",
+        "text": "",
+        "alt": null,
+        "title": null,
+        "data-auto-id": "oc-media"
+      },
+      {
+        "tag": "DIV",
+        "class": "oc-media-thumb-container",
+        "text": "",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "DIV",
+        "class": "media-group-info-wrapper",
+        "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "DIV",
+        "class": "item-info-wrapper",
+        "text": "瑾漂亮私服\nID：9zmao_fushi",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "DIV",
+        "class": "item-info-title",
+        "text": "瑾漂亮私服",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "SPAN",
+        "class": "oc-typography oc-typography-size-xs oc-typography-color-default oc-typography-type-paragraph oc-typography-span-undefined",
+        "text": "瑾漂亮私服",
+        "alt": null,
+        "title": null,
+        "data-auto-id": "oc-typography"
+      },
+      {
+        "tag": "SPAN",
+        "class": "oc-typography-value-int",
+        "text": "瑾漂亮私服",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "DIV",
+        "class": "item-info-bottom",
+        "text": "ID：9zmao_fushi",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "SPAN",
+        "class": "oc-typography oc-typography-size-xs oc-typography-color-secondary oc-typography-type-paragraph oc-typography-span-undefined",
+        "text": "ID：9zmao_fushi",
+        "alt": null,
+        "title": null,
+        "data-auto-id": "oc-typography"
+      },
+      {
+        "tag": "SPAN",
+        "class": "oc-typography-value-int",
+        "text": "ID：9zmao_fushi",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "DIV",
+        "class": "",
+        "text": "管理手动添加抖音号",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "DIV",
+        "class": "oc-button-wrap",
+        "text": "管理手动添加抖音号",
+        "alt": null,
+        "title": null,
+        "data-auto-id": "oc-button"
+      },
+      {
+        "tag": "BUTTON",
+        "class": "ovui-button ovui-button--sm ovui-button--rect ovui-button--default ovui-button--default-stroke ovui-button--text",
+        "text": "管理手动添加抖音号",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "DIV",
+        "class": "auto-pull-aweme-wrapper",
+        "text": "预估自动拉取\n0\n个",
+        "alt": null,
+        "title": null,
+        "data-auto-id": null
+      },
+      {
+        "tag": "SPAN",
+        "class": "oc-typography oc-typography-dashed oc-typography-size-xs oc-typography-color-default oc-typography-type-text oc-typography-span-undefined",
+        "text": "0",
+        "alt": null,
+        "title": null,
+        "data-auto-id": "oc-typography"
+      }
+    ]
+  },
+  "all30": [
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    },
+    {
+      "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号\n预估自动拉取\n0\n个",
+      "manualEntries": [
+        {
+          "text": "瑾漂亮私服\nID：9zmao_fushi\n管理手动添加抖音号",
+          "info": [
+            "瑾漂亮私服\nID：9zmao_fushi"
+          ]
+        }
+      ],
+      "autoPull": [
+        "预估自动拉取\n0\n个"
+      ]
+    }
+  ]
+}

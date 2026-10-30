@@ -133,5 +133,131 @@
     "afterSha256": "4b787ad0242a012542d2cfbc24b52935fb6efe554984e3c0b6fe9fe25501777f",
     "role": "unchanged portable regression dependency",
     "latestStage": "D49"
+  },
+  {
+    "id": "publisher/daily-plan-hidden.vbs",
+    "beforeSha256": null,
+    "afterSha256": "2ff38bc800d66c811c11ce628efe02b2b3859f626b4454fb0280d40a7fae60eb",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/daily-plan-runner.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "8f1680a5d90c39e9847c33c868ff7d75f2007057ef524fa3dee4f1d966e0bc6a",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/daily-plan-task.ps1",
+    "beforeSha256": null,
+    "afterSha256": "72fbb2246c1e6d223c56d0b63b2b4cafce5191c855ed85cf71a014b1d3415347",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/decimal-guard-r66.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "2c3cfb144d583a5a81dca8a182c42d79a52d0b5535572b168fad7672cee3c32d",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/decimal-integration-r67.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "3bd784e31246bb39cf985d8d1b3bc58134d409964ac9d7d40e85d1143c7271f2",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/direct-draft-controller.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "9c6f2d6e2b6717d2bcb74250135f63f958d2aea962a1d01665498e7c20a7611c",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/drawer-settle-r63.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "b81cc21fabfa50b6b4819caae1eaf02a56c689233ee3ae9e5bf480068b69788a",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/final-modal-r68.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "5930f0ae6077a6d95e44697321677900480e418b8b0d04dcaaf5eaf0361e99b1",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/final-policy-r69.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "e7c3b3d9bb1c792a6d32bdecb7d7b21bad9047fcc6b3cc3086e88575ab869acc",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/flow-hardening-r123.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "7db49b5d1537778c8874b93e41edbccecf7a35199887b0825a3408227d5ec174",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/guidance-cookie-persist-r130.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "b48818ab1ae2820cb969e6f220d2d2b68a096123070e36620460d09156238eb8",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/multi-shop.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "0a678758c3814e042e2bbabe66ed0828310a1a3a49ed8884cbaae2671f5b98d8",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/plan-workflow.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "3320d2b67afaddfabf01d3e0870ef390e7192cbe7a2ded73b87fce58d322d7fc",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/preopen-prior-day-r106.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "c13afff332e7a67a6480c9a93a10f9322a78a59ed897ffe5e12e8267ed4d3e48",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/preparation-diagnostics-r65.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "8ac1dbde20a8f2976d54eefa57aec3c6232f34cd33f8a2787551ccad042ccf9a",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/session-loss-r70.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "d43e41897c03debea109e14e61be96f9705132e252ccb0b97802127cf18ab2b7",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/fixtures/published-plan-seed.json",
+    "beforeSha256": null,
+    "afterSha256": "cd5af709e43d58696feb0f8562b2ed1bd82f74f2a201e497fa3ffebb8d218d05",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
+  },
+  {
+    "id": "publisher/fixtures/single-manual-account-native.json",
+    "beforeSha256": null,
+    "afterSha256": "0317e94df2ed5ac6bf23bb176000c59d6960cb3a9b9263ae887f4680f8494960",
+    "role": "portable regression dependency",
+    "latestStage": "D48"
   }
 ]

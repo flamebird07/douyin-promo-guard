@@ -153,3 +153,8 @@ D46：恢复两阶段等待——先给真实绑定结果完整窗口，窗口�
 ## D47 crash-success ledger recovery
 
 See [D47 recovery proof, limits and validation](D47-crash-success-recovery.md). The production runner now reconciles the proven historical first publication without replay. New recovery regression: 323/323; no guard restart or automatic publishing activation.
+
+
+## D49 recovery routing continuation
+
+[D49 routing correction and evidence](D49-recovery-continuation.md) prevents historical success markers from intercepting later recovery. Original 323 tests retained, final 368/368; original F1/R16 proof rules remain. Production runner 039552fa; no new publication or automatic switch activation.

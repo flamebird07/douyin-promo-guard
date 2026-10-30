@@ -92,14 +92,16 @@
   {
     "id": "publisher/daily-plan-runner.cjs",
     "beforeSha256": "39d428f38e775ab8d73d727f24f015ed3cacb1d187b06ddd6836fe4c548b0e70",
-    "afterSha256": "42bab2fcc5fd12ffa55df37d1e10b64b2ea867706cbe491b1506db281fdbce14",
-    "role": "D47 runtime change"
+    "afterSha256": "039552fa1cc8a76124ade4082cc88a119a260e3654f0c63b01419505fa3a16b9",
+    "role": "D47 runtime change",
+    "latestStage": "D49"
   },
   {
     "id": "publisher/crash-success-recovery.test.cjs",
     "beforeSha256": null,
-    "afterSha256": "4f3f0f1d0bd38a05e8bf50ec078cf04e6f54402af95e4e6f4f67ed2a716395f1",
-    "role": "D47 portable regression or unchanged dependency"
+    "afterSha256": "095b0ab8b937db2756bc0651f27d9f2eceaeaba2c37375c02a06792dd96089b3",
+    "role": "D47 portable regression or unchanged dependency",
+    "latestStage": "D49"
   },
   {
     "id": "publisher/direct-draft-controller.cjs",
@@ -124,5 +126,12 @@
     "beforeSha256": null,
     "afterSha256": "66db85c1ecdb8c0115a5e71668462b2d149421d3690a1abd0213f8901b391a3d",
     "role": "D47 portable regression or unchanged dependency"
+  },
+  {
+    "id": "publisher/stale-preparing-recovery.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "4b787ad0242a012542d2cfbc24b52935fb6efe554984e3c0b6fe9fe25501777f",
+    "role": "unchanged portable regression dependency",
+    "latestStage": "D49"
   }
 ]

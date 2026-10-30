@@ -1,0 +1,42 @@
+--- a/publisher/daily-plan-runner.cjs
++++ b/publisher/daily-plan-runner.cjs
+@@ -550,13 +550,17 @@
+     if (!rec0) return fail('recovery-no-current-record');
+ 
+     const crashRecoverySources = ['durable-crash-success-recovery', 'native-first-success-summary-recovery'];
+-    const crashCandidates = Object.keys(rec0.entries || {}).filter(k => {
+-      const e = rec0.entries[k];
+-      return e && (e.status === 'in-progress'
+-        || (e.status === 'success' && crashRecoverySources.includes(e.recoveredBy)));
+-    });
+-    if (crashCandidates.length && (rec0.status === 'unknown'
+-      || crashCandidates.some(k => crashRecoverySources.includes(rec0.entries[k].recoveredBy)))) {
++    const entryKeys = Object.keys(rec0.entries || {});
++    const inProgressCandidates = entryKeys.filter(k => rec0.entries[k] && rec0.entries[k].status === 'in-progress');
++    // Historical successes cannot compete with a pending target or reprove an earlier prefix.
++    const fullyConverged = inProgressCandidates.length === 0 && rec0.error === null
++      && rec0.plans === entryKeys.length
++      && entryKeys.every(k => rec0.entries[k] && rec0.entries[k].status === 'success')
++      && rec0.status === (rec0.plans >= schedulerModule.resolveShopPlansPerDay(shop, c.value.plansPerShopPerDay) ? 'success' : 'partial');
++    const crashCandidates = inProgressCandidates.length ? inProgressCandidates
++      : fullyConverged ? entryKeys.filter(k => rec0.entries[k].planNumber === rec0.plans
++        && crashRecoverySources.includes(rec0.entries[k].recoveredBy)) : [];
++    if (crashCandidates.length && (rec0.status === 'unknown' || fullyConverged)) {
+       const crashRecovery = (() => {
+         const refuse = reason => fail('recovery-crash-' + reason);
+         const object = x => !!x && typeof x === 'object' && !Array.isArray(x);
+@@ -587,9 +591,11 @@
+         let state, attempts, published;
+         try { state = read(paths.stateFile); } catch (_) { return refuse('state-unreadable'); }
+         if (!object(state) || state.businessDate !== businessDate) return refuse('state-date-or-shape');
+-        // A genuinely unconsumed current preparation still belongs to canonical F1, not success recovery.
+-        if (!already && Array.isArray(state.plans) && !state.plans.some(p => p && Number(p.planNumber) === Number(planNo))
+-          && object(state.active) && state.active.status === 'preparing' && Number(state.active.planNumber) === Number(planNo)) return null;
++        // Canonical F1 must prove zero consumption for the current preparation; absence of success is not that proof.
++        if (!already && Number.isInteger(planNo) && key === String(planNo)
++          && Array.isArray(state.plans) && !state.plans.some(p => p && p.status === 'success' && Number(p.planNumber) === planNo)
++          && object(state.active) && ['preparing', 'preparation-stopped'].includes(state.active.status)
++          && Number(state.active.planNumber) === planNo) return null;
+         if (fs.existsSync(paths.lockFile) || fs.existsSync(paths.lockFile + '.recovery')) return refuse('publisher-lock-busy');
+         try { attempts = read(paths.attemptsFile); } catch (_) { return refuse('attempts-unreadable'); }
+         try { published = read(paths.publishedFile); } catch (_) { return refuse('published-unreadable'); }

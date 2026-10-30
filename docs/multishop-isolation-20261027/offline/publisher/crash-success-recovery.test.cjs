@@ -1161,3 +1161,340 @@ for (const file of ['identity', 'seed']) {
     noActions(f);
   });
 }
+
+async function convergedFixture(t, options = { nativeSummary: true }) {
+  const f = fixture(t, options);
+  const result = await f.recover();
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.released, true);
+  const before = snapshot(Object.values(f.files));
+  const again = await f.recover();
+  assert.equal(again.ok, true, JSON.stringify(again));
+  assert.equal(again.idempotent, true);
+  assert.equal(again.released, false);
+  unchanged(before);
+  noActions(f);
+  f.calls.ledgerWrites = 0;
+  return f;
+}
+
+function pendingContinuation(f, number = 2, status = 'in-progress', reason) {
+  f.modify('ledger', l => {
+    const rec = l.days[DATE].shops.synthetic;
+    rec.status = 'unknown';
+    rec.error = status === 'in-progress' ? 'unresolved-in-progress-no-replay' : 'unknown:' + reason;
+    rec.entries[number] = { planNumber: number, status, startedAt: new Date(NOW).toISOString(), ...(reason ? { reason } : {}) };
+  });
+}
+
+function localRecoveryProbe(f) {
+  f.deps.recoverLocalPreparation = async (...args) => {
+    f.calls.local++;
+    f.localResult = await rp.recoverLocalPreparationClose(...args);
+    return f.localResult;
+  };
+}
+
+test('D49 source fingerprint and native first exact repeat stay read-only', async t => {
+  t.diagnostic('cwd=' + process.cwd() + '; node=' + process.version + '; platform=' + process.platform + '; time=' + new Date().toISOString());
+  for (const file of ['daily-plan-runner.cjs', 'crash-success-recovery.test.cjs', 'stale-preparing-recovery.test.cjs',
+    'run-plans.cjs', 'plan-workflow.cjs', '../bill-manager/promo-plan-scheduler.js']) {
+    t.diagnostic(file + ' sha256=' + crypto.createHash('sha256').update(fs.readFileSync(path.join(__dirname, file))).digest('hex'));
+  }
+  const f = await convergedFixture(t, { nativeSummary: true, nativeWriter: true });
+  assert.equal(read(f.files.ledger).days[DATE].shops.synthetic.entries[1].recoveredBy, NATIVE_SOURCE);
+});
+
+for (const options of [{ nativeSummary: true }, {}, { count: 2 }]) {
+  for (const status of ['preparing', 'preparation-stopped']) {
+    test('D49 prior recovered success leaves current preparation to real F1: ' + JSON.stringify(options) + '/' + status, async t => {
+      const f = await convergedFixture(t, options);
+      const number = (options.count || 1) + 1;
+      const previous = read(f.files.ledger).days[DATE].shops.synthetic.entries;
+      const previousBytes = JSON.stringify(previous);
+      pendingContinuation(f, number);
+      f.next('preparing');
+      if (status === 'preparation-stopped') {
+        const closed = await rp.recoverLocalPreparationClose({ shop: SHOP, accountId: ACCOUNT }, DATE, { stateRoot: f.root });
+        assert.equal(closed.ok, true, JSON.stringify(closed));
+        assert.equal(closed.status, 'preparationClosed');
+      }
+      localRecoveryProbe(f);
+      const sources = snapshot([f.files.attempts, f.files.published, f.files.identity, f.files.seed]);
+      const closedState = status === 'preparation-stopped' ? snapshot([f.files.state]) : null;
+      const result = await f.recover();
+      assert.equal(result.ok, true, JSON.stringify(result));
+      assert.equal(result.released, true);
+      assert.equal(result.planNumber, number);
+      assert.equal(result.idempotent, undefined);
+      assert.equal(f.calls.local, 1);
+      assert.deepEqual(f.localResult.zeroConsumptionProof, {
+        initialConsumptions: 0, finalConsumptions: 0, reopenConsumptions: 0,
+        manualUnresolved: 0, plansContainsNumber: false, confirmationConsumptionsRecorded: false,
+      });
+      const rec = read(f.files.ledger).days[DATE].shops.synthetic;
+      assert.equal(rec.status, 'unsubmitted');
+      assert.equal(rec.plans, number - 1);
+      assert.equal(rec.entries[number].status, 'preparation-stopped');
+      assert.equal(rec.entries[number].recoveredBy, 'local-preparation-recovery');
+      assert.equal(JSON.stringify(Object.fromEntries(Object.entries(rec.entries).filter(([k]) => Number(k) < number))), previousBytes);
+      assert.deepEqual(rec.releasedFrom.entries[number].status, 'in-progress');
+      unchanged(sources);
+      if (closedState) unchanged(closedState);
+      assert.deepEqual(f.calls.run, []);
+      assert.equal(f.calls.open, 0);
+      assert.equal(f.calls.discovery, 0);
+      f.calls.allowRun = true;
+      const runner = f.makeRunner();
+      await runner.tick();
+      await runner.tick();
+      assert.deepEqual(f.calls.run, number === 2 ? [2, 3] : [3]);
+      const after = read(f.files.ledger).days[DATE].shops.synthetic;
+      assert.equal(after.status, 'success');
+      for (const [key, entry] of Object.entries(previous)) assert.equal(JSON.stringify(after.entries[key]), JSON.stringify(entry));
+    });
+  }
+}
+
+for (const source of [NATIVE_SOURCE, 'durable-crash-success-recovery']) {
+  test('D49 unique durable second success ignores historical recovery marker: ' + source, async t => {
+    const f = fixture(t, { count: 2, nativeWriter: true });
+    f.modify('ledger', l => { l.days[DATE].shops.synthetic.entries[1].recoveredBy = source; });
+    const firstBytes = JSON.stringify(read(f.files.ledger).days[DATE].shops.synthetic.entries[1]);
+    const sources = snapshot([f.files.state, f.files.attempts, f.files.published, f.files.identity, f.files.seed]);
+    const result = await f.recover();
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.planNumber, 2);
+    assert.equal(result.released, true);
+    assert.equal(result.recoveredBy, 'durable-crash-success-recovery');
+    assert.equal(JSON.stringify(read(f.files.ledger).days[DATE].shops.synthetic.entries[1]), firstBytes);
+    unchanged(sources);
+    noActions(f);
+    const before = snapshot(Object.values(f.files));
+    const again = await f.recover();
+    assert.equal(again.ok, true, JSON.stringify(again));
+    assert.equal(again.idempotent, true);
+    assert.equal(again.planNumber, 2);
+    unchanged(before);
+    f.calls.allowRun = true;
+    await f.makeRunner().tick();
+    assert.deepEqual(f.calls.run, [3]);
+    assert.equal(JSON.stringify(read(f.files.ledger).days[DATE].shops.synthetic.entries[1]), firstBytes);
+  });
+}
+
+function readbackContinuation(t, source, targetOnly = false) {
+  const f = fixture(t, { count: 2 });
+  f.modify('ledger', l => {
+    const rec = l.days[DATE].shops.synthetic;
+    rec.plans = 1;
+    rec.entries[1].recoveredBy = source;
+    rec.entries[2] = { planNumber: 2, status: 'unknown', reason: 'management-identity-hydrate-timeout' };
+    rec.error = 'unknown:management-identity-hydrate-timeout';
+  });
+  f.modify('state', s => {
+    s.active.recoveredBy = 'scheduled-readback-recovery';
+    if (targetOnly) s.firstPublishedPlan = null;
+  });
+  if (targetOnly) {
+    // R16 only accepts the target CID and a single same-day published plan, not a native multi-plan history.
+    f.modify('attempts', a => {
+      delete a.consumed[f.frozen[0].confirmationId];
+      delete a.finalConsumed[f.frozen[0].confirmationId];
+    });
+    f.modify('published', p => { p.plans = p.plans.filter(x => x.planId === planId(2)); });
+  }
+  return f;
+}
+
+for (const source of [NATIVE_SOURCE, 'durable-crash-success-recovery']) {
+  test('D49 R16 synthetic target-only contract still converges second: ' + source, async t => {
+    const f = readbackContinuation(t, source, true);
+    const firstBytes = JSON.stringify(read(f.files.ledger).days[DATE].shops.synthetic.entries[1]);
+    const sources = snapshot([f.files.state, f.files.attempts, f.files.published, f.files.identity, f.files.seed]);
+    const result = await f.recover();
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.method, 'readback-success-ledger-convergence');
+    assert.equal(result.planNumber, 2);
+    assert.equal(result.released, true);
+    const rec = read(f.files.ledger).days[DATE].shops.synthetic;
+    assert.equal(rec.entries[2].recoveredBy, 'scheduled-readback-recovery');
+    assert.equal(JSON.stringify(rec.entries[1]), firstBytes);
+    assert.equal(rec.plans, 2);
+    assert.equal(rec.status, 'partial');
+    unchanged(sources);
+    noActions(f);
+    const before = snapshot(Object.values(f.files));
+    const again = await f.recover();
+    assert.equal(again.ok, true, JSON.stringify(again));
+    assert.equal(again.idempotent, true);
+    assert.equal(again.planNumber, 2);
+    unchanged(before);
+    f.calls.allowRun = true;
+    await f.makeRunner().tick();
+    assert.deepEqual(f.calls.run, [3]);
+    assert.equal(JSON.stringify(read(f.files.ledger).days[DATE].shops.synthetic.entries[1]), firstBytes);
+  });
+}
+
+for (const shape of ['first summary', 'prior CID', 'prior same-day publication']) {
+  test('D49 R16 original later-plan limitation remains unchanged: ' + shape, async t => {
+    const f = readbackContinuation(t, NATIVE_SOURCE);
+    if (shape !== 'first summary') f.modify('state', s => { s.firstPublishedPlan = null; });
+    if (shape === 'prior same-day publication') f.modify('attempts', a => {
+      delete a.consumed[f.frozen[0].confirmationId];
+      delete a.finalConsumed[f.frozen[0].confirmationId];
+    });
+    const expected = shape === 'first summary' ? /^recovery-readback-first-plan-mismatch$/
+      : shape === 'prior CID' ? /^recovery-readback-cross-cid-consumption:consumed$/
+        : /^recovery-readback-published-day-not-unique:2$/;
+    const result = await rejected(f, expected);
+    f.modify('ledger', l => { delete l.days[DATE].shops.synthetic.entries[1].recoveredBy; });
+    const withoutMarker = await rejected(f, expected);
+    assert.equal(result.reason, withoutMarker.reason);
+    await f.makeRunner().tick();
+    noActions(f);
+  });
+}
+
+for (const [status, reason, recoveredBy, expected] of [
+  ['unknown', 'prepare-stopped:account-anchor-account-identity-drift', undefined, /^recovery-reprove-capability-unavailable$/],
+  ['preparation-stopped', 'prepare-stopped:account-anchor-account-identity-drift', 'run-recovery-preparation-closure', /^recovery-reprove-capability-unavailable$/],
+  ['failed', 'synthetic failure', undefined, /^recovery-release-capability-unavailable$/],
+]) {
+  test('D49 historical native marker does not preempt existing route: ' + status, async t => {
+    const f = await convergedFixture(t);
+    pendingContinuation(f, 2, status, reason);
+    f.modify('ledger', l => {
+      const rec = l.days[DATE].shops.synthetic;
+      if (status === 'failed') rec.status = 'failed';
+      if (recoveredBy) rec.entries[2].recoveredBy = recoveredBy;
+    });
+    await rejected(f, expected);
+  });
+}
+
+for (const mutation of ['unknown record', 'failed record', 'blocked record', 'wrong count', 'uncleared error', 'later success']) {
+  test('D49 frozen historical tag is not complete-record idempotence: ' + mutation, async t => {
+    const f = await convergedFixture(t, {});
+    f.modify('ledger', l => {
+      const rec = l.days[DATE].shops.synthetic;
+      if (mutation.endsWith(' record')) rec.status = mutation.split(' ')[0];
+      if (mutation === 'wrong count') rec.plans = 0;
+      if (mutation === 'uncleared error') rec.error = 'unresolved-in-progress-no-replay';
+      if (mutation === 'later success') {
+        rec.entries[2] = { planNumber: 2, status: 'success', planId: planId(2) };
+        rec.plans = 2;
+      }
+    });
+    f.deps.recoverLocalPreparation = () => { f.calls.local++; return { ok: false, status: 'unknown', reason: 'no-current-preparation' }; };
+    const before = snapshot(Object.values(f.files));
+    const result = await f.recover();
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.released, false);
+    assert.notEqual(result.idempotent, true);
+    assert.doesNotMatch(result.reason, /^recovery-crash-/);
+    unchanged(before);
+    assert.deepEqual(f.calls.run, []);
+    assert.equal(f.calls.open, 0);
+    assert.equal(f.calls.discovery, 0);
+    assert.equal(f.calls.ledgerWrites, 0);
+  });
+}
+
+for (const status of ['preparing', 'preparation-stopped']) {
+  for (const conflict of ['consumption', 'missing reopen', 'identity', 'publisher lock', 'scheduler lock', 'source drift', 'source drift under lock']) {
+    test('D49 F1 continuation retains strict rejection: ' + status + '/' + conflict, async t => {
+      const f = await convergedFixture(t);
+      pendingContinuation(f);
+      if (status === 'preparing') f.next();
+      localRecoveryProbe(f);
+      if (conflict === 'consumption') f.modify('attempts', a => {
+        a.consumed['synthetic-second'] = { status: 'unknown', businessDate: DATE, planNumber: 2, runId: runId(2) };
+      });
+      if (conflict === 'missing reopen') f.modify('attempts', a => { delete a.reopenConsumed; });
+      if (conflict === 'identity') f.modify('state', s => { s.shop = 'synthetic wrong shop'; });
+      let lock;
+      if (conflict.endsWith(' lock') && !conflict.startsWith('source')) {
+        lock = conflict === 'publisher lock' ? path.join(f.dir, 'plan-publisher.lock') : f.files.ledger + '.lock';
+        write(lock, { pid: process.pid, at: new Date(NOW).toISOString(), startedAt: new Date(NOW).toISOString(), token: '3'.repeat(32) });
+      }
+      if (conflict.startsWith('source drift')) {
+        let afterLocal = 0;
+        f.deps.currentSourceHash = (...args) => {
+          if (f.calls.local && ++afterLocal === (conflict === 'source drift' ? 1 : 2)) return 'f'.repeat(64);
+          return rp.currentPreOpenSourceHash(...args);
+        };
+      }
+      const files = Object.values(f.files).filter(file => file !== f.files.state);
+      if (lock) files.push(lock);
+      const before = snapshot(files);
+      const stateBefore = snapshot([f.files.state]);
+      const result = await f.recover();
+      assert.equal(result.ok, false, JSON.stringify(result));
+      assert.equal(result.released, false);
+      assert.equal(f.calls.local, 1);
+      assert.doesNotMatch(result.reason, /^recovery-crash-/);
+      if (conflict === 'scheduler lock') assert.equal(result.reason, 'release-locked-by-other-process');
+      else if (conflict === 'source drift') assert.equal(result.reason, 'recovery-source-drift');
+      else if (conflict === 'source drift under lock') assert.equal(result.reason, 'release-source-not-fresh');
+      else assert.match(result.reason, /^recovery-local-not-closed:/);
+      unchanged(before);
+      if (status === 'preparation-stopped' || !['scheduler lock', 'source drift', 'source drift under lock'].includes(conflict)) unchanged(stateBefore);
+      assert.deepEqual(f.calls.run, []);
+      assert.equal(f.calls.open, 0);
+      assert.equal(f.calls.discovery, 0);
+      assert.equal(f.calls.ledgerWrites, 0);
+    });
+  }
+}
+
+test('D49 untrusted later unknown reaches F1 but cannot release or replay', async t => {
+  const f = await convergedFixture(t);
+  pendingContinuation(f, 2, 'unknown', 'untrusted-unknown');
+  localRecoveryProbe(f);
+  const before = snapshot(Object.values(f.files));
+  const result = await f.recover();
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(result.released, false);
+  assert.equal(result.reason, 'release-binding-mismatch');
+  assert.equal(f.calls.local, 1);
+  unchanged(before);
+  const recBeforeTick = read(f.files.ledger).days[DATE].shops.synthetic;
+  await f.makeRunner().tick();
+  assert.deepEqual(read(f.files.ledger).days[DATE].shops.synthetic, recBeforeTick);
+  unchanged(before.filter(x => x.file !== f.files.ledger));
+  assert.deepEqual(f.calls.run, []);
+  assert.equal(f.calls.open, 0);
+  assert.equal(f.calls.discovery, 0);
+});
+
+for (const conflict of ['extra in-progress', 'missing target frozen', 'prior frozen', 'final not success', 'publisher lock', 'scheduler lock', 'source drift']) {
+  test('D49 durable continuation refuses unsafe target proof: ' + conflict, async t => {
+    const f = fixture(t, { count: 2 });
+    f.modify('ledger', l => { l.days[DATE].shops.synthetic.entries[1].recoveredBy = NATIVE_SOURCE; });
+    if (conflict === 'extra in-progress') pendingContinuation(f, 3);
+    if (conflict === 'missing target frozen') f.modify('state', s => { delete s.active.frozen; });
+    if (conflict === 'prior frozen') f.modify('state', s => { s.active.frozen = f.frozen[0]; });
+    if (conflict === 'final not success') f.modify('attempts', a => { a.finalConsumed[f.frozen[1].confirmationId].status = 'unknown'; });
+    if (conflict.endsWith(' lock')) write(conflict === 'publisher lock' ? path.join(f.dir, 'plan-publisher.lock') : f.files.ledger + '.lock',
+      { pid: process.pid, at: new Date(NOW).toISOString(), startedAt: new Date(NOW).toISOString(), token: '4'.repeat(32) });
+    if (conflict === 'source drift') {
+      let n = 0;
+      f.deps.currentSourceHash = (...args) => ++n === 2 ? 'e'.repeat(64) : rp.currentPreOpenSourceHash(...args);
+    }
+    const expected = {
+      'extra in-progress': 'entry-not-unique', 'missing target frozen': 'frozen-missing',
+      'prior frozen': 'frozen-incomplete-or-conflicting', 'final not success': 'consumption-not-success-pair',
+      'publisher lock': 'publisher-lock-busy', 'scheduler lock': 'scheduler-lock-busy', 'source drift': 'source-drift',
+    }[conflict];
+    await rejected(f, new RegExp('^recovery-crash-' + expected + '$'));
+    const entriesBeforeTick = JSON.stringify(read(f.files.ledger).days[DATE].shops.synthetic.entries);
+    await f.makeRunner().tick();
+    assert.equal(JSON.stringify(read(f.files.ledger).days[DATE].shops.synthetic.entries), entriesBeforeTick);
+    assert.deepEqual(f.calls.run, []);
+    assert.equal(f.calls.open, 0);
+    assert.equal(f.calls.discovery, 0);
+    assert.equal(f.calls.local, ['extra in-progress', 'scheduler lock'].includes(conflict) ? 0 : 1);
+  });
+}

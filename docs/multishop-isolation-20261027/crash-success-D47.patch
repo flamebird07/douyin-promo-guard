@@ -1,0 +1,328 @@
+--- a/publisher/daily-plan-runner.cjs
++++ b/publisher/daily-plan-runner.cjs
+@@ -549,6 +549,325 @@
+     let rec0 = recOf(schedulerModule.loadLedger(ledgerFile));
+     if (!rec0) return fail('recovery-no-current-record');
+ 
++    const crashRecoverySources = ['durable-crash-success-recovery', 'native-first-success-summary-recovery'];
++    const crashCandidates = Object.keys(rec0.entries || {}).filter(k => {
++      const e = rec0.entries[k];
++      return e && (e.status === 'in-progress'
++        || (e.status === 'success' && crashRecoverySources.includes(e.recoveredBy)));
++    });
++    if (crashCandidates.length && (rec0.status === 'unknown'
++      || crashCandidates.some(k => crashRecoverySources.includes(rec0.entries[k].recoveredBy)))) {
++      const crashRecovery = (() => {
++        const refuse = reason => fail('recovery-crash-' + reason);
++        const object = x => !!x && typeof x === 'object' && !Array.isArray(x);
++        const read = f => JSON.parse(fs.readFileSync(f, 'utf8'));
++        if (crashCandidates.length !== 1) return refuse('entry-not-unique');
++        const key = crashCandidates[0];
++        const entry = rec0.entries[key];
++        const planNo = entry.planNumber;
++        const already = entry.status === 'success';
++        if (!already && rec0.error !== 'unresolved-in-progress-no-replay') return null;
++        if (typeof deps.resolvePublisherPaths !== 'function' || typeof deps.currentSourceHash !== 'function') return refuse('capability-unavailable');
++        let resolved;
++        try { resolved = deps.resolvePublisherPaths(shopLike, stateRoot || undefined); }
++        catch (_) { return refuse('paths-unavailable'); }
++        if (!resolved || resolved.ok !== true || !resolved.paths) return refuse('paths-unavailable');
++        const paths = resolved.paths;
++        const account = String(resolved.accountId || '');
++        if (!/^\d{6,24}$/.test(account) || (cfgAccount !== null && cfgAccount !== account)) return refuse('account-conflict');
++        if (!paths.stateFile || !paths.attemptsFile || !paths.publishedFile || !paths.lockFile) return refuse('paths-incomplete');
++        const extras = [...new Set([...(resolved.sourceExtraFiles || []), paths.publishedFile,
++          ...(resolved.identityFile ? [resolved.identityFile] : []), ...(paths.seedFile ? [paths.seedFile] : [])])];
++        const sourceHash = () => {
++          try { return deps.currentSourceHash(paths.stateFile, paths.attemptsFile, extras); }
++          catch (_) { return null; }
++        };
++        const before = sourceHash();
++        if (!/^[a-f0-9]{64}$/.test(String(before || ''))) return refuse('source-unreadable');
++        let state, attempts, published;
++        try { state = read(paths.stateFile); } catch (_) { return refuse('state-unreadable'); }
++        if (!object(state) || state.businessDate !== businessDate) return refuse('state-date-or-shape');
++        // A genuinely unconsumed current preparation still belongs to canonical F1, not success recovery.
++        if (!already && Array.isArray(state.plans) && !state.plans.some(p => p && Number(p.planNumber) === Number(planNo))
++          && object(state.active) && state.active.status === 'preparing' && Number(state.active.planNumber) === Number(planNo)) return null;
++        if (fs.existsSync(paths.lockFile) || fs.existsSync(paths.lockFile + '.recovery')) return refuse('publisher-lock-busy');
++        try { attempts = read(paths.attemptsFile); } catch (_) { return refuse('attempts-unreadable'); }
++        try { published = read(paths.publishedFile); } catch (_) { return refuse('published-unreadable'); }
++        const limit = schedulerModule.resolveShopPlansPerDay(shop, c.value.plansPerShopPerDay);
++        if (!object(rec0.entries) || !Number.isInteger(planNo) || planNo < 1 || planNo > limit || key !== String(planNo)) return refuse('entry-plan-number');
++        if (!already && (typeof entry.startedAt !== 'string' || !Number.isFinite(Date.parse(entry.startedAt)))) return refuse('entry-start-missing');
++        if (state.unknown || state.pending) return refuse('state-unresolved');
++        const identityAgrees = r => object(r)
++          && (r.shop == null || String(r.shop) === String(shop.name))
++          && (r.accountId == null || String(r.accountId) === account)
++          && (r.account_id == null || String(r.account_id) === account)
++          && (r.businessDate == null || r.businessDate === businessDate);
++        if (![state, rec0, entry].every(identityAgrees)) return refuse('identity-conflict');
++        if (rec0.frozen != null || rec0.nonce != null || rec0.confirmationId != null || entry.frozen != null || entry.nonce != null) return refuse('ledger-artifacts');
++        const ledgerEntries = Object.entries(rec0.entries);
++        for (const [k, e] of ledgerEntries) {
++          if (!identityAgrees(e) || !Number.isInteger(e.planNumber) || k !== String(e.planNumber)
++            || e.planNumber < 1 || e.planNumber > limit || (k !== key && e.status !== 'success')) return refuse('other-entry-unresolved-or-invalid');
++        }
++        if (!Array.isArray(state.plans) || state.plans.length !== ledgerEntries.length) return refuse('day-plans-count');
++        const plans = new Map();
++        const ids = new Set();
++        for (const p of state.plans) {
++          if (!identityAgrees(p) || p.status !== 'success' || !Number.isInteger(p.planNumber)
++            || !rec0.entries[String(p.planNumber)] || plans.has(p.planNumber)
++            || !/^\d{12,20}$/.test(String(p.planId || '')) || ids.has(String(p.planId))
++            || !/^[a-f0-9]{64}$/.test(String(p.manifestHash || ''))) return refuse('day-plan-conflict');
++          const le = rec0.entries[String(p.planNumber)];
++          if ((p.planNumber !== planNo || le.planId != null) && String(le.planId || '') !== String(p.planId)) return refuse('ledger-plan-id-conflict');
++          plans.set(p.planNumber, p); ids.add(String(p.planId));
++        }
++        // The unchanged scheduler dispatches rec.plans + 1, so success numbers must form a prefix.
++        for (let n = 1; n <= plans.size; n++) if (!plans.has(n)) return refuse('noncontiguous-success');
++        const target = plans.get(planNo);
++        if (!target) return refuse('day-success-missing');
++        if (object(attempts) && !Object.hasOwn(attempts, 'reopenConsumed')) attempts = { ...attempts, reopenConsumed: {} };
++        if (!object(attempts) || !['consumed', 'finalConsumed', 'reopenConsumed'].every(k => object(attempts[k]))) return refuse('attempts-tables-incomplete');
++        if (Object.keys(attempts.reopenConsumed).length) return refuse('reopen-consumption-present');
++        const current = new Map();
++        const consumedRuns = new Set();
++        for (const [cid, initial] of Object.entries(attempts.consumed)) {
++          const final = attempts.finalConsumed[cid];
++          if (!object(initial) || !object(final) || initial.status !== 'success' || final.status !== 'success') return refuse('consumption-not-success-pair');
++          if (!/^\d{4}-\d{2}-\d{2}$/.test(String(initial.businessDate || '')) || initial.businessDate > businessDate
++            || typeof initial.runId !== 'string' || !initial.runId || !Number.isInteger(initial.planNumber)
++            || initial.planNumber < 1 || !/^[a-f0-9]{64}$/.test(String(initial.manifestHash || ''))) return refuse('consumption-scope-missing');
++          const scheduledOrigin = SCHEDULED_RUN_ORIGIN_RE.exec(initial.runId);
++          if ((scheduledOrigin && scheduledOrigin[1] !== initial.businessDate) || consumedRuns.has(initial.runId)) return refuse('consumption-run-conflict');
++          consumedRuns.add(initial.runId);
++          for (const field of ['runId', 'businessDate', 'planNumber', 'manifestHash']) {
++            if (initial[field] !== final[field]) return refuse('consumption-scope-conflict');
++          }
++          for (const r of [initial, final]) {
++            if ((r.confirmationId != null && r.confirmationId !== cid)
++              || (r.shop != null && String(r.shop) !== String(shop.name))
++              || (r.accountId != null && String(r.accountId) !== account)
++              || (r.account_id != null && String(r.account_id) !== account)) return refuse('consumption-identity-conflict');
++          }
++          if (initial.businessDate !== businessDate) continue;
++          const p = plans.get(initial.planNumber);
++          const origin = SCHEDULED_RUN_ORIGIN_RE.exec(initial.runId);
++          if (!p || !origin || origin[1] !== businessDate || current.has(initial.planNumber)
++            || p.manifestHash !== initial.manifestHash) return refuse('current-consumption-conflict');
++          for (const r of [initial, final, p, rec0.entries[String(initial.planNumber)]]) {
++            if (r.runId != null && r.runId !== initial.runId) return refuse('run-id-conflict');
++            if (r.confirmationId != null && r.confirmationId !== cid) return refuse('cid-conflict');
++            if (r.manifestHash != null && r.manifestHash !== p.manifestHash) return refuse('manifest-conflict');
++            if (r.planId != null && String(r.planId) !== String(p.planId)) return refuse('plan-id-conflict');
++          }
++          current.set(initial.planNumber, { cid, initial, final });
++        }
++        if (Object.keys(attempts.finalConsumed).some(cid => !Object.hasOwn(attempts.consumed, cid))) return refuse('orphan-final-consumption');
++        if (current.size !== plans.size) return refuse('success-consumption-missing');
++        if (!Array.isArray(state.confirmationConsumptions) || !Array.isArray(state.manualUiPublicationFacts)
++          || state.manualUiPublicationFacts.length) return refuse('state-consumption-lists');
++        const seenConfirmations = new Set();
++        for (const r of state.confirmationConsumptions) {
++          const pair = object(r) && current.get(r.planNumber);
++          if (!pair || !identityAgrees(r) || r.confirmationId !== pair.cid || r.manifestHash !== pair.initial.manifestHash
++            || (r.runId != null && r.runId !== pair.initial.runId) || seenConfirmations.has(r.confirmationId)) return refuse('state-confirmation-conflict');
++          seenConfirmations.add(r.confirmationId);
++        }
++        if (!object(published) || !identityAgrees(published) || !Array.isArray(published.plans)
++          || !Array.isArray(published.publishedIds)) return refuse('published-shape');
++        const seenPublished = new Set();
++        const todayPublished = new Set();
++        for (const p of published.plans) {
++          if (!object(p) || !/^\d{12,20}$/.test(String(p.planId || '')) || seenPublished.has(String(p.planId))) return refuse('published-plan-duplicate-or-invalid');
++          if ((p.shop != null && String(p.shop) !== String(shop.name))
++            || (p.accountId != null && String(p.accountId) !== account)
++            || (p.account_id != null && String(p.account_id) !== account)
++            || (p.businessDate != null && p.businessDate !== p.date)) return refuse('published-identity-conflict');
++          seenPublished.add(String(p.planId));
++          if (ids.has(String(p.planId)) && p.date !== businessDate) return refuse('published-date-conflict');
++          if (p.date === businessDate) {
++            const dp = state.plans.find(x => String(x.planId) === String(p.planId));
++            if (!dp || !identityAgrees(p) || (p.planNumber != null && p.planNumber !== dp.planNumber)
++              || (p.manifestHash != null && p.manifestHash !== dp.manifestHash)
++              || (p.runId != null && p.runId !== current.get(dp.planNumber).initial.runId)) return refuse('published-plan-conflict');
++            todayPublished.add(String(p.planId));
++          }
++        }
++        if (todayPublished.size !== plans.size) return refuse('published-success-missing');
++        const active = state.active;
++        const pair = current.get(planNo);
++        let successProof;
++        if (active == null) return refuse('frozen-unavailable-without-active');
++        if (!identityAgrees(active)) return refuse('active-identity-conflict');
++        if (active.status === 'preparing' || active.status === 'preparation-stopped') {
++          const origin = SCHEDULED_RUN_ORIGIN_RE.exec(String(active.runId || ''));
++          if (active.planNumber !== plans.size + 1 || active.planNumber > limit || active.businessDate !== businessDate
++            || !origin || origin[1] !== businessDate || (state.runId != null && state.runId !== active.runId)
++            || ['frozen', 'confirmationId', 'manifestHash', 'planId', 'nonce'].some(k => active[k] != null)) return refuse('next-preparation-not-safe');
++          for (const table of ['consumed', 'finalConsumed', 'reopenConsumed']) {
++            if (Object.values(attempts[table]).some(r => r.runId === active.runId
++              || (r.businessDate === businessDate && r.planNumber === active.planNumber))) return refuse('next-preparation-consumed');
++          }
++          if (planNo !== 1 || ledgerEntries.length !== 1 || plans.size !== 1 || current.size !== 1
++            || typeof entry.startedAt !== 'string' || !Number.isFinite(Date.parse(entry.startedAt))) return refuse('native-first-only');
++          if (!resolved.identityFile || !paths.seedFile) return refuse('native-source-paths-incomplete');
++          // Account identity (shop-identity.json) and the account-scoped historical seed are
++          // ACCOUNT-level facts, not facts of today's plan. Each is validated against its own
++          // real schema: carried shop/accountId/account_id must agree with the resolved identity
++          // (no conflict, no malformed document). The seed's productIds is the account's
++          // cumulative published history and its plans are past planId/date pairs, so they may
++          // legitimately differ from today's first plan in membership, order and date; they are
++          // never used as evidence for today's planId/hash/run/product mapping.
++          const accountSourceAgrees = r => object(r)
++            && (r.shop == null || String(r.shop) === String(shop.name))
++            && (r.accountId == null || String(r.accountId) === account)
++            && (r.account_id == null || String(r.account_id) === account);
++          for (const [kind, file] of [['identity', resolved.identityFile], ['seed', paths.seedFile]]) {
++            if (!fs.existsSync(file)) continue;
++            let doc;
++            try { doc = read(file); } catch (_) { return refuse('native-source-' + kind + '-unreadable'); }
++            if (!accountSourceAgrees(doc)) return refuse('native-source-' + kind + '-conflict');
++            if (kind !== 'seed') continue;
++            if (doc.productIds != null) {
++              if (!Array.isArray(doc.productIds) || new Set(doc.productIds).size !== doc.productIds.length
++                || doc.productIds.some(id => typeof id !== 'string' || !/^\d{15,20}$/.test(id))) return refuse('native-source-seed-products-invalid');
++              // Non-empty history must stay attributable to this exact account.
++              if (doc.productIds.length && String(doc.accountId == null ? '' : doc.accountId) !== account) return refuse('native-source-seed-conflict');
++            }
++            if (doc.plans != null && (!Array.isArray(doc.plans) || doc.plans.some(p => !object(p)
++              || !/^\d{12,20}$/.test(String(p.planId || ''))
++              || (p.date != null && !/^\d{4}-\d{2}-\d{2}$/.test(String(p.date)))))) return refuse('native-source-seed-plans-invalid');
++            if (doc.capturedAt != null && !Number.isFinite(Date.parse(String(doc.capturedAt)))) return refuse('native-source-seed-captured-at-invalid');
++          }
++          const fact = Array.isArray(state.preparationClosureFacts) && state.preparationClosureFacts.length === 1
++            ? state.preparationClosureFacts[0] : null;
++          const stopReason = 'prepare-stopped:account-anchor-account-identity-drift';
++          if (active.status !== 'preparation-stopped' || active.originalPhase !== 'preparing'
++            || active.source !== 'scheduled-prepare-stopped' || active.reason !== stopReason
++            || state.runId !== active.runId || !identityAgrees(fact)
++            || fact.status !== 'preparationClosed' || fact.phase !== active.originalPhase
++            || fact.runId !== active.runId || fact.businessDate !== businessDate || fact.planNumber !== 2
++            || fact.shop !== shop.name || String(fact.accountId || '') !== account
++            || fact.reason !== active.reason || fact.source !== active.source
++            || typeof fact.closedAt !== 'string' || !Number.isFinite(Date.parse(fact.closedAt))
++            || active.closedAt !== fact.closedAt || !strictZeroConsumptionProof(fact.zeroConsumptionProof)) return refuse('native-next-closure-not-proven');
++          const artifacts = ['frozen', 'confirmationId', 'manifestHash', 'planId', 'nonce', 'frozenDisposition', 'policyCancel'];
++          if ([active, fact, state].some(r => artifacts.some(k => r[k] != null)
++            || (r.date != null && r.date !== businessDate))
++            || (active.phase != null && active.phase !== fact.phase)
++            || (active.actionTaken != null && active.actionTaken !== false)
++            || (active.zeroConsumptionProof != null && !strictZeroConsumptionProof(active.zeroConsumptionProof))
++            || state.confirmationConsumptions.length) return refuse('native-next-artifacts');
++          const first = state.firstPublishedPlan;
++          if (!identityAgrees(first) || first.status !== 'success' || first.planNumber !== 1
++            || String(first.planId || '') !== String(target.planId) || first.businessDate !== businessDate
++            || first.manifestHash !== target.manifestHash || first.runId !== pair.initial.runId
++            || String(first.account_id || '') !== account || typeof first.planName !== 'string' || !first.planName.trim()
++            || typeof pair.cid !== 'string' || !pair.cid.trim()
++            || first.frozen != null || first.nonce != null) return refuse('native-first-summary-conflict');
++          const products = first.product_ids;
++          if (!Array.isArray(products) || products.length !== 30 || new Set(products).size !== 30
++            || products.some(id => typeof id !== 'string' || !/^\d{15,20}$/.test(id))) return refuse('native-first-products');
++          const publishedIds = new Set(published.publishedIds.map(String));
++          if (!products.every(id => publishedIds.has(id))) return refuse('published-products-missing');
++          const publishedTarget = published.plans.find(p => String(p.planId) === String(target.planId));
++          for (const r of [rec0, entry, first, target, attempts, pair.initial, pair.final, published, publishedTarget]) {
++            if (!identityAgrees(r) || (r.planId != null && String(r.planId) !== String(target.planId))
++              || (r.planNumber != null && r.planNumber !== 1) || (r.runId != null && r.runId !== first.runId)
++              || (r.confirmationId != null && r.confirmationId !== pair.cid)
++              || (r.manifestHash != null && r.manifestHash !== first.manifestHash)
++              || (r.date != null && r.date !== businessDate)
++              || (r.planName != null && r.planName !== first.planName)) return refuse('native-summary-binding-conflict');
++            for (const field of ['productIds', 'product_ids']) {
++              if (r[field] != null && (!Array.isArray(r[field])
++                || JSON.stringify(r[field]) !== JSON.stringify(products))) return refuse('native-summary-product-order-conflict');
++            }
++          }
++          // Native hashes attest a persisted success; absent manifest inputs cannot be recomputed or authorize publishing.
++          successProof = { method: 'native-first-success-summary-ledger-convergence',
++            recoveredBy: 'native-first-success-summary-recovery', runId: first.runId, manifestHash: first.manifestHash,
++            sourceHash: before, manifestRecomputed: false, newPublicationAuthorized: false,
++            proof: 'native-summary proof，未重算原始manifest；不用于新发布授权' };
++          if (already && (entry.sourceHash !== before || entry.convergedFrom !== 'in-progress'
++            || entry.runId !== first.runId || entry.confirmationId !== pair.cid
++            || entry.manifestHash !== first.manifestHash || entry.planId !== String(target.planId)
++            || entry.method !== successProof.method || entry.proof !== successProof.proof
++            || entry.manifestRecomputed !== false || entry.newPublicationAuthorized !== false
++            || rec0.plans !== 1 || rec0.status !== 'partial' || rec0.error !== null || rec0.partial != null)) return refuse('native-idempotent-source-conflict');
++        } else {
++          if (active.status !== 'published-success' || active.planNumber !== planNo
++            || String(active.planId || '') !== String(target.planId)) return refuse('active-not-target-success');
++          if (active.authorizedBy !== 'recurring-user-policy' || active.actionTaken !== false) return refuse('active-provenance-incomplete');
++          const frozen = active.frozen;
++          if (!object(frozen)) return refuse('frozen-missing');
++          const wfMod = require(path.join(RUNNER_DIR, 'plan-workflow.cjs'));
++          const fields = ['planNumber', 'runId', 'businessDate', 'accountId', 'planName', 'roi', 'dailyBudget',
++            'commissionIncluded', 'directPay', 'boundAccounts', 'productIds', 'disclosures'];
++          if (!fields.every(k => Object.hasOwn(frozen, k)) || !identityAgrees(frozen)
++            || frozen.businessDate !== businessDate || String(frozen.accountId) !== account || frozen.planNumber !== planNo
++            || frozen.runId !== pair.initial.runId || frozen.confirmationId !== pair.cid
++            || frozen.manifestHash !== target.manifestHash || typeof frozen.planName !== 'string' || !frozen.planName.trim()
++            || !Array.isArray(frozen.boundAccounts) || !frozen.boundAccounts.length
++            || !object(frozen.disclosures) || !['migration', 'precheck', 'reviewFailed'].every(k => Array.isArray(frozen.disclosures[k]))) return refuse('frozen-incomplete-or-conflicting');
++          let hash;
++          try { hash = wfMod.manifestHash(frozen); } catch (_) { return refuse('manifest-unreadable'); }
++          if (hash !== target.manifestHash) return refuse('manifest-recheck-failed');
++          const productCount = Number.isInteger(shop.productsPerPlan) && shop.productsPerPlan > 0 ? shop.productsPerPlan : wfMod.BUSINESS.productsPerPlan;
++          const products = Array.isArray(frozen.productIds) ? frozen.productIds.map(String) : [];
++          if (products.length !== productCount || new Set(products).size !== productCount || products.some(id => !/^\d{15,20}$/.test(id))) return refuse('frozen-products');
++          if (Number(frozen.roi) !== (shop.targetRoi || 15) || Number(frozen.dailyBudget) !== c.value.dailyBudget
++            || frozen.commissionIncluded !== (shop.commissionIncluded !== false) || frozen.directPay !== (shop.directPay === true)) return refuse('frozen-settings');
++          const publishedIds = new Set(published.publishedIds.map(String));
++          if (!products.every(id => publishedIds.has(id))) return refuse('published-products-missing');
++          const publishedTarget = published.plans.find(p => String(p.planId) === String(target.planId));
++          for (const r of [rec0, entry, active, target, pair.initial, pair.final, publishedTarget]) {
++            if ((r.runId != null && r.runId !== frozen.runId) || (r.planName != null && r.planName !== frozen.planName)
++              || (r.confirmationId != null && r.confirmationId !== pair.cid)
++              || (r.manifestHash != null && r.manifestHash !== hash)) return refuse('frozen-binding-conflict');
++            for (const field of ['productIds', 'product_ids']) {
++              if (r[field] != null && (!Array.isArray(r[field])
++                || JSON.stringify(r[field].map(String).slice().sort()) !== JSON.stringify(products.slice().sort()))) return refuse('product-set-conflict');
++            }
++          }
++          if (state.runId != null && state.runId !== frozen.runId) return refuse('state-run-conflict');
++          const first = state.firstPublishedPlan;
++          if (!identityAgrees(first) || first.status !== 'success' || first.planNumber !== 1
++            || String(first.planId || '') !== String(plans.get(1).planId)
++            || first.manifestHash !== plans.get(1).manifestHash || first.businessDate !== businessDate
++            || first.runId !== current.get(1).initial.runId) return refuse('first-published-conflict');
++          if (planNo === 1 && (String(first.account_id || '') !== account || first.planName !== frozen.planName
++            || !Array.isArray(first.product_ids) || JSON.stringify(first.product_ids.map(String)) !== JSON.stringify(products))) return refuse('first-published-products-conflict');
++          successProof = { method: 'durable-crash-success-ledger-convergence', recoveredBy: 'durable-crash-success-recovery',
++            runId: frozen.runId, manifestHash: hash };
++        }
++        if (already && entry.recoveredBy !== successProof.recoveredBy) return refuse('recovery-method-conflict');
++        if (sourceHash() !== before) return refuse('source-drift');
++        if (typeof schedulerModule.acquireProcessLock !== 'function' || typeof schedulerModule.releaseProcessLock !== 'function'
++          || typeof schedulerModule.saveLedger !== 'function' || typeof schedulerModule.countSuccessEntries !== 'function') return refuse('scheduler-capability-unavailable');
++        const lockFile = ledgerFile + '.lock';
++        const lock = schedulerModule.acquireProcessLock(lockFile, nowMs, 30 * 60 * 1000);
++        if (!lock || lock.held !== true) return refuse('scheduler-lock-busy');
++        try {
++          const ledger = schedulerModule.loadLedger(ledgerFile);
++          const rec = recOf(ledger);
++          if (!rec || JSON.stringify(rec) !== JSON.stringify(rec0)) return refuse('record-drift-under-lock');
++          if (fs.existsSync(paths.lockFile) || fs.existsSync(paths.lockFile + '.recovery')) return refuse('publisher-lock-busy-under-lock');
++          if (sourceHash() !== before) return refuse('source-drift-under-lock');
++          const result = { ...successProof, planNumber: planNo, planId: String(target.planId), confirmationId: pair.cid };
++          if (already) return { ...result, ok: true, released: false, idempotent: true, reason: 'already-converged' };
++          Object.assign(rec.entries[key], { status: 'success', planId: String(target.planId), ...successProof,
++            confirmationId: pair.cid, convergedFrom: 'in-progress', convergedAt: new Date(nowMs()).toISOString() });
++          rec.plans = schedulerModule.countSuccessEntries(rec);
++          rec.status = rec.plans >= limit ? 'success' : 'partial';
++          if (successProof.recoveredBy === 'native-first-success-summary-recovery') delete rec.partial;
++          rec.error = null;
++          rec.lastAt = new Date(nowMs()).toISOString();
++          schedulerModule.saveLedger(ledgerFile, ledger);
++          return { ...result, ok: true, released: true };
++        } finally { schedulerModule.releaseProcessLock(lockFile, lock.token); }
++      })();
++      if (crashRecovery) return crashRecovery;
++    }
++
+     // ── 形状 1：failed/blocked 零发布 → publisher 严格 release 证明 + fresh CAS + canonical 释放。
+     if (String(rec0.status) === 'failed' || String(rec0.status) === 'blocked') {
+       if (typeof deps.proveSchedulerRelease !== 'function' || typeof deps.currentSourceHash !== 'function'

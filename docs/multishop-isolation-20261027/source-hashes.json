@@ -88,5 +88,41 @@
     "id": "publisher/binding-inert-rows.test.cjs",
     "beforeSha256": "bd27656e8e0447cd73d747757df2439e4d336ee7873e9f5c9f5206b2ce74c2f9",
     "afterSha256": "2bacd634b94b48a71137a9715dbffd400af0a63528134d9c4ae49b419159e752"
+  },
+  {
+    "id": "publisher/daily-plan-runner.cjs",
+    "beforeSha256": "39d428f38e775ab8d73d727f24f015ed3cacb1d187b06ddd6836fe4c548b0e70",
+    "afterSha256": "42bab2fcc5fd12ffa55df37d1e10b64b2ea867706cbe491b1506db281fdbce14",
+    "role": "D47 runtime change"
+  },
+  {
+    "id": "publisher/crash-success-recovery.test.cjs",
+    "beforeSha256": null,
+    "afterSha256": "4f3f0f1d0bd38a05e8bf50ec078cf04e6f54402af95e4e6f4f67ed2a716395f1",
+    "role": "D47 portable regression or unchanged dependency"
+  },
+  {
+    "id": "publisher/direct-draft-controller.cjs",
+    "beforeSha256": null,
+    "afterSha256": "6d07707a2a207ee385ec4120205e2a1db18e9085a1f2f8eb4025b6e79604121d",
+    "role": "D47 portable regression or unchanged dependency"
+  },
+  {
+    "id": "publisher/shop-profile.cjs",
+    "beforeSha256": null,
+    "afterSha256": "238a86d439b66caf0a6909c08a2a7f61cf660b96e999dd86cfca41c0b5145e65",
+    "role": "D47 portable regression or unchanged dependency"
+  },
+  {
+    "id": "publisher/confirmation-ui.cjs",
+    "beforeSha256": null,
+    "afterSha256": "0d3bab33ebc95a20893908c7150845a5abaeb44ba60c5740c207f2f0a0717670",
+    "role": "D47 portable regression or unchanged dependency"
+  },
+  {
+    "id": "bill-manager/promo-plan-scheduler.js",
+    "beforeSha256": null,
+    "afterSha256": "66db85c1ecdb8c0115a5e71668462b2d149421d3690a1abd0213f8901b391a3d",
+    "role": "D47 portable regression or unchanged dependency"
   }
 ]

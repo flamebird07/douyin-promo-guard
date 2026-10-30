@@ -148,3 +148,8 @@ D46：恢复两阶段等待——先给真实绑定结果完整窗口，窗口�
 真实结果（2026-10-30）：简尚 3/3 成功，为 D46 首个真实批次。敏敏 1 份耐久已发布（attempts 双表 success + planId + published 收录四重证明），但 12:00 派发进程在发布成功后、账本终态写入前死亡，账本残留 in-progress，当日转 unknown（fail-closed 绝不重放）；"在途条目 + 耐久成功事实"形状无既有可信恢复入口，建议后续轮次按 R16 语义扩展纯本地收敛。瑾漂亮当日 0：受 10-29 夜间崩溃残留的 preparing 状态阻塞；该陈旧状态已用导出 recoverLocalPreparationClose 收口（零消费六零证明，runId 814d14db）。当日账本残局如实保留，不手改；明日三店全新开始。
 
 交付 binding-inert-D44.patch、binding-inert-D46.patch 与 offline 对应源码/测试；D46 补丁按生产 D44 字节回放一致。默认根源码树未全量替换；生产配置、Cookie、账本和原始运行报告不上传 Git。
+
+
+## D47 crash-success ledger recovery
+
+See [D47 recovery proof, limits and validation](D47-crash-success-recovery.md). The production runner now reconciles the proven historical first publication without replay. New recovery regression: 323/323; no guard restart or automatic publishing activation.

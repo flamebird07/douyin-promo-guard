@@ -15,6 +15,12 @@
   "dailyEnableRunning": true,
   "dailyFirstCheckRecordsPreserved": true,
   "liveLowSpendPauseConfirmed": false,
-  "liveLowSpendPauseStatus": "pending natural patrol verification",
-  "financialBusinessDataIncluded": false
+  "liveLowSpendPauseStatus": "not-triggered: fresh sample below threshold",
+  "financialBusinessDataIncluded": false,
+  "completedLivePatrolCycle": true,
+  "liveUnderThresholdDecisionVerified": true,
+  "realHighFeePauseVerifiedBeforeRuleRemoval": true,
+  "cookieActualWritesAndReadbackVerified": true,
+  "repeatAdRequestsForAlreadyPausedShop": 0,
+  "noFinancialSamplesManufactured": true
 }

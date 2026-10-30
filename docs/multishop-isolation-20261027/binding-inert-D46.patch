@@ -1,0 +1,171 @@
+--- a/publisher/run-plans.cjs
++++ b/publisher/run-plans.cjs
+@@ -6134,17 +6134,32 @@
+     // PARTIAL failure. A full-success batch leaves the drawer open with NO popup, so the settled
+     // result wait times out. That must NOT be read as success and must NOT bypass any guard: we
+     // prove completion by an entirely READ-ONLY UI readback, bounded ordinary .panel navigation
+-    // across the batch's known unique 30 ids. Each target must show a settled known subset of the
+-    // approved target accounts (R33 min-1: >=1 checked, remaining rows definite unchecked — an
+-    // enabled row left intentionally unbound is legitimate) at footer checked-count/30
++    // across the batch's known unique 30 ids. In all-success mode each target must show a settled
++    // known subset of the approved target accounts (R33 min-1: >=1 checked, remaining rows definite
++    // unchecked — an enabled row left intentionally unbound is legitimate) at footer checked-count/30
+     // with the SAME exact 30-panel set and a SINGLE active === the target; before
+     // every navigation the PREVIOUS active/drawer identity/panel set/accounts/footer are re-read and
+     // any blocking overlay census is re-checked. A new/unknown overlay, account drift, unknown row,
+-    // footer conflict, foreign/duplicate panel, wrong active or a zero-checked selection stops with ZERO
+-    // acknowledge and ZERO drawer commit — we never click behind an overlay. Only after all 30 are
+-    // positively proven do we navigate back to the ORIGINAL captured batchAnchorId, fresh-prove it,
+-    // and then proceed (still zero ACK) to the normal drawer 确定 + full main-table readback. The
+-    // empty failedIds is derived from this full 30 proof, never from the mere absence of a popup.
++    // footer conflict, foreign/duplicate panel or wrong active stops with ZERO acknowledge and ZERO
++    // drawer commit — we never click behind an overlay. Only after all 30 are positively proven do we
++    // navigate back to the ORIGINAL captured batchAnchorId, fresh-prove it, and then proceed (still
++    // zero ACK) to the normal drawer 确定 + full main-table readback.
++    //
++    // TWO MODES, ONE PROOF (D45; D46 two-phase semantics). The platform raises this popup only on a
++    // PARTIAL failure, so its ABSENCE is ambiguous on its own: it can mean "all 30 bound" OR "some
++    // products bound nothing". mode 'partial' therefore classifies EACH of the 30 panels as PROVEN
++    // BOUND (>=1 checked target row at checked-count/30) or PROVEN ZERO (1..10 displayed rows, every
++    // one a frozen target row definitively UNCHECKED, footer exactly 0/30, same panel-set/unique-
++    // active/account gates) and returns {boundIds, zeroIds}. D46: a zero SHAPE never ends the phase-2
++    // window — the real binding outcome gets the FULL bounded window first, and only when that window
++    // expires with a LAST identity-valid zero reading, a zero shape seen inside the window and NO
++    // unstable reading (empty rows, foreign/duplicate/ambiguous rows, footer conflict — anything
++    // neither bound nor zero) at any point does the panel classify as PROVEN ZERO. The caller derives
++    // failedIds from the PROVEN zero ids only, so an absent popup is never "empty == success" and
++    // never "unknown == empty". A zero-row panel, an unknown checkbox state, a footer conflict, a
++    // foreign/duplicate/malformed row, a wrong active or a drifted panel set is NEITHER bound NOR
++    // zero and still stops fail-closed. The all-success mode (no zero concept) remains for callers
++    // that require every panel positively bound.
+     async function proveAllSuccessByPanelNavigation(originalAnchor, mode) {
+       const partial=mode==='partial';
+       const panelIds=[...new Set(ids.map(String))];
+@@ -6158,7 +6173,9 @@
+       // 严格 partial 口径：一个商品的**明确 0** 只有在同一 30-panel 身份、唯一 active=该商品、账号行仍含
+       // 本店已发现的授权目标账号且全部未选、页脚恰为 0/30 时才算成立（未选中的灰色外来行只作展示，
+       // 不改变 0 的事实，但也不得是勾选/可用/未知状态）。缺行/页脚冲突/账号漂移/读不回
+-      // 一律不算 0（算 unknown，直接停），绝不把"没结果/一直在加载"当成 0。
++      // 一律不算 0（算 unknown，直接停），绝不把"没结果/一直在加载"当成 0。D46：该 0 形状还必须在
++      // Phase 2 整个窗口内稳定成立（末拍仍为 0 形状、窗口内出现过 0 形状且从未出现不稳定读数），
++      // 并且窗口始终等不到真实绑定结果（provesTarget），才在窗口耗尽后分类为 PROVEN ZERO。
+       const provesZero=(s,pid)=>!!s&&s.ok===true&&boundedAccountsReadBack(s)&&consistentSelectionState(s)&&s.totalCount===30&&s.selectedCount===0
+         &&Array.isArray(s.rows)&&s.rows.length>=1&&s.rows.every(r=>r.checked===false)&&panelSetEqualsIds(s)&&provePanelSet(s)===String(pid);
+       // D41: every read below is judged ONLY on its OWN fresh contents. There is deliberately
+@@ -6204,8 +6221,28 @@
+         // exact panel set and the unique target active, so the existing foreign/duplicate/
+         // ambiguous/empty row and footer/checked gates below stay unchanged. Any stable error or
+         // timeout keeps the ORIGINAL fail-closed reason and the sanitized diagnostics.
++        // D46 (partial mode): the window is closed ONLY by provesTarget — a real binding result
++        // gets the FULL window. Zero-shape reads never end it; they are tracked for stability.
+         const freshRead=()=>page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null);
+         const clickedIdentity=s=>!!s&&s.ok===true&&!s.spinnerCount&&panelSetEqualsIds(s)&&provePanelSet(s)===String(pid);
++        // D46 partial phase-2 window: poll the whole budget for provesTarget; remember whether a
++        // zero shape (provesZero) was seen and whether any identity-valid NEITHER-bound-nor-zero
++        // reading (empty rows, foreign/duplicate/ambiguous, footer conflict) flipped it. Only at
++        // window expiry, a LAST identity-valid zero reading with stable zero evidence and no
++        // unstable reading classifies as PROVEN ZERO; everything else stays fail-closed.
++        const partialPhase2Window=async()=>{
++          const deadline=Date.now()+nativeTimeoutMs;
++          let last=null,zeroShape=false,unstable=false;
++          while(Date.now()<deadline){
++            last=await freshRead();
++            if(clickedIdentity(last)){
++              if(provesTarget(last,pid)) return {reading:last,settled:true};
++              if(provesZero(last,pid)) zeroShape=true; else unstable=true;
++            }
++            await sleep(POLL_MS);
++          }
++          return {reading:last,settled:clickedIdentity(last)&&provesZero(last,pid)&&zeroShape&&!unstable};
++        };
+         let lastIdentityRead=null;
+         const identityRead=async()=>{ lastIdentityRead=await freshRead(); return lastIdentityRead; };
+         let identityOk=false;
+@@ -6219,8 +6256,13 @@
+           return {ok:false,reason:'batch-result-panel-target-not-verified',diag:footerStateDiag(last,'panel-navigation',pid)};
+         }
+         let fresh=null;
+-        try { fresh=await until(freshRead, s=>clickedIdentity(s)&&proves(s,pid), nativeTimeoutMs,'batch-result-panel-verified'); }
+-        catch(_) { fresh=await freshRead(); }
++        let p2settled=false;
++        if(partial){ const w=await partialPhase2Window(); fresh=w.reading; p2settled=w.settled; }
++        else {
++          try { fresh=await until(freshRead, s=>clickedIdentity(s)&&proves(s,pid), nativeTimeoutMs,'batch-result-panel-verified'); }
++          catch(_) { fresh=await freshRead(); }
++          p2settled=clickedIdentity(fresh)&&proves(fresh,pid);
++        }
+         // R128: a target that cannot be positively proven is still the SAME fail-closed stop; only
+         // the sanitized numeric footer/row-state of THIS LAST fresh read is attached (never row
+         // text, ids, URLs or cookies), so a real run's stop can be told apart from a stale cache.
+@@ -6232,7 +6274,7 @@
+         // other known panel and back once, then run the SAME fresh two-phase identity+proof. No
+         // header/batch/commit/publication action is added, the footer/avatar chips are never taken
+         // as success, and a persistent empty/unknown render still stops with the ORIGINAL reason.
+-        if(!clickedIdentity(fresh)||!proves(fresh,pid)){
++        if(!p2settled){
+           const contradictoryEmpty=s=>!!s&&s.ok===true&&!s.spinnerCount&&panelSetEqualsIds(s)
+             &&provePanelSet(s)===String(pid)&&Array.isArray(s.rows)&&s.rows.length===0
+             &&Number(s.selectedCount)>0&&s.totalCount===30;
+@@ -6251,13 +6293,18 @@
+                 try{ back=await page.evaluate(selectBindingDrawerPanelInPage,pid); }catch(_){ back=null; }
+                 if(back&&back.clicked===true&&String(back.id)===String(pid)){
+                   try{ await until(()=>page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null),clickedIdentity,nativeTimeoutMs,'batch-result-panel-refresh-identity'); }catch(_){}
+-                  try{ recovered=await until(freshRead,s=>clickedIdentity(s)&&proves(s,pid),nativeTimeoutMs,'batch-result-panel-refresh-verified'); }
+-                  catch(_){ recovered=await freshRead(); }
++                  // D46: the refreshed re-proof follows the SAME partial window semantics.
++                  if(partial){ const w2=await partialPhase2Window(); recovered=w2.reading; p2settled=w2.settled; }
++                  else {
++                    try{ recovered=await until(freshRead,s=>clickedIdentity(s)&&proves(s,pid),nativeTimeoutMs,'batch-result-panel-refresh-verified'); }
++                    catch(_){ recovered=await freshRead(); }
++                    p2settled=!!recovered&&clickedIdentity(recovered)&&proves(recovered,pid);
++                  }
+                 }
+               }
+             }
+           }
+-          if(!recovered||!clickedIdentity(recovered)||!proves(recovered,pid)) return {ok:false,reason:'batch-result-panel-target-not-verified',diag:footerStateDiag(recovered||fresh,'panel-navigation',pid)};
++          if(!p2settled) return {ok:false,reason:'batch-result-panel-target-not-verified',diag:footerStateDiag(recovered||fresh,'panel-navigation',pid)};
+           fresh=recovered;
+         }
+         if(!(await noBlocking())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
+@@ -6625,9 +6672,8 @@
+       } else {
+         // The settled wait timed out. A present-but-unsettled modal is PENDING/UNKNOWN and must STOP,
+         // never be probed around. Only a genuinely ABSENT result popup AND no other blocking overlay
+-        // AND a uniquely-present drawer is the platform's all-success-with-no-modal case; even then we
+-        // do not treat "no popup" as success — we prove it with a bounded read-only .panel readback of
+-        // all 30 ids (zero ACK). If that proof cannot be completed we stop with zero drawer commit.
++        // AND a uniquely-present drawer may reach the read-only 30-panel proof below; even then the
++        // absence itself is never success and never an empty result.
+         const ov=await page.evaluate(bindingOverlaySnapshotInPage).catch(()=>null);
+         if(!rs||rs.present===true) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
+         // R12: a blocking overlay here MAY be the late KNOWN novice guidance over the open
+@@ -6635,14 +6681,25 @@
+         // guidance phase and re-censused; an unknown mask / foreign page / non-durable flag
+         // save / still-present guide keeps the ORIGINAL stop with zero clicks behind it.
+         if((!ov||ov.accountDrawerCount!==1||ov.blockingOverlayPresent===true)&&!(await dismissLateGuideBeforeBatchResult())) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
+-        const probe=await proveAllSuccessByPanelNavigation(batchAnchorId);
++        // D45: the SAME bounded read-only 30-panel proof runs in 'partial' mode, so every panel is
++        // classified from its OWN fresh identity+row+footer read as PROVEN BOUND or PROVEN ZERO.
++        // zeroIds===[] means all 30 panels were positively proven bound (the D40 all-success case is
++        // unchanged); a non-empty zeroIds is a REAL partial outcome whose exact ids feed the existing
++        // failedIds -> partial draft commit/removal/replacement workflow. A panel that is neither
++        // (zero rows, unknown row state, footer conflict, foreign/duplicate row, wrong active,
++        // drifted panel set) fails the proof and stops with zero drawer commit — never success.
++        const probe=await proveAllSuccessByPanelNavigation(batchAnchorId,'partial');
+         if(probe.ok!==true) return probe;
+-        failedIds=[];failedSet=new Set();knownFailures=false;
++        failedIds=(probe.zeroIds||[]).map(String);
++        failedSet=new Set(failedIds);
++        knownFailures=failedIds.length>0;
+       }
+     }
+     // STEP 5: commit the drawer DRAFT with 确定 (identity re-verified in the callback), then
+     // accept a partial-submit warning ONLY when the recorded outcome proved exact failed ids
+-    // (settled result modal, or an explicit 0 read from every panel in the partial-close path).
++    // (settled result modal, an explicit 0 read from every panel in the partial-close path, or the
++    // PROVEN-ZERO panels of the absent-popup 30-panel proof — D45 — where zeroIds are the only
++    // failed ids and an all-bound proof leaves the set empty).
+     await page.evaluate(confirmBatchAccountsApplyInPage, targetPayload());
+     try { await page.evaluate(acceptPartialDraftWarningInPage,knownFailures); } catch(_) { return {ok:false,reason:'partial-draft-warning-not-acceptable'}; }
+     // The fresh main table is the source of truth (R32 min-1): a row showing a definite

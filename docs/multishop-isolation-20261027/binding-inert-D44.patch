@@ -1,0 +1,161 @@
+--- a/publisher/run-plans.cjs
++++ b/publisher/run-plans.cjs
+@@ -5743,6 +5743,22 @@
+       }
+       return hasTargetRow;
+     };
++    // ZERO-CLICK REUSE identity (D43). A drawer that ALREADY shows the exact targets
++    // CHECKED beside provably INERT foreign rows (definitely unchecked AND label-disabled)
++    // needs NO header select-all and NO checkbox action: committing it as-is binds exactly
++    // the checked targets, and an inert row can never be selected. It is therefore a valid
++    // REUSE snapshot even though it is not a strict boundedAccounts membership. Allowed ONLY
++    // once this shop's targets are frozen (never during discovery, where a foreign id could
++    // otherwise be adopted) and ONLY when at least one row is really checked — an
++    // all-unchecked panel still needs the header action and stays on the strict gate. Every
++    // header / batch / modal / commit / discovery gate keeps strict boundedAccounts.
++    const boundedAccountsReuse=s=>!!resolvedTargets&&!!s&&s.ok===true&&boundedAccountsReadBack(s)
++      &&s.rows.filter(r=>r.checked===true).length>=1;
++    // A reuse snapshot is only usable when its ACTIVE product is itself a legitimately-bound
++    // manual2 of THIS batch: the drawer commit binds the checked accounts to that product, so
++    // an unbound/unknown active keeps the original strict path (and its reopen) untouched.
++    const reusableDrawer=s=>boundedAccountsReuse(s)&&isBoundManual2InBatch(provePanelSet(s));
++    const usableDrawer=s=>!!s&&s.ok===true&&(boundedAccounts(s)||reusableDrawer(s));
+     // Freeze the shop's OWN bindable accounts ONCE. R134: the ONLY discovery freeze
+     // authority is the COMPLETED whole-batch union scan (scanDiscoveryUnion) — the union
+     // of every one of the exact 30 identity-proven panels, never the first product's
+@@ -5913,7 +5929,14 @@
+           const rowIds=[...new Set(s.rows.map(r=>String(r.ids[0])))].sort();
+           if(rowIds.length!==s.rows.length)return false;
+           if(resolvedTargets){
+-            if(!rowIds.every(id=>resolvedTargets.includes(id)))foreignAccountSeen=true;
++            // D43: a provably INERT foreign row (definitely unchecked AND label-disabled)
++            // beside the frozen targets is a display fact, not identity drift — it can never
++            // be selected and the zero-click reuse gate judges it explicitly. Any checked /
++            // enabled / unknown-state foreign row still poisons the settle permanently, so
++            // the strict path (and its honest stop) is unchanged for a real foreign account.
++            const inertForeign=s.rows.every(r=>resolvedTargets.includes(String(r.ids[0]))
++              ||(r.checked===false&&r.labelDisabled===true));
++            if(!rowIds.every(id=>resolvedTargets.includes(id))&&!inertForeign)foreignAccountSeen=true;
+             if(foreignAccountSeen)return false;
+           }
+           // R134: DISCOVERY never freezes a per-product row key during the settle. The
+@@ -5935,7 +5958,7 @@
+       let prevSig=null;
+       const signature=s=>JSON.stringify([s&&s.spinnerCount,s&&s.selectedCount,s&&s.totalCount,s&&s.activeProductIds,(s&&s.rows||[]).map(r=>[r&&r.ids,r&&r.checked,r&&r.labelDisabled]),s&&s.rowSignature]);
+       const stable=s=>{ if(!requireStability)return true; const sig=signature(s); const ok=prevSig!==null&&prevSig===sig; prevSig=sig; return ok; };
+-      const usable=s=>!!s&&s.ok===true&&!s.spinnerCount&&boundedAccounts(s)&&consistentSelectionState(s);
++      const usable=s=>!!s&&s.ok===true&&!s.spinnerCount&&usableDrawer(s)&&consistentSelectionState(s);
+       try { return await until(fresh,x=>noteIdentity(x)&&usable(x)&&stable(x),Math.min(nativeTimeoutMs,10000),'account-drawer-settled'); }
+       catch(_) { const fin=await fresh(); if(!trustedIdentity(fin))return fin; return noteIdentity(fin)?fin:null; }
+     }
+@@ -6054,7 +6077,7 @@
+       // EQUALS the requested anchor, and the 1..10 target accounts form a settled known subset
+       // (>=1 checked, remaining rows definite unchecked) at footer checked-count/30. Never loop
+       // forever or click behind an overlay: on timeout return the last read for the caller guards.
+-      const settled=s=>!!s&&s.ok===true&&boundedAccounts(s)&&consistentSelectionState(s)&&Array.isArray(s.rows)&&s.rows.some(r=>r.checked===true)&&s.rows.every(r=>r.checked===true||r.checked===false)&&provePanelSet(s)===String(anchor.productId);
++      const settled=s=>!!s&&s.ok===true&&usableDrawer(s)&&consistentSelectionState(s)&&Array.isArray(s.rows)&&s.rows.some(r=>r.checked===true)&&s.rows.every(r=>r.checked===true||r.checked===false)&&provePanelSet(s)===String(anchor.productId);
+       try { return await until(()=>page.evaluate(bindingDrawerSnapshotInPage),settled,nativeTimeoutMs,'anchor-reopen-settled'); }
+       catch(_) { return await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null); }
+     }
+@@ -6157,6 +6180,8 @@
+       if(!(await noBlocking())&&!(await dismissLateGuideBeforeBatchResult())) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
+       let prev=null;
+       for(const pid of panelIds){
++        // D44: at most ONE bounded native refresh per panel proof (see the failure branch below).
++        let refreshedThisPanel=false;
+         // Re-check the PREVIOUS verification still holds on a fresh read before moving on, and re-run
+         // the blocking-overlay census; a mid-probe popup/drift stops before any further navigation.
+         if(prev!==null){
+@@ -6199,7 +6224,42 @@
+         // R128: a target that cannot be positively proven is still the SAME fail-closed stop; only
+         // the sanitized numeric footer/row-state of THIS LAST fresh read is attached (never row
+         // text, ids, URLs or cookies), so a real run's stop can be told apart from a stale cache.
+-        if(!clickedIdentity(fresh)||!proves(fresh,pid)) return {ok:false,reason:'batch-result-panel-target-not-verified',diag:footerStateDiag(fresh,'panel-navigation',pid)};
++        // D44: ONE bounded native refresh of the SAME proven product. The live D42 capture settled
++        // on an internally CONTRADICTORY render — zero account rows while the footer still reported
++        // 当前商品已选 2/30 on the correct unique active, no spinner, header enabled — and polling the
++        // same DOM can never re-fetch a frozen panel. Only when the identity is ALREADY proven and
++        // the row list is empty while the footer claims a positive selection do we navigate ONE
++        // other known panel and back once, then run the SAME fresh two-phase identity+proof. No
++        // header/batch/commit/publication action is added, the footer/avatar chips are never taken
++        // as success, and a persistent empty/unknown render still stops with the ORIGINAL reason.
++        if(!clickedIdentity(fresh)||!proves(fresh,pid)){
++          const contradictoryEmpty=s=>!!s&&s.ok===true&&!s.spinnerCount&&panelSetEqualsIds(s)
++            &&provePanelSet(s)===String(pid)&&Array.isArray(s.rows)&&s.rows.length===0
++            &&Number(s.selectedCount)>0&&s.totalCount===30;
++          let recovered=null;
++          if(!refreshedThisPanel&&contradictoryEmpty(fresh)){
++            refreshedThisPanel=true;
++            const other=panelIds.find(x=>String(x)!==String(pid));
++            if(other){
++              let away=null;
++              try{ away=await page.evaluate(selectBindingDrawerPanelInPage,other); }catch(_){ away=null; }
++              if(away&&away.clicked===true&&String(away.id)===String(other)){
++                // The away read is only a bounded settle of the OTHER known panel; it is never
++                // adopted as proof of anything.
++                try{ await until(()=>page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null),s=>!!s&&s.ok===true&&!s.spinnerCount&&panelSetEqualsIds(s)&&provePanelSet(s)===String(other),nativeTimeoutMs,'batch-result-panel-refresh-away'); }catch(_){}
++                let back=null;
++                try{ back=await page.evaluate(selectBindingDrawerPanelInPage,pid); }catch(_){ back=null; }
++                if(back&&back.clicked===true&&String(back.id)===String(pid)){
++                  try{ await until(()=>page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null),clickedIdentity,nativeTimeoutMs,'batch-result-panel-refresh-identity'); }catch(_){}
++                  try{ recovered=await until(freshRead,s=>clickedIdentity(s)&&proves(s,pid),nativeTimeoutMs,'batch-result-panel-refresh-verified'); }
++                  catch(_){ recovered=await freshRead(); }
++                }
++              }
++            }
++          }
++          if(!recovered||!clickedIdentity(recovered)||!proves(recovered,pid)) return {ok:false,reason:'batch-result-panel-target-not-verified',diag:footerStateDiag(recovered||fresh,'panel-navigation',pid)};
++          fresh=recovered;
++        }
+         if(!(await noBlocking())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
+         if(partial){ (provesTarget(fresh,pid)?boundIds:zeroIds).push(String(pid)); }
+         prev=pid;
+@@ -6234,14 +6294,23 @@
+     // STEP 2 (supplement): with no usable auto drawer but a proven manual2 anchor, cancel the
+     // auto-opened unsaved drawer, then uniquely open the anchor's management button.
+     let reopenedInStep2=false;
+-    if(!snap||!snap.ok||!boundedAccounts(snap)){
++    if(!usableDrawer(snap)){
+       if(anchor){
+         snap=await reopenBoundAnchor();
+         reopenedInStep2=true;
+-        if((!snap||!snap.ok||!boundedAccounts(snap))&&anchor) return {ok:false,reason:'anchor-account-management-button-not-unique'};
+-      }
+-    }
+-    if(!snap||!snap.ok||!boundedAccounts(snap))return {ok:false,reason:'account-drawer-does-not-show-exact-two-target-accounts'};
++        if(!usableDrawer(snap)&&anchor){
++          // D44: a reopen returns EITHER no drawer snapshot at all (the management button itself
++          // could not be uniquely opened — the only case that may claim the button reason) OR a
++          // real, readable drawer that is simply not reusable. The latter is a PAGE-SNAPSHOT
++          // FACT (every row unchecked and label-disabled), not an ambiguous button, so it keeps
++          // the same literal the later reopen branch uses. Zero clicks on both branches.
++          const allRowsUnchecked=!!snap&&snap.ok===true&&Array.isArray(snap.rows)&&snap.rows.length>=1&&snap.rows.every(r=>r.checked===false);
++          if(allRowsUnchecked&&rowsBlockedUnchecked(snap))return {ok:false,reason:'native-account-rows-label-disabled'};
++          return {ok:false,reason:'anchor-account-management-button-not-unique'};
++        }
++      }
++    }
++    if(!usableDrawer(snap))return {ok:false,reason:'account-drawer-does-not-show-exact-two-target-accounts'};
+     // The stop-reason literals below are kept verbatim for existing operators/diagnostics;
+     // the bound itself is the bounded non-empty account set (0..10 checked of 30).
+     if(snap.totalCount!==30||!Number.isInteger(snap.selectedCount)||snap.selectedCount<0||snap.selectedCount>10)return {ok:false,reason:'account-drawer-selected-count-not-0-1-or-2-of-30'};
+@@ -6294,6 +6363,10 @@
+       // at footer checked-count/30 on its ACTIVE
+       // product. Reuse that product directly as the batch anchor with ZERO cancel/reopen/header —
+       // but ONLY when the active product is itself a legitimately-bound manual2 inside this batch.
++      // D43: the snapshot may additionally carry provably INERT foreign rows (unchecked +
++      // label-disabled); usableDrawer already proved every checked row is a frozen target and
++      // the active is a bound manual2, and nothing is clicked on this path, so those display-only
++      // rows change no binding outcome.
+       // It need NOT be the first rows.find manual2; a second (or last) bound product's active is a
+       // valid batch scope, so do not require every initial active to equal the first anchor.
+       if(!isBoundManual2InBatch(batchAnchorId))return {ok:false,reason:'account-drawer-active-anchor-not-bound-manual2'};
+@@ -6309,7 +6382,7 @@
+       // requires active === the requested management product. (When the current active is itself the
+       // anchor or another bound manual2 and is unblocked, fall through and header it directly.)
+       snap=await reopenBoundAnchor();
+-      if(!snap||!snap.ok||!boundedAccounts(snap))return {ok:false,reason:rowsBlockedUnchecked(snap)?'native-account-rows-label-disabled':'native-account-header-select-all-disabled'};
++      if(!usableDrawer(snap))return {ok:false,reason:rowsBlockedUnchecked(snap)?'native-account-rows-label-disabled':'native-account-header-select-all-disabled'};
+       if(!consistentSelectionState(snap))return {ok:false,reason:'account-drawer-footer-row-state-conflict',diag:footerStateDiag(snap,'reopened-anchor')};
+       const reopenedAnchor=provePanelSet(snap);
+       if(!reopenedAnchor)return {ok:false,reason:'anchor-account-panel-identity-unverified'};

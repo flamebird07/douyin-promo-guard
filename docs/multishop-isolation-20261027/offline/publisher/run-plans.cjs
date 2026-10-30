@@ -5743,6 +5743,22 @@ function createRealDrivers(ctx) {
       }
       return hasTargetRow;
     };
+    // ZERO-CLICK REUSE identity (D43). A drawer that ALREADY shows the exact targets
+    // CHECKED beside provably INERT foreign rows (definitely unchecked AND label-disabled)
+    // needs NO header select-all and NO checkbox action: committing it as-is binds exactly
+    // the checked targets, and an inert row can never be selected. It is therefore a valid
+    // REUSE snapshot even though it is not a strict boundedAccounts membership. Allowed ONLY
+    // once this shop's targets are frozen (never during discovery, where a foreign id could
+    // otherwise be adopted) and ONLY when at least one row is really checked — an
+    // all-unchecked panel still needs the header action and stays on the strict gate. Every
+    // header / batch / modal / commit / discovery gate keeps strict boundedAccounts.
+    const boundedAccountsReuse=s=>!!resolvedTargets&&!!s&&s.ok===true&&boundedAccountsReadBack(s)
+      &&s.rows.filter(r=>r.checked===true).length>=1;
+    // A reuse snapshot is only usable when its ACTIVE product is itself a legitimately-bound
+    // manual2 of THIS batch: the drawer commit binds the checked accounts to that product, so
+    // an unbound/unknown active keeps the original strict path (and its reopen) untouched.
+    const reusableDrawer=s=>boundedAccountsReuse(s)&&isBoundManual2InBatch(provePanelSet(s));
+    const usableDrawer=s=>!!s&&s.ok===true&&(boundedAccounts(s)||reusableDrawer(s));
     // Freeze the shop's OWN bindable accounts ONCE. R134: the ONLY discovery freeze
     // authority is the COMPLETED whole-batch union scan (scanDiscoveryUnion) — the union
     // of every one of the exact 30 identity-proven panels, never the first product's
@@ -5913,7 +5929,14 @@ function createRealDrivers(ctx) {
           const rowIds=[...new Set(s.rows.map(r=>String(r.ids[0])))].sort();
           if(rowIds.length!==s.rows.length)return false;
           if(resolvedTargets){
-            if(!rowIds.every(id=>resolvedTargets.includes(id)))foreignAccountSeen=true;
+            // D43: a provably INERT foreign row (definitely unchecked AND label-disabled)
+            // beside the frozen targets is a display fact, not identity drift — it can never
+            // be selected and the zero-click reuse gate judges it explicitly. Any checked /
+            // enabled / unknown-state foreign row still poisons the settle permanently, so
+            // the strict path (and its honest stop) is unchanged for a real foreign account.
+            const inertForeign=s.rows.every(r=>resolvedTargets.includes(String(r.ids[0]))
+              ||(r.checked===false&&r.labelDisabled===true));
+            if(!rowIds.every(id=>resolvedTargets.includes(id))&&!inertForeign)foreignAccountSeen=true;
             if(foreignAccountSeen)return false;
           }
           // R134: DISCOVERY never freezes a per-product row key during the settle. The
@@ -5935,7 +5958,7 @@ function createRealDrivers(ctx) {
       let prevSig=null;
       const signature=s=>JSON.stringify([s&&s.spinnerCount,s&&s.selectedCount,s&&s.totalCount,s&&s.activeProductIds,(s&&s.rows||[]).map(r=>[r&&r.ids,r&&r.checked,r&&r.labelDisabled]),s&&s.rowSignature]);
       const stable=s=>{ if(!requireStability)return true; const sig=signature(s); const ok=prevSig!==null&&prevSig===sig; prevSig=sig; return ok; };
-      const usable=s=>!!s&&s.ok===true&&!s.spinnerCount&&boundedAccounts(s)&&consistentSelectionState(s);
+      const usable=s=>!!s&&s.ok===true&&!s.spinnerCount&&usableDrawer(s)&&consistentSelectionState(s);
       try { return await until(fresh,x=>noteIdentity(x)&&usable(x)&&stable(x),Math.min(nativeTimeoutMs,10000),'account-drawer-settled'); }
       catch(_) { const fin=await fresh(); if(!trustedIdentity(fin))return fin; return noteIdentity(fin)?fin:null; }
     }
@@ -6054,7 +6077,7 @@ function createRealDrivers(ctx) {
       // EQUALS the requested anchor, and the 1..10 target accounts form a settled known subset
       // (>=1 checked, remaining rows definite unchecked) at footer checked-count/30. Never loop
       // forever or click behind an overlay: on timeout return the last read for the caller guards.
-      const settled=s=>!!s&&s.ok===true&&boundedAccounts(s)&&consistentSelectionState(s)&&Array.isArray(s.rows)&&s.rows.some(r=>r.checked===true)&&s.rows.every(r=>r.checked===true||r.checked===false)&&provePanelSet(s)===String(anchor.productId);
+      const settled=s=>!!s&&s.ok===true&&usableDrawer(s)&&consistentSelectionState(s)&&Array.isArray(s.rows)&&s.rows.some(r=>r.checked===true)&&s.rows.every(r=>r.checked===true||r.checked===false)&&provePanelSet(s)===String(anchor.productId);
       try { return await until(()=>page.evaluate(bindingDrawerSnapshotInPage),settled,nativeTimeoutMs,'anchor-reopen-settled'); }
       catch(_) { return await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null); }
     }
@@ -6111,17 +6134,32 @@ function createRealDrivers(ctx) {
     // PARTIAL failure. A full-success batch leaves the drawer open with NO popup, so the settled
     // result wait times out. That must NOT be read as success and must NOT bypass any guard: we
     // prove completion by an entirely READ-ONLY UI readback, bounded ordinary .panel navigation
-    // across the batch's known unique 30 ids. Each target must show a settled known subset of the
-    // approved target accounts (R33 min-1: >=1 checked, remaining rows definite unchecked — an
-    // enabled row left intentionally unbound is legitimate) at footer checked-count/30
+    // across the batch's known unique 30 ids. In all-success mode each target must show a settled
+    // known subset of the approved target accounts (R33 min-1: >=1 checked, remaining rows definite
+    // unchecked — an enabled row left intentionally unbound is legitimate) at footer checked-count/30
     // with the SAME exact 30-panel set and a SINGLE active === the target; before
     // every navigation the PREVIOUS active/drawer identity/panel set/accounts/footer are re-read and
     // any blocking overlay census is re-checked. A new/unknown overlay, account drift, unknown row,
-    // footer conflict, foreign/duplicate panel, wrong active or a zero-checked selection stops with ZERO
-    // acknowledge and ZERO drawer commit — we never click behind an overlay. Only after all 30 are
-    // positively proven do we navigate back to the ORIGINAL captured batchAnchorId, fresh-prove it,
-    // and then proceed (still zero ACK) to the normal drawer 确定 + full main-table readback. The
-    // empty failedIds is derived from this full 30 proof, never from the mere absence of a popup.
+    // footer conflict, foreign/duplicate panel or wrong active stops with ZERO acknowledge and ZERO
+    // drawer commit — we never click behind an overlay. Only after all 30 are positively proven do we
+    // navigate back to the ORIGINAL captured batchAnchorId, fresh-prove it, and then proceed (still
+    // zero ACK) to the normal drawer 确定 + full main-table readback.
+    //
+    // TWO MODES, ONE PROOF (D45; D46 two-phase semantics). The platform raises this popup only on a
+    // PARTIAL failure, so its ABSENCE is ambiguous on its own: it can mean "all 30 bound" OR "some
+    // products bound nothing". mode 'partial' therefore classifies EACH of the 30 panels as PROVEN
+    // BOUND (>=1 checked target row at checked-count/30) or PROVEN ZERO (1..10 displayed rows, every
+    // one a frozen target row definitively UNCHECKED, footer exactly 0/30, same panel-set/unique-
+    // active/account gates) and returns {boundIds, zeroIds}. D46: a zero SHAPE never ends the phase-2
+    // window — the real binding outcome gets the FULL bounded window first, and only when that window
+    // expires with a LAST identity-valid zero reading, a zero shape seen inside the window and NO
+    // unstable reading (empty rows, foreign/duplicate/ambiguous rows, footer conflict — anything
+    // neither bound nor zero) at any point does the panel classify as PROVEN ZERO. The caller derives
+    // failedIds from the PROVEN zero ids only, so an absent popup is never "empty == success" and
+    // never "unknown == empty". A zero-row panel, an unknown checkbox state, a footer conflict, a
+    // foreign/duplicate/malformed row, a wrong active or a drifted panel set is NEITHER bound NOR
+    // zero and still stops fail-closed. The all-success mode (no zero concept) remains for callers
+    // that require every panel positively bound.
     async function proveAllSuccessByPanelNavigation(originalAnchor, mode) {
       const partial=mode==='partial';
       const panelIds=[...new Set(ids.map(String))];
@@ -6135,7 +6173,9 @@ function createRealDrivers(ctx) {
       // 严格 partial 口径：一个商品的**明确 0** 只有在同一 30-panel 身份、唯一 active=该商品、账号行仍含
       // 本店已发现的授权目标账号且全部未选、页脚恰为 0/30 时才算成立（未选中的灰色外来行只作展示，
       // 不改变 0 的事实，但也不得是勾选/可用/未知状态）。缺行/页脚冲突/账号漂移/读不回
-      // 一律不算 0（算 unknown，直接停），绝不把"没结果/一直在加载"当成 0。
+      // 一律不算 0（算 unknown，直接停），绝不把"没结果/一直在加载"当成 0。D46：该 0 形状还必须在
+      // Phase 2 整个窗口内稳定成立（末拍仍为 0 形状、窗口内出现过 0 形状且从未出现不稳定读数），
+      // 并且窗口始终等不到真实绑定结果（provesTarget），才在窗口耗尽后分类为 PROVEN ZERO。
       const provesZero=(s,pid)=>!!s&&s.ok===true&&boundedAccountsReadBack(s)&&consistentSelectionState(s)&&s.totalCount===30&&s.selectedCount===0
         &&Array.isArray(s.rows)&&s.rows.length>=1&&s.rows.every(r=>r.checked===false)&&panelSetEqualsIds(s)&&provePanelSet(s)===String(pid);
       // D41: every read below is judged ONLY on its OWN fresh contents. There is deliberately
@@ -6157,6 +6197,8 @@ function createRealDrivers(ctx) {
       if(!(await noBlocking())&&!(await dismissLateGuideBeforeBatchResult())) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
       let prev=null;
       for(const pid of panelIds){
+        // D44: at most ONE bounded native refresh per panel proof (see the failure branch below).
+        let refreshedThisPanel=false;
         // Re-check the PREVIOUS verification still holds on a fresh read before moving on, and re-run
         // the blocking-overlay census; a mid-probe popup/drift stops before any further navigation.
         if(prev!==null){
@@ -6179,8 +6221,28 @@ function createRealDrivers(ctx) {
         // exact panel set and the unique target active, so the existing foreign/duplicate/
         // ambiguous/empty row and footer/checked gates below stay unchanged. Any stable error or
         // timeout keeps the ORIGINAL fail-closed reason and the sanitized diagnostics.
+        // D46 (partial mode): the window is closed ONLY by provesTarget — a real binding result
+        // gets the FULL window. Zero-shape reads never end it; they are tracked for stability.
         const freshRead=()=>page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null);
         const clickedIdentity=s=>!!s&&s.ok===true&&!s.spinnerCount&&panelSetEqualsIds(s)&&provePanelSet(s)===String(pid);
+        // D46 partial phase-2 window: poll the whole budget for provesTarget; remember whether a
+        // zero shape (provesZero) was seen and whether any identity-valid NEITHER-bound-nor-zero
+        // reading (empty rows, foreign/duplicate/ambiguous, footer conflict) flipped it. Only at
+        // window expiry, a LAST identity-valid zero reading with stable zero evidence and no
+        // unstable reading classifies as PROVEN ZERO; everything else stays fail-closed.
+        const partialPhase2Window=async()=>{
+          const deadline=Date.now()+nativeTimeoutMs;
+          let last=null,zeroShape=false,unstable=false;
+          while(Date.now()<deadline){
+            last=await freshRead();
+            if(clickedIdentity(last)){
+              if(provesTarget(last,pid)) return {reading:last,settled:true};
+              if(provesZero(last,pid)) zeroShape=true; else unstable=true;
+            }
+            await sleep(POLL_MS);
+          }
+          return {reading:last,settled:clickedIdentity(last)&&provesZero(last,pid)&&zeroShape&&!unstable};
+        };
         let lastIdentityRead=null;
         const identityRead=async()=>{ lastIdentityRead=await freshRead(); return lastIdentityRead; };
         let identityOk=false;
@@ -6194,12 +6256,57 @@ function createRealDrivers(ctx) {
           return {ok:false,reason:'batch-result-panel-target-not-verified',diag:footerStateDiag(last,'panel-navigation',pid)};
         }
         let fresh=null;
-        try { fresh=await until(freshRead, s=>clickedIdentity(s)&&proves(s,pid), nativeTimeoutMs,'batch-result-panel-verified'); }
-        catch(_) { fresh=await freshRead(); }
+        let p2settled=false;
+        if(partial){ const w=await partialPhase2Window(); fresh=w.reading; p2settled=w.settled; }
+        else {
+          try { fresh=await until(freshRead, s=>clickedIdentity(s)&&proves(s,pid), nativeTimeoutMs,'batch-result-panel-verified'); }
+          catch(_) { fresh=await freshRead(); }
+          p2settled=clickedIdentity(fresh)&&proves(fresh,pid);
+        }
         // R128: a target that cannot be positively proven is still the SAME fail-closed stop; only
         // the sanitized numeric footer/row-state of THIS LAST fresh read is attached (never row
         // text, ids, URLs or cookies), so a real run's stop can be told apart from a stale cache.
-        if(!clickedIdentity(fresh)||!proves(fresh,pid)) return {ok:false,reason:'batch-result-panel-target-not-verified',diag:footerStateDiag(fresh,'panel-navigation',pid)};
+        // D44: ONE bounded native refresh of the SAME proven product. The live D42 capture settled
+        // on an internally CONTRADICTORY render — zero account rows while the footer still reported
+        // 当前商品已选 2/30 on the correct unique active, no spinner, header enabled — and polling the
+        // same DOM can never re-fetch a frozen panel. Only when the identity is ALREADY proven and
+        // the row list is empty while the footer claims a positive selection do we navigate ONE
+        // other known panel and back once, then run the SAME fresh two-phase identity+proof. No
+        // header/batch/commit/publication action is added, the footer/avatar chips are never taken
+        // as success, and a persistent empty/unknown render still stops with the ORIGINAL reason.
+        if(!p2settled){
+          const contradictoryEmpty=s=>!!s&&s.ok===true&&!s.spinnerCount&&panelSetEqualsIds(s)
+            &&provePanelSet(s)===String(pid)&&Array.isArray(s.rows)&&s.rows.length===0
+            &&Number(s.selectedCount)>0&&s.totalCount===30;
+          let recovered=null;
+          if(!refreshedThisPanel&&contradictoryEmpty(fresh)){
+            refreshedThisPanel=true;
+            const other=panelIds.find(x=>String(x)!==String(pid));
+            if(other){
+              let away=null;
+              try{ away=await page.evaluate(selectBindingDrawerPanelInPage,other); }catch(_){ away=null; }
+              if(away&&away.clicked===true&&String(away.id)===String(other)){
+                // The away read is only a bounded settle of the OTHER known panel; it is never
+                // adopted as proof of anything.
+                try{ await until(()=>page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null),s=>!!s&&s.ok===true&&!s.spinnerCount&&panelSetEqualsIds(s)&&provePanelSet(s)===String(other),nativeTimeoutMs,'batch-result-panel-refresh-away'); }catch(_){}
+                let back=null;
+                try{ back=await page.evaluate(selectBindingDrawerPanelInPage,pid); }catch(_){ back=null; }
+                if(back&&back.clicked===true&&String(back.id)===String(pid)){
+                  try{ await until(()=>page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null),clickedIdentity,nativeTimeoutMs,'batch-result-panel-refresh-identity'); }catch(_){}
+                  // D46: the refreshed re-proof follows the SAME partial window semantics.
+                  if(partial){ const w2=await partialPhase2Window(); recovered=w2.reading; p2settled=w2.settled; }
+                  else {
+                    try{ recovered=await until(freshRead,s=>clickedIdentity(s)&&proves(s,pid),nativeTimeoutMs,'batch-result-panel-refresh-verified'); }
+                    catch(_){ recovered=await freshRead(); }
+                    p2settled=!!recovered&&clickedIdentity(recovered)&&proves(recovered,pid);
+                  }
+                }
+              }
+            }
+          }
+          if(!p2settled) return {ok:false,reason:'batch-result-panel-target-not-verified',diag:footerStateDiag(recovered||fresh,'panel-navigation',pid)};
+          fresh=recovered;
+        }
         if(!(await noBlocking())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
         if(partial){ (provesTarget(fresh,pid)?boundIds:zeroIds).push(String(pid)); }
         prev=pid;
@@ -6234,14 +6341,23 @@ function createRealDrivers(ctx) {
     // STEP 2 (supplement): with no usable auto drawer but a proven manual2 anchor, cancel the
     // auto-opened unsaved drawer, then uniquely open the anchor's management button.
     let reopenedInStep2=false;
-    if(!snap||!snap.ok||!boundedAccounts(snap)){
+    if(!usableDrawer(snap)){
       if(anchor){
         snap=await reopenBoundAnchor();
         reopenedInStep2=true;
-        if((!snap||!snap.ok||!boundedAccounts(snap))&&anchor) return {ok:false,reason:'anchor-account-management-button-not-unique'};
+        if(!usableDrawer(snap)&&anchor){
+          // D44: a reopen returns EITHER no drawer snapshot at all (the management button itself
+          // could not be uniquely opened — the only case that may claim the button reason) OR a
+          // real, readable drawer that is simply not reusable. The latter is a PAGE-SNAPSHOT
+          // FACT (every row unchecked and label-disabled), not an ambiguous button, so it keeps
+          // the same literal the later reopen branch uses. Zero clicks on both branches.
+          const allRowsUnchecked=!!snap&&snap.ok===true&&Array.isArray(snap.rows)&&snap.rows.length>=1&&snap.rows.every(r=>r.checked===false);
+          if(allRowsUnchecked&&rowsBlockedUnchecked(snap))return {ok:false,reason:'native-account-rows-label-disabled'};
+          return {ok:false,reason:'anchor-account-management-button-not-unique'};
+        }
       }
     }
-    if(!snap||!snap.ok||!boundedAccounts(snap))return {ok:false,reason:'account-drawer-does-not-show-exact-two-target-accounts'};
+    if(!usableDrawer(snap))return {ok:false,reason:'account-drawer-does-not-show-exact-two-target-accounts'};
     // The stop-reason literals below are kept verbatim for existing operators/diagnostics;
     // the bound itself is the bounded non-empty account set (0..10 checked of 30).
     if(snap.totalCount!==30||!Number.isInteger(snap.selectedCount)||snap.selectedCount<0||snap.selectedCount>10)return {ok:false,reason:'account-drawer-selected-count-not-0-1-or-2-of-30'};
@@ -6294,6 +6410,10 @@ function createRealDrivers(ctx) {
       // at footer checked-count/30 on its ACTIVE
       // product. Reuse that product directly as the batch anchor with ZERO cancel/reopen/header —
       // but ONLY when the active product is itself a legitimately-bound manual2 inside this batch.
+      // D43: the snapshot may additionally carry provably INERT foreign rows (unchecked +
+      // label-disabled); usableDrawer already proved every checked row is a frozen target and
+      // the active is a bound manual2, and nothing is clicked on this path, so those display-only
+      // rows change no binding outcome.
       // It need NOT be the first rows.find manual2; a second (or last) bound product's active is a
       // valid batch scope, so do not require every initial active to equal the first anchor.
       if(!isBoundManual2InBatch(batchAnchorId))return {ok:false,reason:'account-drawer-active-anchor-not-bound-manual2'};
@@ -6309,7 +6429,7 @@ function createRealDrivers(ctx) {
       // requires active === the requested management product. (When the current active is itself the
       // anchor or another bound manual2 and is unblocked, fall through and header it directly.)
       snap=await reopenBoundAnchor();
-      if(!snap||!snap.ok||!boundedAccounts(snap))return {ok:false,reason:rowsBlockedUnchecked(snap)?'native-account-rows-label-disabled':'native-account-header-select-all-disabled'};
+      if(!usableDrawer(snap))return {ok:false,reason:rowsBlockedUnchecked(snap)?'native-account-rows-label-disabled':'native-account-header-select-all-disabled'};
       if(!consistentSelectionState(snap))return {ok:false,reason:'account-drawer-footer-row-state-conflict',diag:footerStateDiag(snap,'reopened-anchor')};
       const reopenedAnchor=provePanelSet(snap);
       if(!reopenedAnchor)return {ok:false,reason:'anchor-account-panel-identity-unverified'};
@@ -6552,9 +6672,8 @@ function createRealDrivers(ctx) {
       } else {
         // The settled wait timed out. A present-but-unsettled modal is PENDING/UNKNOWN and must STOP,
         // never be probed around. Only a genuinely ABSENT result popup AND no other blocking overlay
-        // AND a uniquely-present drawer is the platform's all-success-with-no-modal case; even then we
-        // do not treat "no popup" as success — we prove it with a bounded read-only .panel readback of
-        // all 30 ids (zero ACK). If that proof cannot be completed we stop with zero drawer commit.
+        // AND a uniquely-present drawer may reach the read-only 30-panel proof below; even then the
+        // absence itself is never success and never an empty result.
         const ov=await page.evaluate(bindingOverlaySnapshotInPage).catch(()=>null);
         if(!rs||rs.present===true) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
         // R12: a blocking overlay here MAY be the late KNOWN novice guidance over the open
@@ -6562,14 +6681,25 @@ function createRealDrivers(ctx) {
         // guidance phase and re-censused; an unknown mask / foreign page / non-durable flag
         // save / still-present guide keeps the ORIGINAL stop with zero clicks behind it.
         if((!ov||ov.accountDrawerCount!==1||ov.blockingOverlayPresent===true)&&!(await dismissLateGuideBeforeBatchResult())) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
-        const probe=await proveAllSuccessByPanelNavigation(batchAnchorId);
+        // D45: the SAME bounded read-only 30-panel proof runs in 'partial' mode, so every panel is
+        // classified from its OWN fresh identity+row+footer read as PROVEN BOUND or PROVEN ZERO.
+        // zeroIds===[] means all 30 panels were positively proven bound (the D40 all-success case is
+        // unchanged); a non-empty zeroIds is a REAL partial outcome whose exact ids feed the existing
+        // failedIds -> partial draft commit/removal/replacement workflow. A panel that is neither
+        // (zero rows, unknown row state, footer conflict, foreign/duplicate row, wrong active,
+        // drifted panel set) fails the proof and stops with zero drawer commit — never success.
+        const probe=await proveAllSuccessByPanelNavigation(batchAnchorId,'partial');
         if(probe.ok!==true) return probe;
-        failedIds=[];failedSet=new Set();knownFailures=false;
+        failedIds=(probe.zeroIds||[]).map(String);
+        failedSet=new Set(failedIds);
+        knownFailures=failedIds.length>0;
       }
     }
     // STEP 5: commit the drawer DRAFT with 确定 (identity re-verified in the callback), then
     // accept a partial-submit warning ONLY when the recorded outcome proved exact failed ids
-    // (settled result modal, or an explicit 0 read from every panel in the partial-close path).
+    // (settled result modal, an explicit 0 read from every panel in the partial-close path, or the
+    // PROVEN-ZERO panels of the absent-popup 30-panel proof — D45 — where zeroIds are the only
+    // failed ids and an all-bound proof leaves the set empty).
     await page.evaluate(confirmBatchAccountsApplyInPage, targetPayload());
     try { await page.evaluate(acceptPartialDraftWarningInPage,knownFailures); } catch(_) { return {ok:false,reason:'partial-draft-warning-not-acceptable'}; }
     // The fresh main table is the source of truth (R32 min-1): a row showing a definite

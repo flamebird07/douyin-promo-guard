@@ -81,7 +81,12 @@
   },
   {
     "id": "publisher/run-plans.cjs",
-    "beforeSha256": "c2ed5aa90fc0535b64f8f061e9e7331a2ceb71f68d01e8c2a56a4b44109af720",
-    "afterSha256": "23ef1e9a4fff663babea9b19873cb67fab66db2ebbd62c782ca39a1ee464e449"
+    "beforeSha256": "0a5a0c19bd91924c8a7c4c99ce688d8d12f0fc8cbfc9db4aecdfee34fb011fa3",
+    "afterSha256": "8463c99918d8fcd28e8f0b8522ef70c67dbc01647d66cf48d9681ae850955584"
+  },
+  {
+    "id": "publisher/binding-inert-rows.test.cjs",
+    "beforeSha256": "bd27656e8e0447cd73d747757df2439e4d336ee7873e9f5c9f5206b2ce74c2f9",
+    "afterSha256": "2bacd634b94b48a71137a9715dbffd400af0a63528134d9c4ae49b419159e752"
   }
 ]

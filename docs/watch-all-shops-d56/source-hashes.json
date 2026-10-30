@@ -1,0 +1,14 @@
+{
+  "before": {
+    "douyin-promo-guard/src/engine/monitor.js": "1362dbaded95b19bdef9a7766a1477426b320483045a3d888cb9475164f62030",
+    "bill-manager/watch-drill.js": "786e4094a0e4fc5b1c30d25d268b9accba238ae2c4113e5c54add8e3d5cfdf3b",
+    "douyin-promo-guard/test/d56-all-shops-watch.test.js": null,
+    "douyin-promo-guard/test/safe-shop-restore.test.js": "a5ed3dcd08d60f77058791242040ffd7adeae4f63e46820506af571d41825bf7"
+  },
+  "after": {
+    "douyin-promo-guard/src/engine/monitor.js": "f53674d474c398e5924c303be25d0a93336252ca3445374810035c8c61521121",
+    "bill-manager/watch-drill.js": "d6d9b0eed6b880037c839a1c78dbbc7cb63b452d360f1501eccd344639ade4bc",
+    "douyin-promo-guard/test/d56-all-shops-watch.test.js": "6fba0c13706882152b7ba2931fc524c7dd2c90ad54f6f88e4953b5a4c620b9e7",
+    "douyin-promo-guard/test/safe-shop-restore.test.js": "8bda1e44a02d262dd33ccd2fef40c7420a6fdd6fece12a2e0fd36666f0ac9939"
+  }
+}

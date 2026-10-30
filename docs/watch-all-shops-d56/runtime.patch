@@ -1,0 +1,142 @@
+--- a/douyin-promo-guard/src/engine/monitor.js
++++ b/douyin-promo-guard/src/engine/monitor.js
+@@ -1398,9 +1398,13 @@
+   }
+ 
+   // ── 多店铺管理（2026-09-22）──────────────────────────────────────
+-  /** 未删除且未禁用的店铺清单（调度/手动操作的唯一活动范围）。 */
++  /**
++   * 未删除店铺清单（调度/手动操作的唯一活动范围）。
++   * D56：取消单店停用后，活动范围只由软删除决定；是否巡查由全局开关
++   * （this.running / enableRunning）统一控制，历史 enabled=false 不再生效。
++   */
+   _activeShops() {
+-    return (this.config.shops || []).filter((s) => s && s.deleted !== true && s.enabled !== false);
++    return (this.config.shops || []).filter((s) => s && s.deleted !== true);
+   }
+ 
+   /** 店铺是否仍在活动列表（删除后调度器与手动接口都必须再次检查）。 */
+@@ -1595,9 +1599,8 @@
+   async refreshShopData(shopId) {
+     const shopCfg = this._findShop(shopId);
+     if (!shopCfg) return { ok: false, reason: '店铺不存在' };
+-    // F4（2026-10-24）：删除店仍拒绝；未删除但 enabled=false（普通停用 / 删除后主动登录恢复）的
+-    // 店铺允许本**只读**更新（登录后一次只读数据刷新）。不修改 _activeShops/_isShopActive，
+-    // 本方法仍只读，不进入任何广告操作或定时器的活动范围。
++    // F4（2026-10-24）：删除店仍拒绝；D56 起未删除店铺（历史 enabled=false 亦视为正常店）允许本
++    // **只读**更新（登录后一次只读数据刷新）。本方法只读，不进入任何广告操作。
+     if (shopCfg.deleted === true) {
+       return { ok: false, reason: '店铺已删除，不再值守/更新', deleted: true };
+     }
+@@ -3194,10 +3197,11 @@
+       ? orch.hasUnknownBlock(shopId) === true : false;
+     const pending = orch && typeof orch.pendingMixedReconcile === 'function'
+       ? orch.pendingMixedReconcile(shopId) : null;
+-    // 店铺停用/已删除：监控不再轮询，也没有任何收敛动作会被安排（只读刷新不得冒充待收敛）。
++    // 店铺已删除：监控不再轮询，也没有任何收敛动作会被安排（只读刷新不得冒充待收敛）。
++    // D56：单店停用已取消，未删除店铺即使历史 enabled=false 也属正常巡查范围。
+     const shop = (this.config && Array.isArray(this.config.shops))
+       ? this.config.shops.find((s) => s && s.id === shopId) : null;
+-    const shopInactive = !!(shop && (shop.deleted === true || shop.enabled === false));
++    const shopInactive = !!(shop && shop.deleted === true);
+     // 最近一次决策为合法零动作（等于阈值保持等）：本轮也没有安排收敛动作。
+     // 每次 _applyObservedAdState 写入新观测都会清空 lastDecision，因此这里读到的只会是
+     // 与当前观测同源的最新决策；后续只读刷新/新日期/新指标不会沿用旧决策。
+@@ -5408,7 +5412,8 @@
+         name: s.name || null,
+         displayName: s.displayName || s.name || s.id,
+         cookieFile: s.cookieFile,
+-        enabled: s.enabled !== false,
++        // D56：单店停用取消，有效启用状态等价于"未删除"（全局开关另由 monitor.running 表达）。
++        enabled: s.deleted !== true,
+         deleted: s.deleted === true,
+         deletedAt: s.deletedAt || null,
+         thresholdCents,
+@@ -5536,7 +5541,8 @@
+           // 状态供界面兼容；正常配置店铺不显示待核验标记。
+           identityPending: this._shopIdentityState(s).pending,
+           identityNote: this._shopIdentityState(s).reason,
+-          enabled: s.enabled !== false,
++          // D56：有效启用状态等价于"未删除"，避免把历史 enabled=false 的正常店误示为未启用。
++          enabled: s.deleted !== true,
+           platform: s.platform || 'douyin',
+         };
+       }),
+--- a/bill-manager/watch-drill.js
++++ b/bill-manager/watch-drill.js
+@@ -3444,11 +3444,12 @@
+    *   - 值守运行中的单店处理在后台执行，完成后更新 state 并落值守日志；completion 永不 reject。
+    *   - 服务端应剥离 completion 后再 JSON 返回。
+    */
+-  // ── F4（2026-10-24）：登录成功后的“停用/停止”只读刷新 ──────────────────────
+-  // 场景：普通停用店主动登录、删除后主动扫码恢复店（enabled=false）、值守停止时的登录。
++  // ── F4（2026-10-24）：登录成功后的“全局值守停止”只读刷新 ──────────────────────
++  // D56：单店停用已取消，正常店与删除后主动扫码恢复店不再走本路径（一律按正常店接管）；
++  // 本路径仅用于**全局值守未运行**时的登录（全局停止仍有效）。
+   // 只对目标店做一次**现有只读**数据刷新（Monitor.refreshShopData）：不调用
+-  // joinShopNow/pollNowAndReschedule、不启动值守/每日任务/发布恢复、零广告动作；
+-  // enabled 保持 false。复用既有 loginJoins/lastLoginJoin 状态记录与 _loginJoins 同店
++  // joinShopNow/pollNowAndReschedule、不启动值守/每日任务/发布恢复、零广告动作。
++  // 复用既有 loginJoins/lastLoginJoin 状态记录与 _loginJoins 同店
+   // 在途合并；读取失败如实记 failed 与原因，绝不把登录成功冒称数据成功；GET state 不触发读取。
+   function readonlyLoginRefresh(m, shopCfg, base) {
+     const shopName = base.shopName;
+@@ -3587,22 +3588,9 @@
+     if (initialMatches.length > 1) {
+       return done({ ...out, action: 'none', reason: 'TARGET_AMBIGUOUS' });
+     }
+-    // F3：真实删除输出为 deleted:true + enabled:false。仅“普通停用”（非删除）在此提前返回；
+-    // 已删除条目必须下沉到下方 restoreDeletedShop 主动登录恢复分支（恢复后仍保持 enabled:false）。
+-    if (initialMatches.length === 1 && initialMatches[0].enabled === false && initialMatches[0].deleted !== true) {
+-      // F4：普通停用店主动登录 → 仍不发现/不恢复/不接管，但对目标店做一次现有只读数据刷新
+-      // （enabled 保持 false；不启动值守/每日任务/发布恢复；零广告动作）。
+-      const rr = readonlyLoginRefresh(m, initialMatches[0], {
+-        shopName, platform,
+-        note: '店铺停用：不发现、不恢复、不接管；登录后仅做一次只读数据刷新（enabled 保持 false）',
+-      });
+-      return Object.assign(done({
+-        ...out, shopId: initialMatches[0].id, joined: true,
+-        action: 'readonly-refresh', processing: rr.merged ? 'merged' : 'started',
+-        merged: rr.merged || undefined,
+-        reason: '店铺停用：不发现、不恢复、不接管；登录后仅做一次只读数据刷新（enabled 保持 false）',
+-      }), { completion: rr.completion });
+-    }
++    // D56：取消单店停用后，非删除店铺（含历史 enabled=false）一律按正常店处理：
++    // 继续走发现/身份绑定/加入值守；是否真正派发广告仍由下方现读的全局 running 决定。
++    // 已删除条目（deleted:true）仍下沉到下方 restoreDeletedShop 主动登录恢复分支。
+ 
+     // 1) 立即发现（force 绕过 /state 拉取节流；幂等：既有条目原样保留，不重复添加、不重置人工设置）
+     let disc = null;
+@@ -3671,19 +3659,8 @@
+     out.joined = true;
+     out.shopId = shopCfg.id;
+     out.addedNow = out.discovery.added.includes(shopName);
+-    if (shopCfg.enabled === false) {
+-      // F4：删除后主动扫码恢复（或已存在停用）→ 不接管、不安排发布恢复，但做一次只读数据刷新
+-      // （enabled 保持 false；不启动值守/每日任务/发布恢复；零广告动作）。
+-      const rr = readonlyLoginRefresh(m, shopCfg, {
+-        shopName, platform,
+-        note: '店铺停用：不接管、不安排发布恢复；登录后仅做一次只读数据刷新（enabled 保持 false）',
+-      });
+-      return Object.assign(done({
+-        ...out, action: 'readonly-refresh', processing: rr.merged ? 'merged' : 'started',
+-        merged: rr.merged || undefined,
+-        reason: '店铺停用：不接管、不安排发布恢复；登录后仅做一次只读数据刷新（enabled 保持 false）',
+-      }), { completion: rr.completion });
+-    }
++    // D56：删除后主动扫码恢复（restored=true）与历史 enabled=false 的普通店一样按正常店接管；
++    // 不因旧 enabled 字段回落只读刷新，后续是否派发由下方 running 判定。
+     // 3) 现读值守状态（决策时点状态，而非登录开始时的旧状态）
+     out.running = m.running === true;
+     if (!out.running) {
+@@ -3704,7 +3681,9 @@
+     // R78：登录成功 = 账户发现前置阻断（blocked + entries 严格空 + plans=0）的合法恢复
+     // 触发之一（另一入口是显式 recover 端点）。内部无该形状记录即零动作；绝不定时探测。
+     // F5：仅运行中活动店触发；停用/停止登录只读更新不进入发布恢复。
+-    scheduleDiscoveryBlockedRecovery(out.shopId, 'login-success');
++    // D56：发布恢复保留原有 enabled 资格门禁，不影响旧 enabled=false 正常店的推广值守 targeted-join
++    //（早退已取消，旧 false 店照常值守；此处独立保留旧 gate，避免改变任何发布器逻辑）。
++    if (shopCfg.enabled !== false) scheduleDiscoveryBlockedRecovery(out.shopId, 'login-success');
+ 
+     // 4) 值守运行中：只对目标店立即处理（补修 #1：不用 pollNowAndReschedule——那会处理
+     //    所有店铺并重排全局 nextRunAt）。复用引擎 joinShopNow（单店、既有规则/执行器/取消

@@ -1,0 +1,314 @@
+--- a/douyin-promo-guard/src/engine/rules.js
++++ b/douyin-promo-guard/src/engine/rules.js
+@@ -9,21 +9,20 @@
+  * - 恰好等于阈值不关闭（严格大于）；
+  * - 禁止先算出"每单成本"四舍五入再比较（浮点精度陷阱）；
+  * - 订单数必须是非负整数；0 单与正单走同一公式（客户 2026-10-27 修正：
+- *   0 单有消耗也正常，expectedCents=0，是否超标只看费用与 50 元保护线）；
++ *   0 单有消耗也正常，expectedCents=0，正费用按同一公式仍可超标）；
+  * - 费用与订单必须同一店铺、同一业务日期（由 guard 校验后传入）。
+  *
+- * 50 元保护（客户 2026-10-17 新规则）：
+- * - 当天账户整体消耗 <= 5000 分（50.00 元）时，不因费比超标自动暂停；
+- * - 只有消耗 > 5000 分（50.01 元起）且费比严格超标，才具备暂停资格并提示「ROI设置过低」；
+- * - 本模块保留 over 的原始费比语义（cost > orders×threshold），另以
+- *   spendProtected / pauseEligible / roiTooLow 显式表达 50 元门槛，便于所有调用方
+- *   共用同一判断，且不把保护误标成数据异常。
++ * 消耗门槛已取消（客户 2026-10-30 D55）：
++ * - 不再有 50 元下限保护：只要费比严格超标（cost > orders×threshold），即具备暂停资格；
++ * - 字段 SPEND_FLOOR_CENTS / spendFloorCents / spendProtected 仅为既有 API 兼容保留，
++ *   现恒为 0 / false，如实表达「无消耗门槛」；
++ * - pauseEligible / roiTooLow 与 over 同义，0 费用不产生暂停（0 > 0 不成立）。
+  */
+ 
+ const { DataGuardError } = require('../lib/errors');
+ 
+-/** 当天消耗保护线：5000 分 = 50.00 元（<= 保护，> 才允许自动暂停）。 */
+-const SPEND_FLOOR_CENTS = 5000;
++/** 兼容字段：消耗保护线已取消（D55），恒为 0；spendProtected 恒为 false。 */
++const SPEND_FLOOR_CENTS = 0;
+ 
+ /**
+  * @param {object} p
+@@ -44,16 +43,14 @@
+     throw new DataGuardError(`每单成本阈值不是有效正整数分: ${JSON.stringify(thresholdCents)}`);
+   }
+   const expectedCents = orders * thresholdCents; // 整数运算：订单数×阈值分（0 单 → 0）
+-  const spendProtected = costCents <= SPEND_FLOOR_CENTS;
++  // 无消耗门槛：保护线为 0 时 spendProtected 恒 false（0 费用本身也不会 over）。
++  const spendProtected = SPEND_FLOOR_CENTS > 0 && costCents <= SPEND_FLOOR_CENTS;
+   const over = costCents > expectedCents;
+   const pauseEligible = over && !spendProtected;
+   const roiTooLow = pauseEligible;
+   let reason;
+   if (over) {
+-    reason = `全店触发：当天推广费用 ${costCents} 分 > 订单数 ${orders} × 阈值 ${thresholdCents} 分 = ${expectedCents} 分（严格大于，恰好相等不关闭）`;
+-    reason += spendProtected
+-      ? `；当天消耗 ${costCents} 分 ≤ ${SPEND_FLOOR_CENTS} 分（50 元）：50 元保护生效，本轮不自动暂停`
+-      : `；当天消耗 ${costCents} 分 > ${SPEND_FLOOR_CENTS} 分（50 元）：暂停资格成立`;
++    reason = `全店触发：当天推广费用 ${costCents} 分 > 订单数 ${orders} × 阈值 ${thresholdCents} 分 = ${expectedCents} 分（严格大于，恰好相等不关闭；无消耗门槛，暂停资格成立）`;
+   } else {
+     reason = `未触发：当天推广费用 ${costCents} 分 ≤ 订单数 ${orders} × 阈值 ${thresholdCents} 分 = ${expectedCents} 分`;
+   }
+--- a/douyin-promo-guard/src/engine/ad-switch-decision.js
++++ b/douyin-promo-guard/src/engine/ad-switch-decision.js
+@@ -26,14 +26,13 @@
+  * identityOk 必须严格 === true 才通过；缺失/null/字符串一律 data_blocked。
+  * unknown / 数据异常 / 身份不匹配 / 乘法溢出 → fail-closed，零点击；
+  * 零订单本身不是异常（客户 2026-10-27 修正）：与正单同一公式，0 单时
+- * expectedCents=0，任何正费用都 strictly above，是否可暂停只由 50 元保护线决定。
+- *
+- * 50 元保护（客户 2026-10-17）：
+- * - spendProtected = costCents <= 5000（50.00 元）→ 任何方向都不得自动暂停；
+- * - pauseEligible / roiTooLow = costCents > 5000 且 metric 严格 above；
+- * - 保护区内原本会暂停的 on/off/mixed 一律零动作（spend_protected），且不强制重开原 off；
++ * expectedCents=0，任何正费用都 strictly above（无额外零单/消耗门槛，D55）。
++ *
++ * 消耗门槛已取消（客户 2026-10-30 D55）：
++ * - 不再有 50 元下限保护：metric 严格 above 即 pauseEligible/roiTooLow；
++ * - spendProtected 仅为既有 API 兼容保留，恒为 false（spendFloorCents=0）；
+  * - 低于阈值仍按原语义 should_enable；等于阈值 on/off 仍 equal_no_action；
+- * - >100 时 equal + mixed 的既有「统一暂停」策略保留，但不产生 ROI 过低提示（非严格超标）。
++ * - equal + mixed 的既有「统一暂停」策略保留，且不再被消耗门槛阻挡。
+  */
+ 
+ const { DataGuardError } = require('../lib/errors');
+@@ -185,8 +184,8 @@
+   else metric = METRIC.ABOVE;
+   base.metric = metric;
+ 
+-  // 50 元门槛：保护区内一律无暂停资格；严格超标且 >50 元才允许暂停/提示 ROI 过低。
+-  const spendProtected = costCents <= SPEND_FLOOR_CENTS;
++  // 无消耗门槛：spendProtected 兼容保留且恒 false；严格 above 即暂停资格。
++  const spendProtected = SPEND_FLOOR_CENTS > 0 && costCents <= SPEND_FLOOR_CENTS;
+   base.spendProtected = spendProtected;
+   base.pauseEligible = metric === METRIC.ABOVE && !spendProtected;
+   base.roiTooLow = base.pauseEligible;
+@@ -207,17 +206,6 @@
+   // 7) 等于阈值：已确认统一的 on/off 保持；mixed（过渡观测，非完成态）统一暂停收敛到 off
+   if (metric === METRIC.EQUAL) {
+     if (currentAdState === 'mixed') {
+-      if (spendProtected) {
+-        // 50 元保护优先：等于阈值 + mixed 也不得暂停；按原「等于阈值保持」语义零动作。
+-        return {
+-          ...base,
+-          decision: DECISION.EQUAL_NO_ACTION,
+-          targetState: currentAdState,
+-          action: null,
+-          zeroClick: true,
+-          reason: `费用分 ${costCents} == 订单 ${orders} × 阈值 ${thresholdCents} 分 = ${expectedCents} 分：等于阈值且本轮 mixed；当天消耗 ${costCents} 分 ≤ ${SPEND_FLOOR_CENTS} 分（50 元），50 元保护生效 → 保持当前 mixed，零暂停`,
+-        };
+-      }
+       return {
+         ...base,
+         decision: DECISION.SHOULD_PAUSE,
+@@ -264,17 +252,7 @@
+     };
+   }
+ 
+-  // 8b) 高于阈值但仍在 50 元保护区内：零暂停、零强制开关，如实标记 spend_protected。
+-  if (spendProtected) {
+-    return {
+-      ...base,
+-      decision: DECISION.SPEND_PROTECTED,
+-      targetState: currentAdState,
+-      action: null,
+-      zeroClick: true,
+-      reason: `高于费比阈值（${evalR.reason}）；但当天消耗 ${costCents} 分 ≤ ${SPEND_FLOOR_CENTS} 分（50 元）：50 元保护生效，本轮不暂停（当前 ${currentAdState} 保持，不强制重开/关闭）`,
+-    };
+-  }
++  // 8b) 无消耗门槛：严格高于阈值即继续走正常暂停决策（不再有保护区零动作分支）。
+ 
+   if (currentAdState === 'off') {
+     return {
+--- a/douyin-promo-guard/src/engine/monitor.js
++++ b/douyin-promo-guard/src/engine/monitor.js
+@@ -77,7 +77,7 @@
+   pending_recheck: '待收敛',
+   rejudging: '重新判定',
+   retrying: '重试中',
+-  // 明确没有安排任何收敛动作（店铺停用/只读刷新、或等于阈值/50 元保护等合法零动作）：
++  // 明确没有安排任何收敛动作（店铺停用/只读刷新、或等于阈值等合法零动作）：
+   // mixed 仍是过渡观测、仍非完成态，但不得宣称"待收敛"（没有收敛被安排）。
+   no_repair_scheduled: '混合（未安排收敛，非完成态）',
+ });
+@@ -1334,7 +1334,7 @@
+     const rule = (this.config.rules || []).find((r) => r.type === 'wholeShopCostPerOrder' && r.enabled !== false);
+     const thresholdCents = this._thresholdCents(shopCfg);
+     const evaluation = (data && data.evaluation) || null;
+-    // 50 元保护/ROI 提示均由规则/决策投影，消费方（日志/页面）不重算金额。
++    // 消耗门槛已取消（D55）；ROI 提示由规则/决策投影，消费方（日志/页面）不重算金额。
+     const spendProtected = decision ? decision.spendProtected === true
+       : (evaluation ? evaluation.spendProtected === true : null);
+     const pauseEligible = decision ? decision.pauseEligible === true
+@@ -1354,7 +1354,7 @@
+       overKnown: over !== null && over !== undefined,
+       status,
+       reason: reason || null,
+-      // 50 元门槛投影：spendProtected=保护中；pauseEligible=>50 且严格超标；roiTooLow=仅提示不自动改 ROI
++      // 兼容投影：spendFloorCents=0 且 spendProtected=false（无消耗门槛）；pauseEligible=严格超标；roiTooLow=仅提示不自动改 ROI
+       spendFloorCents: SPEND_FLOOR_CENTS,
+       spendProtected,
+       pauseEligible,
+@@ -3175,7 +3175,7 @@
+    *   retrying 重试中：该店修复动作正在执行；
+    *   rejudging 重新判定：旧动作仍是 unknown 阻塞且本轮回读 mixed（证据优先保留）；
+    *   no_repair_scheduled 未安排收敛：店铺停用/仅只读刷新，或最近一次决策是
+-   *     等于阈值保持 / 50 元保护等合法零动作——没有任何收敛动作被安排，
++   *     等于阈值保持等合法零动作——没有任何收敛动作被安排，
+    *     mixed 仍非完成态，但不得宣称"待收敛"；
+    *   pending_recheck 待收敛：活动店铺本轮回读 mixed，等待下一次重判/修复。
+    *
+@@ -3198,7 +3198,7 @@
+     const shop = (this.config && Array.isArray(this.config.shops))
+       ? this.config.shops.find((s) => s && s.id === shopId) : null;
+     const shopInactive = !!(shop && (shop.deleted === true || shop.enabled === false));
+-    // 最近一次决策为合法零动作（等于阈值保持 / 50 元保护）：本轮也没有安排收敛动作。
++    // 最近一次决策为合法零动作（等于阈值保持等）：本轮也没有安排收敛动作。
+     // 每次 _applyObservedAdState 写入新观测都会清空 lastDecision，因此这里读到的只会是
+     // 与当前观测同源的最新决策；后续只读刷新/新日期/新指标不会沿用旧决策。
+     const lastDecision = rt.lastDecision && rt.lastDecision.decision;
+@@ -4366,7 +4366,7 @@
+       rt.lastError = null;
+       rt.lastData = this._summarizeData(data);
+ 
+-      // 有效同日费用/订单的规则评估先投影 50 元门槛；后续决策以同值覆盖。
++      // 有效同日费用/订单的规则评估先投影兼容字段；后续决策以同值覆盖。
+       if (data.ok !== false && data.evaluation) {
+         rt.lastData.spendFloorCents = SPEND_FLOOR_CENTS;
+         rt.lastData.spendProtected = data.evaluation.spendProtected === true;
+@@ -4460,7 +4460,7 @@
+         currentAdState,
+         identityOk: true,
+       });
+-      // 同店同日有效判定 → 页面/日志的 50 元保护与 ROI 提示投影（不由 UI 重算）
++      // 同店同日有效判定 → 页面/日志的 ROI 提示投影（不由 UI 重算；消耗门槛已取消）
+       rt.lastData.spendFloorCents = SPEND_FLOOR_CENTS;
+       rt.lastData.spendProtected = decision.spendProtected === true;
+       rt.lastData.pauseEligible = decision.pauseEligible === true;
+@@ -4474,7 +4474,7 @@
+         at: new Date(this.nowFn()).toISOString(),
+       };
+ 
+-      // 等于阈值保持 / 50 元保护：合法零动作，本轮没有任何收敛动作被安排。
++      // 等于阈值保持：合法零动作，本轮没有任何收敛动作被安排。
+       // 此时 mixed 仍是过渡观测、仍非完成态，但不得宣称"待收敛"。
+       // 只有「合法零动作 + 本轮读取无错误 + 无真实修复在途/unknown 阻塞」才是未安排收敛；
+       // 真实 unknown 阻塞或修复在途按证据保留（rejudging/retrying），仍如实 pending。
+@@ -4487,7 +4487,7 @@
+       const mixedPending = currentAdState === 'mixed' && !mixedNoRepair;
+ 
+       // 每周期一条判断：本轮回读 mixed 且零动作、且存在待执行收敛 → pending（待收敛），不是 ok；
+-      // 合法零动作（等于阈值保持/50 元保护）没有安排收敛 → 如实 ok + 非完成态。
++      // 合法零动作（等于阈值保持）没有安排收敛 → 如实 ok + 非完成态。
+       // mixed + 高于/等于阈值走 should_pause、低于走 should_enable（对侧修复），仍非完成态。
+       this._emitJudgement(shopCfg, {
+         data,
+@@ -4525,7 +4525,7 @@
+       }
+       // 其余零动作决策（统一 on/off 已达目标或等于阈值保持、数据/身份阻断、unknown fail-closed）。
+       // mixed 只有**存在待执行收敛**时才如实 pending（待收敛/待下一次可信重判）；
+-      // 合法零动作（等于阈值保持/50 元保护）没有安排收敛 → ok + 明确"未安排收敛"，
++      // 合法零动作（等于阈值保持）没有安排收敛 → ok + 明确"未安排收敛"，
+       // 绝不伪造 on/off，也不谎称待收敛。
+       const mixedStillOpen = currentAdState === 'mixed';
+       // 复用本轮判定时已计算的视图：状态与 status 同源，避免二次读取运行时状态漂移。
+@@ -5425,7 +5425,7 @@
+         readRecovery: this._readRecoveryView(s.id),
+         today: rt.lastData || null,
+         lastDataAt: rt.lastDataAt || (rt.lastData && rt.lastData.fetchedAt) || null,
+-        // 50 元门槛：只展示同店同日有效投影，不把 null 当 0 重算
++        // 兼容门槛字段（无消耗门槛，恒 0/false）：只展示同店同日有效投影，不把 null 当 0 重算
+         spendFloorCents: SPEND_FLOOR_CENTS,
+         spendProtected: todaySameDay ? todayData.spendProtected === true : null,
+         pauseEligible: todaySameDay ? todayData.pauseEligible === true : false,
+@@ -5526,7 +5526,7 @@
+           balanceAt: t && t.balanceAt ? t.balanceAt : null,
+           thresholdCents: this._thresholdCents(s),
+           over: t ? t.over === true : null,
+-          // 同店同日 50 元保护/ROI 提示投影（t.businessDate 必须等于今日）
++          // 同店同日 ROI 提示投影（t.businessDate 必须等于今日；消耗门槛已取消）
+           spendFloorCents: SPEND_FLOOR_CENTS,
+           spendProtected: (t && t.businessDate === today) ? t.spendProtected === true : null,
+           pauseEligible: (t && t.businessDate === today) ? t.pauseEligible === true : false,
+--- a/bill-manager/watch-drill.js
++++ b/bill-manager/watch-drill.js
+@@ -375,7 +375,7 @@
+     const rec = shop.mixedReconcile || null;
+     const recState = rec && typeof rec.reconcileState === 'string' ? rec.reconcileState : null;
+     // mixed 只消费后端结构化状态：no_repair_scheduled = 明确没有安排收敛
+-    // （店铺停用/只读刷新/等于阈值/50 元保护等合法零动作），不得用字符串原因猜测；
++    // （店铺停用/只读刷新/等于阈值等合法零动作），不得用字符串原因猜测；
+     // 真实待收敛/重新判定/重试中继续使用后端标签，原样保留。
+     const noRepairScheduled = shop.lastAdState === 'mixed' && (recState === 'no_repair_scheduled'
+       || (recState == null && !!(rec && rec.noRepairScheduled === true)));
+@@ -510,7 +510,7 @@
+     .map((s) => {
+       const ad = deriveAdState(status, s);
+       const platform = s.platform || 'douyin';
+-      // 50 元保护/ROI 提示只消费 Monitor 的同店同日受控投影（布尔），
++      // ROI 提示只消费 Monitor 的同店同日受控投影（布尔）；消耗门槛已取消（D55），
+       // 页面/本函数绝不拿 null 当 0 重算费用与费比；跨日即视为无有效提示。
+       const businessDate = status && status.businessDate ? status.businessDate : null;
+       const todaySameDay = !!(s.today && businessDate && s.today.businessDate === businessDate);
+@@ -553,7 +553,7 @@
+         balanceCents: s.today && s.today.balanceCents != null ? s.today.balanceCents : null,
+         balanceAt: s.today && s.today.balanceAt ? s.today.balanceAt : null,
+         thresholdCents: s.thresholdCents != null ? s.thresholdCents : null,
+-        // 50 元保护/ROI 提示（仅同店同日有效；bool 来自 Monitor 判定投影）
++        // ROI 提示（仅同店同日有效；bool 来自 Monitor 判定投影；消耗门槛已取消）
+         spendFloorCents: s.spendFloorCents != null ? s.spendFloorCents : SPEND_FLOOR_CENTS,
+         spendProtected: todaySameDay ? s.today.spendProtected === true : null,
+         pauseEligible: todaySameDay ? s.today.pauseEligible === true : false,
+@@ -750,10 +750,10 @@
+       head = mixed ? '重新判定' : '回读未确认';
+       line = `动作可能已发出但回读未确认 → 保持阻塞，禁止补点${mixed ? '；本轮回读 mixed（非完成态）：用新鲜费用/订单/阈值重判后仅对侧修复一次' : ''}${actionWord ? `；目标动作=${actionWord}` : ''}${safeReason ? `；${safeReason}` : ''}`;
+     } else if (dec === 'spend_protected') {
+-      // 50 元保护优先于 mixed「待收敛」文案：保护区内明确不得暂停，避免日志暗示会统一暂停。
+-      head = '50元保护';
++      // 历史兼容标签：D55 已取消消耗门槛，正常决策不再产生；若读到旧事件仍如实说明零动作。
++      head = '消耗保护（历史标签）';
+       const costText = Number.isSafeInteger(j.costCents) ? `${j.costCents} 分（${centsToYuan(j.costCents)} 元）` : '当天消耗';
+-      line = `${costText} ≤ 50.00 元 → 50元保护：本轮不自动暂停（零动作；不强制重开原关闭项）${mixed ? '；mixed 仅作过渡观测，保持待下一可信重判' : ''}${safeReason ? `；${safeReason}` : ''}`;
++      line = `${costText} → 历史消耗保护标签（当前无消耗门槛）：本条零动作${mixed ? '；mixed 仅作过渡观测，保持待下一可信重判' : ''}${safeReason ? `；${safeReason}` : ''}`;
+     } else if (mixed && (j.status === 'pending' || j.pending === true)) {
+       // mixed 不是完成态，也不是成功：待收敛（等待下一次可信回读 + 重判/收敛动作）
+       head = '待收敛';
+@@ -804,7 +804,7 @@
+     }
+     // ROI 提示只进入本地日志/界面；既有多轮飞书通知不因本次规则外发新提示。
+     const roiWarn = j.roiTooLow === true && opts.includeRoiWarn !== false
+-      ? '；ROI设置过低：消耗已超过50元且费比超标（仅提示，不自动修改 ROI）'
++      ? '；ROI设置过低：当日费比超标（无消耗门槛，仅提示，不自动修改 ROI）'
+       : '';
+     return { head, line: line + roiWarn };
+   }
+@@ -3220,7 +3220,7 @@
+ 
+           if (isJudgement) {
+             // 每个完整周期一条；超出缓存后仍能继续接收（evtSeq 游标）
+-            // 只有「>50 且严格超标」的 ROI 提示才升为 warn；50 元保护区内的费比超标不是数据故障
++            // 严格超标的 ROI 提示升为 warn；D55 取消消耗门槛后低消耗超标同样进入该提示
+             pushLog(evt.roiTooLow === true ? 'warn' : 'info', eventShopPrefix(evt) + describeJudgement(evt));
+             // 飞书通知：同一轮只推一次（cycleNo 幂等），失败只记日志不影响值守
+             notifyJudgement(evt).catch(() => {});
+--- a/bill-manager/index.html
++++ b/bill-manager/index.html
+@@ -1372,7 +1372,7 @@
+             + (r.identityPending ? '<span style="font-size:11px;color:#b45309;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:1px 8px;font-weight:600;" title="' + esc(r.identityNote || '待身份核验') + '">待身份核验</span>' : '')
+             + '<span style="margin-left:auto;">' + ops + '</span>'
+             + '</div>'
+-            // 指标区：紧凑可换行网格（宽屏多列、窄屏自然换行；50 元保护提示只展示后端同店同日受控投影，不在此重算）
++            // 指标区：紧凑可换行网格（宽屏多列、窄屏自然换行；ROI 提示只展示后端同店同日受控投影，不在此重算）
+             + '<div class="wd-metrics" style="width:100%;display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,max-content));gap:2px 16px;justify-content:start;font-size:12px;color:#555;line-height:1.6;margin-top:2px;">'
+             + '<div>费用 ' + esc(cost) + '</div>'
+             + '<div>订单 ' + esc(orders) + '</div>'
+@@ -1382,7 +1382,7 @@
+             + '<div>阈值 ' + esc(thr) + '</div>'
+             + '<div>目标ROI ' + esc(String(roiText))
+             + (r.adControl !== false && r.roiTooLow === true
+-              ? ' <span class="wd-roi-low" style="font-size:12px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:1px 8px;font-weight:600;" title="消耗已超过50元且费比超标；仅提示，不自动修改ROI">ROI设置过低<span style="font-weight:400;color:#b45309;margin-left:4px;">消耗已超过50元且费比超标</span></span>'
++              ? ' <span class="wd-roi-low" style="font-size:12px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:1px 8px;font-weight:600;" title="当日费比超标（无消耗门槛）；仅提示，不自动修改ROI">ROI设置过低<span style="font-weight:400;color:#b45309;margin-left:4px;">费比超标（无消耗门槛）</span></span>'
+               : '') + '</div>'
+             + '<div title="每天自动发布的本店铺计划数量，可按店调整 1~10">每日计划数量 ' + esc(String(qtyText)) + ' 条</div>'
+             + '</div>'

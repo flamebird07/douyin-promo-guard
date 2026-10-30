@@ -1,0 +1,15 @@
+{
+  "name": "promo-no-spend-floor-d55-offline-regression",
+  "private": true,
+  "version": "1.0.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node ../run-tests.cjs",
+    "test:legacy": "node ../run-tests.cjs legacy"
+  },
+  "dependencies": {
+    "playwright": "^1.62.1"
+  }
+}

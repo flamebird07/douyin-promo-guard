@@ -1,0 +1,22 @@
+{
+  "douyin-promo-guard/src/engine/rules.js": {
+    "before": "1f5eb741789e4ebe9e6c8ac6b587ed7b0e7057e9fc043f13d71131de144bb4ea",
+    "after": "666fbda6fe5fc85f915f372317ffdcb15330a0b6be450fda617c263f8761f910"
+  },
+  "douyin-promo-guard/src/engine/ad-switch-decision.js": {
+    "before": "fd7fe398716c9c95b8db42255c130197b119385a7d543e4ae68bb124d342fba6",
+    "after": "44b2b8790ac0a40a880a0565dcac3885d2aa4867bfb6c54f4e7cdf13ea0320ac"
+  },
+  "douyin-promo-guard/src/engine/monitor.js": {
+    "before": "e637469a9d0ef4b9a7d1aa291148c9b39f297b60f3d6ffbff2f788431c29e383",
+    "after": "1362dbaded95b19bdef9a7766a1477426b320483045a3d888cb9475164f62030"
+  },
+  "bill-manager/watch-drill.js": {
+    "before": "44828acd4dfe67a7a605edf15f9347e7167ff6a15286d6d051500bb8841fec3e",
+    "after": "786e4094a0e4fc5b1c30d25d268b9accba238ae2c4113e5c54add8e3d5cfdf3b"
+  },
+  "bill-manager/index.html": {
+    "before": "7f6b96cdbe4f3bf2e041d2a62615b34210038d66d9257003721f5d438db8408d",
+    "after": "6716bf5864ebfe22218c0045d75f7c9ac1f999e6cc58ba68e926e05b7f20996e"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "at": "2026-10-30T22:13:11.521122+08:00",
+  "targetedPassed": 31,
+  "totalChecks": 101,
+  "passed": 95,
+  "existingLegacyFailures": 6,
+  "newFailureNames": 0,
+  "newRegressionPassed": 7,
+  "oldSourceCounterfactualFailures": 5,
+  "spendFloorCents": 0,
+  "runtimePid": 31060,
+  "runtimeFingerprintsMatched": 44,
+  "protectedCookiesUnchanged": 243,
+  "patrolRunning": true,
+  "dailyEnableRunning": true,
+  "dailyFirstCheckRecordsPreserved": true,
+  "liveLowSpendPauseConfirmed": false,
+  "liveLowSpendPauseStatus": "pending natural patrol verification",
+  "financialBusinessDataIncluded": false
+}

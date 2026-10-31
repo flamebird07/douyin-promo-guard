@@ -4,7 +4,7 @@
  * 推广值守 —— 3443 电商助手「推广值守」Tab 的后端调度服务（2026-09-15 接入真实操作模式）。
  *
  * 用户规则（唯一目标）：
- *   1) 每天 07:00 开启全部乘方计划（全店托管 + 商品自选，含昨日暂停的全部计划）；
+ *   1) 每天 00:05 后检查当天是否暂停，暂停才作为当天首次开启（全店托管 + 商品自选，含昨日暂停的全部计划）；已开启零点击记完成；00:00–00:04:59 不强制开启；
  *   2) 08:00 后每 30 分钟检查：当天「账户整体消耗」÷ 当天「全店订单数」**严格超过** 1 元/单
  *      （整数分判定：费用分 > 订单数×100，恰好相等不暂停）时暂停乘方；
  *   3) 绝不删除广告；
@@ -22,7 +22,7 @@
  *   本模块**不提供**任何绕过这些门槛的入口。
  * - 调度在 3443 进程内（Monitor 的 `_intervalLoop`，setTimeout 链），不依赖浏览器 Tab；
  *   刷新/切换 Tab/关闭页面既不重复启动也不停止后台值守；多页面观察同一实例。
- * - 重启语义：服务重启后默认未启动（页面如实显示）；日志有界持久化到 JSONL。
+ * - 重启语义（2026-10-09 客户要求）：服务启动时 watchDrill.boot() 自动启动推广值守一次（幂等；本次运行中人工停止后页面重开不恢复，下一次服务启动再次自动启动）；日志有界持久化到 JSONL。
  * - 日志安全：绝不记录 Cookie/令牌/敏感请求参数；统一 scrubbing；单行上限 2000 字符。
  */
 
@@ -135,18 +135,26 @@ function deriveAdState(status, shop) {
     }
   }
   if (shop && shop.lastAdState) {
-    const map = { on: { on: true, note: '开启' }, off: { on: false, note: '暂停' }, mixed: { on: null, note: '混合' }, unknown: { on: null, note: '未知' } };
+    // mixed 只作过渡观测，不是完成态：界面文案必须带待收敛/重新判定/重试中，不得显示为一次成功
+    const map = { on: { on: true, note: '开启' }, off: { on: false, note: '暂停' }, mixed: { on: null, note: '混合（待收敛，非完成态）' }, unknown: { on: null, note: '未知' } };
     const m = map[shop.lastAdState] || map.unknown;
     // 展示时间必须与当前状态同源且仅有状态证据：只读观测优先，其次动作确认。
     // 无 adStateObservedAt / adStateConfirmedAt 时 at=null；不得用费用/订单采集时间（lastDataAt）冒充。
     const at = shop.adStateObservedAt || shop.adStateConfirmedAt || null;
     const evidenceKind = shop.adStateObservedAt ? 'read_only'
       : (shop.adStateConfirmedAt ? 'action_confirm' : null);
+    const rec = shop.mixedReconcile || null;
     return {
       on: m.on,
       at,
-      note: m.note,
+      note: rec && rec.reconcileText && shop.lastAdState === 'mixed'
+        ? `混合（${rec.reconcileText}，非完成态）` : m.note,
       state: shop.lastAdState,
+      // mixed 永不作为完成态；完成只认 on/off 且由全量回读确认
+      isCompletion: shop.lastAdState === 'on' || shop.lastAdState === 'off',
+      reconcileState: rec ? rec.reconcileState : null,
+      reconcileText: rec ? rec.reconcileText : null,
+      unknownBlock: rec ? rec.unknownBlock === true : false,
       confirmedAt: shop.adStateConfirmedAt || null,
       observedAt: shop.adStateObservedAt || null,
       evidenceKind,
@@ -187,6 +195,11 @@ function buildShopRows(status) {
         // 千川可用余额（2026-09-27，账户级只读展示字段；null=本轮未读到，界面显示"未知"）
         balanceCents: s.today && s.today.balanceCents != null ? s.today.balanceCents : null,
         balanceAt: s.today && s.today.balanceAt ? s.today.balanceAt : null,
+        // 余额终态与在途刷新（2026-10-31 竞态修正）：透传引擎字段，界面区分
+        // ok/error/missing/skipped 与「本轮刷新中」，不再把陈旧/半成品读数当新读数。
+        balanceStatus: s.today && s.today.balanceStatus ? s.today.balanceStatus : null,
+        balanceReason: s.today && s.today.balanceReason ? scrub(String(s.today.balanceReason)) : null,
+        refreshing: s.today && s.today.refreshing === true,
         thresholdCents: s.thresholdCents != null ? s.thresholdCents : null,
         // 账户身份状态（2026-09-25 阶段 6）：界面据此显示"待身份核验/已阻止"
         identityPending: s.identityPending === true,
@@ -369,14 +382,18 @@ function createWatchDrill(opts = {}) {
       head = '状态未知';
       line = `当前广告状态 unknown → 零动作（fail-closed）${safeReason ? `；${safeReason}` : ''}`;
     } else if (serial === 'unknown' || outcome === 'partial') {
-      head = '回读未确认';
-      line = `动作可能已发出但回读未确认 → 保持阻塞，禁止补点${actionWord ? `；目标动作=${actionWord}` : ''}${safeReason ? `；${safeReason}` : ''}`;
+      head = mixed ? '重新判定' : '回读未确认';
+      line = `动作可能已发出但回读未确认 → 保持阻塞，禁止补点${mixed ? '；本轮回读 mixed（非完成态）：用新鲜费用/订单/阈值重判后仅对侧修复一次' : ''}${actionWord ? `；目标动作=${actionWord}` : ''}${safeReason ? `；${safeReason}` : ''}`;
+    } else if (mixed && (j.status === 'pending' || j.pending === true)) {
+      // mixed 不是完成态，也不是成功：待收敛（等待下一次可信回读 + 重判/收敛动作）
+      head = '待收敛';
+      line = `当前 mixed 只是过渡观测（非完成态）→ 标待处理，零动作：须用本轮新鲜费用/订单/阈值重判后按对侧或统一暂停收敛，不把 mixed 报成本轮成功${safeReason ? `；${safeReason}` : ''}`;
     } else if (dec === 'equal_no_action') {
       head = '保持';
       const cmp = (Number.isSafeInteger(j.costCents) && Number.isSafeInteger(j.orders) && Number.isSafeInteger(j.thresholdCents))
         ? `${j.costCents} 分 = ${j.orders}×${j.thresholdCents} 分`
         : null;
-      line = `${cmp ? `整数分判定 ${cmp}` : '等于阈值'} → 保持当前状态，零动作${mixed ? '（mixed 只保持，不单侧操作）' : ''}${safeReason ? `；${safeReason}` : ''}`;
+      line = `${cmp ? `整数分判定 ${cmp}` : '等于阈值'} → 保持当前状态，零动作${safeReason ? `；${safeReason}` : ''}`;
     } else if (dec === 'already_on') {
       head = '已开启';
       line = `当前已开启 → 零点击（already_on）${safeReason ? `；${safeReason}` : ''}`;
@@ -388,13 +405,18 @@ function createWatchDrill(opts = {}) {
       const cmp = (Number.isSafeInteger(j.costCents) && Number.isSafeInteger(j.orders) && Number.isSafeInteger(j.thresholdCents))
         ? `${j.costCents} 分 < ${j.orders}×${j.thresholdCents} 分`
         : null;
-      line = `${cmp ? `整数分判定 ${cmp}；` : ''}${mixed ? 'mixed：只开启暂停项（对侧）' : '低于阈值'} → ${dry ? '演练枚举将开启' : '触发开启'}${safeReason ? `；${safeReason}` : ''}`;
+      line = `${cmp ? `整数分判定 ${cmp}；` : ''}${mixed ? 'mixed：只开启暂停项（对侧；mixed 非完成态，须全量回读确认才算收敛）' : '低于阈值'} → ${dry ? '演练枚举将开启' : '触发开启'}${safeReason ? `；${safeReason}` : ''}`;
     } else if (dec === 'should_pause') {
       head = dry ? '将暂停（演练）' : '将暂停';
       const cmp = (Number.isSafeInteger(j.costCents) && Number.isSafeInteger(j.orders) && Number.isSafeInteger(j.thresholdCents))
         ? `${j.costCents} 分 > ${j.orders}×${j.thresholdCents} 分`
         : null;
-      line = `${cmp ? `整数分判定 ${cmp}；` : ''}${mixed ? 'mixed：只暂停开启项（对侧）' : '高于阈值'} → ${dry ? '演练枚举将暂停' : '触发暂停'}${safeReason ? `；${safeReason}` : ''}`;
+      const mixedNote = mixed
+        ? (j.metric === 'equal'
+          ? 'mixed：等于阈值按「统一暂停」收敛 off，仅点击仍开启的项（mixed 非完成态，须全量回读确认才算收敛）'
+          : 'mixed：只暂停开启项（对侧；mixed 非完成态，须全量回读确认才算收敛）')
+        : '高于阈值';
+      line = `${cmp ? `整数分判定 ${cmp}；` : ''}${mixedNote} → ${dry ? '演练枚举将暂停' : '触发暂停'}${safeReason ? `；${safeReason}` : ''}`;
     } else if (j.status === 'blocked') {
       head = '本轮被拦下';
       line = `本轮被拦下；原因：${safeReason || '未知'}`;
@@ -479,6 +501,10 @@ function createWatchDrill(opts = {}) {
     const cfg = (m && m.config) || drill._config || {};
     const cf = (cfg.monitor && cfg.monitor.chengfang) || {};
     const exec = cfg.execution || {};
+    // 2026-10-09：首查时刻（firstCheckMinuteOfDay，默认 5=00:05），与核心 chengfang-gate 同源口径。
+    const _fcm = (Number.isInteger(cf.firstCheckMinuteOfDay) && cf.firstCheckMinuteOfDay >= 0 && cf.firstCheckMinuteOfDay <= 1439) ? cf.firstCheckMinuteOfDay : 5;
+    const _fct = String(Math.floor(_fcm / 60)).padStart(2, '0') + ':' + String(_fcm % 60).padStart(2, '0');
+
 
     // 2026-09-15 修复第 2 项（第二轮）：复用**与执行器完全一致**的许可判断。
     // 旧行为：`pauseWillExecute = realMode && pauseEnabled` —— 只看 realMode 与开关，
@@ -538,7 +564,10 @@ function createWatchDrill(opts = {}) {
         ? '待核实（配置缺少 execution.realMode，不得据此认为安全）'
         : (realMode ? '真实执行' : '演练模式（不操作广告）'),
       scope: Array.isArray(cf.scope) ? cf.scope.slice() : [],
-      enableHour: Number.isInteger(cf.enableHour) ? cf.enableHour : 7,
+      // 2026-10-09 取消 enableHour/07:00 固定开启；改 firstCheckMinuteOfDay（默认 5=00:05）。
+      firstCheckMinuteOfDay: _fcm,
+      firstCheckTime: _fct,
+      enableHour: cf.enableHour, // [废弃] 仅供兼容展示；调度与门槛不再读取
       enableSchedulerEnabled: cf.enableSchedulerEnabled === true,
       dailyStartHour: (cfg.schedule && cfg.schedule.dailyStartHour) || 8,
       intervalMinutes: (cfg.schedule && cfg.schedule.intervalMinutes) || 30,
@@ -582,7 +611,7 @@ function createWatchDrill(opts = {}) {
     if (!m || typeof m.getStatus !== 'function') return null;
     const ms = m.getStatus().monitor || {};
     return ms.enableScheduler
-      ? { ...ms.enableScheduler, enableHour: ms.enableHour, dailyStartHour: ms.dailyStartHour }
+      ? { ...ms.enableScheduler, firstCheckMinuteOfDay: ms.firstCheckMinuteOfDay, firstCheckTime: ms.firstCheckTime, dailyStartHour: ms.dailyStartHour }
       : null;
   }
 
@@ -878,7 +907,7 @@ function createWatchDrill(opts = {}) {
       // 1) 调度相位 / 下次执行 / 今日开启相位
       // 独立每日开启任务状态（与 running=暂停值守 完全分离，界面分别展示）
       st.enableTask = status.monitor.enableScheduler
-        ? { ...status.monitor.enableScheduler, enableHour: status.monitor.enableHour, dailyStartHour: status.monitor.dailyStartHour }
+        ? { ...status.monitor.enableScheduler, firstCheckMinuteOfDay: status.monitor.firstCheckMinuteOfDay, firstCheckTime: status.monitor.firstCheckTime, dailyStartHour: status.monitor.dailyStartHour }
         : null;
       st.phase = status.monitor.phase;
       st.nextRunAt = status.monitor.nextRunAt;
@@ -1111,9 +1140,12 @@ function createWatchDrill(opts = {}) {
 
   // ── 对外操作 ─────────────────────────────────────────────────────────────
   /**
-   * 服务启动装配（2026-09-15 上线）：3443 进程启动即调用，不依赖任何页面访问。
-   * - 装配 Monitor（只读装配，不启动暂停巡查/值守）；
-   * - 按配置自动登记独立每日开启任务（重启自动恢复；用户独立停用除外）；
+   * 服务启动装配（2026-09-15 上线；2026-10-09 客户要求改为自动启动值守）：
+   * 3443 进程启动即调用，不依赖任何页面访问。
+   * - 装配 Monitor（只读装配）；
+   * - 按配置自动登记独立每日首次开启检查任务（重启自动恢复；用户独立停用除外）；
+   * - **按客户要求自动启动推广值守一次**（幂等；本次运行中人工停止后页面重开不恢复；
+   *   下一次服务启动再次自动启动）；
    * - 启动后台周期同步：无人打开页面也持续转译事件流并落盘值守日志。
    */
   function boot() {
@@ -1128,17 +1160,26 @@ function createWatchDrill(opts = {}) {
     if (m.enableSchedulerShouldRun()) {
       const r = m.startEnableScheduler({ reason: '服务启动自动恢复' });
       if (r && r.ok === false) {
-        pushLog('warn', `每日开启任务登记失败：${r.reason}`);
+        pushLog('warn', `每日首次开启检查任务登记失败：${r.reason}`);
       } else {
         const t = (drill.state.enableTask = syncEnableTask()) || {};
-        pushLog('info', `独立每日开启任务已登记：每日 ${String(t.enableHour).padStart(2, '0')}:00（上海）自动开启全部乘方计划（含人工暂停的）；`
-          + `下次开启 ${t.nextRunAt || '—'}；与"启动值守"相互独立（停止值守不取消本任务）。`);
+        pushLog('info', `独立每日首次开启检查任务已登记：每日 ${t.firstCheckTime || '00:05'}（上海）后检查当天是否暂停，暂停才作为当天首次开启；`
+          + `下次 ${t.nextRunAt || '—'}；与"启动值守"相互独立（停止值守不取消本任务）。`);
       }
     } else {
       const cf = (m.config.monitor && m.config.monitor.chengfang) || {};
       pushLog('info', cf.enableSchedulerEnabled === true
-        ? '每日开启任务保持"用户独立停用"状态（服务重启不自动恢复，可在页面手动恢复）'
-        : '独立每日开启任务未启用（monitor.chengfang.enableSchedulerEnabled=false）');
+        ? '每日首次开启检查任务保持"用户独立停用"状态（服务重启不自动恢复，可在页面手动恢复）'
+        : '独立每日首次开启检查任务未启用（monitor.chengfang.enableSchedulerEnabled=false）');
+    }
+    // 客户目标（2026-10-09 AD-AUTOSTART）：推广值守随主服务启动自动启动一次（幂等；
+    // 本次运行中人工停止后页面重开不恢复；下一次服务启动再次自动启动）。
+    // - 隔离逃逸：opts.autostartOnBoot === false 时不自动启动（仅供不希望 _intervalLoop
+    //   干扰单店派发计数的隔离测试使用；生产服务启动不传该 opt，默认自动启动）。
+    try { refreshGates(); } catch (_) { /* 门槛快照失败不阻塞自动启动 */ }
+    if (opts.autostartOnBoot !== false) {
+      pushLog('info', '服务启动自动启动推广值守（客户 2026-10-09 要求）；页面打开/关闭/刷新只读，不改变后台值守状态');
+      start();
     }
     if (!drill._syncTimer) {
       drill._syncTimer = setInterval(() => { try { syncFromMonitor(); } catch (_) { /* 后台同步失败不影响运行 */ } }, 60 * 1000);
@@ -1206,7 +1247,7 @@ function createWatchDrill(opts = {}) {
       const g = st.gates || {};
       pushLog('info',
         `值守启动 · 店铺 ${(drill.shops || []).map((s) => (s.platform === 'pinduoduo' ? '拼多多/' : '抖店/') + s.name).join('，') || drill.shopName} · 模式：${monitor.modeLabel}；`
-        + `每日 ${String(g.enableHour).padStart(2, '0')}:00 开启乘方，${String(g.dailyStartHour).padStart(2, '0')}:00 后每 ${g.intervalMinutes} 分钟检查；`
+        + `每日 ${g.firstCheckTime || '00:05'} 后首查（暂停才作为当天首次开启，已开启零点击记完成），${String(g.dailyStartHour).padStart(2, '0')}:00 后每 ${g.intervalMinutes} 分钟费比检查；`
         + `规则：当天费用÷当天全店订单 严格超过 1 元/单（整数分 >）即暂停乘方；绝不删除广告。`);
     }
     syncFromMonitor();
@@ -1261,7 +1302,8 @@ function createWatchDrill(opts = {}) {
             running: false, configEnabled: cf.enableSchedulerEnabled === true,
             stoppedByUser: null, phase: null, nextRunAt: null, lastRunAt: null,
             lastMissedReason: null,
-            enableHour: gates.enableHour, dailyStartHour: gates.dailyStartHour,
+            firstCheckMinuteOfDay: gates.firstCheckMinuteOfDay, firstCheckTime: gates.firstCheckTime,
+            dailyStartHour: gates.dailyStartHour,
           };
         }
       } catch (_) { /* 读配置失败：保留 null/未知，不臆断 */ }

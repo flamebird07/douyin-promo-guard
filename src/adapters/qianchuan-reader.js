@@ -578,6 +578,193 @@ async function collectLoginExpiryEvidence(page) {
   return ev;
 }
 
+/**
+ * 千川账户视图探针（页面内执行，只读；arg.click=true 时在同一次执行内关闭已证弹窗）。
+ *
+ * POPUP-SAFETY-20261031：弹窗安全判定必须与视图读取在同一次 DOM 快照内完成，
+ * 判定通过时把唯一关闭按钮打上本次尝试专用标记（arg.tag），后续点击只认该标记。
+ *
+ * POPUP-ATOMIC-CLOSE-20261031（复核收尾）：标记只证明「同一节点」，不证明「同一语义」——
+ * React 复用同一 DOM 节点时标记会留在被改写成业务按钮的节点上。因此关闭必须再走一次
+ * `arg.click === true`：**在同一次同步页面执行内**重新校验完整契约 + 标记仍等于本次 tag，
+ * 校验通过后立刻 `close.click()`，点击前不再给页面任何脚本插入机会（浏览器单线程）。
+ * 点击后移除标记；任一步不满足 → 零点击并返回固定 reason token。
+ *
+ * 已证安全弹窗的完整契约（任一不满足 → safe=false，调用方零点击停止）：
+ * - 全文档只有 1 个 button.close-button，且可见；
+ * - 其直接父元素是可见的 .content；
+ * - 关闭按钮不在 form 内，type 不是 submit/reset；
+ * - 关闭按钮有明确标识：文本为 x/X/×，或 aria-label 为 关闭/close（其余文本一律拒绝）；
+ * - .content 内除关闭按钮外，只有 2 个可见业务按钮（文本精确为 投放乘方 / 开启货款直投）
+ *   和至多 1 个 a[href]；任何 input/select/textarea/[role=button]/其他按钮 → 拒绝；
+ * - 所有可见对话框都必须包含该关闭按钮；
+ * - 弹窗文本（剔除控件自身文本）不得出现 删除/暂停/终止/确认/确定/提交/不可恢复/永久。
+ */
+function readQianchuanAccountViewInPage(arg) {
+  const tag = arg && typeof arg.tag === 'string' ? arg.tag : '';
+  const wantClick = !!(arg && arg.click === true);
+  const visible = el => {
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const textOf = el => String((el && el.textContent) || '').trim();
+  const classHas = (el, name) => !!(el && el.classList && typeof el.classList.contains === 'function' && el.classList.contains(name));
+  const insideForm = el => {
+    let cur = el && el.parentElement;
+    while (cur) {
+      if (String(cur.tagName || '').toUpperCase() === 'FORM') return true;
+      cur = cur.parentElement;
+    }
+    return false;
+  };
+  const shopView = /店铺视图[：:]/.test(document.body ? document.body.innerText : '');
+  const switchPresent = [...document.querySelectorAll('button')]
+    .some(el => textOf(el) === '切至账户视图');
+  const accountContent = [...document.querySelectorAll('[class*="summaryCard"]')]
+    .some(el => visible(el) && (el.textContent || '').includes('账户整体消耗'));
+  const popup = { present: false, safe: false, reason: 'none', closeTag: null, clicked: false };
+  // 只在完整契约校验通过后赋值；点击阶段只认这个已校验节点。
+  let verifiedClose = null;
+  // 弹窗识别必须独立于 shopView / switchPresent：遮挡再观察时，浮层下的店铺视图
+  // 文案与切换按钮可能不可见，唯一结构匹配的安全营销弹窗仍须能被识别与关闭。
+  {
+    const closes = [...document.querySelectorAll('button.close-button')];
+    const visibleCloses = closes.filter(visible);
+    const dialogs = [...document.querySelectorAll('[role="dialog"], dialog, [aria-modal="true"]')].filter(visible);
+    // POPUP-PRESENT-ROOT-20261031：关闭钮/dialog 消失但已知根或遮罩仍在时不得判 present=false。
+    let knownRootOrMaskVisible = false;
+    {
+      const walk = (el) => {
+        if (!el || knownRootOrMaskVisible) return;
+        if (visible(el) && classHas(el, 'overall-release-modal-v2-wrap')) {
+          knownRootOrMaskVisible = true;
+          return;
+        }
+        if (visible(el) && classHas(el, 'mask')) {
+          let cur = el.parentElement;
+          while (cur) {
+            if (classHas(cur, 'overall-release-modal-v2-wrap')) {
+              knownRootOrMaskVisible = true;
+              return;
+            }
+            cur = cur.parentElement;
+          }
+        }
+        const kids = el.children ? [...el.children] : [];
+        for (const c of kids) walk(c);
+      };
+      if (document.body) walk(document.body);
+    }
+    popup.present = visibleCloses.length > 0 || dialogs.length > 0 || knownRootOrMaskVisible;
+    const block = reason => { popup.safe = false; popup.reason = reason; };
+    if (popup.present) {
+      if (closes.length !== 1) {
+        block('close-not-unique');
+      } else if (visibleCloses.length !== 1) {
+        block('close-not-visible-unique');
+      } else {
+        const close = closes[0];
+        const content = close.parentElement;
+        if (!content || !classHas(content, 'content') || !visible(content)) {
+          block('content-not-verified');
+        } else if (String(close.getAttribute('type') || '') !== 'button') {
+          // Must require explicit type=button (align chengfang v2).
+          block('close-type');
+        } else if (insideForm(close)) {
+          block('close-inside-form');
+        } else {
+          // Known root: ancestor must include overall-release-modal-v2-wrap.
+          let knownRoot = false;
+          {
+            let cur = close;
+            while (cur) {
+              if (classHas(cur, 'overall-release-modal-v2-wrap')) { knownRoot = true; break; }
+              cur = cur.parentElement;
+            }
+          }
+          const closeLabel = String(close.getAttribute('aria-label') || '').trim();
+          // aria-label must be exactly CLOSE; empty never safe.
+          const ariaOk = closeLabel === '关闭';
+          let iconOk = false;
+          try {
+            const icons = close.querySelectorAll
+              ? Array.prototype.slice.call(close.querySelectorAll('iconpark-icon'))
+              : [];
+            iconOk = icons.some(el => String(el.getAttribute('name') || '') === 'oc-icon-close');
+          } catch (_) { iconOk = false; }
+          if (!knownRoot) {
+            block('root-not-known');
+          } else if (!ariaOk) {
+            block('close-aria');
+          } else if (!iconOk) {
+            block('close-icon');
+          } else {
+            const controls = [...content.querySelectorAll('button, [role="button"], a[href], input, select, textarea')];
+            const business = controls.filter(el => el !== close && el.tagName === 'BUTTON');
+            const links = controls.filter(el => el.tagName === 'A' && el.hasAttribute('href'));
+            const others = controls.filter(el => el !== close && el.tagName !== 'BUTTON' && !(el.tagName === 'A' && el.hasAttribute('href')));
+            if (others.length > 0) {
+              block('unexpected-controls');
+            } else if (business.length !== 2) {
+              block('business-count');
+            } else if (!business.every(visible)) {
+              block('business-hidden');
+            } else if (links.length > 1) {
+              block('too-many-links');
+            } else if (business.filter(el => textOf(el) === '投放乘方').length !== 1) {
+              block('business-label');
+            } else if (business.filter(el => textOf(el) === '开启货款直投').length !== 1) {
+              block('business-label');
+            } else if (dialogs.length > 0 && dialogs.some(dialog => !dialog.contains(close))) {
+              block('dialog-not-owning-close');
+            } else {
+              let text = String(content.textContent || '');
+              for (const c of controls) {
+                const tt = String((c && c.textContent) || '');
+                if (tt) text = text.split(tt).join('');
+              }
+              if (/删除|暂停|终止|确认|确定|提交|不可恢复|永久/.test(text)) {
+                block('danger-text');
+              } else if (!tag) {
+                block('close-tag-missing');
+              } else if (wantClick && close.getAttribute('data-qc-popup-close') !== tag) {
+                block('close-tag-mismatch');
+              } else {
+                try {
+                  close.setAttribute('data-qc-popup-close', tag);
+                  popup.safe = true;
+                  popup.reason = 'known-marketing-popup';
+                  popup.closeTag = tag;
+                  verifiedClose = close;
+                } catch (_) {
+                  block('close-tag-failed');
+
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  // POPUP-ATOMIC-CLOSE-20261031：判定与点击在同一次同步页面执行内完成。
+  // 上面所有结构/文本/标记校验都在本函数内先行返回；到这里页面脚本不可能再插入，
+  // 因此不存在「判定时是营销弹窗、点击时已被替换」的窗口。点击后立即移除标记。
+  if (wantClick && popup.safe === true && verifiedClose) {
+    try {
+      verifiedClose.click();
+      popup.clicked = true;
+    } catch (_) {
+      popup.clicked = false;
+      popup.safe = false;
+      popup.reason = 'close-click-threw';
+    }
+    try { verifiedClose.removeAttribute('data-qc-popup-close'); } catch (_) { /* 清理失败不影响结论 */ }
+  }
+  return { href: location.href, shopView, switchPresent, accountContent, popup };
+}
+
 async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
   const timeoutMs = sanitizePositiveMs(opts.readinessTimeoutMs, DEFAULT_READINESS_TIMEOUT_MS);
   const intervalMs = sanitizePositiveMs(opts.readinessIntervalMs, DEFAULT_READINESS_INTERVAL_MS);
@@ -604,43 +791,9 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
       return fail('千川受阻切换再观察期间发生导航：停止后续点击');
     }
     let view;
+    const closeTag = `qc-popup-${attempt}-${Math.random().toString(36).slice(2, 8)}`;
     try {
-      view = await target.evaluate(() => {
-        const visible = el => {
-          const rect = el.getBoundingClientRect();
-          const style = getComputedStyle(el);
-          return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-        };
-        const shopView = /店铺视图[：:]/.test(document.body ? document.body.innerText : '');
-        const switchPresent = [...document.querySelectorAll('button')]
-          .some(el => (el.textContent || '').trim() === '切至账户视图');
-        const accountContent = [...document.querySelectorAll('[class*="summaryCard"]')]
-          .some(el => visible(el) && (el.textContent || '').includes('账户整体消耗'));
-        const popup = { present: false, safe: false };
-        if (shopView || switchPresent) {
-          const closes = [...document.querySelectorAll('button.close-button')];
-          const dialogs = [...document.querySelectorAll('[role="dialog"], dialog, [aria-modal="true"]')].filter(visible);
-          popup.present = closes.some(visible) || dialogs.length > 0;
-          if (popup.present && closes.length === 1) {
-            const close = closes[0];
-            const content = close.parentElement;
-            if (content && content.classList.contains('content') && visible(content) && visible(close)) {
-              const controls = [...content.querySelectorAll('button, [role="button"], a[href], input, select, textarea')];
-              const business = controls.filter(el => el !== close && el.tagName === 'BUTTON');
-              const links = controls.filter(el => el.tagName === 'A' && el.hasAttribute('href'));
-              popup.safe = (controls.length === 3 || controls.length === 4) && controls.includes(close)
-                && business.length === 2 && business.every(visible)
-                && links.length === controls.length - 3
-                && business.filter(el => (el.textContent || '').trim() === '投放乘方').length === 1
-                && business.filter(el => (el.textContent || '').trim() === '开启货款直投').length === 1
-                && /^[xX×]?$/.test((close.textContent || '').trim())
-                && /^(?:关闭|close)?$/i.test((close.getAttribute('aria-label') || '').trim())
-                && dialogs.every(dialog => dialog.contains(close));
-            }
-          }
-        }
-        return { href: location.href, shopView, switchPresent, accountContent, popup };
-      });
+      view = await target.evaluate(readQianchuanAccountViewInPage, { tag: closeTag });
     } catch (_) {
       return fail('千川视图 DOM 读取异常：未执行其他导航或按钮操作');
     }
@@ -653,12 +806,64 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
       throw new AuthError('千川视图读取遇到登录页或登录控件：尚未取得账户数据');
     }
     if (target.url() !== before) return fail('千川视图核验期间发生导航：未取得账户数据');
-    if (blockedSwitchUrl !== null && !switched
-      && (!view.shopView || !view.switchPresent || (!popupClosed && (!view.popup.present || !view.popup.safe)))) {
-      return fail('千川受阻切换未取得同页店铺视图及唯一已证营销弹窗的新鲜证据：停止后续点击');
+    const popup = view.popup || { present: false, safe: false, reason: 'none', closeTag: null };
+    let closedThisRound = false;
+    // 任何可见弹窗都必须先被证明是已证营销弹窗：未知/不唯一/结构不符/危险文本 → 立即零点击停止。
+    // 已证弹窗的关闭不依赖店铺视图是否已渲染（实测浮窗可能先于店铺视图出现并遮挡切换按钮）。
+    if (popup.present) {
+      if (popupClosed) {
+        return fail('千川营销弹窗关闭后仍存在：停止后续点击，未点击业务按钮');
+      }
+      // 只接受本次尝试生成的标记（页面不得自造标记，避免选择器注入/旧标记残留）。
+      if (popup.safe !== true || popup.closeTag !== closeTag) {
+        return fail(`千川营销弹窗未通过安全判定（${String(popup.reason || 'unknown')}）：停止后续点击，未点击业务按钮`);
+      }
+      // POPUP-ATOMIC-CLOSE-20261031：关闭不再用「按标记选择器二次定位 + click」——
+      // 那一步会重新解析选择器，节点被 React 复用/标记被搬走时仍可能落到业务按钮。
+      // 改为在同一次页面执行内重新校验完整契约并立即点击：校验不通过 → 零点击。
+      let closed;
+      try {
+        closed = await target.evaluate(readQianchuanAccountViewInPage, { tag: closeTag, click: true });
+      } catch (_) {
+        return fail('千川营销弹窗关闭执行异常：未执行关闭，未尝试其他按钮');
+      }
+      if (target.url() !== before) return fail('千川弹窗关闭期间发生导航：未执行视图切换');
+      // POPUP-CLOSE-RESULT-20261031：evaluate 空值/畸形必须 fail-closed，绝不当「自行消失」。
+      if (!closed || typeof closed !== 'object' || !closed.popup || typeof closed.popup !== 'object') {
+        return fail('千川营销弹窗关闭结果异常：未执行关闭，未尝试其他按钮');
+      }
+      if (closed.popup.clicked === true) {
+        popupClosed = true;
+        closedThisRound = true;
+        reason = '千川营销弹窗已关闭但店铺视图未恢复：未取得账户数据';
+      } else if (closed.popup.present === false) {
+        // 仅在结果结构完整且未点击时，才允许「自行消失」软路径。
+        closedThisRound = true;
+        reason = '千川营销弹窗已自行消失：本轮未执行视图切换';
+      } else {
+        return fail(`千川营销弹窗关闭未执行（${String(closed.popup.reason || 'unknown')}）：未点击业务按钮`);
+      }
     }
-    if (!shopView && view.accountContent === true) return { switched };
-    if (shopView && expectedName) {
+    // 遮挡再观察：唯一已证安全营销弹窗可在店铺视图/切换按钮被浮层遮住（不可见）时
+    // 关闭；或浮层已消失且店铺视图+切换按钮恢复。二者皆无 → fail-closed。
+    if (blockedSwitchUrl !== null && !switched) {
+      const shopRestored = view.shopView && view.switchPresent;
+      // 刚关闭已证弹窗的那一轮允许继续等页面重渲染（只读观察，零点击，受尝试次数约束）。
+      if (!shopRestored && !closedThisRound && !popupClosed) {
+        return fail('千川受阻切换未取得同页店铺视图及唯一已证营销弹窗的新鲜证据：停止后续点击');
+      }
+    }
+    // POPUP-EXPECTED-NAME-20261031：账户内容早退前也必须有目标店名；空名一律 fail-closed。
+    if (!closedThisRound && !shopView && view.accountContent === true) {
+      if (!expectedName) {
+        return fail('千川店铺视图缺少目标店铺名：停止读取，不选择其他账户');
+      }
+      return { switched };
+    }
+    if (!closedThisRound && shopView) {
+      if (!expectedName) {
+        return fail('千川店铺视图缺少目标店铺名：停止读取，不选择其他账户');
+      }
       let identityOk;
       try {
         const title = target.getByText(`店铺视图：${expectedName}`, { exact: true });
@@ -668,7 +873,7 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
       }
       if (!identityOk) return fail('千川店铺视图身份与目标店铺不一致或不唯一：停止读取，不选择其他账户');
     }
-    if (shopView && !switched) {
+    if (!closedThisRound && shopView && !switched) {
       reason = '千川店铺视图未找到唯一的“切至账户视图”按钮：未执行切换';
       const button = target.getByRole('button', { name: '切至账户视图', exact: true, includeHidden: true });
       let count;
@@ -679,33 +884,20 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
       if (count === 1) {
         if (target.url() !== before) return fail('千川切换前发生导航：未执行切换');
         if (view.popup.present) {
-          if (!view.popup.safe || popupClosed) {
-            return fail('千川营销弹窗未知、不唯一、不匹配或关闭后仍存在：停止后续点击，未点击业务按钮');
+          return fail('千川营销弹窗关闭后仍存在：停止后续点击，未点击业务按钮');
+        }
+        try {
+          // 不强制点击；Playwright 的可见、启用和命中测试保护被遮挡的按钮。
+          await button.click({ timeout: Math.min(timeoutMs, 10000) });
+          switched = true;
+          reason = '千川切换后账户视图内容未就绪或结构未识别：未读取店铺汇总，未取得账户数据';
+        } catch (error) {
+          if (popupClosed || blockedSwitchUrl !== null || !error || error.name !== 'TimeoutError'
+            || !/intercepts pointer events/i.test(String(error.message)) || target.url() !== before) {
+            return fail('千川“切至账户视图”按钮不可操作或切换导航失败：未尝试其他按钮');
           }
-          try {
-            const close = target.locator('.content > button.close-button');
-            if (await close.count() !== 1) return fail('千川营销弹窗关闭按钮不唯一：未执行关闭');
-            if (target.url() !== before) return fail('千川弹窗关闭前发生导航：未执行关闭');
-            await close.click({ timeout: Math.min(timeoutMs, 1500) });
-          } catch (_) {
-            return fail('千川已证营销弹窗关闭按钮不可操作或导航异常：未尝试其他按钮');
-          }
-          popupClosed = true;
-          if (target.url() !== before) return fail('千川营销弹窗关闭期间发生导航：未执行视图切换');
-        } else {
-          try {
-            // 不强制点击；Playwright 的可见、启用和命中测试保护被遮挡的按钮。
-            await button.click({ timeout: Math.min(timeoutMs, 10000) });
-            switched = true;
-            reason = '千川切换后账户视图内容未就绪或结构未识别：未读取店铺汇总，未取得账户数据';
-          } catch (error) {
-            if (popupClosed || blockedSwitchUrl !== null || !error || error.name !== 'TimeoutError'
-              || !/intercepts pointer events/i.test(String(error.message)) || target.url() !== before) {
-              return fail('千川“切至账户视图”按钮不可操作或切换导航失败：未尝试其他按钮');
-            }
-            blockedSwitchUrl = before;
-            reason = '千川视图切换被遮挡：未在有界再观察内确认并关闭唯一已证营销弹窗';
-          }
+          blockedSwitchUrl = before;
+          reason = '千川视图切换被遮挡：未在有界再观察内确认并关闭唯一已证营销弹窗';
         }
       }
     }
@@ -759,10 +951,25 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     if (!ok) browser = closing;
     return ok;
   };
+  // D22R 协作取消（回读截止透传）：Monitor 的 300s 读取 deadline 触发后，本函数绝不再
+  // 启动任何新的店铺/候选浏览器进程（恢复链每个候选都是一次全新 chromium.launch，5+5 个
+  // 候选可远超父 deadline）。截止后继续开进程只会让 work 长期不 settle、收口门永远无法
+  // 凭真实关闭证明推进。取消只阻断"新进程启动/新候选链"，不动任何既有等待与关闭语义；
+  // 抛出的 DataGuardError 走既有 catch 收口（browser 已创建时照常 close）。
+  const assertReadNotCancelled = () => {
+    const t = opts.cancelToken;
+    if (t && typeof t === 'object' && t.cancelled === true) {
+      throw new DataGuardError(`回读截止已到：会话开启被协作取消（${t.reason || 'read-deadline'}），不再启动新的浏览器/候选进程`);
+    }
+  };
   // 候选专用浏览器工厂：每个恢复候选一份全新独立浏览器进程（显式注入优先；测试用
   // browserFactory 包装并强制每次新实例；生产默认 Playwright chromium.launch，每次调用
   // 即每次全新进程）。绝不把当前/历史店铺浏览器共享给候选验证（forbiddenBrowsers 拒绝）。
-  const candidateBrowserFactory = typeof opts.restoreCandidateBrowserFactory === 'function'
+  // D22R 内层通用启动门：外壳的 assertReadNotCancelled 检查点不能阻止工厂内部的 INNER
+  // 新进程——无论显式注入的 restoreCandidateBrowserFactory 还是默认工厂，每次候选进程
+  // 启动前都在此处再查一次取消令牌（已取消 → 拒绝调用底层工厂，零新进程；不关闭任何
+  // 外来所有者的进程）。注入的恢复器（restoreRunner）拿到的正是这层包装后的工厂。
+  const baseCandidateBrowserFactory = typeof opts.restoreCandidateBrowserFactory === 'function'
     ? opts.restoreCandidateBrowserFactory
     : createCandidateBrowserFactory({
       injectedFactory: typeof opts.browserFactory === 'function' ? opts.browserFactory : null,
@@ -776,7 +983,12 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
       },
       onResource: typeof opts.onResource === 'function' ? opts.onResource : null,
     });
+  const candidateBrowserFactory = async () => {
+    assertReadNotCancelled();
+    return baseCandidateBrowserFactory();
+  };
   try {
+    assertReadNotCancelled();
     const resolved = resolveCookieFile(loginCfg, shopCfg.cookieFile);
     // 会话 Cookie 回写所需的元信息（2026-09-16 用户明确授权）：
     // 记录**本次实际加载的精确文件路径**与会话开始时的指纹（size/mtime/sha256）。
@@ -843,6 +1055,9 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
           recoveryDir: opts.restoreRecoveryDir,
           nowFn: opts.nowFn,
           audit: opts.audit,
+          // D22R：把本调用的取消令牌透传给恢复链（默认验证器/恢复循环据此停后续候选、
+          // 拒绝取消后的失败缓存与提升；缺令牌时行为与旧版完全一致）。
+          cancelToken: opts.cancelToken,
         });
       } catch (e) {
         return { ok: false, reason: '恢复链异常（未回显可能含凭据的异常详情）' };
@@ -856,11 +1071,19 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
       if (!browserClosed) {
         throw new AuthError('登录失效后原店铺浏览器进程关闭未获证明：阻断四层恢复（绝不重叠会话/绝不带着旧 Cookie 进程继续）');
       }
+      assertReadNotCancelled();
       const restore = await runRestoreChain();
       fail.restore = restore;
+      // D22R：恢复链自身被协作取消（restore.cancelled）≠ "全部候选登录无效"。不得包装成
+      // AuthError——那会把"读取被截止取消"伪装成需要重新扫码的登录失效证据。按既有
+      // DataGuardError + 取消原因如实外抛；已创建的店铺进程由既有 catch/finally 收口。
+      if (restore.cancelled === true) {
+        throw new DataGuardError(`回读截止已到：登录恢复链被协作取消（${(opts.cancelToken && opts.cancelToken.reason) || 'read-deadline'}）：不再继续启动浏览器/候选进程`);
+      }
       if (restore.ok) {
         // 恢复提升已更新工作副本：刷新会话指纹基线（提升后字节即新基线），并在**全新
         // 店铺浏览器进程**上有界重试一次（旧进程已关闭，绝不复用旧 Cookie 进程重载）。
+        assertReadNotCancelled();
         cookieSession.startFingerprint = fingerprintFile(resolved.path);
         browser = await launchShopBrowser();
         sess = await openFxgSession();
@@ -892,6 +1115,7 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     let reached = null;
     let qcFailure = null;
     for (let round = 0; round < 2; round += 1) {
+      assertReadNotCancelled();
       reached = await reachQianchuanHome({
         page: sess.pg, context: sess.ctx, shopCfg,
         // 地址门复用 SSO 收敛已严格核验的首页地址（重试轮 goto 目标即该首页；点击时刻
@@ -931,13 +1155,21 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
           qcFailure = new AuthError(`${e.message}；原店铺浏览器进程关闭未获证明：阻断四层恢复重开，绝不重叠会话`);
           break;
         }
+        assertReadNotCancelled();
         const restore = await runRestoreChain();
+        // D22R：会话中段恢复链被协作取消 → 同样不得包装成 AuthError（取消不是登录失效
+        // 证据）；按 DataGuardError + 取消原因处理，已建进程仍由 finally/catch 收口。
+        if (restore.cancelled === true) {
+          qcFailure = new DataGuardError(`回读截止已到：会话中段恢复链被协作取消（${(opts.cancelToken && opts.cancelToken.reason) || 'read-deadline'}）：不再继续启动浏览器/候选进程`);
+          break;
+        }
         if (!restore.ok) {
           qcFailure = new AuthError(`${e.message}；四层恢复未取得可验证候选（${restore.reason || '未提升'}），工作副本现状未被盲覆盖`);
           break;
         }
         // 恢复提升已更新工作副本：刷新指纹基线（提升后字节即新基线），启动全新店铺浏览器
         // 进程重开干净上下文重走全链路（旧进程已关闭，绝不复用旧 Cookie 进程重载）。
+        assertReadNotCancelled();
         cookieSession.startFingerprint = fingerprintFile(resolved.path);
         browser = await launchShopBrowser();
         sess = await openFxgSession();
@@ -977,6 +1209,19 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     Object.defineProperty(cookieSession, 'identityPage', {
       value: page, enumerable: false, configurable: true, writable: true,
     });
+    // D52：把本次可信 open 的候选验证能力（候选专用独立浏览器工厂 + 本次全部店铺浏览器
+    // 身份禁止列表）以**非枚举临时引用**挂到本次 cookieSession 上（与 R73 identityPage
+    // 同口径：不进 JSON 序列化、不改变既有返回字段、只随同一会话进入后续 Cookie 检查点）。
+    // 供乘方链路（openChengfangShop）的 manager-ready/错误收尾检查点取得同一能力；缺失
+    // 该引用时检查点维持自身 fail-closed（绝不借用业务浏览器/上下文，绝不自启真实浏览器）。
+    // 工厂闭包绑定本次 open 的取消门与 shopBrowserIdentities，不跨店/跨 open 串用。
+    Object.defineProperty(cookieSession, 'candidateVerifyCapability', {
+      value: {
+        candidateBrowserFactory,
+        forbiddenBrowsers: () => shopBrowserIdentities.slice(),
+      },
+      enumerable: false, configurable: true, writable: true,
+    });
     const cookieCheckpoint = { saved: false, skipped: true, reason: '检查点延迟到关闭前：不在首次业务读取前创建并行验证会话' };
     // R87 关闭前收尾检查点登记：把同一检查点实现登记到以本次 owned browser 为键的 WeakMap，
     // 供 closeBrowser 在关闭前以**当前时刻事实**（同 context + 严格可信 URL + 新鲜语义身份）
@@ -985,7 +1230,18 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     try {
       const runFinalize = opts.sessionCheckpoint || checkpointQianchuanSessionCookies;
       browserFinalizers.set(browser, {
-        finalize: () => runFinalize({ context, cookieSession, target, shopCfg, audit: opts.audit }),
+        // D5G：收尾检查点的写前候选验证必须经**候选专用独立浏览器工厂**（每个候选
+        // 全新进程），并把本次全部店铺浏览器身份列为禁止返回实例——绝不借用本次
+        // 主业务浏览器/context.browser() 做检查点验证，也绝不关闭外部健康主浏览器。
+        finalize: () => runFinalize({
+          context,
+          cookieSession,
+          target,
+          shopCfg,
+          audit: opts.audit,
+          candidateBrowserFactory,
+          forbiddenBrowsers: shopBrowserIdentities.slice(),
+        }),
       });
     } catch (_) { /* 登记失败不改变打开结果 */ }
     return { browser, context, page, target, cookieSession, navMode: reached.mode, cookieCheckpoint };
@@ -1623,6 +1879,7 @@ module.exports = {
   createQianchuanAdController,
   openQianchuanHome,
   ensureQianchuanAccountView,
+  readQianchuanAccountViewInPage,
   closeBrowser,
   readQianchuanAccountId,
   extractConsumeCentsFromCardText,

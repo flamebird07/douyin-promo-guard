@@ -1661,6 +1661,22 @@ class Monitor {
     this._commitShopLastData(rt, candidate);
   }
 
+  // 概览先行落盘（2026-11-02 第 1 项：概览与清单空态解耦）：cost+orders 已核验成功即写
+  // rt.lastData / shopRows，余额记终态 skipped（本轮尚未回读，不留下"null 无终态"半成品）。
+  // 随后的商品自选空态/广告状态回读失败、抛错或超时只影响 adState 与开关动作，
+  // 绝不回滚、也绝不把本轮已成功的 costCents/orders 打成 null。
+  _commitShopOverview(rt, candidate) {
+    candidate.balanceCents = null;
+    candidate.balanceStatus = 'skipped';
+    candidate.balanceReason = '概览已写入，本轮千川余额尚未回读';
+    candidate.balanceAt = null;
+    // 广告状态回读仍在途：保留 refreshing，界面显示"刷新中"，不把半轮当完成态。
+    candidate.refreshing = true;
+    rt.lastData = candidate;
+    rt.lastDataAt = new Date(this.nowFn()).toISOString();
+    rt.dataRefreshing = true;
+  }
+
   async refreshShopData(shopId) {
     const shopCfg = this._findShop(shopId);
     if (!shopCfg) return { ok: false, reason: '店铺不存在' };
@@ -1740,6 +1756,8 @@ class Monitor {
         candidate.roiTooLow = data.evaluation.roiTooLow === true;
       }
       this._markShopDataRefreshing(rt);
+      // 概览已成功 → 立即落盘（第 1 项解耦）：后续广告状态回读失败/抛错不再吞掉 cost/orders。
+      if (data.ok !== false) this._commitShopOverview(rt, candidate);
       // 只读回读广告状态（on/off/mixed/unknown）；失败 → unknown + blocked 说明
       const stateRead = await this._readCurrentAdState(shopCfg);
       this._applyBalanceToLastData(candidate, stateRead);
@@ -4561,6 +4579,11 @@ class Monitor {
         candidate.pauseEligible = data.evaluation.pauseEligible === true;
         candidate.roiTooLow = data.evaluation.roiTooLow === true;
       }
+
+      // 概览先行落盘（2026-11-02 第 1 项：概览与清单空态解耦）：cost+orders 已核验成功即写
+      // rt.today / shopRows；后面的商品自选空态、ad=unknown、回读抛错或超时只影响 adState
+      // 与开关动作，绝不把本轮已成功的 costCents/orders 吞掉或打成 null。
+      if (data.ok !== false) this._commitShopOverview(rt, candidate);
 
       // 早退路径不读广告状态/余额：candidate 先写余额终态（skipped）再提交，保持终态完整。
       if (data.ok === false) {

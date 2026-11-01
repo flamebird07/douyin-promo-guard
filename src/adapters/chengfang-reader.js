@@ -24,10 +24,13 @@
 
 const path = require('path');
 const { AuthError, DataGuardError } = require('../lib/errors');
+const { maskUrlQueries } = require('../lib/log');
 const { openQianchuanHome, closeBrowser } = require('./qianchuan-reader');
+const { attestResourceNotCreated } = require('../lib/resource-attestation');
 const {
   checkpointQianchuanSessionCookies,
   probeQianchuanHeaderIdentityInPage,
+  discoverUnknownShopAccountId,
 } = require('../login/session-cookie-checkpoint');
 
 // 自动会话始终保持后台运行；仅控件定位失败时，另开一份同店铺可见会话供人工检查。
@@ -99,6 +102,15 @@ function attachChengfangCleanupHandle(err, browser) {
 function readChengfangCleanupHandle(err) {
   if (!err || typeof err !== 'object') return null;
   return chengfangCleanupHandles.get(err) || null;
+}
+
+/**
+ * 可信"本次未创建任何需收口资源"标记（2026-10-23；r13 缺口 1 收紧为所有权证明）：
+ * 随原始错误交给 Monitor。只允许在**能证明本调用没有 launch 浏览器、也没有新建 context/page**
+ * 的路径上由所有者本人调用；裸属性写入不再被 Monitor 采信（见 lib/resource-attestation.js）。
+ */
+function markChengfangResourceNotCreated(err) {
+  return attestResourceNotCreated('chengfang-manual-review', err);
 }
 
 function isMissingChengfangControl(error) {
@@ -183,6 +195,22 @@ async function retainChengfangPageForManualReview({ context, target, shopCfg, lo
     });
     const page = await reviewContext.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // The original page can be covered by a first-visit overlay before its header
+    // identity renders.  The freshly opened review page is still built from the
+    // exact same in-memory storageState and URL, so take one more strict header
+    // observation here.  This does not infer identity from the URL or shop config:
+    // only one visible account id, with no login control, may fill the missing
+    // frozen value.  Without that positive evidence the existing fail-closed
+    // recovery guard remains unchanged.
+    if (frozenAccountId == null && typeof page.evaluate === 'function') {
+      try {
+        const reviewObs = await page.evaluate(probeQianchuanHeaderIdentityInPage);
+        if (reviewObs && reviewObs.unique === true && reviewObs.loginVisible !== true
+          && typeof reviewObs.accountId === 'string' && /^\d{8,20}$/.test(reviewObs.accountId)) {
+          frozenAccountId = reviewObs.accountId;
+        }
+      } catch (_) { /* keep null: recovery must remain blocked without proof */ }
+    }
     if (typeof page.bringToFront === 'function') await page.bringToFront();
     const held = { browser, page, context: reviewContext, frozenAccountId, cookieSession: reviewCookieSession };
     manualReviewSessions.set(key, held);
@@ -296,13 +324,18 @@ function watchChengfangControlsForManualReview(controller, session) {
  *  - 未知/多义/多个独立浮窗 → 阻断（零点击），不做任何猜测；
  *  - 已知浮窗只点容器内**唯一**关闭控件（intro）或唯一"跳过/我知道了"（guidance 容器内）；
  *  - 点击后必须**连续两次**观察到浮窗消失才算完成；未消失如实返回失败，绝不伪造关闭。
+ *  - 2026-10-18 F1 有界重读：只读探针遭遇**短暂导航**（Execution context destroyed 等）
+ *    或已知浮窗 root 的关闭控件**尚未就绪**（no-control）时，在总预算（默认 ≤3 秒、
+ *    次数上限）内等待并重读；每次重读走完整探针（重新核验可信 URL/唯一控件）后才可能
+ *    进入既有点击路径。未知/多义/危险阻断（blocked/untrusted）绝不重读、立即零点击返回；
+ *    预算耗尽仍 no-control → 如实阻断，不扩大选择器、不点业务 CTA。
  * @returns {Promise<{dismissed:boolean, state:string, action?:string|null, reason?:string}>}
  */
 async function dismissKnownChengfangOverlays({ page, audit, shopId, maxRounds = 2, gapMs = 250,
   transientBudgetMs = 3000, transientGapMs = 300, maxTransientRereads = 10 }) {
-  const emit = (action, result, reason) => {
+  const emit = (action, result, reason, extra) => {
     if (typeof audit !== 'function') return;
-    try { audit({ kind: 'chengfang-overlay', shopId: shopId || null, action, result, reason: reason || null }); } catch (_) { /* 审计失败不影响结果 */ }
+    try { audit({ kind: 'chengfang-overlay', shopId: shopId || null, action, result, reason: reason || null, ...(extra || {}) }); } catch (_) { /* 审计失败不影响结果 */ }
   };
   if (!page || typeof page.evaluate !== 'function') {
     return { dismissed: false, state: 'unavailable', reason: '页面不可用' };
@@ -311,22 +344,44 @@ async function dismissKnownChengfangOverlays({ page, audit, shopId, maxRounds = 
     if (typeof page.waitForTimeout === 'function') { try { await page.waitForTimeout(ms); return; } catch (_) { /* 落到本地等待 */ } }
     await new Promise((r) => setTimeout(r, ms));
   };
+  // 有界重读：仅针对「短暂导航销毁执行上下文」与「已知 root 控件尚未就绪」两类瞬态。
+  const NAVIGATING_RE = /Execution context was destroyed|navigation|navigating/i;
   let transientRereads = 0;
   let transientDeadline = null;
+  const transientWait = async (kind, detail) => {
+    if (transientRereads >= maxTransientRereads) return false;
+    const now = Date.now();
+    if (transientDeadline === null) transientDeadline = now + Math.max(0, transientBudgetMs);
+    if (now >= transientDeadline) return false;
+    transientRereads += 1;
+    emit('probe', 'transient-reread', `${kind}（有界重读 ${transientRereads}/${maxTransientRereads}，预算 ${transientBudgetMs}ms）：${detail}`);
+    await wait(Math.min(transientGapMs, Math.max(50, transientDeadline - now)));
+    return true;
+  };
+  // 完整探针 + 瞬态有界重读：每次重读都是全新的白名单探针（重新核验可信 URL/唯一控件）。
+  const probeWithTransientReread = async () => {
+    for (;;) {
+      try {
+        const p = await page.evaluate(handleChengfangOverlayInPage, { click: false });
+        if (p && p.state === 'no-control' && await transientWait('control-not-ready', '已知浮窗缺少唯一点击控件（可能尚未渲染完成）')) continue;
+        // aurora-qc-loading-mask-transient-20261101: 空壳 aurora-qc-loading-mask → 有界全量重探测（零点击）
+        if (p && p.state === 'transient' && p.kind === 'aurora-qc-loading-mask'
+            && await transientWait('aurora-qc-loading-mask', '空壳 aurora-qc-loading-mask（可等待瞬态，零点击）')) continue;
+        return { probe: p };
+      } catch (e) {
+        const msg = String((e && e.message) || e);
+        if (NAVIGATING_RE.test(msg) && await transientWait('probe-navigation', msg)) continue;
+        return { error: msg };
+      }
+    }
+  };
   let lastState = 'unknown';
   for (let round = 0; round < Math.max(1, maxRounds); round++) {
-    let probe = null;
-    for (;;) {
-      try { probe = await page.evaluate(handleChengfangOverlayInPage, { click: false }); }
-      catch (e) { return { dismissed: false, state: 'probe-failed', reason: `浮窗探测失败：${(e && e.message) || e}` }; }
-      if (!probe || probe.trusted !== true || probe.state !== 'no-control') break;
-      const now = Date.now();
-      if (transientDeadline === null) transientDeadline = now + Math.max(0, transientBudgetMs);
-      if (transientRereads >= maxTransientRereads || now >= transientDeadline) break;
-      transientRereads += 1;
-      emit('probe', 'transient-reread', `已知浮窗控件尚未就绪（有界重读 ${transientRereads}/${maxTransientRereads}）`);
-      await wait(Math.min(transientGapMs, transientDeadline - now));
+    const probed = await probeWithTransientReread();
+    if (probed.error !== undefined) {
+      return { dismissed: false, state: 'probe-failed', reason: `浮窗探测失败：${probed.error}` };
     }
+    const probe = probed.probe;
     lastState = (probe && probe.state) || 'unknown';
     if (!probe || probe.trusted !== true) {
       emit('probe', 'blocked', '当前不是可信千川页面（严格 origin/path），零点击');
@@ -334,11 +389,25 @@ async function dismissKnownChengfangOverlays({ page, audit, shopId, maxRounds = 
     }
     if (probe.state === 'blocked') {
       const reason = (probe.blockers || []).join(',') || '未知/多义浮窗';
-      emit('probe', 'blocked', reason);
-      return { dismissed: false, state: 'blocked', reason };
+      const diag = (probe.unknownDiag || []).slice(0, 5);
+      emit('probe', 'blocked', reason, diag.length ? { unknownDiag: diag } : null);
+      return { dismissed: false, state: 'blocked', reason, ...(diag.length ? { unknownDiag: diag } : {}) };
+    }
+    // aurora-qc-loading-mask-transient-20261101: 有界重读耗尽后仍瞬态 → blocked（不放行、不点击、不永久白名单）
+    if (probe.state === 'transient') {
+      const reason = 'unknown-overlay:1';
+      const diag = (probe.unknownDiag || []).slice(0, 5);
+      emit(
+        'probe',
+        'blocked',
+        `瞬态加载遮罩未在有界重读内消失（aurora-qc-loading-mask；重读 ${transientRereads}/${maxTransientRereads}）`,
+        diag.length ? { unknownDiag: diag } : null,
+      );
+      return { dismissed: false, state: 'blocked', reason, ...(diag.length ? { unknownDiag: diag } : {}) };
     }
     if (probe.state === 'no-control') {
-      emit('probe', 'blocked', '已知浮窗缺少唯一点击控件，零点击');
+      // 有界重读预算耗尽仍缺唯一控件：如实阻断（永久缺控件不猜测、不扩大选择器）。
+      emit('probe', 'blocked', `已知浮窗缺少唯一点击控件，零点击（有界重读 ${transientRereads}/${maxTransientRereads} 次后仍未就绪）`);
       return { dismissed: false, state: 'no-control', reason: '已知浮窗缺少唯一点击控件，零点击' };
     }
     if (probe.state === 'none') {
@@ -350,15 +419,18 @@ async function dismissKnownChengfangOverlays({ page, audit, shopId, maxRounds = 
     catch (e) { return { dismissed: false, state: 'click-failed', reason: `浮窗关闭点击失败：${(e && e.message) || e}` }; }
     if (!clicked || clicked.clicked !== true) {
       const reason = (clicked && clicked.blockers && clicked.blockers.join(',')) || '关闭控件未派发点击';
-      emit('dismiss', 'failed', reason);
-      return { dismissed: false, state: (clicked && clicked.state) || 'click-failed', reason };
+      const cdiag = ((clicked && clicked.unknownDiag) || []).slice(0, 5);
+      emit('dismiss', 'failed', reason, cdiag.length ? { unknownDiag: cdiag } : null);
+      return { dismissed: false, state: (clicked && clicked.state) || 'click-failed', reason, ...(cdiag.length ? { unknownDiag: cdiag } : {}) };
     }
     // 二次观察：连续两次探针都必须看到"无浮窗"才算完成
     let gone = 0;
     for (let i = 0; i < 2; i++) {
       await wait(gapMs);
       let again = null;
-      try { again = await page.evaluate(handleChengfangOverlayInPage, { click: false }); } catch (_) { again = null; }
+      try {
+        again = await page.evaluate(handleChengfangOverlayInPage, { click: false, requirePanelGone: clicked.kind === 'side-panel' });
+      } catch (_) { again = null; }
       if (again && again.trusted === true && again.state === 'none') gone += 1;
       else break;
     }
@@ -1497,8 +1569,8 @@ function readChengfangAccountInPage() {
  *  - CSS 只是**发现线索**，不能代替内容判定：白名单容器正文出现删除/暂停/开启确认、
  *    互斥/终止/不可恢复、小店随心推、授权登录等危险业务文本 → 一律阻断，绝不点 X；
  *  - 未知可见浮层（dialog/alertdialog/modal/popup/mask/dialog/confirm 类，且不属于上述
- *    白名单子树）→ 阻断；外壳同时包含已知浮窗与其它疑似业务对话框时，不把整棵外壳
- *    当白名单；多个独立白名单浮窗 / 多候选控件 → 阻断；一律零点击。
+ *    白名单子树、也不是已精确归属的紧邻独立遮罩）→ 阻断；外壳同时包含已知浮窗与其它疑似
+ *    业务对话框时，不把整棵外壳当白名单；多个独立白名单浮窗 / 多候选控件 → 阻断；一律零点击。
  *  - 绝不以 [class*=modal] 泛化盲点 X，绝不点击业务确认/删除/开关类控件。
  *
  * 兼容语义：本函数同时是 advanceChengfangPlanViewInPage 的兼容实现（alias）。
@@ -1547,21 +1619,45 @@ function handleChengfangOverlayInPage(options) {
   const all = (sel) => {
     try { return Array.prototype.slice.call(doc.querySelectorAll(sel)); } catch (_) { return []; }
   };
+  // 仅收集**实际渲染**的文本：跳过可见性不成立的子树（display:none / visibility:hidden /
+  // 零尺寸）、以及 script/style/noscript/template 等非渲染节点。危险判定只看真正显示的浮层文本，
+  // 避免把隐藏模板/背景说明/脚本内字符串当成现场危险确认（2026-10-19 误判排查）。
+  const collectVisibleText = (el) => {
+    if (!el || !visible(el)) return '';
+    const tag = String(el.tagName || '').toLowerCase();
+    if (tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'template') return '';
+    let text = '';
+    if (typeof el.ownText === 'string') text += el.ownText; // 合成 fixture 自带文本
+    if (el.childNodes && el.childNodes.length) {
+      for (let i = 0; i < el.childNodes.length; i++) {
+        const n = el.childNodes[i];
+        if (!n) continue;
+        if (n.nodeType === 3 || n.nodeType === 4) text += String(n.textContent || '');
+        else if (n.nodeType === 1) text += collectVisibleText(n);
+      }
+    } else if (Array.isArray(el.children)) {
+      for (let i = 0; i < el.children.length; i++) text += collectVisibleText(el.children[i]);
+    }
+    return text;
+  };
   const dedupeOuter = (els) => els.filter((el) => !els.some((o) => o !== el && o.contains && o.contains(el)));
 
   // 危险业务文本：CSS 像 intro 不代表内容安全；删除/暂停/开启确认、互斥/终止、
   // 小店随心推、授权登录等一律优先阻断。文本归一化后匹配，避免换行/空格绕过。
   const DANGER_TEXT_RE = /(?:确认|确定|是否)[^。！？\n]{0,16}(?:删除|暂停|开启|关闭|终止)|(?:删除|暂停|开启|终止)[^。！？\n]{0,16}(?:不可恢复|确认|是否)|互斥|小店随心推|授权登录|扫码登录|重新登录|删除后不可恢复|终止[^。！？\n]{0,8}不可恢复|(?:暂停|删除|开启|终止)\s*[0-9一二三四五六七八九十百千]+\s*条/;
 
+  // 页面根绝不等于弹层容器：vmok 插件把状态类写到 body 上（observed-overlay.json：
+  // body.tools-vmok-plugin-popup__lock），若被泛选择器收入，dedupeOuter 祖先去重会把
+  // body 之外所有真实弹窗候选吞掉，背景正文危险词反过来污染弹窗判定。排除必须发生在
+  // 去重之前，真实弹窗/业务确认的后代才能继续作为独立候选被扫描。
+  const notPageRoot = (el) => !!el && el !== doc && el !== doc.documentElement && el !== doc.body;
   // 介绍/模态浮窗根：只认已知 modal 容器语义（modal-wrap / modal__wrap 外壳），
   // 绝不把共享埋点属性 [data-e2e="oc_emptyKey_overall-prom"] 本身当弹窗根——该属性被
   // 导航/徽标/右侧工具栏/popover 等多个**非模态、无关闭控件**元素共用，据此发现会与真实
   // modal 并列出 multiple-intro 假阻断（2026-10-18 真实 DOM 取证）。真实 modal 靠其
   // modal-wrap 类被识别，仍要求容器内唯一可见关闭控件（见下 dismissable 分支）才可点。
-  // 插件会将 popup 锁定类写到 body；页面根不能吞掉实际浮窗候选。
-  const notPageRoot = (el) => !!el && el !== doc && el !== doc.documentElement && el !== doc.body;
   const introRoots = dedupeOuter(all(
-    '.ocean-vmok-plugin-oc-modal-wrap, .tools-vmok-plugin-modal__wrap, .overall-release-modal-v2-wrap, '
+    '.ocean-vmok-plugin-oc-modal-wrap, .tools-vmok-plugin-modal__wrap, '
     + '[class*="modal-wrap"], [class*="modal__wrap"]'
   ).filter((el) => notPageRoot(el) && visible(el)));
   // 引导容器：class 含 guide/tour 只是线索；必须**容器内确有唯一可见"跳过/我知道了"**才算
@@ -1576,18 +1672,20 @@ function handleChengfangOverlayInPage(options) {
     })).length > 0;
   };
   const guideRoots = dedupeOuter(all('[class*="guide"], [class*="Guide"], [class*="tour"], [class*="Tour"]').filter((el) => {
-    if (!notPageRoot(el) || !visible(el)) return false;
+    if (!notPageRoot(el)) return false;
+    if (!visible(el)) return false;
     if (introRoots.some((r) => r === el || (r.contains && r.contains(el)))) return false;
     return hasSkipControl(el);
   }));
   const known = introRoots.concat(guideRoots);
   // 未知/业务浮层候选：除常见 modal/popup/mask 外，必须纳入 dialog/confirm 类
   // （business-confirm 等），否则已知浮窗旁边的业务确认框永远不会进入 foreign 扫描。
-  const dialogCands = dedupeOuter(all(
-    '[role="dialog"], [role="alertdialog"], [class*="modal"], [class*="Modal"], '
+  const dialogCands = all(
+    'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"], [class*="modal"], [class*="Modal"], '
     + '[class*="popup"], [class*="Popup"], [class*="mask"], [class*="Mask"], '
-    + '[class*="dialog"], [class*="Dialog"], [class*="confirm"], [class*="Confirm"]'
-  ).filter((el) => notPageRoot(el) && visible(el)));
+    + '[class*="dialog"], [class*="Dialog"], [class*="confirm"], [class*="Confirm"], '
+    + '[class*="backdrop"], [class*="Backdrop"]'
+  ).filter((el) => notPageRoot(el) && visible(el));
   const inKnown = (el) => known.some((k) => k === el || (k.contains && k.contains(el)));
   let foreign = [];
   for (const el of dialogCands) {
@@ -1602,57 +1700,406 @@ function handleChengfangOverlayInPage(options) {
     }
     foreign.push(el);
   }
+  foreign = dedupeOuter(foreign);
+  // 已知弹窗的独立遮罩归属（2026-10-19 两份**完整**现场 DOM 取证）：
+  //   fixtures/complete-popup-dom.html    首页：mask + overall-release-modal-v2-wrap；
+  //   fixtures/management-popup-dom.html  管理页：mask + ocean-vmok-plugin-oc-modal-wrap
+  //                                       （内部 .aweme-auto-pull-modal-content）。
+  // 两份取证均为 mask.outerHTML 紧跟 nextElementSibling.outerHTML，即 mask 与弹窗根是
+  // **同一父节点的紧邻兄弟**（实测同为 BODY 直接子节点，z-index 均 2000）。既有 foreign
+  // 扫描把该空壳遮罩判为 unknown-overlay:1，导致同一已知弹窗的唯一可见关闭按钮不可点。
+  // 归属条件必须全部成立，任一不成立即保持 unknown 阻断（门禁不放宽）：
+  //   1) introRoot 恰 1 个，且类名精确命中两种**实测**已知类型之一：
+  //      overall-release-modal-v2-wrap；或 ocean-vmok-plugin-oc-modal-wrap 且内部确有
+  //      .aweme-auto-pull-modal-content。其余 modal+mask 组合不白名单；
+  //   2) 遮罩类名 token 精确等于 tools-vmok-plugin-popup__mask（绝不泛匹配任意 mask/popup 类）；
+  //   3) 遮罩与 introRoot **同 parentNode** 且**紧邻**（nextElementSibling 互为对方）：
+  //      仅用 contains 排除无法证明兄弟关系，远处节点或另一容器内的同名 mask 一律不归属；
+  //   4) 遮罩为空壳（无元素子节点、无非空白文本），且不含任何弹层候选；
+  //   5) 此类遮罩恰 1 个（≥2 时无法归属，整组仍按未知阻断）。
+  // 遮罩自身作为 dialogCand 仍参与下方危险文本扫描；无已知弹窗时遮罩仍按未知阻断。
   const classTokens = (el) => String(
     (el.getAttribute && el.getAttribute('class')) || el.className || ''
   ).split(/\s+/).filter(Boolean);
-  // 仅同父紧邻、唯一且无内容的精确遮罩可归属于新版介绍窗。
-  if (introRoots.length === 1 && classTokens(introRoots[0]).includes('overall-release-modal-v2-wrap')) {
-    const root = introRoots[0];
-    const masks = foreign.filter((el) => {
-      if (!classTokens(el).includes('tools-vmok-plugin-popup__mask')) return false;
-      if (!el.parentNode || el.parentNode !== root.parentNode) return false;
-      if (el.nextElementSibling !== root && root.nextElementSibling !== el) return false;
-      if (String(el.textContent || '').trim()) return false;
-      if (Array.prototype.some.call(el.childNodes || [], (node) => node.nodeType === 1)) return false;
-      if (dialogCands.some((other) => other !== el && el.contains && el.contains(other))) return false;
-      return true;
-    });
-    if (masks.length === 1) {
-      foreign = foreign.filter((el) => el !== masks[0]);
-      out.affiliatedMask = { cls: 'tools-vmok-plugin-popup__mask' };
+  const isKnownAffiliatedPopup = (root) => {
+    const toks = classTokens(root);
+    if (toks.indexOf('overall-release-modal-v2-wrap') !== -1) return true;
+    if (toks.indexOf('ocean-vmok-plugin-oc-modal-wrap') === -1) return false;
+    let inner = null;
+    try { inner = root.querySelector('.aweme-auto-pull-modal-content'); } catch (_) { inner = null; }
+    return !!inner;
+  };
+  const adjacentSiblings = (a, b) => {
+    if (!a || !b || !a.parentNode || !b.parentNode) return false;
+    if (a.parentNode !== b.parentNode) return false;
+    return a.nextElementSibling === b || b.nextElementSibling === a;
+  };
+  const isEmptyMaskShell = (el) => {
+    const kids = el.childNodes || [];
+    for (let i = 0; i < kids.length; i++) {
+      const n = kids[i];
+      if (!n) continue;
+      if (n.nodeType === 1) return false;
+      if ((n.nodeType === 3 || n.nodeType === 4) && String(n.textContent || '').trim()) return false;
+    }
+    return true;
+  };
+  if (introRoots.length === 1) {
+    const ir = introRoots[0];
+    if (isKnownAffiliatedPopup(ir)) {
+      const maskEls = foreign.filter((el) => {
+        if (classTokens(el).indexOf('tools-vmok-plugin-popup__mask') === -1) return false;
+        if (!adjacentSiblings(el, ir)) return false;
+        if (el.contains && el.contains(ir)) return false;
+        if (dialogCands.some((o) => o !== el && el.contains && el.contains(o))) return false;
+        if (!isEmptyMaskShell(el)) return false;
+        return true;
+      });
+      if (maskEls.length === 1) {
+        foreign = foreign.filter((el) => el !== maskEls[0]);
+        out.affiliatedMask = { cls: 'tools-vmok-plugin-popup__mask' };
+      }
     }
   }
   // 危险文本扫描：白名单容器与短文本弹层候选（页面级大 mask 不做全文扫描，
   // 避免把列表正文误判为浮窗；其内部真实业务弹层会作为独立候选被扫描）。
+  // 阻断以**可见渲染文本**为准（真实弹层的危险确认必然可见）；危险文本仅存在于
+  // 未渲染节点（隐藏模板/背景/script）时不阻断，只记录无敏感原文的结构化诊断供精确定位。
   let dangerText = false;
+  const dangerDiag = [];
   for (const el of known.concat(dialogCands)) {
-    const t = String((el && el.textContent) || '').replace(/\s+/g, ' ').trim();
-    if (!t || t.length > 1200) continue;
-    if (DANGER_TEXT_RE.test(t)) { dangerText = true; break; }
+    const raw = String((el && el.textContent) || '').replace(/\s+/g, ' ').trim();
+    if (!raw || raw.length > 1200) continue;
+    const vis = collectVisibleText(el).replace(/\s+/g, ' ').trim();
+    const visHit = !!vis && DANGER_TEXT_RE.test(vis);
+    const rawHit = DANGER_TEXT_RE.test(raw);
+    if (visHit) {
+      dangerText = true;
+      if (dangerDiag.length < 5) {
+        dangerDiag.push({
+          scope: inKnown(el) ? 'known' : 'dialog',
+          tag: String(el.tagName || '').toLowerCase(),
+          cls: String((el.getAttribute && el.getAttribute('class')) || '').slice(0, 60),
+          chars: vis.length, hidden: false,
+        });
+      }
+    } else if (rawHit && dangerDiag.length < 5) {
+      dangerDiag.push({
+        scope: inKnown(el) ? 'known' : 'dialog',
+        tag: String(el.tagName || '').toLowerCase(),
+        cls: String((el.getAttribute && el.getAttribute('class')) || '').slice(0, 60),
+        rawChars: raw.length, visChars: vis.length, hidden: true,
+      });
+    }
   }
   if (dangerText) out.blockers.push('danger-text');
-  if (foreign.length > 0) out.blockers.push(`unknown-overlay:${foreign.length}`);
+  if (dangerDiag.length) out.dangerDiag = dangerDiag;
+
+  const panelCandidates = [];
+  const inspectSidePanel = (root) => {
+    try {
+      const vw = doc.documentElement && doc.documentElement.clientWidth;
+      const vh = doc.documentElement && doc.documentElement.clientHeight;
+      if (!(vw > 0 && vh > 0) || typeof doc.elementFromPoint !== 'function'
+        || typeof getComputedStyle !== 'function') return null;
+      const rectOf = (el) => {
+        const r = el.getBoundingClientRect();
+        if (![r.left, r.top, r.width, r.height].every(Number.isFinite)) return null;
+        return { left: r.left, top: r.top, right: r.left + r.width, bottom: r.top + r.height, width: r.width, height: r.height };
+      };
+      const r = rectOf(root);
+      if (!r || r.width > vw * 0.35 || r.height > vh * 0.75
+        || r.left < 0 || r.top < 0 || r.right > vw || r.bottom > vh
+        || Math.min(r.left, vw - r.right) > Math.min(100, vw * 0.08)) return null;
+      if (known.some((k) => root.contains(k))) return null;
+      const fits = (b) => b && b.left >= r.left - 1 && b.top >= r.top - 1
+        && b.right <= r.right + 1 && b.bottom <= r.bottom + 1;
+      const modal = (el) => /^(dialog|alertdialog)$/.test(el.getAttribute('role') || '')
+        || el.getAttribute('aria-modal') === 'true' || String(el.tagName).toLowerCase() === 'dialog'
+        || /modal|mask|backdrop|dialog|confirm/i.test(classTokens(el).join(' '));
+      const nodes = [{ nodes: [root], index: 0 }];
+      const closes = [];
+      let scanned = 0;
+      let text = '';
+      while (nodes.length) {
+        const frame = nodes[nodes.length - 1];
+        if (frame.index >= frame.nodes.length) { nodes.pop(); continue; }
+        if (++scanned > 200) return null;
+        const node = frame.nodes[frame.index++];
+        if (node.nodeType === 3 || node.nodeType === 4) {
+          text += String(node.textContent || '');
+          if (text.length > 1200) return null;
+          continue;
+        }
+        const tag = String(node.tagName || '').toLowerCase();
+        if (['script', 'style', 'noscript', 'template'].includes(tag) || !visible(node)) continue;
+        if (modal(node) || !fits(rectOf(node))) return null;
+        // 溢出后代及伪元素不能借外壳的小矩形获得放行。
+        for (const pseudo of ['::before', '::after']) {
+          const cs = getComputedStyle(node, pseudo);
+          if (!cs || !cs.content || ['none', 'normal'].includes(cs.content) || cs.display === 'none') continue;
+          if (cs.position === 'fixed') return null;
+          if (cs.position === 'absolute') {
+            const width = parseFloat(cs.width), height = parseFloat(cs.height);
+            if (!Number.isFinite(width) || !Number.isFinite(height) || width > r.width || height > r.height
+              || ['left', 'right', 'top', 'bottom'].some((key) => parseFloat(cs[key]) < 0)
+              || (cs.transform && cs.transform !== 'none')) return null;
+          }
+        }
+        if (typeof node.ownText === 'string') text += node.ownText;
+        if (text.length > 1200) return null;
+        if (node !== root) {
+          const label = String(node.getAttribute('aria-label') || node.getAttribute('title') || '').trim();
+          const own = String(node.textContent || '').trim();
+          const closeLabel = /^(关闭|关闭浮窗|关闭面板|close|dismiss)$/i.test(label);
+          const closeGlyph = /^[xX×✕✖]$/.test(own);
+          const isControl = (tag === 'button' && node.getAttribute('type') === 'button')
+            || node.getAttribute('role') === 'button'
+            || (['span', 'i', 'svg'].includes(tag) && closeLabel);
+          if (isControl && (closeLabel || closeGlyph) && /^(?:关闭|close|dismiss|[xX×✕✖])?$/i.test(own)) {
+            if (node.disabled || node.getAttribute('aria-disabled') === 'true') return null;
+            closes.push(node);
+          }
+        }
+        const children = node.childNodes || node.children || [];
+        if (children.length) nodes.push({ nodes: children, index: 0 });
+      }
+      if (DANGER_TEXT_RE.test(text.replace(/\s+/g, ' '))
+        || /登录|安全验证|身份验证|验证码|授权|人机验证/.test(text)) return null;
+      const controls = dedupeOuter(closes);
+      if (controls.length > 1) return null;
+      let close = controls[0] || null;
+      if (close) {
+        const b = rectOf(close);
+        const hit = b && doc.elementFromPoint(b.left + b.width / 2, b.top + b.height / 2);
+        if (!b || b.width > 48 || b.height > 48 || b.left < r.right - Math.min(80, r.width * 0.3)
+          || b.bottom > r.top + Math.min(80, r.height * 0.3)
+          || !hit || !(hit === close || close.contains(hit))) return null;
+        for (let p = close; p; p = p.parentNode) {
+          if (['form', 'a', 'input'].includes(String(p.tagName || '').toLowerCase())) return null;
+        }
+      }
+      const targets = all('button, a, input, select, textarea, [role="button"], [role="tab"], '
+        + '[role="switch"], [role="checkbox"], [tabindex], .oc-switch, .ovui-switch, .aurora-qc-switch');
+      if (targets.length > 600) return null;
+      let checked = 0;
+      let obstructed = false;
+      for (const target of targets) {
+        if (root.contains(target) || !visible(target)) continue;
+        const b = rectOf(target);
+        if (!b) return null;
+        const left = Math.max(0, b.left), right = Math.min(vw, b.right);
+        const top = Math.max(0, b.top), bottom = Math.min(vh, b.bottom);
+        if (right <= left || bottom <= top) continue;
+        checked += 1;
+        const sample = (l, t, rr, bb) => {
+          const dx = Math.min(0.5, (rr - l) / 4), dy = Math.min(0.5, (bb - t) / 4);
+          return [[(l + rr) / 2, (t + bb) / 2], [l + dx, t + dy], [rr - dx, bb - dy], [l + dx, bb - dy], [rr - dx, t + dy]];
+        };
+        const points = sample(left, top, right, bottom);
+        const il = Math.max(left, r.left), ir = Math.min(right, r.right);
+        const it = Math.max(top, r.top), ib = Math.min(bottom, r.bottom);
+        const intersects = il < ir && it < ib;
+        if (intersects) points.push(...sample(il, it, ir, ib));
+        for (const [x, y] of points) {
+          const hit = doc.elementFromPoint(x, y);
+          if (!hit) return null;
+          if (root.contains(hit)) obstructed = true;
+          else if (intersects && hit !== target && !target.contains(hit)) return null;
+        }
+      }
+      if (!checked) return null;
+      if (obstructed && !close) return null;
+      return { root, close, obstructed, checked };
+    } catch (_) { return null; }
+  };
+  if (!dangerText && foreign.length <= 5 && !(options && options.requirePanelGone)) {
+    for (const root of foreign) {
+      const panel = inspectSidePanel(root);
+      if (panel) panelCandidates.push(panel);
+    }
+    foreign = foreign.filter((root) => !panelCandidates.some((p) => p.root === root));
+  }
+  const closablePanels = panelCandidates.filter((p) => p.close);
+  if (closablePanels.length > 1 || (closablePanels.length && known.length)) out.blockers.push('ambiguous-panel-close');
+  if (panelCandidates.length) out.sidePanels = panelCandidates.map((p) => ({ obstructed: p.obstructed, checkedTargets: p.checked, close: !!p.close }));
+  // aurora-qc-loading-mask-transient-20261101: 精确识别唯一空壳 aurora-qc-loading-mask 为可等待瞬态（非永久 none 白名单）。
+  // 条件：精确 class token + 空文本 + 无元素子节点/可见后代/关闭控件 + 无其它 foreign·danger·已知弹窗·侧栏。
+  // 泛 [class*="mask"] 扫描保留；畸形/并存仍走 unknown-overlay 阻断；全程零点击。
+  const isExactEmptyAuroraQcLoadingMask = (el) => {
+    if (!el) return false;
+    if (classTokens(el).indexOf('aurora-qc-loading-mask') === -1) return false;
+    const text = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (text) return false;
+    const elKids = el.children ? Array.prototype.slice.call(el.children) : [];
+    if (elKids.length > 0) return false;
+    const nodes = el.childNodes ? Array.prototype.slice.call(el.childNodes) : [];
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i];
+      if (!n) continue;
+      if (n.nodeType === 1) return false;
+      if ((n.nodeType === 3 || n.nodeType === 4) && String(n.textContent || '').trim()) return false;
+    }
+    if (typeof el.querySelectorAll === 'function') {
+      let ctrls = [];
+      try {
+        ctrls = Array.prototype.slice.call(el.querySelectorAll(
+          'button, a, [role="button"], .tools-vmok-plugin-modal__close-icon, button.close-button'
+        ));
+      } catch (_) { ctrls = []; }
+      if (ctrls.length > 0) return false;
+    }
+    return true;
+  };
+  let transientAuroraLoading = false;
+  if (!dangerText
+      && out.blockers.length === 0
+      && known.length === 0
+      && panelCandidates.length === 0
+      && foreign.length === 1
+      && isExactEmptyAuroraQcLoadingMask(foreign[0])) {
+    transientAuroraLoading = true;
+  }
+  if (foreign.length > 0 && !transientAuroraLoading) {
+    out.blockers.push(`unknown-overlay:${foreign.length}`);
+    const structure = (el) => ({
+      tag: String(el.tagName || '').toLowerCase().slice(0, 24),
+      cls: String((el.getAttribute && el.getAttribute('class')) || '').slice(0, 60),
+      role: String((el.getAttribute && el.getAttribute('role')) || '').slice(0, 24),
+    });
+    out.unknownDiag = foreign.slice(0, 5).map((el) => {
+      const diag = {};
+      try {
+        Object.assign(diag, structure(el));
+        const rect = el.getBoundingClientRect();
+        diag.rect = {};
+        for (const key of ['left', 'top', 'width', 'height']) {
+          diag.rect[key] = Number.isFinite(rect[key]) ? rect[key] : null;
+        }
+        const children = el.children || [];
+        diag.directChildren = children.length;
+        diag.visibleDirectChildren = 0;
+        diag.directChildrenTruncated = children.length > 200;
+        diag.children = [];
+        for (let i = 0; i < Math.min(children.length, 200); i++) {
+          const childVisible = visible(children[i]);
+          if (childVisible) diag.visibleDirectChildren += 1;
+          if (i < 5) diag.children.push({ ...structure(children[i]), visible: childVisible });
+        }
+        diag.containedIntroRoots = introRoots.filter((root) => el.contains(root)).length;
+        diag.containedGuideRoots = guideRoots.filter((root) => el.contains(root)).length;
+        diag.rawChars = 0;
+        diag.visChars = 0;
+        diag.visibleDescendants = 0;
+        diag.scannedNodes = 0;
+        diag.closeControls = [];
+        diag.visibleCloseControls = 0;
+        const stack = [{ nodes: [el], index: 0, rendered: true }];
+        // 截断时文本长度与可见后代计数仅为下界；不递归、不扩展到候选外。
+        while (stack.length && diag.scannedNodes < 200) {
+          const frame = stack[stack.length - 1];
+          if (frame.index >= frame.nodes.length) { stack.pop(); continue; }
+          const node = frame.nodes[frame.index++];
+          diag.scannedNodes += 1;
+          if (node.nodeType === 3 || node.nodeType === 4) {
+            const chars = String(node.textContent || '').length;
+            diag.rawChars += chars;
+            if (frame.rendered) diag.visChars += chars;
+            continue;
+          }
+          if (node.nodeType !== 1 && !node.tagName) continue;
+          const tag = String(node.tagName || '').toLowerCase();
+          const rendered = frame.rendered && visible(node)
+            && !['script', 'style', 'noscript', 'template'].includes(tag);
+          if (typeof node.ownText === 'string') {
+            diag.rawChars += node.ownText.length;
+            if (rendered) diag.visChars += node.ownText.length;
+          }
+          if (rendered && node !== el) {
+            diag.visibleDescendants += 1;
+            const legacyClose = node.matches('.tools-vmok-plugin-modal__close-icon');
+            const v2CloseButton = node.matches('button.close-button[aria-label="关闭"][type="button"]');
+            let closeText = null;
+            if (node.matches('button, a, [role="button"], span')) {
+              const text = String(node.textContent || '');
+              const compact = text.length <= 1200 ? text.replace(/\s+/g, '') : '';
+              if (compact === '跳过') closeText = 'skip';
+              else if (compact === '跳过引导') closeText = 'skip-guide';
+              else if (compact === '我知道了') closeText = 'acknowledge';
+            }
+            if (legacyClose || v2CloseButton || closeText) {
+              diag.visibleCloseControls += 1;
+              if (diag.closeControls.length < 5) {
+                diag.closeControls.push({
+                  ...structure(node), legacyClose, v2CloseButton, closeText,
+                  ariaClose: node.getAttribute('aria-label') === '关闭',
+                });
+              }
+            }
+          }
+          const nodes = node.childNodes || node.children || [];
+          if (nodes.length) stack.push({ nodes, index: 0, rendered });
+        }
+        while (stack.length && stack[stack.length - 1].index >= stack[stack.length - 1].nodes.length) stack.pop();
+        diag.scanTruncated = stack.length > 0;
+        diag.closeControlsTruncated = diag.visibleCloseControls > 5;
+      } catch (_) {
+        // 诊断失败不能替换原有 unknown 阻断，异常原文也不得进入审计。
+        diag.incomplete = true;
+      }
+      return diag;
+    });
+  }
   if (introRoots.length > 1) out.blockers.push(`multiple-intro:${introRoots.length}`);
   if (guideRoots.length > 1) out.blockers.push(`multiple-guide:${guideRoots.length}`);
   if (introRoots.length === 1 && guideRoots.length > 0) out.blockers.push('intro-and-guide');
   if (out.blockers.length > 0) { out.state = 'blocked'; return out; }
-  if (introRoots.length === 0 && guideRoots.length === 0) { out.state = 'none'; return out; }
+  // aurora-qc-loading-mask-transient-20261101: 瞬态加载遮罩 — 不点、不放行；由 dismiss 有界重读，消失后才 none。
+  if (transientAuroraLoading) {
+    out.state = 'transient';
+    out.kind = 'aurora-qc-loading-mask';
+    out.key = 'aurora-qc-loading-mask';
+    out.action = 'none';
+    out.clicked = false;
+    out.transient = { cls: 'aurora-qc-loading-mask', waitable: true };
+    try {
+      const el = foreign[0];
+      out.unknownDiag = [{
+        tag: String(el.tagName || '').toLowerCase().slice(0, 24),
+        cls: String((el.getAttribute && el.getAttribute('class')) || '').slice(0, 60),
+        role: String((el.getAttribute && el.getAttribute('role')) || '').slice(0, 24),
+        directChildren: (el.children && el.children.length) || 0,
+        visibleDescendants: 0,
+        closeControls: [],
+        transient: true,
+      }];
+    } catch (_) { /* 诊断可选 */ }
+    return out;
+  }
+  if (introRoots.length === 0 && guideRoots.length === 0 && closablePanels.length === 0) { out.state = 'none'; return out; }
 
   let root = null;
   let control = null;
-  if (introRoots.length === 1) {
+  if (closablePanels.length === 1) {
+    out.kind = 'side-panel';
+    out.key = 'side-panel';
+    out.closeCandidates = 1;
+    root = closablePanels[0].root;
+    control = closablePanels[0].close;
+    out.action = 'dismiss-side-panel';
+  } else if (introRoots.length === 1) {
     out.kind = 'intro';
     root = introRoots[0];
     const e2e = (root.getAttribute ? String(root.getAttribute('data-e2e') || '') : '');
     out.key = e2e || 'ocean-modal';
-    // 旧白名单 X。
+    // 旧白名单 X：--hide 时不可见，被 visible() 过滤，不计入候选。
     let cands = Array.prototype.slice.call(
       root.querySelectorAll('.tools-vmok-plugin-modal__close-icon')
     ).filter(visible);
-    // 新版介绍浮窗（overall-release-modal-v2-wrap）：唯一可见关闭控件为
-    // button.close-button[aria-label="关闭"][type="button"]，内部含
-    // iconpark-icon[name="oc-icon-close"]。仅在同一已知 root 且具 overall-release-modal-v2-wrap
-    // 类时纳入：绝不泛匹配任意 aria-label=关闭、绝不放宽 root、绝不点业务 CTA。
+    // 新版介绍浮窗（overall-release-modal-v2-wrap，2026-10-18 真实 DOM 取证 exact-overlay-block.json）：
+    // 唯一可见关闭控件为 button.close-button[aria-label="关闭"][type="button"]，内部含
+    // iconpark-icon[name="oc-icon-close"]。仅在同一已知 root 且 root 具 overall-release-modal-v2-wrap
+    // 类时纳入；绝不泛匹配任意 aria-label=关闭、绝不放宽 root、绝不点业务 CTA（投放乘方/开启货款直投）。
     const rootClass = String((root.getAttribute && root.getAttribute('class')) || root.className || '');
     if (rootClass.split(/\s+/).indexOf('overall-release-modal-v2-wrap') !== -1) {
       const v2 = Array.prototype.slice.call(
@@ -1870,11 +2317,194 @@ function assertChengfangOverlaySafe(result, { phase, allowUntrusted }) {
   throw new DataGuardError(`浮窗状态未知（${phase}）：${result.state || 'unknown'}，停止自动操作`);
 }
 
+const readOnlyEmptySessions = new WeakMap();
+
+function readChengfangFirstUseInPage() {
+  const url = new URL(location.href);
+  if (url.origin !== 'https://qianchuan.jinritemai.com' || url.pathname !== '/overall-prom') return false;
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const controls = [...document.querySelectorAll('button, a, [role="button"]')].filter(visible);
+  const text = el => (el.textContent || '').replace(/\s+/g, '').trim();
+  if (!['新建乘方直播', '新建乘方商品自选'].every(label => controls.filter(el => text(el) === label).length === 1)) return false;
+  const views = [...document.querySelectorAll('[role="tab"], [class*="tab"], [class*="Tab"], .aurora-qc-radio-button-label')].filter(visible);
+  if (views.some(el => /^(商品|计划视图|商品自选|全店托管)/.test(text(el)))) return false;
+  if (document.querySelectorAll('tr.ovui-tr, [role="switch"], .ovui-switch, .aurora-qc-switch').length > 0) return false;
+  return true;
+}
+
+function observeChengfangEmptyScope(target, accountId) {
+  const startedAt = Date.now();
+  const deadline = startedAt + 20000;
+  const requests = new Map();
+  let disposed = false;
+  let invalid = false;
+  let collected = false;
+  let pending = 0;
+  let pc = false;
+  let upgrade = false;
+  let timer;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    clearTimeout(timer);
+    target.removeListener('request', onRequest);
+    target.removeListener('response', onResponse);
+    target.removeListener('close', onClose);
+    requests.clear();
+  };
+  const onClose = () => { invalid = true; dispose(); };
+  const onRequest = request => {
+    const observedAt = Date.now();
+    if (disposed || (!collected && observedAt > deadline)) return;
+    try {
+      if (request.frame() !== target.mainFrame()) return;
+      const pageUrl = new URL(target.url());
+      if (pageUrl.origin !== 'https://qianchuan.jinritemai.com' || pageUrl.pathname !== '/overall-prom') return;
+      const url = new URL(request.url());
+      if (url.origin !== 'https://qianchuan.jinritemai.com') return;
+      let kind;
+      if (url.pathname === '/ad/api/pmc/agw/uni/get-uni-prom-has-pc-delivery') {
+        const scenes = url.searchParams.getAll('AdlabScene');
+        if (scenes.length === 0) return;
+        if (scenes.length !== 1 || scenes[0] !== '1') { invalid = true; return; }
+        kind = 'pc';
+      } else if (url.pathname === '/ad/api/pmc/v1/ad/get_overall_upgrade_info') {
+        kind = 'upgrade';
+      } else return;
+      const ids = url.searchParams.getAll('aavid');
+      const requestAt = request.timing().startTime;
+      // Playwright leaves startTime at 0 until the response arrives.
+      if (request.method() !== 'GET' || ids.length !== 1 || ids[0] !== accountId
+          || observedAt < startedAt || !Number.isFinite(requestAt) || requestAt < 0
+          || (requestAt > 0 && (requestAt < startedAt || requestAt > observedAt
+            || (!collected && requestAt >= deadline)))) {
+        invalid = true;
+        return;
+      }
+      requests.set(request, { kind, observedAt });
+    } catch (_) { invalid = true; }
+  };
+  const onResponse = response => {
+    if (disposed) return;
+    let kind;
+    try {
+      const request = response.request();
+      const observed = requests.get(request);
+      if (!observed) return;
+      requests.delete(request);
+      const responseAt = Date.now();
+      const requestAt = request.timing().startTime;
+      if (!Number.isFinite(requestAt) || requestAt <= 0 || requestAt < startedAt
+          || requestAt > responseAt || (!collected && (requestAt >= deadline || responseAt >= deadline))
+          || observed.observedAt < startedAt || observed.observedAt > responseAt
+          || response.status() !== 200 || response.url() !== request.url()) { invalid = true; return; }
+      kind = observed.kind;
+    } catch (_) { invalid = true; return; }
+    pending++;
+    Promise.resolve().then(() => response.json()).then(body => {
+      if (disposed) return;
+      if (!body || body.status_code !== 0 || !body.data) { invalid = true; return; }
+      if (kind === 'pc') {
+        const rows = body.data.results;
+        const scopes = new Set(['1:0', '2:0', '1:7', '2:7']);
+        if (!Array.isArray(rows) || rows.length !== 4) { invalid = true; return; }
+        for (const row of rows) {
+          if (!row || row.adlabScene !== 1 || ![1, 2].includes(row.marGoal)
+              || ![0, 7].includes(row.smartBidType) || row.hasPcDelivery !== false
+              || !scopes.delete(`${row.marGoal}:${row.smartBidType}`)) { invalid = true; return; }
+        }
+        pc = scopes.size === 0;
+      } else {
+        if (!['productInfo', 'shopInfo', 'liveInfo'].every(key => body.data[key] && body.data[key].hasAd === false)) {
+          invalid = true;
+          return;
+        }
+        upgrade = true;
+      }
+    }).catch(() => { if (!disposed) invalid = true; }).finally(() => { pending--; });
+  };
+  const confirmed = () => !disposed && !invalid && pending === 0 && requests.size === 0 && pc && upgrade
+    && (collected || Date.now() < deadline) && !target.isClosed();
+  // R9（2026-10-25）：双源正证据在原 20 秒窗口内完整确认后即标记收集完成并清除该窗口
+  // timer——此后工作 Cookie 检查点等保存/收尾耗时不再把已验证数据过期丢弃。监听与全部
+  // 真实性校验（原生 request0→response>0 时序、当前 owner、新鲜 observedAt、来源/账户）
+  // 保持不变，晚到矛盾/失败/未完成仍使 confirmed=false；dispose 仍在 finally。
+  const markCollected = () => {
+    if (disposed || invalid || pending !== 0 || requests.size !== 0 || !pc || !upgrade) return false;
+    if (Date.now() >= deadline) return false;
+    collected = true;
+    clearTimeout(timer);
+    return true;
+  };
+  target.on('request', onRequest);
+  target.on('response', onResponse);
+  target.on('close', onClose);
+  timer = setTimeout(() => { invalid = true; dispose(); }, 20000);
+  return {
+    dispose,
+    confirmed,
+    markCollected,
+    async wait(readiness) {
+      while (!disposed && Date.now() < deadline) {
+        const ready = await readiness();
+        if (disposed || Date.now() >= deadline) return null;
+        if (ready === 'tabs' || (ready === 'first-use' && confirmed())) return ready;
+        await target.waitForTimeout(Math.min(250, deadline - Date.now()));
+      }
+      return null;
+    },
+  };
+}
+
+async function verifyChengfangReadOnlyEmpty({ evidence, page, shopCfg }) {
+  const binding = evidence && readOnlyEmptySessions.get(evidence);
+  const fail = () => { throw new DataGuardError('乘方只读空范围身份或页面证据未通过，拒绝判定关闭'); };
+  if (!binding || evidence.kind !== 'chengfang-readonly-empty' || binding.target !== page
+      || binding.shopId !== shopCfg.id || page.isClosed() || page.context() !== binding.context) return fail();
+  if (shopCfg.accountId != null && String(shopCfg.accountId).trim() !== binding.accountId) return fail();
+  const header = await page.evaluate(probeQianchuanHeaderIdentityInPage);
+  if (!header || header.unique !== true || header.loginVisible !== false || header.accountId !== binding.accountId) return fail();
+  const sso = await discoverUnknownShopAccountId({ context: binding.context, identityPage: binding.identityPage,
+    target: page, shopCfg, url: page.url(), observed: header });
+  if (!sso || sso.ok !== true || sso.accountId !== binding.accountId) return fail();
+  if (await page.evaluate(readChengfangFirstUseInPage) !== true) return fail();
+  const overlay = await page.evaluate(handleChengfangOverlayInPage, { click: false });
+  if (!overlay || overlay.trusted !== true || overlay.state !== 'none') return fail();
+  const finalHeader = await page.evaluate(probeQianchuanHeaderIdentityInPage);
+  const url = new URL(page.url());
+  if (page.isClosed() || url.origin !== 'https://qianchuan.jinritemai.com' || url.pathname !== '/overall-prom'
+      || !finalHeader || finalHeader.unique !== true || finalHeader.loginVisible !== false
+      || finalHeader.accountId !== binding.accountId) return fail();
+  return { ok: true, pageShopId: binding.shopId, pageShopName: sso.shopName,
+    pageAccountId: binding.accountId, pageAccountName: finalHeader.accountName || null,
+    pageUrl: url.origin + url.pathname, accountIdOptional: false };
+}
+
+/**
+ * D52：从本次可信 open（openQianchuanHome）附着在 cookieSession 上的非枚举临时引用
+ * （candidateVerifyCapability）取出 manager-ready/错误收尾 Cookie 检查点所需的候选验证
+ * 能力。只有候选专用工厂与禁止列表**同时**可得才透传（fail-closed：任一缺失保持原样
+ * 不传，由检查点自身拒绝——绝不借用业务浏览器/上下文，绝不自启真实浏览器）；禁止列表
+ * 在调用时刻取新鲜快照。能力只随本次 cookieSession 存在，不序列化、不跨店/跨 open 串用。
+ */
+function chengfangCheckpointVerifyArgs(cookieSession) {
+  const cap = cookieSession && cookieSession.candidateVerifyCapability;
+  return (cap
+    && typeof cap.candidateBrowserFactory === 'function'
+    && typeof cap.forbiddenBrowsers === 'function')
+    ? { candidateBrowserFactory: cap.candidateBrowserFactory, forbiddenBrowsers: cap.forbiddenBrowsers() }
+    : {};
+}
+
 async function openChengfangShop(p) {
   const audit = typeof p.audit === 'function' ? p.audit : () => {};
   if (hasChengfangManualReview(p.shopCfg)) {
     const rel = await releaseChengfangManualReviewForReadOnlyOpen({ shopCfg: p.shopCfg, audit });
-    if (!rel.released) throw chengfangManualReviewError(rel.reason);
+    if (!rel.released) throw markChengfangResourceNotCreated(chengfangManualReviewError(rel.reason));
     // lease 从 release 一直保留到这里：最终复核、Cookie checkpoint 与安全交回
     // 全部处在同一临界区，期间并发 opener 只能看到「另一个恢复流程正在进行」。
     const guardKey = rel.shopKey || manualReviewShopKey(p.shopCfg);
@@ -1992,11 +2622,14 @@ async function openChengfangShop(p) {
           action: 'release-manual-review', result: 'held', reason: '最终复核未通过，guard 保持',
         });
       } catch (_) { /* 审计失败不影响异常传播 */ }
-      throw e;
+      // 复用分支只用已核验的保留窗口（不新开浏览器、不新建 context），且**绝不**代用户关闭
+      // 保留窗口：这是可证的"未创建"，Monitor 据此清门而不必等待不可能的关闭证明。
+      throw markChengfangResourceNotCreated(e);
     }
   }
   const openHome = p.openHome || openQianchuanHome;
   const { browser, context, target, cookieSession } = await openHome(p.loginCfg, p.shopCfg, p);
+  let emptyObserver = null;
   try {
     await target.waitForTimeout(2000);
     // 普通打开阶段：只做有界白名单浮窗关闭（未知/多义/多个独立浮窗一律零点击）。
@@ -2007,8 +2640,24 @@ async function openChengfangShop(p) {
       page: target, audit, shopId: p.shopCfg && p.shopCfg.id, maxRounds: 2,
     });
     assertChengfangOverlaySafe(initialOverlay, { phase: '普通打开-导航前', allowUntrusted: true });
+    let emptyAccountId = null;
+    if (p.readOnlyStatus === true) {
+      try {
+        const homeUrl = new URL(target.url());
+        const header = await target.evaluate(probeQianchuanHeaderIdentityInPage);
+        if (homeUrl.origin === 'https://qianchuan.jinritemai.com' && homeUrl.pathname === '/home'
+            && header && header.unique === true && header.loginVisible === false
+            && typeof header.accountId === 'string' && /^\d{8,20}$/.test(header.accountId)
+            && (p.shopCfg.accountId == null || String(p.shopCfg.accountId).trim() === header.accountId)) {
+          emptyAccountId = header.accountId;
+        }
+      } catch (_) { emptyAccountId = null; }
+    }
     let st = null;
+    let readOnlyEmpty = null;
     for (let attempt = 0; attempt < 2; attempt++) {
+      if (emptyObserver) emptyObserver.dispose();
+      if (emptyAccountId) emptyObserver = observeChengfangEmptyScope(target, emptyAccountId);
       await target.evaluate(() => {
         const el = [...document.querySelectorAll('[data-e2e]')].find((e) => /navigatormenu_overall/.test(e.getAttribute('data-e2e') || ''));
         if (el) el.click();
@@ -2019,39 +2668,79 @@ async function openChengfangShop(p) {
       if (st && CHENGFANG_URL_RE.test(st.url)) break;
     }
     if (!st || !CHENGFANG_URL_RE.test(st.url)) {
-      throw new DataGuardError(`导航"乘方"未到达管理页（当前 ${st ? st.url.slice(0, 80) : '未知'}）`);
+      throw new DataGuardError(`导航"乘方"未到达管理页（当前 ${st ? maskUrlQueries(st.url).slice(0, 80) : '未知'}）`);
     }
-    // 部分店铺需关闭介绍浮层，再依次进入「商品」和「计划视图」；
-    // 只有「商品自选/全店托管」子标签真实出现才继续。
-    const deadlineTab = Date.now() + 15000;
-    let hasTabs = false;
-    while (Date.now() < deadlineTab) {
-      // 浮窗关闭与 tab 导航严格分离：先关白名单浮窗，再做只读导航。
-      // 已到达乘方管理页，探针必须可信且安全；未知/危险/未消失即阻断，不继续 tab 导航。
-      const tabOverlay = await dismissKnownChengfangOverlays({
+    const readOnlyTabDeadline = p.readOnlyStatus === true && emptyObserver ? Date.now() + 55000 : null;
+    let readiness = null;
+    if (p.readOnlyStatus === true && st.hasSubTabs !== true && emptyObserver) {
+      readiness = await emptyObserver.wait(async () => {
+        st = await target.evaluate(readChengfangAccountInPage);
+        if (st && st.hasSubTabs === true) return 'tabs';
+        return await target.evaluate(readChengfangFirstUseInPage) === true ? 'first-use' : null;
+      });
+    }
+    if (p.readOnlyStatus === true && (!st || st.hasSubTabs !== true)
+        && (readiness === 'first-use' || await target.evaluate(readChengfangFirstUseInPage) === true)) {
+      if (!emptyObserver || !emptyObserver.confirmed()) {
+        throw new DataGuardError('乘方只读完整空范围双源证据不足，拒绝判定关闭');
+      }
+      emptyObserver.markCollected();
+      readOnlyEmpty = Object.freeze({ kind: 'chengfang-readonly-empty', confirmedEmpty: true });
+      readOnlyEmptySessions.set(readOnlyEmpty, { target, context, accountId: emptyAccountId,
+        shopId: p.shopCfg.id, identityPage: cookieSession && cookieSession.identityPage });
+      // 首次引导双源已确认后、第一次只读核验前，先走既有白名单关闭器处理合法晚到的
+      // 介绍浮窗（只点容器内唯一 X；未知/危险/多义仍零点击阻断）。原顺序相反：
+      // verify 先要求 overlay===none，晚到的介绍浮窗永远进不了原关闭步骤。
+      const firstUseOverlay = await dismissKnownChengfangOverlays({
         page: target, audit, shopId: p.shopCfg && p.shopCfg.id, maxRounds: 1,
       });
+      assertChengfangOverlaySafe(firstUseOverlay, { phase: '只读空范围-首次核验前', allowUntrusted: false });
+      await verifyChengfangReadOnlyEmpty({ evidence: readOnlyEmpty, page: target, shopCfg: p.shopCfg });
+    }
+    if (!readOnlyEmpty && emptyObserver) emptyObserver.dispose();
+    // 部分店铺需关闭介绍浮层，再依次进入「商品」和「计划视图」；
+    // 只有「商品自选/全店托管」子标签真实出现才继续。
+    const deadlineTab = readOnlyTabDeadline === null ? Date.now() + 15000 : readOnlyTabDeadline - 40000;
+    let hasTabs = false;
+    let tabOverlay = null;
+    while (!readOnlyEmpty && Date.now() < deadlineTab) {
+      // 浮窗关闭与 tab 导航严格分离：先关白名单浮窗，再做只读导航。
+      // 已到达乘方管理页，探针必须可信且安全；未知/危险/未消失即阻断，不继续 tab 导航。
+      tabOverlay = await dismissKnownChengfangOverlays({
+        page: target, audit, shopId: p.shopCfg && p.shopCfg.id, maxRounds: 1,
+      });
+      // 管理页快照可能早于迟到导航；不可信期间只消耗现有等待预算，不导航。
+      if (tabOverlay.state === 'untrusted') {
+        await target.waitForTimeout(Math.max(0, Math.min(2000, deadlineTab - Date.now())));
+        continue;
+      }
       assertChengfangOverlaySafe(tabOverlay, { phase: '乘方管理页-子标签等待', allowUntrusted: false });
       await target.evaluate(navigateChengfangPlanViewInPage).catch(() => {});
-      await target.waitForTimeout(2000);
+      await target.waitForTimeout(readOnlyTabDeadline === null ? 2000 : Math.max(0, Math.min(2000, deadlineTab - Date.now())));
       const check = await target.evaluate(readChengfangAccountInPage);
       if (check && check.hasSubTabs) { st = check; hasTabs = true; break; }
     }
-    if (!hasTabs) {
+    if (!hasTabs && !readOnlyEmpty) {
       // 子标签（商品自选/全店托管）异步渲染，轮询等待（最长 40s）
-      const deadline = Date.now() + 40000;
+      const deadline = readOnlyTabDeadline === null ? Date.now() + 40000 : readOnlyTabDeadline;
       while (Date.now() < deadline) {
-        const tabOverlay = await dismissKnownChengfangOverlays({
+        tabOverlay = await dismissKnownChengfangOverlays({
           page: target, audit, shopId: p.shopCfg && p.shopCfg.id, maxRounds: 1,
         });
+        if (tabOverlay.state === 'untrusted') {
+          await target.waitForTimeout(Math.max(0, Math.min(2000, deadline - Date.now())));
+          continue;
+        }
         assertChengfangOverlaySafe(tabOverlay, { phase: '乘方管理页-子标签长等待', allowUntrusted: false });
         await target.evaluate(navigateChengfangPlanViewInPage).catch(() => {});
-        await target.waitForTimeout(2000);
+        await target.waitForTimeout(readOnlyTabDeadline === null ? 2000 : Math.max(0, Math.min(2000, deadline - Date.now())));
         const check = await target.evaluate(readChengfangAccountInPage);
         if (check && check.hasSubTabs) { st = check; hasTabs = true; break; }
       }
     }
-    if (!hasTabs) {
+    if (!hasTabs && !readOnlyEmpty) {
+      if (tabOverlay) assertChengfangOverlaySafe(tabOverlay, { phase: '乘方管理页-子标签等待超时', allowUntrusted: false });
+      if (p.readOnlyStatus === true) throw new DataGuardError('乘方只读页面范围无法确认，拒绝判定关闭');
       throw new DataGuardError('乘方页未找到"商品自选/全店托管"子标签（尝试进入"商品→计划视图"后仍未出现），拒绝继续');
     }
     // 子标签 ready 不是「浮窗已消失」的证明：交回前再做一次严格零点击复核，
@@ -2065,22 +2754,33 @@ async function openChengfangShop(p) {
     let cookieCheckpoint;
     try {
       const runCheckpoint = p.sessionCheckpoint || checkpointQianchuanSessionCookies;
-      cookieCheckpoint = await runCheckpoint({ context, cookieSession, target, shopCfg: p.shopCfg, audit: p.audit });
+      // D52：本次会话来自可信 openHome——把附着在 cookieSession 上的候选验证能力接到
+      // manager-ready 检查点（缺能力时检查点自身 fail-closed，行为与旧版一致）。
+      cookieCheckpoint = await runCheckpoint({ context, cookieSession, target, shopCfg: p.shopCfg, audit: p.audit,
+        ...chengfangCheckpointVerifyArgs(cookieSession) });
     } catch (e) {
       cookieCheckpoint = { saved: false, skipped: true, reason: `会话检查点异常（不影响本次打开结果）: ${(e && e.message) || e}` };
     }
-    return { browser, target, account: st, context, cookieSession, cookieCheckpoint };
+    if (readOnlyEmpty) {
+      await verifyChengfangReadOnlyEmpty({ evidence: readOnlyEmpty, page: target, shopCfg: p.shopCfg });
+      if (!emptyObserver.confirmed()) throw new DataGuardError('乘方只读空范围证据已失效，拒绝判定关闭');
+    }
+    return { browser, target, account: st, context, cookieSession, cookieCheckpoint,
+      ...(readOnlyEmpty ? { readOnlyEmpty } : {}) };
   } catch (e) {
+    if (emptyObserver) emptyObserver.dispose();
     await holdOnMissingChengfangControl(e, {
       context, target, shopCfg: p.shopCfg, loginCfg: p.loginCfg, cookieSession, audit,
       browserFactory: p.browserFactory, reviewBrowserFactory: p.reviewBrowserFactory,
     });
     // R58 失败路径检查点：关闭浏览器前再尝试一次——仅当当前时刻地址/身份仍是
     // 新鲜的同账户千川正证据才会写（登录页/foreign/身份缺失由检查点自身跳过）。
+    // D52：同样接上本次可信 open 的候选验证能力（同 manager-ready 口径，fail-closed）。
     // 结果只丢弃不传播：原始错误原样抛出，绝不掩盖或改写。
     try {
       await (p.sessionCheckpoint || checkpointQianchuanSessionCookies)({
         context, cookieSession, target, shopCfg: p.shopCfg, audit: p.audit,
+        ...chengfangCheckpointVerifyArgs(cookieSession),
       });
     } catch (_) { /* 检查点失败不得影响原始错误的如实传播 */ }
     // 关闭仍走 closeBrowser（保留其 Cookie 收尾语义）；它吞掉 browser.close 的拒绝，
@@ -2093,6 +2793,8 @@ async function openChengfangShop(p) {
     // 由后续巡查先推进真实关闭；关闭核验成功前该店不得启动新 opener。
     attachChengfangCleanupHandle(e, browser);
     throw e;
+  } finally {
+    if (emptyObserver) emptyObserver.dispose();
   }
 }
 
@@ -2568,6 +3270,8 @@ module.exports = {
   clickChengfangNextPageInPage,
   clickChengfangFirstPageInPage,
   readChengfangAccountInPage,
+  readChengfangFirstUseInPage,
+  verifyChengfangReadOnlyEmpty,
   advanceChengfangPlanViewInPage,
   navigateChengfangPlanViewInPage,
   handleChengfangOverlayInPage,

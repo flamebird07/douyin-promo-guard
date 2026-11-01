@@ -12,18 +12,38 @@
  * - 未收到停止信号
  * - 触发业务日期与当前上海日历日一致（未跨日）
  *
- * 真实开启（每日 07:00 自动开启相位）独立于暂停门槛，必须同时满足：
+ * 真实开启（每日首次开启检查相位，2026-10-09 起）独立于暂停门槛，必须同时满足：
  * - execution.realMode === true
  * - monitor.chengfang.enableEnabled === true
  * - execution.dryRun !== true（非演练）
- * - 上海时间 enableHour 起、dailyStartHour 前（每日一次，由监控相位调度）
+ * - 上海时间 firstCheckMinuteOfDay（配置缺省 5 = 00:05）起至当日结束（每日一次，
+ *   由监控相位调度；不再使用 enableHour 时段；00:00–00:04:59 不执行当天首次强制开启）
  * - 未收到停止信号；触发业务日期与当前上海日历日一致（未跨日）
  * - 开启不依赖费用/订单阈值（不读费用与订单）
+ *
+ * 历史 enableHour（07:00 固定开启）已于 2026-10-09 按客户要求取消：不再有 07:00
+ * 的独立日程。enableHour 字段在配置中仍被校验接受（兼容旧配置文件），但调度与门槛
+ * 均不再读取它。
  *
  * 显式传入 dryRun:false 不能越过上述配置门槛（执行器据此决定是否演练）。
  */
 
 const { shanghaiDate, shanghaiWall, isAfterDailyStart } = require('../lib/time');
+
+/**
+ * 每日首次开启检查的当天最早时刻（分钟，0–1439；配置缺省 5 = 00:05，Asia/Shanghai）。
+ * 读取 monitor.chengfang.firstCheckMinuteOfDay；非法或缺省回落 5。enableHour 不再参与。
+ */
+function resolveFirstCheckMinuteOfDay(cf) {
+  const v = cf && cf.firstCheckMinuteOfDay;
+  return (v !== undefined && v !== null && Number.isInteger(v) && v >= 0 && v <= 1439) ? v : 5;
+}
+
+/** 首查时刻展示文本（HH:MM，上海）。 */
+function firstCheckTimeText(cf) {
+  const m = resolveFirstCheckMinuteOfDay(cf);
+  return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+}
 
 /** 配置门槛：真实暂停是否被允许（不涉及时段/停止/日期，那些在请求级 gate 里）。 */
 function resolveChengfangRealAllowed(config) {
@@ -82,9 +102,11 @@ function resolveChengfangEnableAllowed(config) {
 /**
  * @param {'pause'|'enable'} [p.action]
  * @param {'daily_schedule'|'threshold_recovery'|'manual_verify'} [p.enableSource]
- *   daily_schedule：enableHour 起至当日结束（2026-09-29 第 10 阶段去除 dailyStartHour 上界，
- *     支持 enableHour 晚于 dailyStartHour 的配置；每日一次由监控相位调度保证）；
- *   threshold_recovery：值守窗口 dailyStartHour 起（周期低阈值恢复）；
+ *   daily_schedule：每日首次开启检查窗口（firstCheckMinuteOfDay 起，配置缺省 00:05，
+ *     至当日结束；2026-10-09 取消 07:00 固定开启、改 00:05 后检查，无小时上界，
+ *     晚开机也补检查；每日一次由监控相位调度 + 店铺+日期去重保证）；
+ *   threshold_recovery：首查窗口 firstCheckMinuteOfDay 起（周期低阈值恢复；
+ *     2026-10-09 R1：首查完成后费比恢复不再等 dailyStartHour）；
  *   manual_verify：人工按需验证（2026-09-29 第 10 阶段）——不设时段门槛（任意时刻可验证），
  *     但保留停止信号、跨日、realMode、enableEnabled、dryRun 全部门禁（fail-closed 不变）。
  *   缺省/未识别按 daily_schedule（旧定时开启语义）；显式非法值拒绝。
@@ -92,7 +114,7 @@ function resolveChengfangEnableAllowed(config) {
 function buildChengfangRequestGate({ config, nowFn, stopRequested, businessDate, action = 'pause', enableSource = 'daily_schedule' }) {
   const sch = (config && config.schedule) || { dailyStartHour: 8 };
   const cf = (config && config.monitor && config.monitor.chengfang) || {};
-  const enableHour = cf.enableHour !== undefined && cf.enableHour !== null ? cf.enableHour : 7;
+  const firstCheckMinute = resolveFirstCheckMinuteOfDay(cf);
   const label = action === 'enable' ? '开启' : '暂停';
   const src = enableSource === undefined || enableSource === null ? 'daily_schedule' : enableSource;
   return function check() {
@@ -104,20 +126,28 @@ function buildChengfangRequestGate({ config, nowFn, stopRequested, businessDate,
         return { ok: false, reason: `未知开启来源 ${JSON.stringify(src)}：拒绝放行` };
       }
       const w = shanghaiWall(nowFn());
+      const tod = (w.hour || 0) * 60 + (w.minute || 0);
       if (src === 'daily_schedule') {
-        if (w.hour < enableHour) {
-          const hh = String(enableHour).padStart(2, '0');
-          return { ok: false, reason: `未到允许开启时段（每日 ${hh}:00 起至当日结束，Asia/Shanghai）：不再发出新的开启请求` };
+        // 00:00–00:04:59（或自定义 firstCheckMinute 前）不执行当天首次强制开启；
+        // 之后至当日结束均为窗口（无小时上界，晚开机也补检查）。
+        if (tod < firstCheckMinute) {
+          const hhmm = firstCheckTimeText(cf);
+          return { ok: false, reason: `未到每日首次开启检查时刻（每日 ${hhmm} 起至当日结束，Asia/Shanghai）：不再发出新的开启请求` };
         }
-      } else if (src === 'threshold_recovery' && !isAfterDailyStart(nowFn(), sch.dailyStartHour)) {
-        // threshold_recovery：仅值守窗口（dailyStartHour 起）
-        const hh = String(sch.dailyStartHour).padStart(2, '0');
-        return { ok: false, reason: `未到值守窗口（每日 ${hh}:00 后，Asia/Shanghai）：周期恢复开启被拒绝` };
+      } else if (src === 'threshold_recovery' && tod < firstCheckMinute) {
+        // threshold_recovery：首查窗口后放行（首查完成后费比恢复，不再等 dailyStartHour；客户 2026-10-09 R1）
+        const hhmm = firstCheckTimeText(cf);
+        return { ok: false, reason: `未到每日首查时刻（每日 ${hhmm} 后，Asia/Shanghai）：周期恢复开启被拒绝` };
       }
       // manual_verify：无时段门槛（人工显式验证可任意时刻），其余门禁照常
-    } else if (!isAfterDailyStart(nowFn(), sch.dailyStartHour)) {
-      const hh = String(sch.dailyStartHour).padStart(2, '0');
-      return { ok: false, reason: `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：不再发出新的暂停请求` };
+    } else {
+      // pause：首查窗口后放行（首查完成后费比暂停，不再等 dailyStartHour；客户 2026-10-09 R1）
+      const w = shanghaiWall(nowFn());
+      const tod = (w.hour || 0) * 60 + (w.minute || 0);
+      if (tod < firstCheckMinute) {
+        const hhmm = firstCheckTimeText(cf);
+        return { ok: false, reason: `未到每日首查时刻（每日 ${hhmm} 后，Asia/Shanghai）：不再发出新的暂停请求` };
+      }
     }
     if (businessDate !== undefined && businessDate !== null && shanghaiDate(nowFn()) !== businessDate) {
       return { ok: false, reason: `跨日（触发业务日期 ${businessDate} → 当前 ${shanghaiDate(nowFn())}）：不再发出新的${label}请求` };
@@ -131,4 +161,4 @@ function buildChengfangRequestGate({ config, nowFn, stopRequested, businessDate,
   };
 }
 
-module.exports = { resolveChengfangRealAllowed, resolveChengfangEnableAllowed, buildChengfangRequestGate };
+module.exports = { resolveChengfangRealAllowed, resolveChengfangEnableAllowed, buildChengfangRequestGate, resolveFirstCheckMinuteOfDay, firstCheckTimeText };

@@ -1,0 +1,6 @@
+stdout:
+PASS balance-atomic-commit selftest
+
+stderr:
+
+exit=0

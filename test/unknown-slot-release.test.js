@@ -16,6 +16,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
 const { Monitor } = require('../src/engine/monitor.js');
+const { createSwitchSerialGate, HANDOFF_KIND } = require('../src/engine/switch-serial.js');
 const { makeTempDir, makeCfgResult } = require('./helpers.js');
 
 const TAB_MAIN = '全店托管';
@@ -258,5 +259,207 @@ test('N9 正例补充：enable unknown 槽位 + 全量 on 回读 → 释放', as
   assert.ok(r && r.resolved === true, JSON.stringify(r));
   assert.equal(monitor._switchOrchestrator.hasUnknownBlock('shop-a'), false);
   assert.equal(fake.calls.click, 0);
+  monitor.stop();
+});
+
+/*
+ * 2026-10-19 AD-WATCHDOG-BOOT-ENABLE 判别性补充：
+ * 旧 enable unknown 槽位在「本轮新鲜、完整、身份背书的全量 off」下按目标未达成安全结案；
+ * 仅该证据组合可释放，且同轮应能重建新 enable；其它情形（身份失败/mixed/空清单/
+ * 持久化失败/pause 反向证据）一律保持 unknown 阻塞、零点击。
+ */
+
+const EMPTY_VIEWS = { [TAB_MAIN]: [{ rows: [] }], [TAB_SUB]: [{ rows: [] }] };
+const ENABLE_SLOT_ID = 'act_1792342289490_1'; // 与生产敏敏高定私服旧 enable 槽同形
+
+function auditResolveEvents(dataDir) {
+  return auditList(dataDir).filter((j) => j.step === 'resolve-unknown-attempt'
+    || (j.step === 'resolve-unknown' && j.kind === 'ad-switch'));
+}
+
+test('G1 门级：enable unknown + 完整全量 off 证据才释放；逐项缺证保持阻塞且不标 confirmed', () => {
+  const gate = createSwitchSerialGate();
+  const b = gate.tryBegin('shop-a', 'enable');
+  assert.equal(b.ok, true);
+  assert.equal(gate.markUnknown('shop-a', b.actionId, '回读超时').ok, true);
+  const valid = { listComplete: true, identityOk: true, allRowsOff: true, rowCount: 2, freshState: 'off' };
+  // rowCount 契约（与 switch-serial.js 一致）：Number() 后必须是正安全整数。
+  // 可安全解析的字符串（'2'）等价于数字 2，予以接受（生产端传 rows.length，为 number）；
+  // 真正无效的 rowCount（0/负数/NaN/缺失/非整数/非数字文本）一律 fail-closed 拒绝。
+  const missing = [
+    { ...valid, listComplete: false },
+    { ...valid, identityOk: false },
+    { ...valid, allRowsOff: false },
+    { ...valid, rowCount: 0 },
+    { ...valid, rowCount: -1 },
+    { ...valid, rowCount: NaN },
+    { ...valid, rowCount: undefined },
+    { ...valid, rowCount: 2.5 },
+    { ...valid, rowCount: '2.5' },
+    { ...valid, rowCount: 'abc' },
+    { ...valid, freshState: 'mixed' },
+    { ...valid, freshState: 'unknown' },
+  ];
+  for (const evidence of missing) {
+    const r = gate.settleUnknownTargetNotAchieved('shop-a', b.actionId, { evidence }, { persist: () => ({ ok: true }) });
+    assert.equal(r.ok, false, `证据不足不得释放：${JSON.stringify(evidence)}`);
+    assert.equal(gate.hasUnknownBlock('shop-a'), true);
+  }
+  // 非 enable 动作不得走本入口（pause 的反向证据必须保持阻塞）
+  const p = gate.tryBegin('shop-b', 'pause');
+  gate.markUnknown('shop-b', p.actionId, '回读超时');
+  const pr = gate.settleUnknownTargetNotAchieved('shop-b', p.actionId, { evidence: valid }, { persist: () => ({ ok: true }) });
+  assert.equal(pr.ok, false);
+  assert.equal(gate.hasUnknownBlock('shop-b'), true);
+
+  const ok = gate.settleUnknownTargetNotAchieved('shop-a', b.actionId, {
+    evidence: valid, note: '全量 off 证明旧 enable 目标未达成',
+  }, { persist: () => ({ ok: true }) });
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  assert.equal(ok.kind, HANDOFF_KIND.ENABLE_TARGET_NOT_ACHIEVED);
+  assert.equal(ok.previous.confirmed, false, '释放绝不标 confirmed');
+  assert.equal(gate.peek('shop-a'), null);
+  assert.equal(gate.hasUnknownBlock('shop-a'), false);
+  const h = gate.handoffHistory('shop-a');
+  assert.equal(h.length, 1);
+  assert.equal(h[0].settledAs, HANDOFF_KIND.ENABLE_TARGET_NOT_ACHIEVED);
+  assert.equal(h[0].confirmed, false);
+  assert.equal(h[0].freshReadState, 'off');
+});
+
+test('G2 门级：目标未达成结案持久化失败 → 回滚 unknown 并拒绝同轮新动作', () => {
+  const gate = createSwitchSerialGate();
+  const b = gate.tryBegin('shop-a', 'enable');
+  gate.markUnknown('shop-a', b.actionId, '回读超时');
+  const r = gate.settleUnknownTargetNotAchieved('shop-a', b.actionId, {
+    evidence: { listComplete: true, identityOk: true, allRowsOff: true, rowCount: 1, freshState: 'off' },
+  }, { persist: () => { throw new Error('磁盘只读'); } });
+  assert.equal(r.ok, false);
+  assert.equal(r.persistFailed, true);
+  const slot = gate.peek('shop-a');
+  assert.ok(slot && slot.unknown === true && slot.settled !== true && slot.confirmed === false, JSON.stringify(slot));
+  assert.equal(gate.handoffHistory('shop-a').length, 0, '落盘失败不得留下成功结案审计');
+  assert.equal(gate.tryBegin('shop-a', 'enable').ok, false, '旧槽回滚后同轮不得创建新动作');
+});
+
+test('E1 正例：enable unknown + 全量 off 新鲜回读 → 按目标未达成释放（非 confirmed、零点击）', async () => {
+  const dataDir = makeTempDir('enable-notachieved-');
+  seedSlot(dataDir, 'shop-a', 'enable', ENABLE_SLOT_ID);
+  const fake = makeFake({ shopId: 'shop-a', views: OFF_VIEWS });
+  const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
+  const orch = monitor._switchOrchestrator;
+  assert.equal(orch.hasUnknownBlock('shop-a'), true);
+  const r = await monitor._tryResolveUnknownSlotWithFreshRead({ id: 'shop-a', name: 'shop-a' });
+  assert.ok(r && r.resolved === true, `应释放，实际 ${JSON.stringify(r)}`);
+  assert.equal(r.resolvedAs, 'enable_target_not_achieved');
+  assert.equal(orch.hasUnknownBlock('shop-a'), false);
+  assert.equal(orch.isBusy('shop-a'), false);
+  assert.equal(fake.calls.click, 0, '核验释放全程零点击');
+  const evs = auditResolveEvents(dataDir);
+  const attempt = evs.find((j) => j.step === 'resolve-unknown-attempt' && j.ok === true);
+  assert.ok(attempt, JSON.stringify(evs.map((x) => x.step)));
+  assert.equal(attempt.settledAs, 'enable_target_not_achieved');
+  assert.ok(/未达成/.test(attempt.reason) && /不声明历史点击因果/.test(attempt.reason), attempt.reason);
+  const settle = evs.find((j) => j.step === 'resolve-unknown' && j.ok === true);
+  if (settle) assert.equal(settle.confirmed, false, '结案审计不得声明 confirmed');
+  const st = JSON.parse(fs.readFileSync(path.join(dataDir, 'state.json'), 'utf8'));
+  assert.equal((st.switchSlots.slots || []).filter((x) => x.settled !== true).length, 0);
+  monitor.stop();
+});
+
+test('E2 同轮重建：enable unknown 释放后，同一每日开启轮创建新 enable actionId（不再 serial_gate）', async () => {
+  const dataDir = makeTempDir('enable-recreate-');
+  seedSlot(dataDir, 'shop-a', 'enable', ENABLE_SLOT_ID);
+  const fake = makeFake({ shopId: 'shop-a', views: OFF_VIEWS });
+  const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
+  monitor.enableRunning = true;
+  monitor._enableGen = 1;
+  await monitor._runEnablePhase(1, '2026-09-30');
+  const audits = auditList(dataDir);
+  const decide = audits.find((j) => j.event === 'daily-decide' && j.shopId === 'shop-a');
+  assert.ok(decide, '应有 daily-decide 审计');
+  assert.equal(decide.currentAdState, 'off');
+  assert.equal(decide.decision, 'should_enable');
+  const gateRejects = audits.filter((j) => j.step === 'serial-gate' && j.ok === false);
+  assert.equal(gateRejects.length, 0, `旧槽释放后不得再被串行门拒绝：${JSON.stringify(gateRejects.map((x) => x.reason))}`);
+  const recreated = audits.find((j) => j.step === 'enable-recreated' && j.shopId === 'shop-a');
+  assert.ok(recreated, '应有旧→新 actionId 关联审计');
+  assert.equal(recreated.oldActionId, ENABLE_SLOT_ID);
+  assert.equal(recreated.settledAs, 'enable_target_not_achieved');
+  assert.ok(recreated.newActionId && recreated.newActionId !== ENABLE_SLOT_ID, JSON.stringify(recreated));
+  assert.equal(monitor._switchOrchestrator.hasUnknownBlock('shop-a'), false);
+  assert.equal(fake.calls.click, 0, '演练模式零真实点击');
+  monitor.stop();
+});
+
+test('E3 负例：enable unknown + 全量 off 但身份核验失败 → 不释放', async () => {
+  const dataDir = makeTempDir('enable-identity-fail-');
+  seedSlot(dataDir, 'shop-a', 'enable', ENABLE_SLOT_ID);
+  const fake = makeFake({ shopId: 'shop-a', views: OFF_VIEWS });
+  const monitor = buildMonitor({
+    dataDir,
+    openerFn: async () => {
+      const s = await fake.opener();
+      s.controller.verifyIdentity = async () => ({ ok: false, reason: '模拟身份失败' });
+      return s;
+    },
+  });
+  const r = await monitor._tryResolveUnknownSlotWithFreshRead({ id: 'shop-a', name: 'shop-a' });
+  assert.ok(r && r.resolved === false, JSON.stringify(r));
+  assert.equal(monitor._switchOrchestrator.hasUnknownBlock('shop-a'), true, '身份未通过必须保持 unknown');
+  assert.equal(fake.calls.click, 0);
+  monitor.stop();
+});
+
+test('E4 负例：enable unknown + mixed 新鲜回读 → 不按目标未达成释放', async () => {
+  const dataDir = makeTempDir('enable-mixed-');
+  seedSlot(dataDir, 'shop-a', 'enable', ENABLE_SLOT_ID);
+  const fake = makeFake({ shopId: 'shop-a', views: MIXED_VIEWS });
+  const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
+  const r = await monitor._tryResolveUnknownSlotWithFreshRead({ id: 'shop-a', name: 'shop-a' });
+  assert.ok(r && r.resolved === false && /目标态未确认/.test(r.reason), JSON.stringify(r));
+  assert.equal(monitor._switchOrchestrator.hasUnknownBlock('shop-a'), true);
+  monitor.stop();
+});
+
+test('E5 负例：enable unknown + 完整空清单（off）→ 无实际行，不得释放', async () => {
+  const dataDir = makeTempDir('enable-empty-');
+  seedSlot(dataDir, 'shop-a', 'enable', ENABLE_SLOT_ID);
+  const fake = makeFake({ shopId: 'shop-a', views: EMPTY_VIEWS });
+  const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
+  const r = await monitor._tryResolveUnknownSlotWithFreshRead({ id: 'shop-a', name: 'shop-a' });
+  assert.ok(r && r.resolved === false, JSON.stringify(r));
+  assert.equal(monitor._switchOrchestrator.hasUnknownBlock('shop-a'), true, '至少一行是硬性证据');
+  monitor.stop();
+});
+
+test('E6 负例：enable unknown 目标未达成结案持久化失败 → 回滚 unknown、零新动作', async () => {
+  const dataDir = makeTempDir('enable-notachieved-persist-');
+  seedSlot(dataDir, 'shop-a', 'enable', ENABLE_SLOT_ID);
+  const fake = makeFake({ shopId: 'shop-a', views: OFF_VIEWS });
+  const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
+  monitor._saveState = () => ({ ok: false, reason: '模拟持久化失败' });
+  const r = await monitor._tryResolveUnknownSlotWithFreshRead({ id: 'shop-a', name: 'shop-a' });
+  assert.ok(r && r.resolved === false && /持久化|保存失败|persistence/.test(String(r.reason)), JSON.stringify(r));
+  const slot = monitor._switchOrchestrator.peek('shop-a');
+  assert.ok(slot && slot.unknown === true && slot.settled !== true && slot.confirmed === false, `槽位应回滚 unknown：${JSON.stringify(slot)}`);
+  assert.equal(monitor._switchOrchestrator.hasUnknownBlock('shop-a'), true);
+  // 生产登记新动作的真实入口是串行门 gate.tryBegin（编排器内部即调用 this.gate.tryBegin）：
+  // unknown 阻塞保持期间同店新 enable 必须被拒 → 零新动作。
+  assert.equal(monitor._switchGate.tryBegin('shop-a', 'enable').ok, false, '零新动作');
+  assert.equal(fake.calls.click, 0);
+  monitor.stop();
+});
+
+test('E7 pause 对称不误释放：pause unknown + 全量 on（目标 off 未达成）→ 保持阻塞', async () => {
+  const dataDir = makeTempDir('pause-symmetry-');
+  seedSlot(dataDir, 'shop-a', 'pause', SLOT_ACTION_ID);
+  const fake = makeFake({ shopId: 'shop-a', views: ON_VIEWS });
+  const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
+  const r = await monitor._tryResolveUnknownSlotWithFreshRead({ id: 'shop-a', name: 'shop-a' });
+  assert.ok(r && r.resolved === false && /目标态未确认/.test(r.reason), JSON.stringify(r));
+  assert.equal(monitor._switchOrchestrator.hasUnknownBlock('shop-a'), true);
+  const bad = auditList(dataDir).filter((j) => j.settledAs === 'enable_target_not_achieved');
+  assert.equal(bad.length, 0, 'pause 槽位不得套用 enable 的目标未达成结案');
   monitor.stop();
 });

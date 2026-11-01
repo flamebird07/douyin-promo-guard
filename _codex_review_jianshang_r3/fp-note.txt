@@ -1,0 +1,18 @@
+{
+  "pid": 15528,
+  "checked_at_local": "2026-10-31 20:25+ Asia/Shanghai (approx during r3 review)",
+  "port_3443_owner": 15528,
+  "allOk_prior": true,
+  "runtime_qianchuan_prior": {
+    "id": "src/adapters/qianchuan-reader.js",
+    "resolvedPath": "C:\\Users\\Administrator\\Documents\\电商助手\\douyin-promo-guard\\src\\adapters\\qianchuan-reader.js",
+    "sha256": "669722974af6a42fd2298632691fdf3694938595d741cbc5cf8ea09f199b3652",
+    "size": 100906,
+    "ok": true
+  },
+  "disk_sha256_now": "f5427b003dc634aee74db5729f0af19b896fc1c1b135684bdd9cd4e7310dcb37",
+  "disk_size_now": 109877,
+  "disk_mtime_utc": "2026-10-31T12:22:26.203188Z",
+  "match_disk": false,
+  "note": "No restart this round (intentional). Runtime still PID 15528 from earlier deploy; disk reader changed again after that start (size 100906 runtime vs 109877 disk now)."
+}

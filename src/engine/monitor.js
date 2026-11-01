@@ -3384,6 +3384,7 @@ class Monitor {
     // 与当前观测同源的最新决策；后续只读刷新/新日期/新指标不会沿用旧决策。
     const lastDecision = rt.lastDecision && rt.lastDecision.decision;
     const decisionNoAction = lastDecision === DECISION.EQUAL_NO_ACTION
+      || lastDecision === DECISION.ZERO_ORDER_NO_PAUSE
       || lastDecision === DECISION.SPEND_PROTECTED;
     // 监控未运行时没有后续定时巡查，也就不会安排新的收敛动作；但真实修复在途/unknown
     // 阻塞是硬证据，必须优先保留（见 evidenceBlocksNoRepair）。
@@ -4674,6 +4675,7 @@ class Monitor {
       // 只有「合法零动作 + 本轮读取无错误 + 无真实修复在途/unknown 阻塞」才是未安排收敛；
       // 真实 unknown 阻塞或修复在途按证据保留（rejudging/retrying），仍如实 pending。
       const legalNoAction = decision.decision === DECISION.EQUAL_NO_ACTION
+        || decision.decision === DECISION.ZERO_ORDER_NO_PAUSE
         || decision.decision === DECISION.SPEND_PROTECTED;
       const mixedViewEarly = currentAdState === 'mixed'
         ? this._mixedReconcileView(shopCfg.id, { noRepairScheduled: legalNoAction, cycleActive: true })

@@ -9,7 +9,7 @@
  *   判定式：费用整数分 > 订单数 × 100，不得先四舍五入每单成本；
  * - 统计日期按 Asia/Shanghai，当天从 00:00 累计；
  * - 每天只在 08:00 后执行真实暂停操作，每 30 分钟巡查一次；
- * - 每天 07:00（enableHour）自动开启一次乘方（默认关闭，须 realMode+enableEnabled 同时开启）。
+ * - 每天 00:05 后检查当天是否暂停、暂停才作为当天首次开启（firstCheckMinuteOfDay，默认关闭，须 realMode+enableEnabled 同时开启）。
  *
  * 仍待用户提供（保持 TODO 占位，缺任一项监控不可启动）：
  * - 推广页面网址、目标店铺（店铺唯一标识 + Cookie 文件名）、可选广告账户 ID。
@@ -61,10 +61,13 @@ const DEFAULTS = {
       scope: ['全店托管', '商品自选'], // 本轮控制范围：乘方两视图
       pauseEnabled: false,            // 乘方暂停动作真实执行开关（默认关闭；realMode 为总闸）
       enableEnabled: false,           // 乘方开启动作真实执行开关（默认关闭；realMode 为总闸）
-      enableHour: 7,                  // 每日自动开启时段起点（Asia/Shanghai；当天一次，跨日重置）
-      // 独立每日开启调度器（2026-09-15 上线）：true = 服务启动即登记每日 enableHour 的
-      // 自动开启任务，不依赖"启动值守"（超额暂停巡查独立启停）。执行仍受 enableEnabled+
-      // realMode+dryRun 门禁约束；页面提供独立停用控制（按用户+日期持久化）。
+      // 2026-10-09 取消 07:00 固定开启，改每天 00:05 后检查当天是否暂停、暂停才作为当天
+      // 首次开启。enableHour 字段保留兼容旧配置文件（仍校验），但调度与门槛均不再读取它。
+      firstCheckMinuteOfDay: 5,       // 每日首次开启检查的当天最早时刻（分钟，0-1439；缺省 5=00:05，Asia/Shanghai）
+      enableHour: 7,                  // [废弃] 不再参与调度（保留以兼容旧配置文件）
+      // 独立每日开启调度器：true = 服务启动即登记每日 00:05 后的首查任务，不依赖"启动值守"
+      // （超额暂停巡查独立启停）。执行仍受 enableEnabled+realMode+dryRun 门禁约束；页面提供
+      // 独立停用控制（按用户+日期持久化）。
       enableSchedulerEnabled: false,
     },
     qianchuan: {
@@ -99,10 +102,10 @@ function deepMerge(base, patch) {
   return out;
 }
 
-// 目标 ROI 默认值（缺字段时采用）：客户 2026-10-11 明确“缺字段默认 15”。
+// 目标 ROI 默认值（缺字段时采用）：客户 2026-10-11 明确"缺字段默认 15"。
 const DEFAULT_TARGET_ROI = 15;
 
-// 每店每天计划数量的合法范围与全局默认（客户 2026-10-13 明确“每天几条加在目标 ROI 后面，可按店调整”）：
+// 每店每天计划数量的合法范围与全局默认（客户 2026-10-13 明确"每天几条加在目标 ROI 后面，可按店调整"）：
 // - 全局排程默认仍为 3（不配置就不自作主张多发）；
 // - 每店可用 shops[].plansPerShopPerDay 覆盖，合法整数 1..10；缺字段/非法一律回落全局默认 3。
 const DEFAULT_PLANS_PER_SHOP = 3;
@@ -262,8 +265,13 @@ function collectPending(cfg) {
     push('monitor.chengfang.enableSchedulerEnabled: 必须是布尔值（独立每日开启调度器，默认 false）');
   }
   if (cf.enableHour !== undefined) {
+    // [废弃] enableHour 不再参与调度；保留校验以兼容旧配置文件，不报错不阻塞。
     const enableHourErr = intInRange(cf.enableHour, 0, 23, 'monitor.chengfang.enableHour');
     if (enableHourErr) push(enableHourErr);
+  }
+  if (cf.firstCheckMinuteOfDay !== undefined) {
+    const fcmErr = intInRange(cf.firstCheckMinuteOfDay, 0, 1439, 'monitor.chengfang.firstCheckMinuteOfDay');
+    if (fcmErr) push(fcmErr);
   }
   if (!Array.isArray(cf.scope) || cf.scope.length === 0) {
     push('monitor.chengfang.scope: 必须声明本轮控制视图（默认 ["全店托管","商品自选"]）');

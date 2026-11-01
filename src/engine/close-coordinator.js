@@ -62,9 +62,19 @@ class WholeShopCloseCoordinator {
    * 读取费用+订单（零订单与正单同一公式，不做零单专用重读），通过后做规则判断。
    * @returns {{ok:true, cost, orders, evaluation, rechecked:number}} 或 {ok:false, blocked, reason}
    */
-  async readAndEvaluate(shopCfg) {
+  async readAndEvaluate(shopCfg, { readOnlyRefresh = false } = {}) {
     const cost = await this._readVerifiedSummary('cost', shopCfg);
-    let orders = await this._readVerifiedSummary('orders', shopCfg);
+    let orders;
+    try {
+      orders = await this._readVerifiedSummary('orders', shopCfg);
+    } catch (e) {
+      if (readOnlyRefresh === true && e instanceof DataGuardError && e.code === 'DATA_GUARD'
+        && e.detail && e.detail.source === 'compass-order-reader'
+        && e.detail.metric === 'pay_cnt' && e.detail.observation === 'value_placeholder') {
+        return { ok: false, cost, orders: null, blocked: 'orders_unavailable', reason: e.reason };
+      }
+      throw e;
+    }
     guard.checkSameShopAndDate(cost, orders);
 
     // 客户 2026-10-27 修正：0 单有消耗也正常，零订单与正单同一公式判定；

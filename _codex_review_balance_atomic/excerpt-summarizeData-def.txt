@@ -1,0 +1,31 @@
+5250|      return { status: 'window_blocked', reason };
+5251|    }
+5252|    this.schedule.lastWindowBlockReason = null;
+5253|
+5254|    const todayStatus = new Map(); // 批次内结果累积（跨批次状态以最新清单读取为准）
+5255|    const batch = await coord.executeWholeShopCloseBatch({ shopCfg, cycleToken, todayStatus, trigger: { reason: data.evaluation.reason } });
+5256|    batch.actionType = batch.actionType || 'pause';
+5257|    this._recordBatch(shopCfg.id, batch);
+5258|    this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) }, undefined, 'batch');
+5259|    this._audit({ kind: 'action', shopId: shopCfg.id, ...this._summarizeBatch(batch) });
+5260|    return { status: 'ok', over: true, batch: this._summarizeBatch(batch) };
+5261|  }
+5262|
+5263|  _summarizeData(data) {
+5264|    if (data.ok === false) {
+5265|      return {
+5266|        businessDate: data.cost && data.cost.businessDate,
+5267|        costCents: data.cost && data.cost.valueCents,
+5268|        costText: data.cost && data.cost.valueCents !== undefined && data.cost.valueCents !== null ? `${centsToYuan(data.cost.valueCents)} 元` : null,
+5269|        rawCostText: data.cost && data.cost.rawText,
+5270|        orders: data.orders && data.orders.valueCount,
+5271|        source: (data.cost && data.cost.source) || null,
+5272|        fetchedAt: data.cost && data.cost.fetchedAt,
+5273|        pageUpdatedAt: (data.cost && data.cost.pageUpdatedAt) || (data.orders && data.orders.pageUpdatedAt) || null,
+5274|        perOrderText: '—',
+5275|        over: false,
+5276|      };
+5277|    }
+5278|    return {
+5279|      businessDate: data.cost.businessDate,
+5280|      costCents: data.cost.valueCents,

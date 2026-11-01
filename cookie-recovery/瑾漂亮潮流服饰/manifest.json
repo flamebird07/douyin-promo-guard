@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "shop": "瑾漂亮潮流服饰",
+  "versions": [
+    {
+      "versionId": "v20261024T053152Z-21964-417831",
+      "sha256": "67b8ccef60c91cc96b893d9f7253ce2895fdf7f95fb84944549ab95394b646bd",
+      "bytes": 14758,
+      "createdAtMs": 1792819912233,
+      "origin": "verified-login",
+      "structureValid": true
+    },
+    {
+      "versionId": "v20261024T053405Z-21964-d52466",
+      "sha256": "2b7b22ac5e6cec232f878d51d75f1ef26e8ef0bdefebdba65f26528ecd44f849",
+      "bytes": 12477,
+      "createdAtMs": 1792820045140,
+      "origin": "verified-login",
+      "structureValid": true
+    },
+    {
+      "versionId": "v20261029T092743Z-33588-bbbca3",
+      "sha256": "bfec0611e57314d61dcf1871a20082b3508dfbfc370486ec1ebf11db9be05fd3",
+      "bytes": 15681,
+      "createdAtMs": 1793266063810,
+      "origin": "verified-login",
+      "structureValid": true
+    }
+  ]
+}

@@ -1,0 +1,598 @@
+'use strict';
+
+/**
+ * DIAN-4 长期 unknown 收口门最小修复（2026-10-23）离线回归。
+ *
+ * 锁死的边界（逐条对应实施口径）：
+ *  - 资源创建后、任何 await 前**同步**登记 ownership（opener 的 onResource → meta.openerResource）；
+ *  - 门携带 gateId/readEpoch/身份 CAS：迟到的旧门推进结果不得清掉新门；
+ *  - 同一次推进由多个调用方共享（advancePromise），不叠加关闭/核验；
+ *  - 有界探测节奏 1s→5s→30s，且**只做收口**：零 opener、零页面读取、零点击；
+ *  - 只有"已证明未创建"（可信 resourceCreated=false）或"已证明已关闭"才清门；
+ *    无证明 → terminal 并保持阻断，绝不按时间盲放行（后续拿到真实证明仍可清门）；
+ *  - stop 取消探测 timer 但保留门（阻断事实跨 stop/start 不丢），start 恢复有界探测；
+ *  - 删除店保留门（句柄仍须真实关闭），只留审计事实；
+ *  - 跨店隔离：一店的门不阻塞另一店读取；
+ *  - 所有 poll/审计原因统一走 sanitize/mask：完整 URL 查询串不得入审计。
+ *
+ * 不访问浏览器/CDP/网络/真实 Cookie；除读取总期限外不真实等待（探测 timer 全部注入）。
+ */
+
+const { test } = require('node:test');
+const assert = require('node:assert');
+const fs = require('fs');
+const path = require('path');
+const { Monitor } = require('../src/engine/monitor.js');
+const { AuthError } = require('../src/lib/errors.js');
+const log = require('../src/lib/log.js');
+const { makeTempDir, makeCfgResult } = require('./helpers.js');
+
+const TAB_MAIN = '全店托管';
+const TAB_SUB = '商品自选';
+const SHOP_A = { id: 'shop-a', name: 'shop-a', cookieFile: 'shop-a', accountId: null, enabled: true };
+const SHOP_B = { id: 'shop-b', name: 'shop-b', cookieFile: 'shop-b', accountId: null, enabled: true };
+const TRANSIENT_REASON = '分页 total 不一致'; // 既有瞬态白名单：允许登记收口门
+
+function rows(prefix, count, checked = true) {
+  return Array.from({ length: count }, (_, i) => ({ id: `${prefix}-${i + 1}`, switchChecked: checked }));
+}
+function fullViews(prefix) {
+  return {
+    [TAB_MAIN]: [
+      { rows: rows(prefix, 10), hasNext: true, total: 32 },
+      { rows: rows(`${prefix}b`, 10), hasNext: true, total: 32 },
+      { rows: rows(`${prefix}c`, 10), hasNext: true, total: 32 },
+      { rows: rows(`${prefix}d`, 2), hasNext: false, total: 32 },
+    ],
+    [TAB_SUB]: [{ rows: [], hasNext: false, total: 0 }],
+  };
+}
+
+/** fake clock：只有注入的 timer 参与推进；advance 触发到点任务并排空微任务。 */
+function makeClock(startMs = Date.parse('2026-10-18T20:00:00Z')) {
+  let now = startMs;
+  let seq = 0;
+  const timers = new Map();
+  const flush = async () => {
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+  };
+  return {
+    nowFn: () => now,
+    setTimeoutFn(fn, ms) {
+      const id = ++seq;
+      const delay = Math.max(0, Number(ms) || 0);
+      timers.set(id, { id, at: now + delay, ms: delay, fn });
+      return { id, unref() { /* fake */ } };
+    },
+    clearTimeoutFn(h) { if (h && h.id != null) timers.delete(h.id); },
+    pending() { return Array.from(timers.values()).sort((a, b) => a.at - b.at || a.id - b.id); },
+    async advance(ms) {
+      now += Math.max(0, Number(ms) || 0);
+      for (let guard = 0; guard < 300; guard += 1) {
+        const due = this.pending().filter((t) => t.at <= now)[0];
+        if (!due) break;
+        timers.delete(due.id);
+        due.fn();
+        // 收口推进内部用真实定时器做上界竞速（work settle / close 等待）：给它在真实时间上收敛，
+        // 否则探测会停在竞速中途，测试看到的是"未完成"而不是"下一次探测已排队"。
+        await new Promise((r) => setTimeout(r, 45));
+        await flush();
+      }
+      await new Promise((r) => setTimeout(r, 45));
+      await flush();
+    },
+    async flush() { await flush(); },
+  };
+}
+
+/**
+ * 把虚拟时间按"下一个已排队 timer"逐段推进（等价于真实世界依次到期）。
+ * 探测在真实时间上做 settle/close 竞速后才排下一次，所以一次性大跳只会触发第一段。
+ */
+async function drainTimers(clock, maxSteps = 8) {
+  for (let i = 0; i < maxSteps; i += 1) {
+    const due = clock.pending();
+    if (!due.length) return i;
+    await clock.advance(Math.max(1, due[0].at - clock.nowFn()));
+  }
+  return maxSteps;
+}
+
+/**
+ * 收口门专用假 opener。
+ *  mode：
+ *   hang            创建浏览器→**同步登记句柄**→挂住不返回（截止先到），fake.reject(i)/resolve(i) 收口
+ *   failNotCreated  不创建任何资源，抛瞬态错误并携带可信 chengfangResourceCreated=false
+ *   failUnknown     抛瞬态错误：既不登记句柄也不给"未创建"证明（无任何可核验事实）
+ *   failWithHandle  登记句柄后抛瞬态错误（句柄连接状态由 closeMode 决定能否证明已关闭）
+ *   ok              正常成功会话
+ *  closeMode：'ok'（close 后 connected=false）| 'reject'（close 被拒绝）| 'hang'（close 挂起）
+ */
+function makeFactory(opts = {}) {
+  const modeOf = typeof opts.mode === 'function' ? opts.mode : () => opts.mode || 'ok';
+  const closeMode = { value: opts.closeMode || 'ok' };
+  const calls = { opener: 0, readView: 0, evaluate: 0, adClicks: 0, handleRegister: 0, handleClose: 0, isConnected: 0 };
+  const gates = [];
+  const waits = [];
+
+  const opener = async (args) => {
+    calls.opener += 1;
+    const no = calls.opener;
+    const mode = modeOf(no, args.shopCfg.id);
+    const browser = { closed: false, connected: false };
+    const rec = { no, shopId: args.shopCfg.id, mode, browser, handle: null };
+    gates.push(rec);
+
+    const makeHandle = () => {
+      rec.handle = {
+        close: () => {
+          calls.handleClose += 1;
+          if (closeMode.value === 'reject') return Promise.reject(new Error('mock close rejected'));
+          if (closeMode.value === 'hang') return new Promise(() => {});
+          browser.closed = true;
+          browser.connected = false;
+          return Promise.resolve();
+        },
+        isConnected: () => { calls.isConnected += 1; return browser.connected; },
+      };
+      browser.connected = true;
+      calls.handleRegister += 1;
+      if (typeof args.onResource === 'function') args.onResource(rec.handle);
+      return rec.handle;
+    };
+
+    if (mode === 'failNotCreated') {
+      const e = new Error(TRANSIENT_REASON);
+      e.chengfangResourceCreated = false;
+      throw e;
+    }
+    if (mode === 'failUnknown') throw new Error(TRANSIENT_REASON);
+    if (mode === 'failWithHandle') {
+      makeHandle();
+      throw new Error(TRANSIENT_REASON);
+    }
+
+    const page = {
+      browser: () => browser,
+      evaluate: async () => { calls.evaluate += 1; return null; },
+    };
+    if (mode === 'hang') {
+      makeHandle(); // 创建后立即**同步**登记，先于任何 await
+      await new Promise((resolve, reject) => {
+        waits.push({
+          no,
+          reject: () => reject(new Error(TRANSIENT_REASON)),
+          resolve: () => resolve(),
+        });
+      });
+    }
+    if (mode === 'ok' || mode === 'hang') {
+      const perTab = {};
+      const controller = {
+        async verifyIdentity() { return { ok: true, pageShopId: args.shopCfg.id, pageShopName: args.shopCfg.id }; },
+        async refreshView() { return { refreshed: true }; },
+        async switchView() {},
+        async readView({ tab }) {
+          calls.readView += 1;
+          const pages = fullViews(`s${no}`)[tab] || [{ rows: [], hasNext: false, total: 0 }];
+          const i = Math.min(perTab[tab] || 0, pages.length - 1);
+          perTab[tab] = (perTab[tab] || 0) + 1;
+          const p = pages[i];
+          return {
+            rows: { rows: p.rows.map((r) => ({ ...r })) },
+            pagination: { total: p.total, hasNext: p.hasNext, activePage: String(i + 1) },
+          };
+        },
+        async clickNextPage() { return { clicked: true }; },
+        async clickBatchPause() { calls.adClicks += 1; return {}; },
+        async clickBatchEnable() { calls.adClicks += 1; return {}; },
+        async clickRowSwitch() { calls.adClicks += 1; return {}; },
+      };
+      browser.close = async () => {
+        if (closeMode.value === 'reject') throw new Error('mock browser.close rejected');
+        browser.closed = true;
+        browser.connected = false;
+      };
+      rec.session = { browser, page, controller };
+      return rec.session;
+    }
+    if (mode === 'authThrow') throw new AuthError('登录失效：抖店页面有界收敛后仍命中登录页（当前 https://fxg.jinritemai.com/login/common?enter_from=utm_x&sessionid=abcdef123456），请重新扫码登录');
+    throw new Error(`未知夹具模式：${mode}`);
+  };
+
+  return {
+    opener,
+    calls,
+    gates,
+    recAt: (i) => gates[i],
+    setCloseMode(m) { closeMode.value = m; },
+    releaseHang(i, how) {
+      const w = waits.find((x) => x.no === (i == null ? waits.length : i) + 0) || waits[waits.length - 1];
+      if (!w) throw new Error('无挂起 opener');
+      if (how === 'resolve') w.resolve(); else w.reject();
+    },
+    lastGate() { return gates[gates.length - 1]; },
+  };
+}
+
+function buildMonitor({ dataDir, clock, opener, shops = [SHOP_A, SHOP_B], timeoutMs = 50 }) {
+  const cfgResult = makeCfgResult({
+    shops: shops.map((s) => ({ ...s })),
+    monitor: {
+      chengfang: {
+        scope: [TAB_MAIN, TAB_SUB],
+        adStateReadTimeoutMs: timeoutMs,
+        adStateCloseWaitMs: 30,
+        adStateSettleWaitMs: 30,
+      },
+    },
+  });
+  return new Monitor(cfgResult, null, {
+    dataDir,
+    chengfangOpener: opener,
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+}
+
+function auditEvents(dataDir) {
+  const p = path.join(dataDir, 'audit.jsonl');
+  return fs.existsSync(p) ? fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+}
+function gateEvents(dataDir) {
+  return auditEvents(dataDir).filter((j) => String(j.event || '').indexOf('gate-') === 0);
+}
+
+// ────────────────────────────────────────────────────────────────────
+
+test('U1 截止门携带同步登记的句柄：work 未 settle 时不放行，opener 事后失败后由探测证明关闭并清门', async () => {
+  const dataDir = makeTempDir('ugo-u1-');
+  const clock = makeClock();
+  const fake = makeFactory({ mode: (no) => (no === 1 ? 'hang' : 'ok') });
+  const mon = buildMonitor({ dataDir, clock, opener: fake.opener });
+
+  const r1 = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(r1.state, 'unknown');
+  assert.equal(r1.error.blockedBy, 'unread_session');
+  assert.equal(fake.calls.opener, 1, '截止后不得新开第二份读取');
+  assert.equal(fake.lastGate().handle ? 1 : 0, 1, '句柄必须在创建后、任何 await 前同步登记');
+
+  const gate = mon._pendingReadGateFor(SHOP_A.id);
+  assert.ok(gate, '截止必须登记收口门');
+  assert.equal(gate.resourceCreated, true, '已创建资源必须如实登记为 true');
+  assert.ok(gate.gateId >= 1 && typeof gate.readEpoch === 'number', '门必须携带 gateId/readEpoch');
+  assert.equal(typeof gate.handleRef, 'function', '门必须以活引用取句柄（晚到也可见）');
+  const pend = clock.pending();
+  assert.equal(pend.length, 1, '只允许门自身的有界收口探测 timer');
+  assert.equal(pend[0].ms, 1000, '第一次探测 1s');
+
+  const before = { readView: fake.calls.readView, evaluate: fake.calls.evaluate, adClicks: fake.calls.adClicks };
+  await clock.advance(1000); // work 仍挂账 → 不放行
+  assert.ok(mon._pendingReadGateFor(SHOP_A.id), 'work 未 settle 必须保持阻断');
+  assert.equal(clock.pending()[0].ms, 5000, '下一次探测 5s');
+  assert.equal(fake.calls.opener, 1, '探测绝不启动新 opener');
+
+  fake.releaseHang(1, 'reject'); // opener 之后失败：work 才 settle
+  await clock.flush();
+  await clock.advance(5000);
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id), null, '真实关闭+连接核验通过后才清门');
+  assert.equal(fake.calls.handleClose, 1, '探测内只做一次真实关闭');
+  const released = gateEvents(dataDir).filter((j) => j.event === 'gate-released');
+  assert.equal(released.length, 1);
+  assert.equal(released[0].proof, 'closed', '清门必须记录关闭证明');
+  assert.equal(released[0].via, 'probe');
+
+  assert.deepEqual({ readView: fake.calls.readView, evaluate: fake.calls.evaluate, adClicks: fake.calls.adClicks }, before,
+    '收口探测期间零页面读取/零 evaluate/零点击');
+  const r2 = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(r2.state, 'on', JSON.stringify(r2.error || r2));
+  assert.equal(fake.calls.opener, 2, '清门后才允许下一次读取');
+});
+
+test('U2 可信 resourceCreated=false：只凭该证明清门（poll 与探测两条路），未到点绝不盲放行', async () => {
+  const dataDir = makeTempDir('ugo-u2-');
+  const clock = makeClock();
+  const fake = makeFactory({ mode: 'failNotCreated' });
+  const mon = buildMonitor({ dataDir, clock, opener: fake.opener });
+
+  const r1 = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(r1.state, 'unknown');
+  assert.equal(r1.error.blockedBy, 'unread_session');
+  const gate = mon._pendingReadGateFor(SHOP_A.id);
+  assert.ok(gate);
+  assert.equal(gate.resourceCreated, false, '生产者可信"未创建"必须进门');
+  assert.equal(fake.calls.handleRegister, 0, '未创建路径不得伪造句柄');
+
+  await clock.advance(500); // 未到 1s：门仍在（清门只由推进取证触发，不按时间盲清）
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id), gate, '未到推进点不得自动清门');
+
+  // poll 入口推进：拿到"已证明未创建"才清旧门，随后才允许下一次真实读取
+  const r1b = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(r1b.error.blockedBy, 'unread_session');
+  const pollRel = gateEvents(dataDir).filter((j) => j.event === 'gate-released' && j.gateId === gate.gateId);
+  assert.equal(pollRel.length, 1, '旧门必须恰好清一次');
+  assert.equal(pollRel[0].via, 'poll');
+  assert.equal(pollRel[0].proof, 'not-created');
+  assert.equal(fake.calls.opener, 2, '凭证明清门后才允许下一次读取（且只有一次）');
+  const gate2 = mon._pendingReadGateFor(SHOP_A.id);
+  assert.ok(gate2 && gate2.gateId > gate.gateId, '新一轮未收口必须另登记新门');
+
+  // 有界探测同样只凭证明清门，并在清门时取消自己的 timer
+  const steps = await drainTimers(clock, 4);
+  assert.ok(steps >= 1, '探测必须被推进');
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id), null, '未创建证明即放行');
+  const rel = gateEvents(dataDir).filter((j) => j.event === 'gate-released' && j.gateId === gate2.gateId);
+  assert.equal(rel.length, 1);
+  assert.equal(rel[0].via, 'probe');
+  assert.equal(rel[0].proof, 'not-created');
+  assert.equal(clock.pending().length, 0, '清门必须取消探测 timer');
+  assert.equal(fake.calls.readView, 0, '收口路径零页面读取');
+  assert.equal(fake.calls.adClicks, 0, '收口路径零点击');
+});
+
+test('U3 无任何证明：1s/5s/30s 三次有界探测后用尽转 terminal，门保持阻断（绝不盲放行）', async () => {
+  const dataDir = makeTempDir('ugo-u3-');
+  const clock = makeClock();
+  const fake = makeFactory({ mode: 'failUnknown' });
+  const mon = buildMonitor({ dataDir, clock, opener: fake.opener });
+
+  const r1 = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(r1.error.blockedBy, 'unread_session');
+  const gate = mon._pendingReadGateFor(SHOP_A.id);
+  assert.equal(gate.resourceCreated, null, '既无句柄也无未创建证明：必须记为未知');
+  assert.equal(gate.phase, 'pending');
+
+  await clock.advance(1000);
+  assert.ok(mon._pendingReadGateFor(SHOP_A.id));
+  assert.equal(clock.pending()[0].ms, 5000);
+  await clock.advance(5000);
+  assert.ok(mon._pendingReadGateFor(SHOP_A.id));
+  assert.equal(clock.pending()[0].ms, 30000, '第三次探测 30s');
+  await clock.advance(30000);
+
+  const still = mon._pendingReadGateFor(SHOP_A.id);
+  assert.ok(still, '无证明一律不清门');
+  assert.equal(still.phase, 'terminal');
+  assert.equal(clock.pending().length, 0, 'terminal 后不再保留 timer（有界）');
+
+  const r2 = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(r2.state, 'unknown');
+  assert.equal(r2.error.blockedBy, 'unread_session');
+  assert.equal(r2.error.gatePhase, 'terminal', '受阻原因必须透出 terminal（需人工处置）');
+  assert.match(String(r2.error.reason), /人工/);
+  assert.equal(fake.calls.opener, 1, 'terminal 之后仍不得启动新读取');
+
+  const term = gateEvents(dataDir).filter((j) => j.event === 'gate-terminal');
+  assert.equal(term.length, 1);
+  assert.equal(term[0].probes, 3);
+  assert.equal(gateEvents(dataDir).filter((j) => j.event === 'gate-probe').length, 3);
+  assert.equal(fake.calls.readView, 0);
+  assert.equal(fake.calls.adClicks, 0);
+});
+
+test('U4 并发推进共享同一次 advancePromise：不叠加关闭/核验，结束后不残留', async () => {
+  const dataDir = makeTempDir('ugo-u4-');
+  const clock = makeClock();
+  const fake = makeFactory({ mode: 'failWithHandle', closeMode: 'hang' });
+  const mon = buildMonitor({ dataDir, clock, opener: fake.opener });
+
+  const r1 = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(r1.error.blockedBy, 'unread_session');
+  const gate = mon._pendingReadGateFor(SHOP_A.id);
+  assert.ok(gate);
+  assert.equal(fake.calls.handleRegister, 1);
+
+  const a = mon._advanceReadGate(gate, 20, 20);
+  assert.ok(gate.advancePromise, '推进在途必须挂共享 promise');
+  const b = mon._advanceReadGate(gate, 20, 20);
+  const [ra, rb] = await Promise.all([a, b]);
+  assert.equal(ra.done, false, 'close 挂起：无证明不放行');
+  assert.equal(rb.done, false);
+  assert.equal(gate.advancePromise, null, '推进结束必须释放共享 promise');
+  assert.equal(fake.calls.handleClose, 1, '并发调用只推进一次真实关闭（不叠加）');
+  assert.ok(mon._pendingReadGateFor(SHOP_A.id), '未证明仍阻断');
+});
+
+test('U5 gateId/readEpoch/CAS：迟到的旧门不得清掉新门；审计只记标量与"有无句柄"', async () => {
+  const dataDir = makeTempDir('ugo-u5-');
+  const clock = makeClock();
+  const fake = makeFactory({ mode: 'failUnknown' });
+  const mon = buildMonitor({ dataDir, clock, opener: fake.opener });
+
+  await mon._readCurrentAdState(SHOP_A);
+  const g1 = mon._pendingReadGateFor(SHOP_A.id);
+  assert.ok(g1);
+  const readEpoch1 = g1.readEpoch;
+  const handle = { close: async () => {}, isConnected: () => false };
+
+  // 模拟"新门已登记"（同店更晚一次未收口读取）：旧门的推进/清理一律不得生效
+  const g2 = mon._newReadGate(SHOP_A.id, {
+    workRec: { settledP: Promise.resolve(), isSettled: () => true },
+    sessionRef: () => null,
+    handleRef: () => handle,
+    resourceCreated: true,
+    closes: [],
+  });
+  assert.ok(g2.gateId > g1.gateId, 'gateId 必须单调递增');
+  assert.equal(g2.readEpoch, readEpoch1, 'readEpoch 取登记时的物理读取计数');
+
+  assert.equal(mon._clearReadGateIf(SHOP_A.id, g1, 'late'), false, '旧门 CAS 必须失败');
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id), g2, '新门不得被迟到结果清掉');
+  const late = await mon._advanceReadGate(g1, 20, 20);
+  assert.equal(late.done, false, '无证明的旧门不得判为已收口');
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id), g2);
+
+  // 新门自己拿到证明 → 清门成功
+  await clock.advance(1000);
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id), null, '新门凭真实证明清门');
+
+  const reg = gateEvents(dataDir).filter((j) => j.event === 'gate-registered');
+  assert.equal(reg.length, 2);
+  for (const j of reg) {
+    assert.ok(Object.values(j).every((v) => v === null || ['number', 'string', 'boolean'].includes(typeof v) || Array.isArray(v)),
+      '审计只允许标量/字符串数组：句柄对象与函数绝不落盘');
+    assert.equal(typeof j.gateId, 'number');
+    assert.equal(typeof j.readEpoch, 'number');
+    assert.ok('resourceCreated' in j && 'hasHandle' in j && 'hasSession' in j);
+  }
+  const raw = fs.readFileSync(path.join(dataDir, 'audit.jsonl'), 'utf8');
+  assert.doesNotMatch(raw, /isConnected/, '审计绝不包含句柄字段/函数');
+  assert.doesNotMatch(raw, /close.*function/, '审计绝不序列化收口句柄');
+});
+
+test('U6 stop 取消探测 timer 并保留门；start 恢复有界探测（只收口，不读取）', async () => {
+  const dataDir = makeTempDir('ugo-u6-');
+  const clock = makeClock();
+  const fake = makeFactory({ mode: 'failWithHandle', closeMode: 'reject' });
+  const mon = buildMonitor({ dataDir, clock, opener: fake.opener, shops: [SHOP_A] });
+
+  const r1 = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(r1.error.blockedBy, 'unread_session');
+  const gate = mon._pendingReadGateFor(SHOP_A.id);
+  assert.ok(gate);
+  assert.equal(clock.pending().length, 1);
+
+  mon.stop();
+  assert.equal(clock.pending().length, 0, 'stop 必须取消探测 timer');
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id), gate, 'stop 不得丢掉阻断事实（门保留）');
+  await clock.advance(60000);
+  assert.equal(fake.calls.opener, 1, 'stop 期间不得有任何再读取');
+
+  const started = mon.start();
+  assert.equal(started.ok, true, JSON.stringify(started));
+  const pend = clock.pending();
+  assert.ok(pend.length >= 1, 'start 后恢复有界收口探测');
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id), gate, '恢复的仍是同一扇门');
+
+  const closesBefore = fake.calls.handleClose;
+  const nextDelay = clock.pending().map((t) => t.ms).sort((a, b) => a - b)[0];
+  assert.ok([1000, 5000, 30000].includes(nextDelay), `恢复后的探测必须落在有界节奏上：${nextDelay}`);
+  await clock.advance(nextDelay);
+  assert.ok(mon._pendingReadGateFor(SHOP_A.id), 'close 仍被拒绝：继续阻断');
+  assert.equal(fake.calls.readView, 0, '探测期间零页面读取');
+  assert.equal(fake.calls.opener, 1, '探测期间零新 opener');
+  assert.ok(fake.calls.handleClose > closesBefore, '探测确实推进了真实关闭尝试');
+
+  fake.setCloseMode('ok');
+  const r2 = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(r2.error.blockedBy, 'unread_session', '本轮仍按既有门推进：证明后才放行');
+  const after = mon._pendingReadGateFor(SHOP_A.id);
+  assert.ok(!after || after.gateId > gate.gateId, '旧门必须凭真实关闭证明清除（新失败另登记新门）');
+  const rel = gateEvents(dataDir).filter((j) => j.event === 'gate-released' && j.gateId === gate.gateId);
+  assert.equal(rel.length, 1, '旧门清除必须留一次清门审计');
+  assert.equal(rel[0].via, 'poll');
+  assert.equal(rel[0].proof, 'closed');
+  mon.stop();
+});
+
+test('U7 删除店：门保留（句柄仍须真实关闭），探测只做收口且留审计事实', async () => {
+  const dataDir = makeTempDir('ugo-u7-');
+  const clock = makeClock();
+  const cfgPath = path.join(dataDir, 'config.json');
+  fs.writeFileSync(cfgPath, JSON.stringify({ shops: [{ ...SHOP_A }, { ...SHOP_B }] }));
+  const fake = makeFactory({ mode: 'failWithHandle', closeMode: 'reject' });
+  const mon = buildMonitor({ dataDir, clock, opener: fake.opener });
+  mon.cfgResult.sourcePath = cfgPath;
+
+  await mon._readCurrentAdState(SHOP_A);
+  const gate = mon._pendingReadGateFor(SHOP_A.id);
+  assert.ok(gate);
+
+  const del = mon.deleteShop(SHOP_A.id);
+  assert.equal(del.ok, true, JSON.stringify(del));
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id), gate, '删除不得丢掉未收口的门（浏览器仍须关闭）');
+  const note = gateEvents(dataDir).filter((j) => j.event === 'gate-shop-deleted');
+  assert.equal(note.length, 1);
+  assert.equal(note[0].gateId, gate.gateId);
+
+  const opens = fake.calls.opener;
+  await drainTimers(clock); // 依次到期 1s/5s/30s 三次探测
+  assert.equal(fake.calls.opener, opens, '删除店后探测绝不再读取');
+  assert.equal(fake.calls.readView, 0);
+  assert.equal(fake.calls.adClicks, 0);
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id).phase, 'terminal');
+});
+
+test('U8 跨店隔离：一店的门/terminal 不阻塞另一店正常读取', async () => {
+  const dataDir = makeTempDir('ugo-u8-');
+  const clock = makeClock();
+  let n = 0;
+  const fake = makeFactory({
+    mode: () => { n += 1; return n === 1 ? 'failUnknown' : 'ok'; },
+  });
+  const mon = buildMonitor({ dataDir, clock, opener: fake.opener });
+
+  const ra = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(ra.error.blockedBy, 'unread_session');
+  await drainTimers(clock);
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id).phase, 'terminal');
+
+  const rb = await mon._readCurrentAdState(SHOP_B);
+  assert.equal(rb.state, 'on', JSON.stringify(rb.error || rb));
+  assert.equal(mon._pendingReadGateFor(SHOP_B.id), null, '另一店不得有门');
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id).phase, 'terminal', 'A 店阻断不得因 B 店成功而解除');
+  assert.equal(fake.calls.adClicks, 0);
+});
+
+test('U9 close 曾拒绝转 terminal：真实证明出现后由下一次 poll 推进清门并成功读取', async () => {
+  const dataDir = makeTempDir('ugo-u9-');
+  const clock = makeClock();
+  const fake = makeFactory({ mode: (no) => (no === 1 ? 'failWithHandle' : 'ok'), closeMode: 'reject' });
+  const mon = buildMonitor({ dataDir, clock, opener: fake.opener });
+
+  await mon._readCurrentAdState(SHOP_A);
+  await drainTimers(clock);
+  const gate = mon._pendingReadGateFor(SHOP_A.id);
+  assert.equal(gate.phase, 'terminal');
+  const r = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(r.error.blockedBy, 'unread_session');
+
+  fake.setCloseMode('ok'); // 真实可关闭（外部状态变化）
+  const r2 = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(r2.state, 'on', JSON.stringify(r2.error || r2));
+  assert.equal(mon._pendingReadGateFor(SHOP_A.id), null);
+  const rel = gateEvents(dataDir).filter((j) => j.event === 'gate-released');
+  assert.equal(rel[rel.length - 1].via, 'poll', '由 poll 推进以真实证明清门');
+  assert.equal(rel[rel.length - 1].proof, 'closed');
+  assert.equal(fake.calls.adClicks, 0);
+});
+
+test('U10 poll 原因统一遮蔽：完整 URL 查询串不得进入审计/掩码摘要/展示边界', async () => {
+  const dataDir = makeTempDir('ugo-u10-');
+  const clock = makeClock();
+  const fake = makeFactory({ mode: 'authThrow' });
+  const mon = buildMonitor({ dataDir, clock, opener: fake.opener });
+
+  const r = await mon._readCurrentAdState(SHOP_A);
+  assert.equal(r.state, 'unknown');
+  assert.equal(r.error.blocked, 'auth');
+
+  const raw = fs.readFileSync(path.join(dataDir, 'audit.jsonl'), 'utf8');
+  assert.doesNotMatch(raw, /\?enter_from=/, '审计不得出现完整查询串');
+  assert.doesNotMatch(raw, /sessionid=abcdef123456/, '审计不得出现会话票据');
+  assert.match(raw, /查询参数已遮蔽/, '审计必须出现统一遮蔽标记');
+
+  const masked = mon._maskReadError({
+    status: 'blocked',
+    reason: '登录失效（当前 https://fxg.jinritemai.com/login/common?a=1&b=2）请重新扫码登录',
+  });
+  assert.match(String(masked.reason), /login\/common\?…（查询参数已遮蔽，原 URL 共 \d+ 字符）/);
+  assert.doesNotMatch(String(masked.reason), /a=1&b=2/);
+
+  assert.equal(/http:\/\/x\/y\?q=1/.test(log.scrubDeep('页 http://x/y?q=1 尾')), false);
+  assert.match(log.scrubDeep('页 http://x/y?q=1 尾'), /查询参数已遮蔽/);
+  assert.equal(log.scrubDeep('页 https://a.com/path 尾'), '页 https://a.com/path 尾', '无查询段的地址原样保留（回读定位需要）');
+  assert.equal(log.sanitize({ r: 'sessionid=ab 裸票据' }).r, '[疑似凭证，已脱敏]', '整段脱敏优先级不变');
+  // 幂等：源侧遮过一次，落盘/展示边界再遮不得叠出第二个标记（生产曾出现 "共 40 字符…共 83 字符" 叠字）
+  const once = log.maskUrlQueries('登录失效（当前 https://fxg.jinritemai.com/login/common?a=1&b=2）请重新扫码登录');
+  assert.equal((once.match(/查询参数已遮蔽/g) || []).length, 1, JSON.stringify(once));
+  assert.equal(log.maskUrlQueries(once), once, 'maskUrlQueries 必须幂等');
+  assert.equal((log.sanitize({ reason: once }).reason.match(/查询参数已遮蔽/g) || []).length, 1,
+    '落盘边界二次处理必须保持单标记');
+  for (const l of raw.trim().split('\n')) {
+    assert.ok((l.match(/查询参数已遮蔽/g) || []).length <= 1, '同一审计行不得叠标记：' + l.slice(0, 200));
+  }
+  assert.equal(fake.calls.adClicks, 0);
+});

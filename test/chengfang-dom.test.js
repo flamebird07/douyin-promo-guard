@@ -591,9 +591,15 @@ async function loadIdentityPage(navText, urlPath) {
     <div role="tab">全店托管</div>
   </body></html>`;
   const p = await browser.newPage();
-  await p.route('**/uni-prom/overall**', (route) => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html }));
-  await p.goto(urlPath, { waitUntil: 'load' });
-  return p;
+  // 错误 URL（/home）也只加载本地假数据；仍由真实 verifyIdentity 拒绝。
+  await p.route((url) => url.href === urlPath, (route) => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html }));
+  try {
+    await p.goto(urlPath, { waitUntil: 'load' });
+    return p;
+  } catch (error) {
+    await p.close();
+    throw error;
+  }
 }
 
 test('verifyIdentity：账户 ID 缺失/不一致不因 ID 失败；错误 URL/缺子视图仍拒绝', async () => {

@@ -1,0 +1,346 @@
+==== atomic symbols in WORKING monitor ====
+1590: * 终态三字段：balanceStatus='ok'|'error'|'missing'|'skipped'，balanceReason 仅非 ok 时有值。
+1593: _applyBalanceToLastData(target, stateRead) {
+1599: target.balanceStatus = 'ok';
+1600: target.balanceReason = null;
+1604: target.balanceStatus = 'error';
+1605: target.balanceReason = String(bal.reason);
+1609: target.balanceStatus = 'missing';
+1610: target.balanceReason = '本轮未返回余额读数';
+1616: _markShopDataRefreshing(rt) {
+1617: rt.dataRefreshing = true;
+1622: _commitShopLastData(rt, candidate) {
+1626: rt.dataRefreshing = false;
+1631: _commitShopLastDataSkippedBalance(rt, candidate, reason) {
+1633: candidate.balanceStatus = 'skipped';
+1634: candidate.balanceReason = reason;
+1636: this._commitShopLastData(rt, candidate);
+1717: this._markShopDataRefreshing(rt);
+1720: this._applyBalanceToLastData(candidate, stateRead);
+1734: this._commitShopLastData(rt, candidate);
+1750: this._commitShopLastData(rt, candidate);
+1787: rt.dataRefreshing = false;
+2710: if (result && result.balance !== undefined) this._applyBalanceToLastData(rt, result);
+4422: this._markShopDataRefreshing(rt);
+4435: this._commitShopLastDataSkippedBalance(rt, candidate, '本轮数据读取失败，未读取千川余额');
+4445: this._commitShopLastDataSkippedBalance(rt, candidate, '控制范围门禁未通过，未读取千川余额');
+4464: this._commitShopLastDataSkippedBalance(rt, candidate, '首查安全门禁拦截暂停，未读取千川余额');
+4477: this._commitShopLastDataSkippedBalance(rt, candidate, '未到允许执行时段，未读取千川余额');
+4490: this._applyBalanceToLastData(candidate, stateRead);
+4499: this._commitShopLastData(rt, candidate);
+4517: this._commitShopLastData(rt, candidate);
+4638: rt.dataRefreshing = false;
+5494: dataRefreshing: rt.dataRefreshing === true,
+5596: balanceStatus: (t && t.balanceStatus) || null,
+5597: balanceReason: (t && t.balanceStatus && t.balanceStatus !== 'ok') ? t.balanceReason || null : null,
+5599: refreshing: rt.dataRefreshing === true || (t && t.refreshing === true),
+==== early overwrite rt.lastData=_summarizeData WORKING ====
+NONE
+==== early overwrite in HEAD ====
+NONE in HEAD
+==== helper function bodies (WORKING excerpts) ====
+-- _applyBalanceToLastData @ line ~1593 --
+   * 绝不进入费用/订单/阈值/开关判定与通知判断。
+   */
+  _applyBalanceToLastData(target, stateRead) {
+    if (!target) return;
+    const bal = stateRead && stateRead.balance ? stateRead.balance : null;
+    if (bal && bal.balanceCents != null) {
+      target.balanceCents = bal.balanceCents;
+      target.balanceAt = bal.balanceAt || null;
+      target.balanceStatus = 'ok';
+      target.balanceReason = null;
+    } else if (bal && bal.reason) {
+      target.balanceCents = null;
+      target.balanceAt = bal.balanceAt || null;
+      target.balanceStatus = 'error';
+      target.balanceReason = String(bal.reason);
+    } else {
+      target.balanceCents = null;
+      target.balanceAt = bal && bal.balanceAt ? bal.balanceAt : null;
+      target.balanceStatus = 'missing';
+      target.balanceReason = '本轮未返回余额读数';
+    }
+  }
+
+  // 在途可见性（2026-10-31 竞态修正）：本轮 candidate 组装期间只置 refreshing 标记，
+  // 绝不把半成品（无余额终态的新读数）提前提交为 rt.lastData。
+  _markShopDataRefreshing(rt) {
+    rt.dataRefreshing = true;
+    if (rt.lastData && typeof rt.lastData === 'object') rt.lastData.refreshing = true;
+  }
+
+  // 原子提交：整轮读数（含余额终态）组装完成后一次性替换 lastData 并清除在途标记。
+  _commitShopLastData(rt, candidate) {
+    candidate.refreshing = false;
+    rt.lastData = candidate;
+    rt.lastDataAt = new Date(this.nowFn()).toISOString();
+    rt.dataRefreshing = false;
+  }
+
+  // 早退路径（门禁/窗口/读取失败，未回读广告状态）：candidate 先写余额终态 skipped，
+  // 避免提交后 UI 把缺失读数和未读混淆；再原子提交。
+  _commitShopLastDataSkippedBalance(rt, candidate, reason) {
+    candidate.balanceCents = null;
+    candidate.balanceStatus = 'skipped';
+    candidate.balanceReason = reason;
+    candidate.balanceAt = null;
+    this._commitShopLastData(rt, candidate);
+  }
+
+  async refreshShopData(shopId) {
+    const shopCfg = this._findShop(shopId);
+    if (!shopCfg) return { ok: false, reason: '店铺不存在' };
+    // F4（2026-10-24）：删除店仍拒绝；D56 起未删除店铺（历史 enabled=false 亦视为正常店）允许本
+    // **只读**更新（登录后一次只读数据刷新）。本方法只读，不进入任何广告操作。
+    if (shopCfg.deleted === true) {
+      return { ok: false, reason: '店铺已删除，不再值守/更新', deleted: true };
+    }
+    if (this.pending.length > 0) {
+      return { ok: false, reason: `存在待配置/非法配置项，不允许更新: ${this.pending.join('；')}` };
+    }
+    // 同店互斥：恢复链正在执行物理读取时，手动刷新不得叠加另一路读取（返回真实进度，稍后可再试）。
+    const activeRec = this._readRecoveryFor(shopId);
+    if (activeRec && activeRec.phase === 'running') {
+      const view = this._readRecoveryView(shopId);
+      return {
+        ok: true, readOnly: true, shopId, adState: 'unknown',
+        blocked: 'recovery_inflight',
+        reason: `本店有限恢复执行中（${view.attempts}/${view.maxRetries}），本次手动更新未叠加新读取`,
+        readRecovery: view, zeroClick: true,
+      };
+    }
+    // 用户手动更新可重置恢复事件：先取消旧链的等待 timer，再按本次真实读取重新开始。
+    this._clearReadRecovery(shopId, 'manual-refresh');
+    // D24R 跨入口串行：巡查/每日开启周期进行中时，即使目标店不同也不叠加并发处理
+    // （同店在途仍走下方 shop_busy 既有语义，返回真实进度）。如实 blocked，稍后可重试。
+    if (this._cycleRunning && !this._shopBusy(shopId)) {
+      return {
+        ok: true, readOnly: true, shopId, adState: 'unknown',
+        blocked: 'cycle_busy',
+        reason: '巡查/每日开启周期进行中（跨店串行），本次手动更新未执行，稍后可重试',
+        zeroClick: true,
+      };
+    }
+    // D24S 周期外同样串行：他店仍在处理在途或真实资源收口未证明 → 复用既有 busy 响应，
+-- _markShopDataRefreshing @ line ~1616 --
+  // 在途可见性（2026-10-31 竞态修正）：本轮 candidate 组装期间只置 refreshing 标记，
+  // 绝不把半成品（无余额终态的新读数）提前提交为 rt.lastData。
+  _markShopDataRefreshing(rt) {
+    rt.dataRefreshing = true;
+    if (rt.lastData && typeof rt.lastData === 'object') rt.lastData.refreshing = true;
+  }
+
+  // 原子提交：整轮读数（含余额终态）组装完成后一次性替换 lastData 并清除在途标记。
+  _commitShopLastData(rt, candidate) {
+    candidate.refreshing = false;
+    rt.lastData = candidate;
+    rt.lastDataAt = new Date(this.nowFn()).toISOString();
+    rt.dataRefreshing = false;
+  }
+
+  // 早退路径（门禁/窗口/读取失败，未回读广告状态）：candidate 先写余额终态 skipped，
+  // 避免提交后 UI 把缺失读数和未读混淆；再原子提交。
+  _commitShopLastDataSkippedBalance(rt, candidate, reason) {
+    candidate.balanceCents = null;
+    candidate.balanceStatus = 'skipped';
+    candidate.balanceReason = reason;
+    candidate.balanceAt = null;
+    this._commitShopLastData(rt, candidate);
+  }
+
+  async refreshShopData(shopId) {
+    const shopCfg = this._findShop(shopId);
+    if (!shopCfg) return { ok: false, reason: '店铺不存在' };
+    // F4（2026-10-24）：删除店仍拒绝；D56 起未删除店铺（历史 enabled=false 亦视为正常店）允许本
+    // **只读**更新（登录后一次只读数据刷新）。本方法只读，不进入任何广告操作。
+    if (shopCfg.deleted === true) {
+      return { ok: false, reason: '店铺已删除，不再值守/更新', deleted: true };
+    }
+    if (this.pending.length > 0) {
+      return { ok: false, reason: `存在待配置/非法配置项，不允许更新: ${this.pending.join('；')}` };
+    }
+    // 同店互斥：恢复链正在执行物理读取时，手动刷新不得叠加另一路读取（返回真实进度，稍后可再试）。
+    const activeRec = this._readRecoveryFor(shopId);
+    if (activeRec && activeRec.phase === 'running') {
+      const view = this._readRecoveryView(shopId);
+      return {
+        ok: true, readOnly: true, shopId, adState: 'unknown',
+        blocked: 'recovery_inflight',
+        reason: `本店有限恢复执行中（${view.attempts}/${view.maxRetries}），本次手动更新未叠加新读取`,
+        readRecovery: view, zeroClick: true,
+      };
+    }
+    // 用户手动更新可重置恢复事件：先取消旧链的等待 timer，再按本次真实读取重新开始。
+    this._clearReadRecovery(shopId, 'manual-refresh');
+    // D24R 跨入口串行：巡查/每日开启周期进行中时，即使目标店不同也不叠加并发处理
+    // （同店在途仍走下方 shop_busy 既有语义，返回真实进度）。如实 blocked，稍后可重试。
+    if (this._cycleRunning && !this._shopBusy(shopId)) {
+      return {
+        ok: true, readOnly: true, shopId, adState: 'unknown',
+        blocked: 'cycle_busy',
+        reason: '巡查/每日开启周期进行中（跨店串行），本次手动更新未执行，稍后可重试',
+        zeroClick: true,
+      };
+    }
+    // D24S 周期外同样串行：他店仍在处理在途或真实资源收口未证明 → 复用既有 busy 响应，
+    // 不叠加新的并发处理；待在途处理结束/收口实际证明后可重试。同店在途仍走下方 shop_busy。
+    const otherBusy = this._otherBusyOrUnprovenShop(shopId);
+    if (otherBusy && !this._shopBusy(shopId)) {
+      return {
+        ok: true, readOnly: true, shopId, adState: 'unknown',
+        blocked: 'shop_busy',
+        reason: `店 ${otherBusy} 处理在途/真实资源收口未证明（一次一家店，跨店串行），本次手动更新未执行，稍后可重试`,
+        zeroClick: true,
+      };
+    }
+    // D24 逐店串行（跨入口收口）：目标店正被巡查周期/每日开启/登录接管在途处理时，
+    // 本只读刷新不叠加并发同店处理，如实返回可稍后重试（复用既有每店处理互斥，不另造锁）。
+    if (!this._tryAcquireShop(shopId)) {
+      return {
+        ok: true, readOnly: true, shopId, adState: 'unknown',
+        blocked: 'shop_busy',
+        reason: '该店已有处理在途（巡查/每日开启/登录接管/恢复链），本次手动更新未叠加新读取',
+        zeroClick: true,
+      };
+    }
+    const rt = this._runtime(shopId);
+    try {
+      const coord = this._getCoordinator(shopCfg);
+-- _commitShopLastData @ line ~1622 --
+
+  // 原子提交：整轮读数（含余额终态）组装完成后一次性替换 lastData 并清除在途标记。
+  _commitShopLastData(rt, candidate) {
+    candidate.refreshing = false;
+    rt.lastData = candidate;
+    rt.lastDataAt = new Date(this.nowFn()).toISOString();
+    rt.dataRefreshing = false;
+  }
+
+  // 早退路径（门禁/窗口/读取失败，未回读广告状态）：candidate 先写余额终态 skipped，
+  // 避免提交后 UI 把缺失读数和未读混淆；再原子提交。
+  _commitShopLastDataSkippedBalance(rt, candidate, reason) {
+    candidate.balanceCents = null;
+    candidate.balanceStatus = 'skipped';
+    candidate.balanceReason = reason;
+    candidate.balanceAt = null;
+    this._commitShopLastData(rt, candidate);
+  }
+
+  async refreshShopData(shopId) {
+    const shopCfg = this._findShop(shopId);
+    if (!shopCfg) return { ok: false, reason: '店铺不存在' };
+    // F4（2026-10-24）：删除店仍拒绝；D56 起未删除店铺（历史 enabled=false 亦视为正常店）允许本
+    // **只读**更新（登录后一次只读数据刷新）。本方法只读，不进入任何广告操作。
+    if (shopCfg.deleted === true) {
+      return { ok: false, reason: '店铺已删除，不再值守/更新', deleted: true };
+    }
+    if (this.pending.length > 0) {
+      return { ok: false, reason: `存在待配置/非法配置项，不允许更新: ${this.pending.join('；')}` };
+    }
+    // 同店互斥：恢复链正在执行物理读取时，手动刷新不得叠加另一路读取（返回真实进度，稍后可再试）。
+    const activeRec = this._readRecoveryFor(shopId);
+    if (activeRec && activeRec.phase === 'running') {
+      const view = this._readRecoveryView(shopId);
+      return {
+        ok: true, readOnly: true, shopId, adState: 'unknown',
+        blocked: 'recovery_inflight',
+        reason: `本店有限恢复执行中（${view.attempts}/${view.maxRetries}），本次手动更新未叠加新读取`,
+        readRecovery: view, zeroClick: true,
+      };
+    }
+    // 用户手动更新可重置恢复事件：先取消旧链的等待 timer，再按本次真实读取重新开始。
+    this._clearReadRecovery(shopId, 'manual-refresh');
+    // D24R 跨入口串行：巡查/每日开启周期进行中时，即使目标店不同也不叠加并发处理
+    // （同店在途仍走下方 shop_busy 既有语义，返回真实进度）。如实 blocked，稍后可重试。
+    if (this._cycleRunning && !this._shopBusy(shopId)) {
+      return {
+        ok: true, readOnly: true, shopId, adState: 'unknown',
+        blocked: 'cycle_busy',
+        reason: '巡查/每日开启周期进行中（跨店串行），本次手动更新未执行，稍后可重试',
+        zeroClick: true,
+      };
+    }
+    // D24S 周期外同样串行：他店仍在处理在途或真实资源收口未证明 → 复用既有 busy 响应，
+    // 不叠加新的并发处理；待在途处理结束/收口实际证明后可重试。同店在途仍走下方 shop_busy。
+    const otherBusy = this._otherBusyOrUnprovenShop(shopId);
+    if (otherBusy && !this._shopBusy(shopId)) {
+      return {
+        ok: true, readOnly: true, shopId, adState: 'unknown',
+        blocked: 'shop_busy',
+        reason: `店 ${otherBusy} 处理在途/真实资源收口未证明（一次一家店，跨店串行），本次手动更新未执行，稍后可重试`,
+        zeroClick: true,
+      };
+    }
+    // D24 逐店串行（跨入口收口）：目标店正被巡查周期/每日开启/登录接管在途处理时，
+    // 本只读刷新不叠加并发同店处理，如实返回可稍后重试（复用既有每店处理互斥，不另造锁）。
+    if (!this._tryAcquireShop(shopId)) {
+      return {
+        ok: true, readOnly: true, shopId, adState: 'unknown',
+        blocked: 'shop_busy',
+        reason: '该店已有处理在途（巡查/每日开启/登录接管/恢复链），本次手动更新未叠加新读取',
+        zeroClick: true,
+      };
+    }
+    const rt = this._runtime(shopId);
+    try {
+      const coord = this._getCoordinator(shopCfg);
+      let data;
+      try {
+        data = await coord.readAndEvaluate(shopCfg, { readOnlyRefresh: true });
+      } catch (e) {
+        if (e instanceof NotConnectedError) {
+          rt.lastError = '推广数据读取尚未接入';
+==== refreshShopData / poll publish sites ====
+refreshShopData: [1639, 5414]
+_summarizeData: [1710, 4421, 5263]
+_commitShopLastData(: [1622, 1636, 1734, 1750, 4499, 4517]
+_markShopDataRefreshing(: [1616, 1717, 4422]
+balanceCents: [34, 1589, 1596, 1597, 1602, 1607, 1632, 3910, 3913, 4420, 5593]
+==== qianchuan-reader: confirm Qoder did not touch vs claim ====
+ integrations/bill-manager/watch-drill.js |   86 +-
+ src/adapters/qianchuan-reader.js         | 1178 +++++++++++-
+ src/engine/monitor.js                    | 3071 ++++++++++++++++++++++++++----
+ 3 files changed, 3861 insertions(+), 474 deletions(-)
+
+parent:  bill-manager/watch-drill.js | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+==== nested/parent watch-drill balance fields ====
+nested:196:balanceCents: s.today && s.today.balanceCents != null ? s.today.balanceCents : null,
+nested:200:balanceStatus: s.today && s.today.balanceStatus ? s.today.balanceStatus : null,
+nested:201:balanceReason: s.today && s.today.balanceReason ? scrub(String(s.today.balanceReason)) : null,
+nested:202:refreshing: s.today && s.today.refreshing === true,
+parent:401:balanceCents: s.today && s.today.balanceCents != null ? s.today.balanceCents : null,
+parent:404:balanceStatus: s.today && s.today.balanceStatus ? s.today.balanceStatus : null,
+parent:405:balanceReason: s.today && s.today.balanceReason ? scrub(String(s.today.balanceReason)) : null,
+parent:406:refreshing: !!(s.today && s.today.refreshing === true) || s.dataRefreshing === true,
+==== selftest ====
+path=C:\Users\Administrator\Documents\电商助手\_balance_null_fix_20261031\selftest-atomic.js
+
+node:internal/errors:542
+      throw error;
+      ^
+
+TypeError [ERR_INVALID_ARG_TYPE]: The "path" argument must be of type string or an instance of Buffer or URL. Received undefined
+    at Object.readFileSync (node:fs:438:14)
+    at Object.<anonymous> (C:\Users\Administrator\Documents\电商助手\_balance_null_fix_20261031\selftest-atomic.js:86:16)
+    at Module._compile (node:internal/modules/cjs/loader:1812:14)
+    at Object..js (node:internal/modules/cjs/loader:1943:10)
+    at Module.load (node:internal/modules/cjs/loader:1533:32)
+    at Module._load (node:internal/modules/cjs/loader:1335:12)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)
+    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)
+    at node:internal/main/run_main_module:33:47 {
+  code: 'ERR_INVALID_ARG_TYPE'
+}
+
+Node.js v24.14.0
+
+selftest exit=1
+==== node --check ====
+monitor check exit=0 out='' err=''
+nested-wd check exit=0 out='' err=''
+parent-wd check exit=0 out='' err=''
+monitor patch bytes=425711
+atomic hit lines in patch: 0 (wrote first 300)

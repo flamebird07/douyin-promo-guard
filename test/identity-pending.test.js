@@ -58,7 +58,7 @@ function setup(t, { shops, costAccountId = null, pageAccountId = null, controlle
       ads: [{ adId: `${s.id}-ad-1`, name: '广告1', status: '投放中', switchChecked: true }],
     });
     const r = makeLinkedReader(c, {
-      costCents: 2000, orders: 10, // 2000 分 > 10×100 → 超标
+      costCents: 6000, orders: 10, // 每单 600 分 > 100 超标，且总消耗 6000 分 > 5000（50 元）门槛 → 具备暂停资格
       costShopId: s.id, orderShopId: s.id, adsShopId: s.id,
       costDate: '2026-09-12', orderDate: '2026-09-12', adsDate: '2026-09-12',
       costFetchedAt: new Date(clock.nowFn()).toISOString(),
@@ -158,7 +158,7 @@ test('显式配置的账户号不匹配：不因 ID 阻断，超标仍执行原�
   });
   const p = await m.pollOnce('test');
   // 归属=Cookie 文件+店铺 ID：费用源实测 ACC-WRONG / 乘方页 ACC-M 与配置 ACC-M 不一致
-  // 不得仅因此 AUTH 停机；本夹具费用 2000 分 > 10 单×100 分（超标）且广告投放中，
+  // 不得仅因此 AUTH 停机；本夹具费用 6000 分 > 10 单×100 分（超标）且 > 5000 分门槛、广告投放中，
   // 应与无账户号用例同构，照常执行原有整店关闭路径。
   assert.notStrictEqual(p.results[0].status, 'stopped', '不得仅因账户 ID 不一致返回 AUTH 停机');
   assert.strictEqual(controllers.get('shop-m').state.closeCalls.length, 1, '超标且投放中：使用该店 Cookie 会话执行原有关闭路径');

@@ -1,13 +1,12 @@
 'use strict';
 
 /**
- * 0 单正常流：_pollShop 与只读状态观测（客户 2026-10-27 修正）。
+ * 0 单正常流：_pollShop 与只读状态观测（规则 C，用户 2026-11-01 拍板）。
  *
- * 旧版测试把 0 单当成 zero_orders 阻断，验证「阻断轮询也不得跳过只读观测」。
- * 修正后 0 单与正单走同一公式，本文件改为验证正常零单数据流：
- * 1. <=50 元（含 0 单）：spend_protected 零动作，仍做一次真实只读状态观测；
- * 2. on/off/mixed 如实落账，绝不因 0 单触发开启/暂停；
- * 3. >50 元且严格超标：决策 should_pause；动作派发被测试编排器拦截（mocked controller only，零真实动作）；
+ * 旧口径（2026-10-27：0 单与正单同一公式 + 50 元保护线）自规则 C 起废止，本文件验证：
+ * 1. 0 单任何费用：zero_order_no_pause 零动作，仍做一次真实只读状态观测；
+ * 2. on/off/mixed 如实落账，绝不因 0 单触发开启/暂停（含 50.01 元旧口径会暂停的用例）；
+ * 3. mixed + 0 单：合法零动作、未安排收敛 → ok（不再是 pending）；
  * 4. 真实读取失败仍 blocked + 完整原因；unknown 仍 unknown_blocked；
  * 5. 其他数据阻断（身份等）不新增状态读；配置/落盘路径不变。
  *
@@ -43,7 +42,7 @@ function normalZeroData(nowMs, { costCents = 1200, businessDate = '2026-10-26' }
 /**
  * 构造真实 Monitor（不 start()）。coordinator 返回正常 0 单数据；readAdState 按序返回；
  * switchOrchestrator 使用真实 decideAdSwitchAction 判定，但 runSwitchAction 被拦截，
- * 证明「>50 元可暂停」只到决策层，绝不真正派发（mocked controller only）。
+ * 证明规则 C 的 0 单（任何费用）只到观察决策层，绝不真正派发（mocked controller only）。
  */
 function setup(t, { costCents = 1200, readResults, coordOverride = null } = {}) {
   const cookieDir = makeTempDir('pg-zo-cookies-');
@@ -147,18 +146,18 @@ const OFF_READ = { state: 'off', rows: [{ id: 'p1', switchChecked: false }], ide
 const MIXED_READ = { state: 'mixed', rows: [{ id: 'p1', switchChecked: true }, { id: 'p2', switchChecked: false }], identity: { ok: true }, balance: null };
 const FAILED_READ = { state: 'unknown', error: { status: 'blocked', reason: '回读失败：模拟清单不完整', blocked: 'inventory' } };
 
-test('0 单 + 12.00 元（≤50 元）：正常判定 spend_protected，仍做一次只读观测，零动作', async (t) => {
+test('0 单 + 12.00 元：规则 C 判定 zero_order_no_pause，仍做一次只读观测，零动作', async (t) => {
   const { monitor, clock, rt, counts, poll } = setup(t, { costCents: 1200, readResults: [ON_READ] });
   const res = await poll();
 
   assert.strictEqual(res.status, 'ok');
-  assert.strictEqual(res.decision, DECISION.SPEND_PROTECTED);
+  assert.strictEqual(res.decision, DECISION.ZERO_ORDER_NO_PAUSE);
   assert.strictEqual(res.zeroClick, true);
-  assert.strictEqual(res.spendProtected, true);
-  assert.strictEqual(res.pauseEligible, false);
+  assert.strictEqual(res.spendProtected, false, '无消耗门槛（D55）：spendProtected 恒 false');
+  assert.strictEqual(res.pauseEligible, false, '0 单无暂停资格');
   assert.strictEqual(res.blocked, undefined, '正常 0 单不得带 blocked');
   assert.strictEqual(counts.read(), 1, '恰好一次只读状态观测');
-  assert.strictEqual(counts.eval(), 1, '正常进入决策（使用同一公式）');
+  assert.strictEqual(counts.eval(), 1, '正常进入决策（规则 C 0 单观察分支）');
   assert.strictEqual(counts.run(), 0, '不得进入任何开关动作');
 
   const nowIso = new Date(clock.now()).toISOString();
@@ -176,19 +175,19 @@ test('0 单读到 off：如实记 off，绝不因 0 单触发开启', async (t) 
   const res = await poll();
 
   assert.strictEqual(res.status, 'ok');
-  assert.strictEqual(res.decision, DECISION.SPEND_PROTECTED);
+  assert.strictEqual(res.decision, DECISION.ZERO_ORDER_NO_PAUSE);
   assert.strictEqual(rt.lastAdState, 'off', 'off 如实落账');
   assert.strictEqual(counts.run(), 0, 'off 绝不触发开启/暂停');
   assert.strictEqual(rt.lastData.blockedReason, undefined);
 });
 
-test('0 单读到 mixed：如实 pending（非完成态），保护区内零动作', async (t) => {
+test('0 单读到 mixed：如实落账 mixed，规则 C 合法零动作 → ok（未安排收敛）', async (t) => {
   const { rt, counts, poll } = setup(t, { costCents: 1200, readResults: [MIXED_READ] });
   const res = await poll();
 
-  assert.strictEqual(res.status, 'pending');
-  assert.strictEqual(res.pending, true);
-  assert.strictEqual(res.decision, DECISION.SPEND_PROTECTED);
+  assert.strictEqual(res.status, 'ok', 'mixed + 0 单合法零动作：本轮未安排任何收敛动作 → ok');
+  assert.strictEqual(res.pending, undefined, '不再 pending：规则 C 0 单没有待执行收敛');
+  assert.strictEqual(res.decision, DECISION.ZERO_ORDER_NO_PAUSE);
   assert.strictEqual(res.currentAdState, 'mixed');
   assert.strictEqual(res.zeroClick, true);
   assert.strictEqual(rt.lastAdState, 'mixed');
@@ -196,8 +195,8 @@ test('0 单读到 mixed：如实 pending（非完成态），保护区内零动�
   assert.strictEqual(rt.lastData.blockedReason, undefined, 'mixed 不是数据错误，不得写成 blockedReason');
 });
 
-test('0 单读取失败：unknown + 完整原因可见，不推 lastDataAt、不用旧 on 保绿', async (t) => {
-  const { rt, oldAt, counts, poll } = setup(t, { costCents: 1200, readResults: [FAILED_READ] });
+test('0 单读取失败：unknown + 完整原因可见，不用旧 on 保绿；本轮有效数据仍原子提交', async (t) => {
+  const { rt, clock, counts, poll } = setup(t, { costCents: 1200, readResults: [FAILED_READ] });
   const res = await poll();
 
   assert.strictEqual(res.status, 'blocked');
@@ -206,7 +205,9 @@ test('0 单读取失败：unknown + 完整原因可见，不推 lastDataAt、不
   assert.strictEqual(rt.lastAdState, 'unknown', '失败不得保留旧 on');
   assert.ok(rt.lastReadError, '写入结构化读取失败');
   assert.match(String(rt.lastReadError.reason), /模拟清单不完整/);
-  assert.strictEqual(rt.lastDataAt, oldAt, '失败不得推进 lastDataAt');
+  // 已提交的竞态修正行为：状态读取失败时本轮有效费用/订单数据仍先原子提交，lastDataAt 推进；
+  // 但广告状态证据被撤销（lastAdState=unknown），且不进入决策/动作。
+  assert.strictEqual(rt.lastDataAt, new Date(clock.now()).toISOString(), '本轮数据原子提交，lastDataAt 推进');
   assert.strictEqual(counts.eval(), 0, '状态回读失败在决策之前返回，不进入 evaluatePeriodic');
   assert.strictEqual(counts.run(), 0);
 });
@@ -222,18 +223,21 @@ test('readAdState 抛错走真实失败路径，不得吞成成功', async (t) =
   assert.strictEqual(counts.run(), 0);
 });
 
-test('0 单 + 50.01 元 + on：决策 should_pause；仅测试编排器记录意图，零真实动作', async (t) => {
+// 规则 C 关键回归：旧口径（>50 元 + 0 单 + on → should_pause）已废止；0 单任何费用只观察。
+test('0 单 + 50.01 元 + on：规则 C 仍 zero_order_no_pause（旧口径会 should_pause），零真实动作', async (t) => {
   const { monitor, controller, counts, poll } = setup(t, { costCents: 5001, readResults: [ON_READ] });
   const res = await poll();
 
-  assert.strictEqual(res.decision, DECISION.SHOULD_PAUSE);
-  assert.strictEqual(res.action, 'pause');
-  assert.strictEqual(res.zeroClick, true, '测试编排器未派发请求 → zeroClick');
+  assert.strictEqual(res.decision, DECISION.ZERO_ORDER_NO_PAUSE);
+  assert.strictEqual(res.action, undefined, '0 单无任何动作');
+  assert.strictEqual(res.zeroClick, true);
+  assert.strictEqual(res.pauseEligible, false, '0 单无暂停资格，即使费用超过旧 50 元保护线');
+  assert.strictEqual(res.roiTooLow, false);
   assert.strictEqual(counts.eval(), 1);
-  assert.strictEqual(counts.run(), 1, '决策要求暂停，进入动作入口一次');
-  assert.deepStrictEqual(counts.actions(), ['pause']);
+  assert.strictEqual(counts.run(), 0, '0 单绝不进入动作入口');
+  assert.deepStrictEqual(counts.actions(), []);
   assert.strictEqual(controller.state.closeCalls.length, 0, 'mocked controller only：没有真实关闭调用');
-  assert.strictEqual(monitor.triggers.length, 0, '未派发/未演练，无触发记录');
+  assert.strictEqual(monitor.triggers.length, 0, '零触发记录');
   assert.strictEqual(monitor.actions.length, 0, '无执行批次');
 });
 

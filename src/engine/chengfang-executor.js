@@ -326,6 +326,15 @@ async function pauseZixuan({ controller, page, shopCfg, result, dryRun, requestG
     const pag = view0.pagination || {};
     if (pag.total !== 0) {
       fail('zixuan', V_READ_FAILED, `商品自选无行但缺少数量的空态证据（分页 total=${pag.total ?? '缺失'}），不当作无计划`);
+      // 空表机读码证据（DIAN-4 只读恢复桥接）：本批次仍以 partial/read_failed 收口，绝不当作无计划；
+      // 这里只记录本函数亲自观测的事实（第 1 页、0 行、原始 total/hasNext/activePage、身份已核验、
+      // 切视图与切 100 条/页后重新读取成功）。关闭证明与派发数由调用方补齐后才铸码。
+      result.views.zixuan.emptyTableEvidence = {
+        tab: '商品自选', pageNo: 1, activePage: pag.activePage, rows: view0.rows,
+        pagination: { total: pag.total, hasNext: pag.hasNext },
+        identityOk: !!(result.identity && result.identity.ok === true),
+        refreshOk: true,
+      };
       return false;
     }
     result.views.zixuan = { status: V_CONFIRMED_EMPTY, note: '已确认无计划（成功读取且分页 total=0）' };
@@ -1409,6 +1418,13 @@ async function enableZixuan({ controller, page, shopCfg, result, dryRun, request
     const pag = view0.pagination || {};
     if (pag.total !== 0) {
       fail('zixuan', V_READ_FAILED, `商品自选无行但缺少数量的空态证据（分页 total=${pag.total ?? '缺失'}），不当作无计划`);
+      // 空表机读码证据（开启镜像，与暂停侧同一形态）：批次仍以 partial/read_failed 收口。
+      result.views.zixuan.emptyTableEvidence = {
+        tab: '商品自选', pageNo: 1, activePage: pag.activePage, rows: view0.rows,
+        pagination: { total: pag.total, hasNext: pag.hasNext },
+        identityOk: !!(result.identity && result.identity.ok === true),
+        refreshOk: true,
+      };
       return false;
     }
     result.views.zixuan = { status: V_CONFIRMED_EMPTY, note: '已确认无计划（成功读取且分页 total=0）' };

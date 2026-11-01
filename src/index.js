@@ -29,9 +29,7 @@
  */
 
 const path = require('path');
-const { loadConfig } = require('./config');
-const { Monitor } = require('./engine/monitor');
-const { createUiServer } = require('./ui/server');
+const { loadConfig, loadConfigFrom, CONFIG_PATH } = require('./config');
 const { loadShopCookieMeta } = require('./login/session');
 const log = require('./lib/log');
 
@@ -75,6 +73,8 @@ function cmdCheck() {
 }
 
 async function cmdServe() {
+  const { Monitor } = require('./engine/monitor');
+  const { createUiServer } = require('./ui/server');
   const cfg = loadConfig();
   const monitor = new Monitor(cfg);
   const { server } = createUiServer(monitor, PORT);
@@ -94,17 +94,55 @@ async function cmdServe() {
 }
 
 async function cmdPoll() {
+  const { Monitor } = require('./engine/monitor');
   const cfg = loadConfig();
   const monitor = new Monitor(cfg);
   const r = await monitor.pollOnce('cli');
   console.log(JSON.stringify(r, null, 2));
 }
 
+function recoveryArgs() {
+  const { values, tokens } = require('util').parseArgs({
+    args: process.argv.slice(3),
+    options: { shop: { type: 'string' }, config: { type: 'string' } },
+    strict: true, tokens: true,
+  });
+  if (tokens.filter((token) => token.name === 'shop').length > 1) throw new Error('INVALID_REQUEST');
+  return values;
+}
+
 async function cmdLogin() {
-  const cfg = loadConfig();
-  const { runQrLogin } = require('./login/qr-login');
-  const result = await runQrLogin(cfg.config.login);
-  console.log(`登录完成。请把店铺名 "${result.shopName}" 填入 config/config.json 的 shops[].cookieFile。`);
+  const { LoginFailure, failureCode, MESSAGES } = require('../../bill-manager/login-target-gate');
+  try {
+    const args = recoveryArgs();
+    if (typeof args.shop !== 'string' || !args.shop.trim()) throw new LoginFailure('TARGET_REQUIRED');
+    const cfg = loadConfigFrom(args.config ? path.resolve(args.config) : CONFIG_PATH);
+    const { runQrLogin } = require('./login/qr-login');
+    const result = await runQrLogin(cfg.config.login, { cfgResult: cfg, targetShopId: args.shop });
+    console.log(JSON.stringify(result));
+    if (!result.success || result.partial) process.exitCode = 1;
+  } catch (error) {
+    const code = failureCode(error);
+    console.error(JSON.stringify({ success: false, code, message: MESSAGES[code] }));
+    process.exitCode = 1;
+  }
+}
+
+function cmdRestoreShop() {
+  try {
+    const args = recoveryArgs();
+    const configPath = args.config ? path.resolve(args.config) : CONFIG_PATH;
+    const { restoreShopConfig } = require('./engine/shop-restore');
+    const result = restoreShopConfig({
+      configPath, shopId: args.shop,
+      auditPath: path.resolve(path.dirname(configPath), '..', 'data', 'audit.jsonl'),
+    });
+    console.log(JSON.stringify(result));
+    if (!result.ok) process.exitCode = 1;
+  } catch (_) {
+    console.error(JSON.stringify({ ok: false, code: 'INVALID_RESTORE_REQUEST' }));
+    process.exitCode = 1;
+  }
 }
 
 /**
@@ -318,12 +356,13 @@ async function main() {
     case 'serve': return cmdServe();
     case 'poll': return cmdPoll();
     case 'login': return cmdLogin();
+    case 'restore-shop': return cmdRestoreShop();
     case 'orders': return cmdOrders();
     case 'ads': return cmdAds();
     case 'chengfang': return cmdChengfang();
     case 'chengfang-read': return cmdChengfangRead();
     default:
-      console.error(`未知命令: ${cmd}（可用: check / serve / poll / login / orders / ads / chengfang / chengfang-read）`);
+      console.error(`未知命令: ${cmd}（可用: check / serve / poll / login --shop ID / restore-shop --shop ID / orders / ads / chengfang / chengfang-read）`);
       process.exit(1);
   }
 }

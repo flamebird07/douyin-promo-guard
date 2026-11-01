@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "shop": "敏敏高定私服",
+  "versions": [
+    {
+      "versionId": "v20261024T084620Z-21964-063f6f",
+      "sha256": "7d592d76bbc4957069a2ee0c391e89a247c1d6b30774dc4d8c2a626888d24aac",
+      "bytes": 15441,
+      "createdAtMs": 1792831580151,
+      "origin": "verified-login",
+      "structureValid": true
+    },
+    {
+      "versionId": "v20261027T103126Z-24412-4c9ad7",
+      "sha256": "28febe86b9d93d8566499822093dcdc0f19672e43021eac21035fc6244aea135",
+      "bytes": 15677,
+      "createdAtMs": 1793097086091,
+      "origin": "verified-login",
+      "structureValid": true
+    },
+    {
+      "versionId": "v20261029T042802Z-18620-0f6087",
+      "sha256": "39f543c2908b90e0509692c69f27f6854b9b2b950bcf61c439444e8d12262ebe",
+      "bytes": 15855,
+      "createdAtMs": 1793248082715,
+      "origin": "verified-login",
+      "structureValid": true
+    }
+  ]
+}

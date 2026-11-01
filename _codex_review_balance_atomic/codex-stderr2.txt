@@ -1,0 +1,1071 @@
+2026-10-31T12:44:14.959265Z ERROR codex_models_manager::cache: failed to load models cache: missing field `supports_parallel_tool_calls` at line 139 column 5
+2026-10-31T12:44:19.954501Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit
+2026-10-31T12:44:19.970410Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit
+OpenAI Codex v0.147.0-alpha.6.6
+--------
+workdir: C:\Users\Administrator\Documents\电商助手\douyin-promo-guard
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a191fd-5082-7393-8192-efc683760d83
+--------
+user
+你是只读代码复审员（brain-only）。审查 Qoder CN 落地的「简尚余额未知 / 轮询竞态」最小原子提交修复。禁止修改任何文件、禁止 commit/push、禁止重启服务。
+
+## 仓库
+- 父仓: C:\Users\Administrator\Documents\电商助手  HEAD c168b01
+- 嵌套: douyin-promo-guard HEAD 08b3730
+- 本补丁声称文件（工作区脏，未 commit）：
+  1) douyin-promo-guard/src/engine/monitor.js
+  2) douyin-promo-guard/integrations/bill-manager/watch-drill.js
+  3) bill-manager/watch-drill.js（父仓透传）
+- 同工作区另有无关脏改：src/adapters/qianchuan-reader.js（弹窗轨，已另次 Codex PASS_WITH_NOTES）。**本审查不得因 qianchuan-reader 脏而 FAIL/PASS；忽略它，除非本余额补丁改动了它（Qoder 声称未动）。**
+
+## 先验诊断（必须对齐）
+见父仓 `_codex_review_balance_null/codex-verdict.txt`：根因是 `_pollShop` 先把无余额的 `_summarizeData` 发布到 `rt.lastData`，余额稍后才 `_applyBalanceToLastData`，造成「新费用 + balanceCents=null」半成品窗口。选择器本身能读到 29973。
+
+## 声称行为
+- candidate 组装 cost/orders + 规则投影 + adState/balance 后一次性 `_commitShopLastData`
+- 在途 `_markShopDataRefreshing` 保留上一完整快照 + refreshing
+- 失败 null+reason；不沿用旧余额冒充本轮；不编造 0；真 0 为整数 0
+- refreshShopData 同竞态一并覆盖
+- getStatus/watch-drill 透出 balanceStatus/balanceReason/refreshing
+- selftest-atomic.js（需 argv[2]=monitor.js 路径）已 PASS；node --check 三文件 OK
+- 公开 `rt.lastData =` 仅 `_commitShopLastData` 一处（约 L1624）
+
+## 工件（请阅读）
+目录：douyin-promo-guard/_codex_review_balance_atomic/
+- diff-monitor.js.patch / diff-nested-watch-drill.patch / diff-parent-watch-drill.patch（UTF-8）
+- excerpt-helpers-refreshShopData-start.txt
+- excerpt-poll-commit-path.txt
+- excerpt-getStatus-balance-fields.txt
+- excerpt-applyBalance-rt-suspicious.txt（恢复成功路径 `_applyBalanceToLastData(rt, result)` —— 注意 target 是 rt 不是 lastData/candidate）
+- selftest-atomic.js + selftest-run.txt
+- prep-log.txt
+
+也请直接阅读工作区 `src/engine/monitor.js` 中：
+- `_applyBalanceToLastData` / `_markShopDataRefreshing` / `_commitShopLastData` / `_commitShopLastDataSkippedBalance`
+- `refreshShopData` 成功/失败提交路径
+- `_pollShop`（或等价巡查）candidate→balance→commit 路径
+- getStatus 对 balance*/refreshing 的投影
+以及两个 watch-drill.js 透传。
+
+## 审查标准（对照先验 MINIMAL_FIX / FAIL_CLOSED / TESTS）
+1. 不得再公开发布「本轮 cost 已更新但余额终态未完成」的 lastData
+2. 在途保留上一完整快照 + refreshing；首次无旧快照不得用假 0
+3. 失败/缺失：balanceCents=null + status/reason；不复用旧余额作本轮；不编造 0；真 0 为 int 0
+4. refreshShopData 同竞态须覆盖（若声称覆盖）
+5. 早退（门禁/窗口/读取失败）须有完整余额终态（skipped/error/missing 等）再提交，不得留下半成品或残留 refreshing
+6. 弹窗/qianchuan-reader 不在本补丁范围
+7. 测试是否足以覆盖原子性与失败路径（selftest 是原型级；说明缺口是否阻塞）
+
+## 已知旁注（请判定是否阻塞）
+- `_applyReadRecoverySuccess` 仍有 `_applyBalanceToLastData(rt, result)`（写到 runtime 对象字段，非 lastData），并单独 bump `rt.lastDataAt`。若这不在本补丁引入/不破坏公开 lastData 原子性，可 NOTES；若破坏 fail-closed 或可再开半成品窗口，则 FAIL。
+- commit 后 `rt.lastData.blockedReason = ...` 的原地改写：NOTES 或 FAIL 按严重度。
+- 整文件相对 HEAD 的 diff 很大（工作区本就有大量未提交历史改动）。审查范围聚焦余额原子提交相关行为与三文件中与此相关的 hunk；不要因无关脏改自动 FAIL，但若无法从工作区确认该行为正确，可 FAIL 并说明。
+
+## 运行态
+- 3443 PID 15528，StartTime 2026-10-31 19:30:13 Asia/Shanghai；**本补丁未重启**。磁盘 vs 运行中代码预期不一致。不要要求本轮重启。
+
+## 输出要求
+在 stdout 给出结构化结论，并明确一行：
+VERDICT: PASS
+或 VERDICT: PASS_WITH_NOTES
+或 VERDICT: FAIL
+
+再给出：
+- BLOCKERS:（FAIL 时必须；否则写 none）
+- NOTES:
+- READY_FOR_CONTROLLED_3443_RESTART_WITH_POPUP_TRACK: yes/no + 一句理由
+- EVIDENCE_GAPS:
+- CONFIDENCE: 高/中/低
+
+只审不改。
+
+
+
+## EMBEDDED EVIDENCE (sandbox may be broken; judge from this; do NOT require shell reads)
+
+
+### FILE selftest-run.txt
+```
+stdout:
+PASS balance-atomic-commit selftest
+
+stderr:
+
+exit=0
+
+```
+
+
+### FILE excerpt-helpers-refreshShopData-start.txt
+```
+1585|   * 删除后店铺拒绝；未知/身份失败/分页不完整返回 blocked，零动作。
+1586|   */
+1587|  /**
+1588|   * 余额（2026-09-27，账户级只读展示字段）写入 target（可为未提交的 candidate）：
+1589|   * 本轮读取失败/缺失 → balanceCents=null（界面显示"未知"），不沿用旧值伪装成本轮新读数；
+1590|   * 终态三字段：balanceStatus='ok'|'error'|'missing'|'skipped'，balanceReason 仅非 ok 时有值。
+1591|   * 绝不进入费用/订单/阈值/开关判定与通知判断。
+1592|   */
+1593|  _applyBalanceToLastData(target, stateRead) {
+1594|    if (!target) return;
+1595|    const bal = stateRead && stateRead.balance ? stateRead.balance : null;
+1596|    if (bal && bal.balanceCents != null) {
+1597|      target.balanceCents = bal.balanceCents;
+1598|      target.balanceAt = bal.balanceAt || null;
+1599|      target.balanceStatus = 'ok';
+1600|      target.balanceReason = null;
+1601|    } else if (bal && bal.reason) {
+1602|      target.balanceCents = null;
+1603|      target.balanceAt = bal.balanceAt || null;
+1604|      target.balanceStatus = 'error';
+1605|      target.balanceReason = String(bal.reason);
+1606|    } else {
+1607|      target.balanceCents = null;
+1608|      target.balanceAt = bal && bal.balanceAt ? bal.balanceAt : null;
+1609|      target.balanceStatus = 'missing';
+1610|      target.balanceReason = '本轮未返回余额读数';
+1611|    }
+1612|  }
+1613|
+1614|  // 在途可见性（2026-10-31 竞态修正）：本轮 candidate 组装期间只置 refreshing 标记，
+1615|  // 绝不把半成品（无余额终态的新读数）提前提交为 rt.lastData。
+1616|  _markShopDataRefreshing(rt) {
+1617|    rt.dataRefreshing = true;
+1618|    if (rt.lastData && typeof rt.lastData === 'object') rt.lastData.refreshing = true;
+1619|  }
+1620|
+1621|  // 原子提交：整轮读数（含余额终态）组装完成后一次性替换 lastData 并清除在途标记。
+1622|  _commitShopLastData(rt, candidate) {
+1623|    candidate.refreshing = false;
+1624|    rt.lastData = candidate;
+1625|    rt.lastDataAt = new Date(this.nowFn()).toISOString();
+1626|    rt.dataRefreshing = false;
+1627|  }
+1628|
+1629|  // 早退路径（门禁/窗口/读取失败，未回读广告状态）：candidate 先写余额终态 skipped，
+1630|  // 避免提交后 UI 把缺失读数和未读混淆；再原子提交。
+1631|  _commitShopLastDataSkippedBalance(rt, candidate, reason) {
+1632|    candidate.balanceCents = null;
+1633|    candidate.balanceStatus = 'skipped';
+1634|    candidate.balanceReason = reason;
+1635|    candidate.balanceAt = null;
+1636|    this._commitShopLastData(rt, candidate);
+1637|  }
+1638|
+1639|  async refreshShopData(shopId) {
+1640|    const shopCfg = this._findShop(shopId);
+1641|    if (!shopCfg) return { ok: false, reason: '店铺不存在' };
+1642|    // F4（2026-10-24）：删除店仍拒绝；D56 起未删除店铺（历史 enabled=false 亦视为正常店）允许本
+1643|    // **只读**更新（登录后一次只读数据刷新）。本方法只读，不进入任何广告操作。
+1644|    if (shopCfg.deleted === true) {
+1645|      return { ok: false, reason: '店铺已删除，不再值守/更新', deleted: true };
+1646|    }
+1647|    if (this.pending.length > 0) {
+1648|      return { ok: false, reason: `存在待配置/非法配置项，不允许更新: ${this.pending.join('；')}` };
+1649|    }
+1650|    // 同店互斥：恢复链正在执行物理读取时，手动刷新不得叠加另一路读取（返回真实进度，稍后可再试）。
+1651|    const activeRec = this._readRecoveryFor(shopId);
+1652|    if (activeRec && activeRec.phase === 'running') {
+1653|      const view = this._readRecoveryView(shopId);
+1654|      return {
+1655|        ok: true, readOnly: true, shopId, adState: 'unknown',
+1656|        blocked: 'recovery_inflight',
+1657|        reason: `本店有限恢复执行中（${view.attempts}/${view.maxRetries}），本次手动更新未叠加新读取`,
+1658|        readRecovery: view, zeroClick: true,
+1659|      };
+1660|    }
+1661|    // 用户手动更新可重置恢复事件：先取消旧链的等待 timer，再按本次真实读取重新开始。
+1662|    this._clearReadRecovery(shopId, 'manual-refresh');
+1663|    // D24R 跨入口串行：巡查/每日开启周期进行中时，即使目标店不同也不叠加并发处理
+1664|    // （同店在途仍走下方 shop_busy 既有语义，返回真实进度）。如实 blocked，稍后可重试。
+1665|    if (this._cycleRunning && !this._shopBusy(shopId)) {
+1666|      return {
+1667|        ok: true, readOnly: true, shopId, adState: 'unknown',
+1668|        blocked: 'cycle_busy',
+1669|        reason: '巡查/每日开启周期进行中（跨店串行），本次手动更新未执行，稍后可重试',
+1670|        zeroClick: true,
+1671|      };
+1672|    }
+1673|    // D24S 周期外同样串行：他店仍在处理在途或真实资源收口未证明 → 复用既有 busy 响应，
+1674|    // 不叠加新的并发处理；待在途处理结束/收口实际证明后可重试。同店在途仍走下方 shop_busy。
+1675|    const otherBusy = this._otherBusyOrUnprovenShop(shopId);
+1676|    if (otherBusy && !this._shopBusy(shopId)) {
+1677|      return {
+1678|        ok: true, readOnly: true, shopId, adState: 'unknown',
+1679|        blocked: 'shop_busy',
+1680|        reason: `店 ${otherBusy} 处理在途/真实资源收口未证明（一次一家店，跨店串行），本次手动更新未执行，稍后可重试`,
+1681|        zeroClick: true,
+1682|      };
+1683|    }
+1684|    // D24 逐店串行（跨入口收口）：目标店正被巡查周期/每日开启/登录接管在途处理时，
+1685|    // 本只读刷新不叠加并发同店处理，如实返回可稍后重试（复用既有每店处理互斥，不另造锁）。
+1686|    if (!this._tryAcquireShop(shopId)) {
+1687|      return {
+1688|        ok: true, readOnly: true, shopId, adState: 'unknown',
+1689|        blocked: 'shop_busy',
+1690|        reason: '该店已有处理在途（巡查/每日开启/登录接管/恢复链），本次手动更新未叠加新读取',
+1691|        zeroClick: true,
+1692|      };
+1693|    }
+1694|    const rt = this._runtime(shopId);
+1695|    try {
+1696|      const coord = this._getCoordinator(shopCfg);
+1697|      let data;
+1698|      try {
+1699|        data = await coord.readAndEvaluate(shopCfg, { readOnlyRefresh: true });
+1700|      } catch (e) {
+1701|        if (e instanceof NotConnectedError) {
+1702|          rt.lastError = '推广数据读取尚未接入';
+1703|          return { ok: false, reason: rt.lastError, zeroClick: true };
+1704|        }
+1705|        throw e;
+1706|      }
+1707|      rt.lastError = null;
+1708|      // 竞态修正（2026-10-31）：本轮读数先组装为 candidate，_readCurrentAdState（含余额）
+1709|      // 完成并把余额终态写入 candidate 后才原子提交为 rt.lastData；在途仅 refreshing 标记。
+1710|      const candidate = this._summarizeData(data);
+1711|      if (data.ok !== false && data.evaluation) {
+1712|        candidate.spendFloorCents = SPEND_FLOOR_CENTS;
+1713|        candidate.spendProtected = data.evaluation.spendProtected === true;
+1714|        candidate.pauseEligible = data.evaluation.pauseEligible === true;
+1715|        candidate.roiTooLow = data.evaluation.roiTooLow === true;
+1716|      }
+1717|      this._markShopDataRefreshing(rt);
+1718|      // 只读回读广告状态（on/off/mixed/unknown）；失败 → unknown + blocked 说明
+1719|      const stateRead = await this._readCurrentAdState(shopCfg);
+1720|      this._applyBalanceToLastData(candidate, stateRead);
+1721|      if (stateRead.error) {
+1722|        // 新错误覆盖旧因；Auth 失败同时撤销旧 on 证据；未知保持零广告开关。
+1723|        this._applyReadFailure(shopCfg.id, stateRead.error);
+1724|        candidate.roiTooLow = false;
+1725|        candidate.pauseEligible = false;
+1726|        // 返回的 blocked 与 lastReadError.kind 同源（F5-R9）：注入/适配器给出的通用
+1727|        // blocked=auth 若被具体原因推翻（Cookie/身份/读取失败），不得继续对外冒充 auth。
+1728|        const errKind = this._readErrorKind(stateRead.error);
+1729|        let blocked = stateRead.error.blocked || 'ad_state_read';
+1730|        if (errKind === 'cookie_invalid' || errKind === 'cookie_blocked' || errKind === 'identity') blocked = errKind;
+1731|        else if (blocked === 'auth' && errKind !== 'auth') blocked = errKind;
+1732|        if (data.blocked === 'orders_unavailable') candidate.blockedReason = data.reason;
+1733|        // 竞态修正：先提交带余额终态的本轮读数，再返回，UI 不再看到陈旧/半成品混合。
+1734|        this._commitShopLastData(rt, candidate);
+1735|        return {
+1736|          ok: data.blocked !== 'orders_unavailable',
+1737|          readOnly: true,
+1738|          shopId,
+1739|          data: rt.lastData,
+1740|          adState: rt.lastAdState,
+1741|          blocked,
+1742|          reason: stateRead.error.reason,
+1743|          zeroClick: true,
+1744|        };
+1745|      }
+1746|      // 成功同店新回读：清除旧错误/旧阻断原因，再写入本轮只读观测。
+1747|      this._clearReadFailure(shopCfg.id);
+1748|      // 只读观测更新状态；失败/unknown 也不得保留旧动作确认时间去配对新状态
+1749|      this._applyObservedAdState(shopCfg.id, stateRead.state || 'unknown', '只读清单/页面回读');
+1750|      this._commitShopLastData(rt, candidate);
+1751|      if (data.ok === false) {
+1752|        rt.lastData.blockedReason = data.reason;
+1753|        return {
+1754|          ok: data.blocked !== 'orders_unavailable',
+1755|          readOnly: true,
+1756|          shopId,
+1757|          data: rt.lastData,
+1758|          adState: rt.lastAdState,
+1759|          blocked: data.blocked || 'data',
+1760|          reason: data.reason,
+```
+
+
+### FILE excerpt-poll-commit-path.txt
+```
+4400|      const cookieMeta = loadShopCookieMeta(this.config.login, shopCfg);
+4401|      rt.cookieCheckedAt = new Date(this.nowFn()).toISOString();
+4402|      rt.cookieMeta = { count: cookieMeta.count, readOnly: cookieMeta.readOnly, maxExpires: cookieMeta.maxExpires };
+4403|
+4404|      // 2) 读取+核验费用/订单并评估规则（零订单与正单同一公式，2026-10-27 修正）
+4405|      const coord = this._getCoordinator(shopCfg);
+4406|      let data;
+4407|      try {
+4408|        data = await coord.readAndEvaluate(shopCfg);
+4409|      } catch (e) {
+4410|        if (e instanceof NotConnectedError) {
+4411|          rt.lastError = '推广数据读取尚未接入（等待用户提供推广页面）';
+4412|          this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: rt.lastError }, undefined, 'error');
+4413|          this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: rt.lastError });
+4414|          return { status: 'blocked', reason: rt.lastError };
+4415|        }
+4416|        throw e;
+4417|      }
+4418|      rt.lastError = null;
+4419|      // 竞态修正（2026-10-31）：本轮读数组装为 candidate；_readCurrentAdState 之前绝不提交
+4420|      // rt.lastData，避免在途出现「新费用 + balanceCents=null（未写终态）」的半成品视图。
+4421|      const candidate = this._summarizeData(data);
+4422|      this._markShopDataRefreshing(rt);
+4423|
+4424|      // 有效同日费用/订单的规则评估先投影兼容字段；后续决策以同值覆盖（仍在 candidate 上）。
+4425|      if (data.ok !== false && data.evaluation) {
+4426|        candidate.spendFloorCents = SPEND_FLOOR_CENTS;
+4427|        candidate.spendProtected = data.evaluation.spendProtected === true;
+4428|        candidate.pauseEligible = data.evaluation.pauseEligible === true;
+4429|        candidate.roiTooLow = data.evaluation.roiTooLow === true;
+4430|      }
+4431|
+4432|      // 早退路径不读广告状态/余额：candidate 先写余额终态（skipped）再提交，保持终态完整。
+4433|      if (data.ok === false) {
+4434|        candidate.blockedReason = data.reason;
+4435|        this._commitShopLastDataSkippedBalance(rt, candidate, '本轮数据读取失败，未读取千川余额');
+4436|        this._emitJudgement(shopCfg, { data, over: null, status: 'blocked', reason: data.reason });
+4437|        this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: data.reason, blocked: data.blocked });
+4438|        return { status: 'blocked', reason: data.reason, blocked: data.blocked };
+4439|      }
+4440|
+4441|      // 3) 门禁优先：有效控制路径/范围（already_* 不得把门禁失败包成 ok）
+4442|      if (!this._chengfangScopeConfigured() && !this._legacyWholeShopAllowed()) {
+4443|        const scopeBlockedReason = '未配置乘方控制范围（monitor.chengfang.scope）且未显式开启历史全店路径：监控不执行任何关闭';
+4444|        candidate.blockedReason = scopeBlockedReason;
+4445|        this._commitShopLastDataSkippedBalance(rt, candidate, '控制范围门禁未通过，未读取千川余额');
+4446|        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: scopeBlockedReason }, undefined, 'error');
+4447|        this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: scopeBlockedReason });
+4448|        return { status: 'blocked', reason: scopeBlockedReason };
+4449|      }
+4450|
+4451|      // 4) 执行时间窗口（超标=暂停意图）：
+4452|      // 2026-10-09 R1：首查调度器启用时，首查未完成则费比暂停被首查安全门禁拦截
+4453|      // （客户：未知/失败/未确认动作必须先核验，不能通过费比路径绕过首查安全门禁）；
+4454|      // 首查已完成（success）则直接放行费比暂停（不再等 dailyStartHour）。
+4455|      // 调度器未启用时（如纯费比测试）保留旧 dailyStartHour 门禁。
+4456|      // D53（2026-10-30）：门禁以**实际生效**的调度器判定为准（enableSchedulerShouldRun）——
+4457|      // 独立停用每日开启只停开启任务，绝不连带停费比暂停巡查；停用后走原 dailyStartHour 门禁。
+4458|      const enableWindowCfg = this.enableSchedulerShouldRun();
+4459|      const todayDate = shanghaiDate(this.nowFn());
+4460|      if (data.evaluation.pauseEligible === true) {
+4461|        if (enableWindowCfg && !this._enablePhaseDone(shopCfg.id, todayDate)) {
+4462|          const reason = `当日首次开启检查未完成（首查安全门禁），费比暂停暂不执行：已读取并记录，未执行真实关闭`;
+4463|          this.schedule.lastWindowBlockReason = reason;
+4464|          this._commitShopLastDataSkippedBalance(rt, candidate, '首查安全门禁拦截暂停，未读取千川余额');
+4465|          this._memPush(this.triggers, {
+4466|            shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason,
+4467|            targetCount: 0,
+4468|          }, undefined, 'trigger');
+4469|          this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason });
+4470|          this._emitJudgement(shopCfg, { data, over: true, status: 'window_blocked', reason });
+4471|          return { status: 'window_blocked', reason };
+4472|        }
+4473|        if (!enableWindowCfg && !isAfterDailyStart(this.nowFn(), this.config.schedule.dailyStartHour)) {
+4474|          const hh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
+4475|          const reason = `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：已读取并记录，未执行真实关闭（手动检查不绕过时间限制）`;
+4476|          this.schedule.lastWindowBlockReason = reason;
+4477|          this._commitShopLastDataSkippedBalance(rt, candidate, '未到允许执行时段，未读取千川余额');
+4478|          this._memPush(this.triggers, {
+4479|            shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason,
+4480|            targetCount: 0,
+4481|          }, undefined, 'trigger');
+4482|          this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason });
+4483|          this._emitJudgement(shopCfg, { data, over: true, status: 'window_blocked', reason });
+4484|          return { status: 'window_blocked', reason };
+4485|        }
+4486|      }
+4487|
+4488|      // 5) 本轮回读 currentAdState（清单身份/完整性失败 → blocked，不得包成 ok）
+4489|      const stateRead = await this._readCurrentAdState(shopCfg);
+4490|      this._applyBalanceToLastData(candidate, stateRead);
+4491|      if (stateRead.error) {
+4492|        const err = stateRead.error;
+4493|        // 失败/unknown：新错误覆盖旧因，撤销旧 on 证据；只读观测不得伪称动作确认。
+4494|        this._applyReadFailure(shopCfg.id, err);
+4495|        // 本轮没有可信决策 → 不保留上一轮的 ROI 提示（避免陈旧警告）
+4496|        candidate.roiTooLow = false;
+4497|        candidate.pauseEligible = false;
+4498|        // 竞态修正：带余额终态的本轮读数先原子提交，再返回 blocked。
+4499|        this._commitShopLastData(rt, candidate);
+4500|        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: err.reason }, undefined, 'error');
+4501|        this._emitJudgement(shopCfg, { data, over: data.evaluation.over === true, status: 'blocked', reason: err.reason, currentAdState: stateRead.state });
+4502|        this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: err.reason, blocked: err.blocked, zeroClick: true });
+4503|        // 状态回读失败发生在任何开关之前：blocked + 原因 + zeroClick；不伪造成 already_* / 成功
+4504|        return {
+4505|          status: 'blocked',
+4506|          reason: err.reason,
+4507|          blocked: err.blocked || 'ad_state_read',
+4508|          zeroClick: true,
+4509|          decision: DECISION.UNKNOWN_BLOCKED,
+4510|          currentAdState: stateRead.state || 'unknown',
+4511|        };
+4512|      }
+4513|      const currentAdState = stateRead.state;
+4514|      this._clearReadFailure(shopCfg.id);
+4515|      this._applyObservedAdState(shopCfg.id, currentAdState, '只读清单/页面回读');
+4516|      // 竞态修正：余额终态已写入 candidate，此刻一次性原子提交为本轮可见读数。
+4517|      this._commitShopLastData(rt, candidate);
+4518|      const thresholdCents = this._thresholdCents(shopCfg);
+4519|      const decision = this._switchOrchestrator.evaluatePeriodic({
+4520|        costCents: data.cost.valueCents,
+4521|        orders: data.orders.valueCount,
+4522|        thresholdCents,
+4523|        currentAdState,
+4524|        identityOk: true,
+4525|      });
+4526|      // 同店同日有效判定 → 页面/日志的 ROI 提示投影（不由 UI 重算；消耗门槛已取消）
+4527|      rt.lastData.spendFloorCents = SPEND_FLOOR_CENTS;
+4528|      rt.lastData.spendProtected = decision.spendProtected === true;
+4529|      rt.lastData.pauseEligible = decision.pauseEligible === true;
+4530|      rt.lastData.roiTooLow = decision.roiTooLow === true;
+4531|      // 最近一次决策（供 getStatus/mixed 收敛视图如实区分「有修复安排」与「合法零动作」）。
+4532|      rt.lastDecision = {
+4533|        decision: decision.decision,
+4534|        metric: decision.metric,
+4535|        action: decision.action,
+4536|        targetState: decision.targetState,
+4537|        at: new Date(this.nowFn()).toISOString(),
+4538|      };
+4539|
+4540|      // 等于阈值保持：合法零动作，本轮没有任何收敛动作被安排。
+```
+
+
+### FILE excerpt-getStatus-balance-fields.txt
+```
+5570|        const rt = (this._runtimeMap && this._runtimeMap.get(s.id)) || {};
+5571|        const t = rt.lastData || null;
+5572|        const mr = this._mixedReconcileView(s.id);
+5573|        return {
+5574|          id: s.id,
+5575|          name: s.name || s.id,
+5576|          displayName: s.displayName || s.name || s.id,
+5577|          adState: rt.lastAdState || 'unknown',
+5578|          adStateConfirmedAt: rt.adStateConfirmedAt || null,
+5579|          adStateObservedAt: rt.adStateObservedAt || null,
+5580|          adStateEvidenceKind: rt.adStateEvidenceKind || null,
+5581|          // mixed 非完成态：主控制页直接消费（待收敛/重新判定/重试中；on/off 才视为已收敛）
+5582|          mixedReconcile: {
+5583|            state: mr.reconcileState,
+5584|            text: mr.reconcileText,
+5585|            mixedIsCompletion: false,
+5586|            unknownBlock: mr.unknownBlock,
+5587|          },
+5588|          lastDataAt: rt.lastDataAt || (t && t.fetchedAt) || null,
+5589|          costCents: t && t.costCents != null ? t.costCents : null,
+5590|          costText: t ? t.costText : null,
+5591|          orders: t && t.orders != null ? t.orders : null,
+5592|          // 千川可用余额（2026-09-27，账户级只读展示字段；null=本轮未读到，界面显示"未知"）
+5593|          balanceCents: t && t.balanceCents != null ? t.balanceCents : null,
+5594|          balanceAt: t && t.balanceAt ? t.balanceAt : null,
+5595|          // 余额终态（2026-10-31 竞态修正）：ok/error/missing/skipped + 非 ok 具体原因
+5596|          balanceStatus: (t && t.balanceStatus) || null,
+5597|          balanceReason: (t && t.balanceStatus && t.balanceStatus !== 'ok') ? t.balanceReason || null : null,
+5598|          // 本轮刷新在途（candidate 未提交）：界面可显示"刷新中"，而非把陈旧读数当新读数
+5599|          refreshing: rt.dataRefreshing === true || (t && t.refreshing === true),
+5600|          thresholdCents: this._thresholdCents(s),
+5601|          over: t ? t.over === true : null,
+5602|          // 同店同日 ROI 提示投影（t.businessDate 必须等于今日；消耗门槛已取消）
+5603|          spendFloorCents: SPEND_FLOOR_CENTS,
+5604|          spendProtected: (t && t.businessDate === today) ? t.spendProtected === true : null,
+5605|          pauseEligible: (t && t.businessDate === today) ? t.pauseEligible === true : false,
+5606|          roiTooLow: !!(t && t.businessDate === today && t.roiTooLow === true),
+5607|          lastError: rt.lastError || (t && t.blockedReason) || null,
+5608|          readRecovery: this._readRecoveryView(s.id),
+5609|          // 状态供界面兼容；正常配置店铺不显示待核验标记。
+5610|          identityPending: this._shopIdentityState(s).pending,
+5611|          identityNote: this._shopIdentityState(s).reason,
+5612|          // D56：有效启用状态等价于"未删除"，避免把历史 enabled=false 的正常店误示为未启用。
+5613|          enabled: s.deleted !== true,
+5614|          platform: s.platform || 'douyin',
+5615|        };
+5616|      }),
+5617|      rules: this.config.rules || [],
+5618|      // 事件流（2026-09-15 修复第 1 项）：附带单调序号，供消费方可靠增量。
+5619|      evtSeq: this._evtSeq || 0,
+5620|      cycleNo: this.cycleNo || 0,
+```
+
+
+### FILE excerpt-applyBalance-rt-suspicious.txt
+```
+2680|    if (!rec || rec.cancelled) return;
+2681|    const view = this._readRecoveryView(rec.shopId);
+2682|    if (!view) return;
+2683|    const reason = error ? String(error.reason || '读取失败') : (rec.lastReason || '读取失败');
+2684|    const rt = this._runtime(rec.shopId);
+2685|    rt.lastReadError = {
+2686|      kind: 'retrying',
+2687|      reason,
+2688|      blocked: (error && error.blocked) || rec.lastBlocked || 'ad_state_read',
+2689|      retrying: true,
+2690|      retried: true,
+2691|      retryCount: rec.attempts,
+2692|      recovery: view,
+2693|      at: new Date(this.nowFn()).toISOString(),
+2694|    };
+2695|    rt.lastError = reason;
+2696|    if (rt.lastData) rt.lastData.blockedReason = reason;
+2697|    this._applyObservedAdState(rec.shopId, 'unknown', `有限恢复重试（${rec.attempts}/${READ_RECOVERY_MAX_RETRIES}）`);
+2698|  }
+2699|
+2700|  _applyReadRecoverySuccess(shopCfg, result, rec) {
+2701|    const shopId = String(shopCfg.id);
+2702|    const rt = this._runtime(shopId);
+2703|    const state = (result && result.state) || 'unknown';
+2704|    this._audit({
+2705|      kind: 'ad-state-read', shopId, event: 'recovery-success',
+2706|      attempts: rec ? rec.attempts : 0, state,
+2707|    });
+2708|    this._clearReadFailure(shopId); // 同时清旧错误/旧阻断原因/旧恢复链
+2709|    this._applyObservedAdState(shopId, state, `有限恢复重试成功（第${rec ? rec.attempts : 0}次，只读回读）`);
+2710|    if (result && result.balance !== undefined) this._applyBalanceToLastData(rt, result);
+2711|    rt.lastDataAt = new Date(this.nowFn()).toISOString();
+2712|    this._clearReadRecovery(shopId, 'recovery-success');
+2713|  }
+2714|
+2715|  _markReadRecoveryExhausted(rec, reason) {
+2716|    if (!rec) return;
+2717|    rec.phase = 'exhausted';
+2718|    rec.nextAt = null;
+2719|    if (rec.timer) {
+2720|      try { this._clearTimeoutFn(rec.timer); } catch (_) { /* 清理失败不影响 */ }
+2721|      rec.timer = null;
+2722|    }
+2723|    rec.lastReason = String(reason || rec.lastReason || '读取失败');
+2724|    const rt = this._runtime(rec.shopId);
+2725|    const view = this._readRecoveryView(rec.shopId);
+2726|    rt.lastReadError = {
+2727|      kind: 'read_failed',
+2728|      reason: rec.lastReason,
+2729|      blocked: rec.lastBlocked || 'ad_state_read',
+2730|      retrying: false,
+2731|      retried: true,
+2732|      retryCount: rec.attempts,
+2733|      recovery: view,
+2734|      at: new Date(this.nowFn()).toISOString(),
+2735|    };
+2736|    rt.lastError = rec.lastReason;
+2737|    if (rt.lastData) rt.lastData.blockedReason = rec.lastReason;
+2738|    this._audit({ kind: 'ad-state-read', shopId: rec.shopId, event: 'recovery-exhausted', attempts: rec.attempts, maxRetries: READ_RECOVERY_MAX_RETRIES, reason: rec.lastReason });
+2739|  }
+2740|
+```
+
+
+### FILE excerpt-summarizeData-def.txt
+```
+5250|      return { status: 'window_blocked', reason };
+5251|    }
+5252|    this.schedule.lastWindowBlockReason = null;
+5253|
+5254|    const todayStatus = new Map(); // 批次内结果累积（跨批次状态以最新清单读取为准）
+5255|    const batch = await coord.executeWholeShopCloseBatch({ shopCfg, cycleToken, todayStatus, trigger: { reason: data.evaluation.reason } });
+5256|    batch.actionType = batch.actionType || 'pause';
+5257|    this._recordBatch(shopCfg.id, batch);
+5258|    this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) }, undefined, 'batch');
+5259|    this._audit({ kind: 'action', shopId: shopCfg.id, ...this._summarizeBatch(batch) });
+5260|    return { status: 'ok', over: true, batch: this._summarizeBatch(batch) };
+5261|  }
+5262|
+5263|  _summarizeData(data) {
+5264|    if (data.ok === false) {
+5265|      return {
+5266|        businessDate: data.cost && data.cost.businessDate,
+5267|        costCents: data.cost && data.cost.valueCents,
+5268|        costText: data.cost && data.cost.valueCents !== undefined && data.cost.valueCents !== null ? `${centsToYuan(data.cost.valueCents)} 元` : null,
+5269|        rawCostText: data.cost && data.cost.rawText,
+5270|        orders: data.orders && data.orders.valueCount,
+5271|        source: (data.cost && data.cost.source) || null,
+5272|        fetchedAt: data.cost && data.cost.fetchedAt,
+5273|        pageUpdatedAt: (data.cost && data.cost.pageUpdatedAt) || (data.orders && data.orders.pageUpdatedAt) || null,
+5274|        perOrderText: '—',
+5275|        over: false,
+5276|      };
+5277|    }
+5278|    return {
+5279|      businessDate: data.cost.businessDate,
+5280|      costCents: data.cost.valueCents,
+```
+
+
+### FILE diff-nested-watch-drill.patch
+```
+diff --git a/integrations/bill-manager/watch-drill.js b/integrations/bill-manager/watch-drill.js
+index b5f5cda..2a60707 100644
+--- a/integrations/bill-manager/watch-drill.js
++++ b/integrations/bill-manager/watch-drill.js
+@@ -4,7 +4,7 @@
+  * 推广值守 —— 3443 电商助手「推广值守」Tab 的后端调度服务（2026-09-15 接入真实操作模式）。
+  *
+  * 用户规则（唯一目标）：
+- *   1) 每天 07:00 开启全部乘方计划（全店托管 + 商品自选，含昨日暂停的全部计划）；
++ *   1) 每天 00:05 后检查当天是否暂停，暂停才作为当天首次开启（全店托管 + 商品自选，含昨日暂停的全部计划）；已开启零点击记完成；00:00–00:04:59 不强制开启；
+  *   2) 08:00 后每 30 分钟检查：当天「账户整体消耗」÷ 当天「全店订单数」**严格超过** 1 元/单
+  *      （整数分判定：费用分 > 订单数×100，恰好相等不暂停）时暂停乘方；
+  *   3) 绝不删除广告；
+@@ -22,7 +22,7 @@
+  *   本模块**不提供**任何绕过这些门槛的入口。
+  * - 调度在 3443 进程内（Monitor 的 `_intervalLoop`，setTimeout 链），不依赖浏览器 Tab；
+  *   刷新/切换 Tab/关闭页面既不重复启动也不停止后台值守；多页面观察同一实例。
+- * - 重启语义：服务重启后默认未启动（页面如实显示）；日志有界持久化到 JSONL。
++ * - 重启语义（2026-10-09 客户要求）：服务启动时 watchDrill.boot() 自动启动推广值守一次（幂等；本次运行中人工停止后页面重开不恢复，下一次服务启动再次自动启动）；日志有界持久化到 JSONL。
+  * - 日志安全：绝不记录 Cookie/令牌/敏感请求参数；统一 scrubbing；单行上限 2000 字符。
+  */
+ 
+@@ -135,18 +135,26 @@ function deriveAdState(status, shop) {
+     }
+   }
+   if (shop && shop.lastAdState) {
+-    const map = { on: { on: true, note: '开启' }, off: { on: false, note: '暂停' }, mixed: { on: null, note: '混合' }, unknown: { on: null, note: '未知' } };
++    // mixed 只作过渡观测，不是完成态：界面文案必须带待收敛/重新判定/重试中，不得显示为一次成功
++    const map = { on: { on: true, note: '开启' }, off: { on: false, note: '暂停' }, mixed: { on: null, note: '混合（待收敛，非完成态）' }, unknown: { on: null, note: '未知' } };
+     const m = map[shop.lastAdState] || map.unknown;
+     // 展示时间必须与当前状态同源且仅有状态证据：只读观测优先，其次动作确认。
+     // 无 adStateObservedAt / adStateConfirmedAt 时 at=null；不得用费用/订单采集时间（lastDataAt）冒充。
+     const at = shop.adStateObservedAt || shop.adStateConfirmedAt || null;
+     const evidenceKind = shop.adStateObservedAt ? 'read_only'
+       : (shop.adStateConfirmedAt ? 'action_confirm' : null);
++    const rec = shop.mixedReconcile || null;
+     return {
+       on: m.on,
+       at,
+-      note: m.note,
++      note: rec && rec.reconcileText && shop.lastAdState === 'mixed'
++        ? `混合（${rec.reconcileText}，非完成态）` : m.note,
+       state: shop.lastAdState,
++      // mixed 永不作为完成态；完成只认 on/off 且由全量回读确认
++      isCompletion: shop.lastAdState === 'on' || shop.lastAdState === 'off',
++      reconcileState: rec ? rec.reconcileState : null,
++      reconcileText: rec ? rec.reconcileText : null,
++      unknownBlock: rec ? rec.unknownBlock === true : false,
+       confirmedAt: shop.adStateConfirmedAt || null,
+       observedAt: shop.adStateObservedAt || null,
+       evidenceKind,
+@@ -187,6 +195,11 @@ function buildShopRows(status) {
+         // 千川可用余额（2026-09-27，账户级只读展示字段；null=本轮未读到，界面显示"未知"）
+         balanceCents: s.today && s.today.balanceCents != null ? s.today.balanceCents : null,
+         balanceAt: s.today && s.today.balanceAt ? s.today.balanceAt : null,
++        // 余额终态与在途刷新（2026-10-31 竞态修正）：透传引擎字段，界面区分
++        // ok/error/missing/skipped 与「本轮刷新中」，不再把陈旧/半成品读数当新读数。
++        balanceStatus: s.today && s.today.balanceStatus ? s.today.balanceStatus : null,
++        balanceReason: s.today && s.today.balanceReason ? scrub(String(s.today.balanceReason)) : null,
++        refreshing: s.today && s.today.refreshing === true,
+         thresholdCents: s.thresholdCents != null ? s.thresholdCents : null,
+         // 账户身份状态（2026-09-25 阶段 6）：界面据此显示"待身份核验/已阻止"
+         identityPending: s.identityPending === true,
+@@ -369,14 +382,18 @@ function createWatchDrill(opts = {}) {
+       head = '状态未知';
+       line = `当前广告状态 unknown → 零动作（fail-closed）${safeReason ? `；${safeReason}` : ''}`;
+     } else if (serial === 'unknown' || outcome === 'partial') {
+-      head = '回读未确认';
+-      line = `动作可能已发出但回读未确认 → 保持阻塞，禁止补点${actionWord ? `；目标动作=${actionWord}` : ''}${safeReason ? `；${safeReason}` : ''}`;
++      head = mixed ? '重新判定' : '回读未确认';
++      line = `动作可能已发出但回读未确认 → 保持阻塞，禁止补点${mixed ? '；本轮回读 mixed（非完成态）：用新鲜费用/订单/阈值重判后仅对侧修复一次' : ''}${actionWord ? `；目标动作=${actionWord}` : ''}${safeReason ? `；${safeReason}` : ''}`;
++    } else if (mixed && (j.status === 'pending' || j.pending === true)) {
++      // mixed 不是完成态，也不是成功：待收敛（等待下一次可信回读 + 重判/收敛动作）
++      head = '待收敛';
++      line = `当前 mixed 只是过渡观测（非完成态）→ 标待处理，零动作：须用本轮新鲜费用/订单/阈值重判后按对侧或统一暂停收敛，不把 mixed 报成本轮成功${safeReason ? `；${safeReason}` : ''}`;
+     } else if (dec === 'equal_no_action') {
+       head = '保持';
+       const cmp = (Number.isSafeInteger(j.costCents) && Number.isSafeInteger(j.orders) && Number.isSafeInteger(j.thresholdCents))
+         ? `${j.costCents} 分 = ${j.orders}×${j.thresholdCents} 分`
+         : null;
+-      line = `${cmp ? `整数分判定 ${cmp}` : '等于阈值'} → 保持当前状态，零动作${mixed ? '（mixed 只保持，不单侧操作）' : ''}${safeReason ? `；${safeReason}` : ''}`;
++      line = `${cmp ? `整数分判定 ${cmp}` : '等于阈值'} → 保持当前状态，零动作${safeReason ? `；${safeReason}` : ''}`;
+     } else if (dec === 'already_on') {
+       head = '已开启';
+       line = `当前已开启 → 零点击（already_on）${safeReason ? `；${safeReason}` : ''}`;
+@@ -388,13 +405,18 @@ function createWatchDrill(opts = {}) {
+       const cmp = (Number.isSafeInteger(j.costCents) && Number.isSafeInteger(j.orders) && Number.isSafeInteger(j.thresholdCents))
+         ? `${j.costCents} 分 < ${j.orders}×${j.thresholdCents} 分`
+         : null;
+-      line = `${cmp ? `整数分判定 ${cmp}；` : ''}${mixed ? 'mixed：只开启暂停项（对侧）' : '低于阈值'} → ${dry ? '演练枚举将开启' : '触发开启'}${safeReason ? `；${safeReason}` : ''}`;
++      line = `${cmp ? `整数分判定 ${cmp}；` : ''}${mixed ? 'mixed：只开启暂停项（对侧；mixed 非完成态，须全量回读确认才算收敛）' : '低于阈值'} → ${dry ? '演练枚举将开启' : '触发开启'}${safeReason ? `；${safeReason}` : ''}`;
+     } else if (dec === 'should_pause') {
+       head = dry ? '将暂停（演练）' : '将暂停';
+       const cmp = (Number.isSafeInteger(j.costCents) && Number.isSafeInteger(j.orders) && Number.isSafeInteger(j.thresholdCents))
+         ? `${j.costCents} 分 > ${j.orders}×${j.thresholdCents} 分`
+         : null;
+-      line = `${cmp ? `整数分判定 ${cmp}；` : ''}${mixed ? 'mixed：只暂停开启项（对侧）' : '高于阈值'} → ${dry ? '演练枚举将暂停' : '触发暂停'}${safeReason ? `；${safeReason}` : ''}`;
++      const mixedNote = mixed
++        ? (j.metric === 'equal'
++          ? 'mixed：等于阈值按「统一暂停」收敛 off，仅点击仍开启的项（mixed 非完成态，须全量回读确认才算收敛）'
++          : 'mixed：只暂停开启项（对侧；mixed 非完成态，须全量回读确认才算收敛）')
++        : '高于阈值';
++      line = `${cmp ? `整数分判定 ${cmp}；` : ''}${mixedNote} → ${dry ? '演练枚举将暂停' : '触发暂停'}${safeReason ? `；${safeReason}` : ''}`;
+     } else if (j.status === 'blocked') {
+       head = '本轮被拦下';
+       line = `本轮被拦下；原因：${safeReason || '未知'}`;
+@@ -479,6 +501,10 @@ function createWatchDrill(opts = {}) {
+     const cfg = (m && m.config) || drill._config || {};
+     const cf = (cfg.monitor && cfg.monitor.chengfang) || {};
+     const exec = cfg.execution || {};
++    // 2026-10-09：首查时刻（firstCheckMinuteOfDay，默认 5=00:05），与核心 chengfang-gate 同源口径。
++    const _fcm = (Number.isInteger(cf.firstCheckMinuteOfDay) && cf.firstCheckMinuteOfDay >= 0 && cf.firstCheckMinuteOfDay <= 1439) ? cf.firstCheckMinuteOfDay : 5;
++    const _fct = String(Math.floor(_fcm / 60)).padStart(2, '0') + ':' + String(_fcm % 60).padStart(2, '0');
++
+ 
+     // 2026-09-15 修复第 2 项（第二轮）：复用**与执行器完全一致**的许可判断。
+     // 旧行为：`pauseWillExecute = realMode && pauseEnabled` —— 只看 realMode 与开关，
+@@ -538,7 +564,10 @@ function createWatchDrill(opts = {}) {
+         ? '待核实（配置缺少 execution.realMode，不得据此认为安全）'
+         : (realMode ? '真实执行' : '演练模式（不操作广告）'),
+       scope: Array.isArray(cf.scope) ? cf.scope.slice() : [],
+-      enableHour: Number.isInteger(cf.enableHour) ? cf.enableHour : 7,
++      // 2026-10-09 取消 enableHour/07:00 固定开启；改 firstCheckMinuteOfDay（默认 5=00:05）。
++      firstCheckMinuteOfDay: _fcm,
++      firstCheckTime: _fct,
++      enableHour: cf.enableHour, // [废弃] 仅供兼容展示；调度与门槛不再读取
+       enableSchedulerEnabled: cf.enableSchedulerEnabled === true,
+       dailyStartHour: (cfg.schedule && cfg.schedule.dailyStartHour) || 8,
+       intervalMinutes: (cfg.schedule && cfg.schedule.intervalMinutes) || 30,
+@@ -582,7 +611,7 @@ function createWatchDrill(opts = {}) {
+     if (!m || typeof m.getStatus !== 'function') return null;
+     const ms = m.getStatus().monitor || {};
+     return ms.enableScheduler
+-      ? { ...ms.enableScheduler, enableHour: ms.enableHour, dailyStartHour: ms.dailyStartHour }
++      ? { ...ms.enableScheduler, firstCheckMinuteOfDay: ms.firstCheckMinuteOfDay, firstCheckTime: ms.firstCheckTime, dailyStartHour: ms.dailyStartHour }
+       : null;
+   }
+ 
+@@ -878,7 +907,7 @@ function createWatchDrill(opts = {}) {
+       // 1) 调度相位 / 下次执行 / 今日开启相位
+       // 独立每日开启任务状态（与 running=暂停值守 完全分离，界面分别展示）
+       st.enableTask = status.monitor.enableScheduler
+-        ? { ...status.monitor.enableScheduler, enableHour: status.monitor.enableHour, dailyStartHour: status.monitor.dailyStartHour }
++        ? { ...status.monitor.enableScheduler, firstCheckMinuteOfDay: status.monitor.firstCheckMinuteOfDay, firstCheckTime: status.monitor.firstCheckTime, dailyStartHour: status.monitor.dailyStartHour }
+         : null;
+       st.phase = status.monitor.phase;
+       st.nextRunAt = status.monitor.nextRunAt;
+@@ -1111,9 +1140,12 @@ function createWatchDrill(opts = {}) {
+ 
+   // ── 对外操作 ─────────────────────────────────────────────────────────────
+   /**
+-   * 服务启动装配（2026-09-15 上线）：3443 进程启动即调用，不依赖任何页面访问。
+-   * - 装配 Monitor（只读装配，不启动暂停巡查/值守）；
+-   * - 按配置自动登记独立每日开启任务（重启自动恢复；用户独立停用除外）；
++   * 服务启动装配（2026-09-15 上线；2026-10-09 客户要求改为自动启动值守）：
++   * 3443 进程启动即调用，不依赖任何页面访问。
++   * - 装配 Monitor（只读装配）；
++   * - 按配置自动登记独立每日首次开启检查任务（重启自动恢复；用户独立停用除外）；
++   * - **按客户要求自动启动推广值守一次**（幂等；本次运行中人工停止后页面重开不恢复；
++   *   下一次服务启动再次自动启动）；
+    * - 启动后台周期同步：无人打开页面也持续转译事件流并落盘值守日志。
+    */
+   function boot() {
+@@ -1128,17 +1160,26 @@ function createWatchDrill(opts = {}) {
+     if (m.enableSchedulerShouldRun()) {
+       const r = m.startEnableScheduler({ reason: '服务启动自动恢复' });
+       if (r && r.ok === false) {
+-        pushLog('warn', `每日开启任务登记失败：${r.reason}`);
++        pushLog('warn', `每日首次开启检查任务登记失败：${r.reason}`);
+       } else {
+         const t = (drill.state.enableTask = syncEnableTask()) || {};
+-        pushLog('info', `独立每日开启任务已登记：每日 ${String(t.enableHour).padStart(2, '0')}:00（上海）自动开启全部乘方计划（含人工暂停的）；`
+-          + `下次开启 ${t.nextRunAt || '—'}；与"启动值守"相互独立（停止值守不取消本任务）。`);
++        pushLog('info', `独立每日首次开启检查任务已登记：每日 ${t.firstCheckTime || '00:05'}（上海）后检查当天是否暂停，暂停才作为当天首次开启；`
++          + `下次 ${t.nextRunAt || '—'}；与"启动值守"相互独立（停止值守不取消本任务）。`);
+       }
+     } else {
+       const cf = (m.config.monitor && m.config.monitor.chengfang) || {};
+       pushLog('info', cf.enableSchedulerEnabled === true
+-        ? '每日开启任务保持"用户独立停用"状态（服务重启不自动恢复，可在页面手动恢复）'
+-        : '独立每日开启任务未启用（monitor.chengfang.enableSchedulerEnabled=false）');
++        ? '每日首次开启检查任务保持"用户独立停用"状态（服务重启不自动恢复，可在页面手动恢复）'
++        : '独立每日首次开启检查任务未启用（monitor.chengfang.enableSchedulerEnabled=false）');
++    }
++    // 客户目标（2026-10-09 AD-AUTOSTART）：推广值守随主服务启动自动启动一次（幂等；
++    // 本次运行中人工停止后页面重开不恢复；下一次服务启动再次自动启动）。
++    // - 隔离逃逸：opts.autostartOnBoot === false 时不自动启动（仅供不希望 _intervalLoop
++    //   干扰单店派发计数的隔离测试使用；生产服务启动不传该 opt，默认自动启动）。
++    try { refreshGates(); } catch (_) { /* 门槛快照失败不阻塞自动启动 */ }
++    if (opts.autostartOnBoot !== false) {
++      pushLog('info', '服务启动自动启动推广值守（客户 2026-10-09 要求）；页面打开/关闭/刷新只读，不改变后台值守状态');
++      start();
+     }
+     if (!drill._syncTimer) {
+       drill._syncTimer = setInterval(() => { try { syncFromMonitor(); } catch (_) { /* 后台同步失败不影响运行 */ } }, 60 * 1000);
+@@ -1206,7 +1247,7 @@ function createWatchDrill(opts = {}) {
+       const g = st.gates || {};
+       pushLog('info',
+         `值守启动 · 店铺 ${(drill.shops || []).map((s) => (s.platform === 'pinduoduo' ? '拼多多/' : '抖店/') + s.name).join('，') || drill.shopName} · 模式：${monitor.modeLabel}；`
+-        + `每日 ${String(g.enableHour).padStart(2, '0')}:00 开启乘方，${String(g.dailyStartHour).padStart(2, '0')}:00 后每 ${g.intervalMinutes} 分钟检查；`
++        + `每日 ${g.firstCheckTime || '00:05'} 后首查（暂停才作为当天首次开启，已开启零点击记完成），${String(g.dailyStartHour).padStart(2, '0')}:00 后每 ${g.intervalMinutes} 分钟费比检查；`
+         + `规则：当天费用÷当天全店订单 严格超过 1 元/单（整数分 >）即暂停乘方；绝不删除广告。`);
+     }
+     syncFromMonitor();
+@@ -1261,7 +1302,8 @@ function createWatchDrill(opts = {}) {
+             running: false, configEnabled: cf.enableSchedulerEnabled === true,
+             stoppedByUser: null, phase: null, nextRunAt: null, lastRunAt: null,
+             lastMissedReason: null,
+-            enableHour: gates.enableHour, dailyStartHour: gates.dailyStartHour,
++            firstCheckMinuteOfDay: gates.firstCheckMinuteOfDay, firstCheckTime: gates.firstCheckTime,
++            dailyStartHour: gates.dailyStartHour,
+           };
+         }
+       } catch (_) { /* 读配置失败：保留 null/未知，不臆断 */ }
+
+```
+
+
+### FILE diff-parent-watch-drill.patch
+```
+diff --git a/bill-manager/watch-drill.js b/bill-manager/watch-drill.js
+index 6381323..906a5a2 100644
+--- a/bill-manager/watch-drill.js
++++ b/bill-manager/watch-drill.js
+@@ -400,6 +400,10 @@ function buildShopRows(status) {
+         // 千川可用余额（2026-09-27，账户级只读展示字段；null=本轮未读到，界面显示"未知"）
+         balanceCents: s.today && s.today.balanceCents != null ? s.today.balanceCents : null,
+         balanceAt: s.today && s.today.balanceAt ? s.today.balanceAt : null,
++        // 余额终态/在途标记（2026-10-31 竞态修正透传；缺省不破坏旧断言）
++        balanceStatus: s.today && s.today.balanceStatus ? s.today.balanceStatus : null,
++        balanceReason: s.today && s.today.balanceReason ? scrub(String(s.today.balanceReason)) : null,
++        refreshing: !!(s.today && s.today.refreshing === true) || s.dataRefreshing === true,
+         thresholdCents: s.thresholdCents != null ? s.thresholdCents : null,
+         // 50 元保护/ROI 提示（仅同店同日有效；bool 来自 Monitor 判定投影）
+         spendFloorCents: s.spendFloorCents != null ? s.spendFloorCents : SPEND_FLOOR_CENTS,
+@@ -413,11 +417,6 @@ function buildShopRows(status) {
+         identityNote: s.identityNote ? scrub(String(s.identityNote)) : null,
+         // 展示结构一律递归脱敏（today.blockedReason / today.reason / lastError / batchToday…）
+         lastError: s.lastError ? scrub(String(s.lastError)) : null,
+-        // 结构化读取失败投影（2026-10-31）：页面 errCn 据此显示三态文案，不得伪装成"已开启"
+-        readErrorKind: s.readErrorKind || (s.lastReadError && s.lastReadError.kind) || null,
+-        readErrorReason: s.readErrorReason
+-          ? scrub(String(s.readErrorReason))
+-          : (s.lastReadError && s.lastReadError.reason ? scrub(String(s.lastReadError.reason)) : null),
+         today: s.today ? scrubDeep(s.today) : null,
+         batchToday: s.batchToday ? scrubDeep(s.batchToday) : null,
+       };
+
+```
+
+
+### FILTERED monitor patch hits
+```
++   * 余额（2026-09-27，账户级只读展示字段）写入 target（可为未提交的 candidate）：
++   * 本轮读取失败/缺失 → balanceCents=null（界面显示"未知"），不沿用旧值伪装成本轮新读数；
++   * 终态三字段：balanceStatus='ok'|'error'|'missing'|'skipped'，balanceReason 仅非 ok 时有值。
+    * 绝不进入费用/订单/阈值/开关判定与通知判断。
+    */
+-  _applyBalanceToLastData(rt, stateRead) {
++  _applyBalanceToLastData(target, stateRead) {
++    if (!target) return;
+     const bal = stateRead && stateRead.balance ? stateRead.balance : null;
++      target.balanceCents = bal.balanceCents;
++      target.balanceAt = bal.balanceAt || null;
++      target.balanceStatus = 'ok';
++      target.balanceReason = null;
++    } else if (bal && bal.reason) {
++      target.balanceCents = null;
++      target.balanceStatus = 'error';
++      target.balanceReason = String(bal.reason);
++    } else {
++      target.balanceAt = bal.balanceAt || null;
++      target.balanceAt = bal && bal.balanceAt ? bal.balanceAt : null;
++      target.balanceStatus = 'missing';
++      target.balanceReason = '本轮未返回余额读数';
++    }
++  }
++
++  // 在途可见性（2026-10-31 竞态修正）：本轮 candidate 组装期间只置 refreshing 标记，
++  // 绝不把半成品（无余额终态的新读数）提前提交为 rt.lastData。
++  _markShopDataRefreshing(rt) {
++    rt.dataRefreshing = true;
++    if (rt.lastData && typeof rt.lastData === 'object') rt.lastData.refreshing = true;
++  }
++
++  // 原子提交：整轮读数（含余额终态）组装完成后一次性替换 lastData 并清除在途标记。
++  _commitShopLastData(rt, candidate) {
++    candidate.refreshing = false;
++    rt.lastData = candidate;
++    rt.lastDataAt = new Date(this.nowFn()).toISOString();
++    rt.dataRefreshing = false;
++  }
++
++  // 早退路径（门禁/窗口/读取失败，未回读广告状态）：candidate 先写余额终态 skipped，
++  // 避免提交后 UI 把缺失读数和未读混淆；再原子提交。
++  _commitShopLastDataSkippedBalance(rt, candidate, reason) {
++    candidate.balanceCents = null;
++    candidate.balanceStatus = 'skipped';
++    candidate.balanceReason = reason;
++    candidate.balanceAt = null;
++    this._commitShopLastData(rt, candidate);
+   }
+ 
+-      rt.lastDataAt = new Date(this.nowFn()).toISOString();
++      // 竞态修正（2026-10-31）：本轮读数先组装为 candidate，_readCurrentAdState（含余额）
++      // 完成并把余额终态写入 candidate 后才原子提交为 rt.lastData；在途仅 refreshing 标记。
++      const candidate = this._summarizeData(data);
++      if (data.ok !== false && data.evaluation) {
++        candidate.spendFloorCents = SPEND_FLOOR_CENTS;
++        candidate.roiTooLow = data.evaluation.roiTooLow === true;
++      }
++      this._markShopDataRefreshing(rt);
+       // 只读回读广告状态（on/off/mixed/unknown）；失败 → unknown + blocked 说明
+       const stateRead = await this._readCurrentAdState(shopCfg);
+-      this._applyBalanceToLastData(rt, stateRead);
+-      // 只读观测更新状态；失败/unknown 也不得保留旧动作确认时间去配对新状态
+-      this._applyObservedAdState(shopCfg.id, stateRead.state || 'unknown', stateRead.error
+-        ? `只读回读失败：${stateRead.error.reason || 'unknown'}`
+-        : '只读清单/页面回读');
++      this._applyBalanceToLastData(candidate, stateRead);
+       if (stateRead.error) {
+-        rt.lastData.blockedReason = stateRead.error.reason;
++        if (data.blocked === 'orders_unavailable') candidate.blockedReason = data.reason;
++        // 竞态修正：先提交带余额终态的本轮读数，再返回，UI 不再看到陈旧/半成品混合。
++        this._commitShopLastData(rt, candidate);
+         return {
+-          ok: true,
++      // 只读观测更新状态；失败/unknown 也不得保留旧动作确认时间去配对新状态
++      this._applyObservedAdState(shopCfg.id, stateRead.state || 'unknown', '只读清单/页面回读');
++      this._commitShopLastData(rt, candidate);
+       if (data.ok === false) {
+         rt.lastData.blockedReason = data.reason;
+       return { ok: false, reason, zeroClick: true };
++    } finally {
++      // 异常/早退不得把 refreshing 卡在 true（candidate 未提交则维持上一轮已提交读数）。
++      rt.dataRefreshing = false;
++      if (rt.lastData && typeof rt.lastData === "object") rt.lastData.refreshing = false;
++      this._releaseShop(shopId);
+     }
++    this._clearReadFailure(shopId); // 同时清旧错误/旧阻断原因/旧恢复链
++    this._applyObservedAdState(shopId, state, `有限恢复重试成功（第${rec ? rec.attempts : 0}次，只读回读）`);
++    if (result && result.balance !== undefined) this._applyBalanceToLastData(rt, result);
++    rt.lastDataAt = new Date(this.nowFn()).toISOString();
++    this._clearReadRecovery(shopId, 'recovery-success');
++      // 竞态修正（2026-10-31）：本轮读数组装为 candidate；_readCurrentAdState 之前绝不提交
++      // rt.lastData，避免在途出现「新费用 + balanceCents=null（未写终态）」的半成品视图。
++      const candidate = this._summarizeData(data);
++      this._markShopDataRefreshing(rt);
++
++      // 有效同日费用/订单的规则评估先投影兼容字段；后续决策以同值覆盖（仍在 candidate 上）。
+-        rt.lastData.blockedReason = data.reason;
++        candidate.blockedReason = data.reason;
++        this._commitShopLastDataSkippedBalance(rt, candidate, '本轮数据读取失败，未读取千川余额');
+         this._emitJudgement(shopCfg, { data, over: null, status: 'blocked', reason: data.reason });
+         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: data.reason, blocked: data.blocked });
+-        rt.lastData.blockedReason = scopeBlockedReason;
++        candidate.blockedReason = scopeBlockedReason;
++        this._commitShopLastDataSkippedBalance(rt, candidate, '控制范围门禁未通过，未读取千川余额');
+         this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: scopeBlockedReason }, undefined, 'error');
+         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: scopeBlockedReason });
++          const reason = `当日首次开启检查未完成（首查安全门禁），费比暂停暂不执行：已读取并记录，未执行真实关闭`;
++          this.schedule.lastWindowBlockReason = reason;
++          this._commitShopLastDataSkippedBalance(rt, candidate, '首查安全门禁拦截暂停，未读取千川余额');
++          this._memPush(this.triggers, {
++            shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason,
++          const reason = `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：已读取并记录，未执行真实关闭（手动检查不绕过时间限制）`;
++          this._commitShopLastDataSkippedBalance(rt, candidate, '未到允许执行时段，未读取千川余额');
+       // 5) 本轮回读 currentAdState（清单身份/完整性失败 → blocked，不得包成 ok）
+       const stateRead = await this._readCurrentAdState(shopCfg);
+-      this._applyBalanceToLastData(rt, stateRead);
++      this._applyBalanceToLastData(candidate, stateRead);
+       if (stateRead.error) {
+         const err = stateRead.error;
++        candidate.pauseEligible = false;
++        // 竞态修正：带余额终态的本轮读数先原子提交，再返回 blocked。
++        this._commitShopLastData(rt, candidate);
+         this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: err.reason }, undefined, 'error');
+         this._emitJudgement(shopCfg, { data, over: data.evaluation.over === true, status: 'blocked', reason: err.reason, currentAdState: stateRead.state });
+-      rt.lastDataAt = new Date(this.nowFn()).toISOString();
++      // 竞态修正：余额终态已写入 candidate，此刻一次性原子提交为本轮可见读数。
++      this._commitShopLastData(rt, candidate);
+       const thresholdCents = this._thresholdCents(shopCfg);
+       const decision = this._switchOrchestrator.evaluatePeriodic({
+       const reason = e.reason || e.message;
+       rt.lastError = reason;
++      // 异常退出不得把 refreshing 卡在 true（candidate 未提交则维持上一轮已提交读数）。
++      rt.dataRefreshing = false;
++      if (rt.lastData && typeof rt.lastData === "object") rt.lastData.refreshing = false;
+       this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: reason, code: e.code || null }, undefined, 'error');
+       this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'stopped', reason, code: e.code || null });
++        readRecovery: this._readRecoveryView(s.id),
+         today: rt.lastData || null,
++        dataRefreshing: rt.dataRefreshing === true,
+         lastDataAt: rt.lastDataAt || (rt.lastData && rt.lastData.fetchedAt) || null,
++        // 兼容门槛字段（无消耗门槛，恒 0/false）：只展示同店同日有效投影，不把 null 当 0 重算
+           balanceAt: t && t.balanceAt ? t.balanceAt : null,
++          // 余额终态（2026-10-31 竞态修正）：ok/error/missing/skipped + 非 ok 具体原因
++          balanceStatus: (t && t.balanceStatus) || null,
++          balanceReason: (t && t.balanceStatus && t.balanceStatus !== 'ok') ? t.balanceReason || null : null,
++          // 本轮刷新在途（candidate 未提交）：界面可显示"刷新中"，而非把陈旧读数当新读数
++          refreshing: rt.dataRefreshing === true || (t && t.refreshing === true),
+           thresholdCents: this._thresholdCents(s),
+           over: t ? t.over === true : null,
+```
+
+
+### PRIOR DIAGNOSIS VERDICT
+```
+VERDICT: 此前 `balanceCents=null` 是轮询进行中的非原子可见窗口，不是已证实的余额选择器失败。费用快照先发布，余额约 2–3 分钟后才补写；同轮完成后及后续 live 均成功得到 `29973`。
+
+ROOT_CAUSE: `_pollShop` 在 `readAndEvaluate` 完成后立即用 `_summarizeData(data)` 覆盖 `rt.lastData`；该摘要不含余额。随后才执行 `_readCurrentAdState`，余额虽在身份核验后读取，却要等整个广告清单读取完成才由 `_applyBalanceToLastData` 写回。因此 19:39 快照处于 11:38:59Z–11:41:08Z 的在途区间，必然可见新费用配无余额。此窗口每轮都可复发。现有证据反而证明选择器在同轮有效：11:40:03Z 读到 `29973`，11:41:08Z 完成后状态即含该值。
+
+WHY_COST_WITHOUT_BALANCE: cost/orders 来自独立的 `promo-page` 路径，11:37:57Z 已完成并先写入 `lastData`；余额来自之后的乘方会话。两条读取不仅来源不同，而且提交时间不同，所以费用成功不代表余额阶段已经执行。UI 只是忠实地把缺失字段显示为“未知”。
+
+MINIMAL_FIX: files + behavior：核心只需修改 `douyin-promo-guard/src/engine/monitor.js`：用局部候选对象组装本轮 cost/orders、规则投影、广告状态和余额，完成或明确失败后一次性替换公开的 `rt.lastData`/`lastDataAt`；读取期间继续暴露上一份完整快照并标记 refreshing，首次读取则显示“读取中”，不能发布半成品。余额终态同时保留 `balanceStatus`、`balanceReason`、`balanceAt`。若需把原因展示给用户，再最小增加 `bill-manager/watch-drill.js` 透传及 `bill-manager/index.html` 展示；无需改余额选择器。
+
+FAIL_CLOSED: 余额失败或缺失的终态仍必须是 `balanceCents=null`，不得沿用旧余额冒充本轮结果，也不得编造为 0；上一完整快照只能以原时间戳和“正在刷新”身份继续展示。真实 0 必须保持为整数 `0`。余额失败不得影响费用判断或触发额外广告动作，但必须保留具体 reason，避免把“尚未读取”和“选择器失败”都压成同一个未知。
+
+SHIP_WITH_POPUP_PATCH: no；弹窗关闭处理位于页面进入/控件可用性层，原子提交问题位于 `monitor.js` 状态发布层。此次审查窗口内弹窗已成功关闭且余额随后读到，说明它不是该 null 的直接根因。两者最多存在间接时延关系，应分别提交、测试和验收，避免把现有无关脏改混入余额修复。
+
+ACCEPTANCE_FIELDS: 简尚应同时核验 `shops[].today` 与 `shopRows[]`：`costCents=27`、`orders=1`、`source=promo-page`、`balanceCents` 等于当次乘方页面真实值（本证据轮为 `29973`）、`balanceAt` 非空、`balanceStatus=ok`、`balanceReason=null`、`lastDataAt >= balanceAt`、`adState=on`、`lastError/readFailure=null`。UI 应显示对应真实金额（本轮 `299.73 元`）及读取时间。读取在途时不得出现“新 fetchedAt + null 余额”的混合快照。
+
+TESTS: 增加受控 Promise 的并发测试：先建立完整旧快照，启动下一轮并阻塞 `_readCurrentAdState`，断言中途仍是旧完整快照且标记 refreshing；释放后断言新费用和新余额一次性出现。另测首次轮询显示“读取中”；成功值 `29973`；真实零余额 `0`；缺失、解析失败和 evaluate 异常终态均为 null 且 reason 可见；失败不得沿用旧值、不得产生广告动作。保留现有 DOM 选择器、千分位/小数解析、today/shopRows 投影测试；弹窗关闭测试单独运行。
+
+CONFIDENCE: 高。对这次 19:39 的 null 窗口约 0.95：时间线与代码写入顺序完全吻合，同轮稍后及下一轮都读取到 `29973`。但不能据此断言选择器未来永不失败。
+
+RISKS: 原子提交后，在较慢的乘方清单读取期间 UI 会显示上一完整快照而非半成品，因此必须明确显示 refreshing 和原时间戳；否则用户可能误认数据已更新。余额实际读取早于整轮提交约一分钟，仍有轻微陈旧风险。DOM 改版、未知弹窗或身份页仍可能造成真正的余额失败；当前 reason 被丢弃会掩盖这些故障，建议一并补足可观测性。早退分支也必须显式形成终态，避免候选对象永不提交或旧 refreshing 标志残留。
+
+
+```
+
+
+## PRECHECK RESULTS (executor already ran; treat as evidence)
+- selftest-atomic.js with argv monitor path: PASS
+- node --check monitor.js / nested watch-drill / parent watch-drill: all exit 0
+- Working tree public `rt.lastData =` non-comment assignments: ONLY line 1624 inside `_commitShopLastData`
+- HEAD lacked `_commitShopLastData` / `_markShopDataRefreshing` / `dataRefreshing`; HEAD already had `_applyBalanceToLastData`
+- qianchuan-reader.js is dirty separately; not part of this delta's accept/reject
+- Runtime PID 15528 started 2026-10-31 19:30:13 Asia/Shanghai; disk sha16 monitor=35f4c5016584bee3; no restart after this patch → disk≠runtime expected
+- HTTP to 127.0.0.1:3443 currently RemoteDisconnected (cannot refresh live snapshot this turn)
+
+IMPORTANT: Even if tool/sandbox fails, you MUST produce VERDICT from the embedded evidence above. Do not FAIL solely for inability to open files when evidence is embedded.
+
+2026-10-31T12:44:39.863365Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit
+codex
+我会按 brain-worker 的主脑独立验收口径做只读复审，不派发牛马、不改文件、不触碰服务。先对齐历史诊断与本次原子提交路径，再重点检查异常/早退是否会残留 `refreshing`，以及恢复链那处可疑写法是否真正影响公开 `lastData`。
+exec
+"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "Get-Content -LiteralPath 'C:\\Users\\Administrator\\.ccsc\\codex-mimo\\skills\\brain-worker\\SKILL.md' -Raw; Select-String -LiteralPath 'C:\\Users\\Administrator\\.ccsc\\codex-mimo\\memories\\MEMORY.md' -Pattern '余额|轮询|简尚|douyin-promo-guard|D56' -Context 2,3" in C:\Users\Administrator\Documents\电商助手\douyin-promo-guard
+2026-10-31T12:44:44.700935Z ERROR codex_core::exec: exec error: windows sandbox: CreateProcessWithLogonW failed: 2
+2026-10-31T12:44:44.701305Z ERROR codex_core::tools::router: error=execution error: Io(Custom { kind: Other, error: "windows sandbox: CreateProcessWithLogonW failed: 2" })
+ exited -1 in 0ms:
+execution error: Io(Custom { kind: Other, error: "windows sandbox: CreateProcessWithLogonW failed: 2" })
+2026-10-31T12:44:49.750693Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit
+codex
+VERDICT: PASS_WITH_NOTES
+
+BLOCKERS: none
+
+NOTES:
+
+- 核心竞态已修复：`_pollShop` 与 `refreshShopData` 都先在局部 `candidate` 上组装费用、订单、规则投影和余额终态，再由 `_commitShopLastData` 一次替换公开 `rt.lastData`。未发现新的“本轮费用 + 未完成余额”公开窗口。
+- `0` 余额可由 `!= null` 分支保留为整数 `0`；失败、缺失和 skipped 均明确写为 `null + status + reason`，不会沿用旧余额或编造 `0`。
+- `_applyReadRecoverySuccess` 的 `_applyBalanceToLastData(rt, result)` 写错目标，只会生成 `rt.balance*` 字段，当前 `getStatus` 读取的是 `rt.lastData`，因此不会破坏公开快照原子性。但它会丢失恢复读取到的余额，同时单独推进 `lastDataAt`，属于非阻塞语义瑕疵，建议另行修正。
+- commit 后对 `rt.lastData.blockedReason`、规则字段的修改目前均在同一同步调用栈内、没有 `await`，不会形成可观察竞态；但弱化了“仅一次原子发布”的代码约束，后续宜全部移到 candidate。
+- 父仓 `watch-drill.js` 同时读取 `s.today.refreshing` 和 `s.dataRefreshing`；嵌套版本只读取前者。首次读取没有旧 `today` 时，嵌套版本可能漏掉“刷新中”，但不会显示假 `0`，不阻塞本次核心修复。
+- `qianchuan-reader.js` 弹窗轨未纳入结论。
+- 自测 PASS、三文件语法检查通过、公开 `rt.lastData =` 仅保留在提交 helper，足以支持代码级放行；但仍属于原型级验证。
+
+READY_FOR_CONTROLLED_3443_RESTART_WITH_POPUP_TRACK: yes — 核心 fail-closed 与原子发布路径成立，可在受控重启后将余额验收和弹窗轨分别观察；当前 PID 未加载该磁盘补丁，不应视为运行态已验收。
+
+EVIDENCE_GAPS:
+
+- 尚无受控重启后的真实简尚回读，需确认 `costCents=27`、`orders=1`、真实余额、`balanceStatus=ok`、`balanceReason=null` 及时间关系。
+- HTTP 3443 当前 `RemoteDisconnected`，未完成 `shops[].today` 与 `shopRows[]` 的运行态全量回读。
+- 自测缺少：首次无旧快照、异常抛出后 refreshing 清理、缺失/解析失败、真实零余额、旧余额不得沿用，以及嵌套 watch-drill 首次刷新投影。
+- 本轮无法通过 shell 复读 skill/工作区，结论依据用户提供的完整摘录、补丁和预检证据。
+
+CONFIDENCE: 高
+tokens used
+43,508

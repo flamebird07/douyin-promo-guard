@@ -74,7 +74,12 @@ function makeCfg(cookieDir, shops) {
       snapshotMaxAgeMinutes: 30, mockDataSource: false,
       chengfang: { scope: ['全店托管', '商品自选'], pauseEnabled: false, enableEnabled: false, enableHour: 7, enableSchedulerEnabled: false },
     },
-    login: { cookieSourceDir: cookieDir, edgePath: 'C:/no/such/edge.exe', douyinHomeUrl: 'https://example.test/home' },
+    login: {
+      cookieSourceDir: cookieDir,
+      cookieWorkDir: tmpDir('s13b-work-'),
+      edgePath: 'C:/no/such/edge.exe',
+      douyinHomeUrl: 'https://example.test/home',
+    },
   };
 }
 
@@ -91,6 +96,7 @@ function makeDrill({ cookieDir, cfgPath, clock, shops, counters }) {
     chengfangOpener: async () => { counters.opener += 1; throw new Error('隔离测试不得打开页面'); },
     readAdState: async () => { counters.readAdState += 1; throw new Error('隔离测试不得回读'); },
     persistFile: null,
+    autostartOnBoot: false,
   });
   CREATED.push(drill);
   return drill;

@@ -45,7 +45,7 @@
     <div id="wdError" style="display:none;font-size:13px;color:#dc2626;margin:6px 0 0;padding:8px 12px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;"></div>
     <div id="wdGap" style="display:none;font-size:12.5px;color:#b45309;margin-top:6px;"></div>
     <div style="font-size:12.5px;color:#555;margin:6px 0 0;padding:8px 12px;background:#ecfdf5;border:1px solid #bbf7d0;border-radius:6px;">
-      <b>每日 07:00 自动开启</b>：<span id="wdEnableTaskState">加载中…</span>
+      <b>每日 00:05 后首查开启</b>：<span id="wdEnableTaskState">加载中…</span>
       <span id="wdEnableTaskNext" style="color:#16a34a;font-weight:600;"></span>
       <span id="wdEnableToday" style="color:#555;"></span>
       <span id="wdEnableTaskMissed" style="color:#b45309;"></span>
@@ -71,17 +71,17 @@
     </div>
     <div id="wdReason" style="font-size:12.5px;color:#666;margin-top:8px;"></div>
     <p style="font-size:12px;color:#999;margin:8px 0 0;">
-      每天 07:00 自动开启全部乘方计划（独立任务，不受启停值守影响）；
-      「启动值守」控制 08:00 后每 30 分钟一次的超额巡查，费用 ÷ 订单 &gt; 1 元/单 时自动暂停乘方。<b>绝不删除广告。</b>
+      每天 00:05（上海）后检查当天是否暂停，暂停才作为当天首次开启（独立任务，不受启停值守影响）；
+      「启动值守」由服务启动时自动启动，控制 08:00 后每 30 分钟一次的超额巡查，费用 ÷ 订单 &gt; 1 元/单 时自动暂停乘方。<b>绝不删除广告。</b>
     </p>
     <details id="wdGateDetails" style="margin-top:8px;">
       <summary style="font-size:12.5px;color:#555;cursor:pointer;">执行门槛与配置明细（realMode / dryRun / 回读 / Cookie）</summary>
       <div id="wdGates" style="font-size:12.5px;color:#555;margin:8px 0 0;padding:8px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;"></div>
       <p style="font-size:12px;color:#999;margin:8px 0 0;">
-        完整规则：每天 07:00（上海）自动开启全部乘方计划（含人工暂停的；独立任务，无需启动值守，重启自动恢复）；
-        08:00 后由「启动值守」控制超额巡查：立即检查一次，再每 30 分钟检查，费用=千川「账户整体消耗」，
+        完整规则：每天 00:05（上海）后检查当天是否暂停，暂停才作为当天首次开启（含人工暂停的；独立任务，无需打开页面，服务启动即登记；已开启则零点击记完成，00:00–00:04:59 不强制开启）；
+        08:00 后由「启动值守」（服务启动时自动启动）控制超额巡查：立即检查一次，再每 30 分钟检查，费用=千川「账户整体消耗」，
         订单=罗盘经营概况「全店+实时」成交订单数，整数分 &gt; 订单数×100 才暂停乘方（恰好 1 元/单不暂停）。
-        「停止值守」只停止超额巡查，不影响每日开启。绝不删除广告。
+        「停止值守」只停止超额巡查，不影响每日首次开启检查。绝不删除广告。
       </p>
     </details>
   </div>
@@ -299,10 +299,14 @@
         }
         nEl.style.color = (nf.lastStatus === 'failed') ? '#b45309' : '#888';
         // 广告开/关状态（主信息格）：投放中=绿，已暂停=橙，未知=灰
+        // mixed 只作过渡观测：必须显式呈现待收敛/重新判定/重试中（非完成态），不得显示为一次成功
         var ad = s.adState || {};
         var adEl = $('wdAdState');
-        adEl.textContent = ad.note || '未知';
-        adEl.style.color = ad.on === true ? '#16a34a' : (ad.on === false ? '#b45309' : '#999');
+        var adMixed = String(ad.state) === 'mixed';
+        adEl.textContent = adMixed
+          ? (ad.note || '混合') + ' ｜ ' + (ad.reconcileText || '待收敛') + (ad.unknownBlock ? '（旧动作仍未确认）' : '') + '（非完成态）'
+          : (ad.note || '未知');
+        adEl.style.color = ad.on === true ? '#16a34a' : (ad.on === false ? '#b45309' : (adMixed ? '#d97706' : '#999'));
         // 阈值回显（输入框聚焦时不覆盖用户正在输入的值）
         var thr = s.threshold;
         var thrInput = $('wdThresholdInput');
@@ -313,7 +317,7 @@
         }
         $('wdLastCheck').textContent = fmtTime(s.lastCheckAt);
         $('wdNextRun').textContent = fmtTime(s.nextRunAt);
-        // 今日开启相位（按店铺+上海日期，成功才算完成）——并入「每日 07:00 自动开启」行内展示
+        // 今日首次开启相位（按店铺+上海日期，成功才算完成）——并入「每日 00:05 后首查开启」行内展示
         var ep = s.enablePhaseToday || [];
         $('wdEnableToday').textContent = ep.length
           ? ' · 今日：' + ep.map(function (it) {
@@ -445,7 +449,7 @@
         }, POLL_MS);
       }
 
-      // 页面加载：只恢复查看，绝不自动启动值守（后端默认未启动）。
+      // 页面加载：只读拉取状态与日志，不隐式启停值守（值守由服务启动时自动启动；页面打开/关闭/刷新不改变后台状态）。
       wdRefreshAll().catch(function () {}).then(function () { wdStartPolling(); });
       // 暴露给全局（switchTab 懒加载进入时补拉一次）
       window.wdRefreshAll = wdRefreshAll;

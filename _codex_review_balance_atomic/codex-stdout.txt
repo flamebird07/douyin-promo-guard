@@ -1,0 +1,22 @@
+VERDICT: FAIL
+
+BLOCKERS:
+- 当前只读执行通道连续两次失败：`codex-windows-sandbox-setup.exe` 缺失；本机 UI 只读通道也不可用。因此无法读取指定工件、源码及测试输出，不能独立确认原子提交、早退清理和失败路径是否正确。
+- 这是“证据不足导致无法放行”，不代表已发现确定的代码缺陷。
+
+NOTES:
+- 未修改文件、未 commit/push、未重启服务。
+- 无法核验 `_applyBalanceToLastData(rt, result)` 是否仅误写 runtime，也无法判断 commit 后原地修改 `blockedReason` 的实际影响。
+- `qianchuan-reader.js` 未纳入判定。
+- brain-worker skill 文件也因同一只读通道故障无法读取，故按用户给定审查标准直接复审。
+
+READY_FOR_CONTROLLED_3443_RESTART_WITH_POPUP_TRACK: no — 未完成源码与证据的独立回读，不能签发受控重启许可。
+
+EVIDENCE_GAPS:
+- 三份 patch 的实际内容。
+- 四条关键提交/刷新路径及所有早退分支。
+- `getStatus` 与两个 `watch-drill.js` 的字段透传。
+- `selftest-run.txt`、`node --check` 和“仅一处公开 `rt.lastData =`”声明的独立复核。
+- 父仓先验 verdict 的原文对齐。
+
+CONFIDENCE: 低

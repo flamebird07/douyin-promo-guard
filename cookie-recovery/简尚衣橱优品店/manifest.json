@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "shop": "简尚衣橱优品店",
+  "versions": [
+    {
+      "versionId": "v20261024T084503Z-21964-942f7e",
+      "sha256": "9571957209f674a5cd8e960bd2754f65cabb2e10a640e4c498905222c3ae2718",
+      "bytes": 14072,
+      "createdAtMs": 1792831503197,
+      "origin": "verified-login",
+      "structureValid": true
+    },
+    {
+      "versionId": "v20261024T115350Z-27968-ef39a0",
+      "sha256": "9a33fbc4685d9866ae8d5270f2a7ae2fbe94e95647f40fc2c8f523006e6b9fc9",
+      "bytes": 15010,
+      "createdAtMs": 1792842830117,
+      "origin": "verified-login",
+      "structureValid": true
+    },
+    {
+      "versionId": "v20261026T135540Z-8328-7ea908",
+      "sha256": "2b4c5a7b44eb307508cd42cada627317518e7ad442cf879cb1107ad5d0cba4c8",
+      "bytes": 12462,
+      "createdAtMs": 1793022940721,
+      "origin": "verified-login",
+      "structureValid": true
+    },
+    {
+      "versionId": "v20261029T060917Z-32592-9672e5",
+      "sha256": "3f03d6d97346a980322d783009cb4fd5c38bdd527efd94d2b52b0544837195b0",
+      "bytes": 14318,
+      "createdAtMs": 1793254157714,
+      "origin": "verified-login",
+      "structureValid": true
+    }
+  ]
+}

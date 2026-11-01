@@ -1,0 +1,24 @@
+VERDICT: PASS_WITH_NOTES
+
+BLOCKERS: none
+
+NOTES:
+
+- 核心竞态已修复：`_pollShop` 与 `refreshShopData` 都先在局部 `candidate` 上组装费用、订单、规则投影和余额终态，再由 `_commitShopLastData` 一次替换公开 `rt.lastData`。未发现新的“本轮费用 + 未完成余额”公开窗口。
+- `0` 余额可由 `!= null` 分支保留为整数 `0`；失败、缺失和 skipped 均明确写为 `null + status + reason`，不会沿用旧余额或编造 `0`。
+- `_applyReadRecoverySuccess` 的 `_applyBalanceToLastData(rt, result)` 写错目标，只会生成 `rt.balance*` 字段，当前 `getStatus` 读取的是 `rt.lastData`，因此不会破坏公开快照原子性。但它会丢失恢复读取到的余额，同时单独推进 `lastDataAt`，属于非阻塞语义瑕疵，建议另行修正。
+- commit 后对 `rt.lastData.blockedReason`、规则字段的修改目前均在同一同步调用栈内、没有 `await`，不会形成可观察竞态；但弱化了“仅一次原子发布”的代码约束，后续宜全部移到 candidate。
+- 父仓 `watch-drill.js` 同时读取 `s.today.refreshing` 和 `s.dataRefreshing`；嵌套版本只读取前者。首次读取没有旧 `today` 时，嵌套版本可能漏掉“刷新中”，但不会显示假 `0`，不阻塞本次核心修复。
+- `qianchuan-reader.js` 弹窗轨未纳入结论。
+- 自测 PASS、三文件语法检查通过、公开 `rt.lastData =` 仅保留在提交 helper，足以支持代码级放行；但仍属于原型级验证。
+
+READY_FOR_CONTROLLED_3443_RESTART_WITH_POPUP_TRACK: yes — 核心 fail-closed 与原子发布路径成立，可在受控重启后将余额验收和弹窗轨分别观察；当前 PID 未加载该磁盘补丁，不应视为运行态已验收。
+
+EVIDENCE_GAPS:
+
+- 尚无受控重启后的真实简尚回读，需确认 `costCents=27`、`orders=1`、真实余额、`balanceStatus=ok`、`balanceReason=null` 及时间关系。
+- HTTP 3443 当前 `RemoteDisconnected`，未完成 `shops[].today` 与 `shopRows[]` 的运行态全量回读。
+- 自测缺少：首次无旧快照、异常抛出后 refreshing 清理、缺失/解析失败、真实零余额、旧余额不得沿用，以及嵌套 watch-drill 首次刷新投影。
+- 本轮无法通过 shell 复读 skill/工作区，结论依据用户提供的完整摘录、补丁和预检证据。
+
+CONFIDENCE: 高

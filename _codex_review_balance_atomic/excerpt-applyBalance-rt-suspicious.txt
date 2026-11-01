@@ -1,0 +1,61 @@
+2680|    if (!rec || rec.cancelled) return;
+2681|    const view = this._readRecoveryView(rec.shopId);
+2682|    if (!view) return;
+2683|    const reason = error ? String(error.reason || '读取失败') : (rec.lastReason || '读取失败');
+2684|    const rt = this._runtime(rec.shopId);
+2685|    rt.lastReadError = {
+2686|      kind: 'retrying',
+2687|      reason,
+2688|      blocked: (error && error.blocked) || rec.lastBlocked || 'ad_state_read',
+2689|      retrying: true,
+2690|      retried: true,
+2691|      retryCount: rec.attempts,
+2692|      recovery: view,
+2693|      at: new Date(this.nowFn()).toISOString(),
+2694|    };
+2695|    rt.lastError = reason;
+2696|    if (rt.lastData) rt.lastData.blockedReason = reason;
+2697|    this._applyObservedAdState(rec.shopId, 'unknown', `有限恢复重试（${rec.attempts}/${READ_RECOVERY_MAX_RETRIES}）`);
+2698|  }
+2699|
+2700|  _applyReadRecoverySuccess(shopCfg, result, rec) {
+2701|    const shopId = String(shopCfg.id);
+2702|    const rt = this._runtime(shopId);
+2703|    const state = (result && result.state) || 'unknown';
+2704|    this._audit({
+2705|      kind: 'ad-state-read', shopId, event: 'recovery-success',
+2706|      attempts: rec ? rec.attempts : 0, state,
+2707|    });
+2708|    this._clearReadFailure(shopId); // 同时清旧错误/旧阻断原因/旧恢复链
+2709|    this._applyObservedAdState(shopId, state, `有限恢复重试成功（第${rec ? rec.attempts : 0}次，只读回读）`);
+2710|    if (result && result.balance !== undefined) this._applyBalanceToLastData(rt, result);
+2711|    rt.lastDataAt = new Date(this.nowFn()).toISOString();
+2712|    this._clearReadRecovery(shopId, 'recovery-success');
+2713|  }
+2714|
+2715|  _markReadRecoveryExhausted(rec, reason) {
+2716|    if (!rec) return;
+2717|    rec.phase = 'exhausted';
+2718|    rec.nextAt = null;
+2719|    if (rec.timer) {
+2720|      try { this._clearTimeoutFn(rec.timer); } catch (_) { /* 清理失败不影响 */ }
+2721|      rec.timer = null;
+2722|    }
+2723|    rec.lastReason = String(reason || rec.lastReason || '读取失败');
+2724|    const rt = this._runtime(rec.shopId);
+2725|    const view = this._readRecoveryView(rec.shopId);
+2726|    rt.lastReadError = {
+2727|      kind: 'read_failed',
+2728|      reason: rec.lastReason,
+2729|      blocked: rec.lastBlocked || 'ad_state_read',
+2730|      retrying: false,
+2731|      retried: true,
+2732|      retryCount: rec.attempts,
+2733|      recovery: view,
+2734|      at: new Date(this.nowFn()).toISOString(),
+2735|    };
+2736|    rt.lastError = rec.lastReason;
+2737|    if (rt.lastData) rt.lastData.blockedReason = rec.lastReason;
+2738|    this._audit({ kind: 'ad-state-read', shopId: rec.shopId, event: 'recovery-exhausted', attempts: rec.attempts, maxRetries: READ_RECOVERY_MAX_RETRIES, reason: rec.lastReason });
+2739|  }
+2740|

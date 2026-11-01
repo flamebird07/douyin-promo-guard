@@ -563,6 +563,10 @@ function createCompassOrderReader(p) {
           target: sessionTarget,
           shopCfg,
           audit: p.audit,
+          // D5G：写前候选验证必须经候选专用独立浏览器工厂（每个候选全新进程），
+          // 且本次全部店铺浏览器身份禁止被工厂返回——绝不借用主业务浏览器。
+          candidateBrowserFactory,
+          forbiddenBrowsers: shopBrowserIdentities.slice(),
         });
       } catch (_) { /* 收尾保存失败不得阻止关闭，也不改变已确认的业务结果 */ }
       // 恢复失败路径中浏览器可能已因候选切换被证明关闭并置空：不为 null 才需要收口。

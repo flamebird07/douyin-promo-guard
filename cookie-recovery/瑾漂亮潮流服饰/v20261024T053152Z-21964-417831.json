@@ -1,0 +1,572 @@
+[
+  {
+    "name": "fems-gray-random",
+    "value": "78",
+    "domain": "lgw.jinritemai.com",
+    "path": "/api/v2/agw/app-base",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "bd_sso_hi3jfd",
+    "value": "mu9zcPVXveDHufG0A%2BqWJQe6hguF17RzdPkHGHTmAws%3D",
+    "domain": ".bytednsdoc.com",
+    "path": "/",
+    "expires": 1824355907.587977,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "s_v_web_id",
+    "value": "verify_mvlynowr_Hb5f1nSM_mvsR_42CK_8ioT_0vji0WlLdQsL",
+    "domain": "fxg.jinritemai.com",
+    "path": "/",
+    "expires": 1798003864,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "passport_csrf_token",
+    "value": "8b5e8f295cf27bd6bf50bf29df5fcb7d",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003864.609003,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "passport_csrf_token_default",
+    "value": "8b5e8f295cf27bd6bf50bf29df5fcb7d",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003864.609102,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "gfkadpd",
+    "value": "4272,47079|4272,23756",
+    "domain": "fxg.jinritemai.com",
+    "path": "/",
+    "expires": 1793079064,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "x-web-secsdk-uid",
+    "value": "21a7af87-de79-4ce1-84ed-6133744e1510",
+    "domain": "fxg.jinritemai.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "HMACCOUNT_BFESS",
+    "value": "AEFA15EABDA3C7A3",
+    "domain": ".hm.baidu.com",
+    "path": "/",
+    "expires": 1827379865.227156,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "Hm_lvt_b6520b076191ab4b36812da4c90f7a5e",
+    "value": "1792819865",
+    "domain": ".fxg.jinritemai.com",
+    "path": "/",
+    "expires": 1824355865,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "Hm_lpvt_b6520b076191ab4b36812da4c90f7a5e",
+    "value": "1792819865",
+    "domain": ".fxg.jinritemai.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "HMACCOUNT",
+    "value": "AEFA15EABDA3C7A3",
+    "domain": ".fxg.jinritemai.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "ttwid",
+    "value": "1%7Cy9V14chkq8dxT_6XG85tbmtPt5ntrpVLE_jfxHSfDYI%7C1792819865%7C45851cf83c80611d33e8839592c4fba8977e42e2c9da9e3ab3aed8ae670db818",
+    "domain": ".bytedance.com",
+    "path": "/",
+    "expires": 1824355866.080954,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "ttwid",
+    "value": "1%7Cy9V14chkq8dxT_6XG85tbmtPt5ntrpVLE_jfxHSfDYI%7C1792819873%7C3b970a2dc5feba88299a13362551b303f0dde76c4ff862d657de88d4ff51fedf",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1824355874.920641,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "n_mh_doudian",
+    "value": "8xkjSXIQsz2wBE3254TkFZ_L5Fd2Bik333zbqViuZaw",
+    "domain": ".doudian-sso.jinritemai.com",
+    "path": "/",
+    "expires": 1803187880.513193,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "sso_uid_tt_doudian",
+    "value": "455082adc19646a496366f324b149796",
+    "domain": ".doudian-sso.jinritemai.com",
+    "path": "/",
+    "expires": 1798003880.513242,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "sso_uid_tt_ss_doudian",
+    "value": "455082adc19646a496366f324b149796",
+    "domain": ".doudian-sso.jinritemai.com",
+    "path": "/",
+    "expires": 1798003880.513277,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "toutiao_sso_user_doudian",
+    "value": "c007b182acad4f2281617a11678ae7f3",
+    "domain": ".doudian-sso.jinritemai.com",
+    "path": "/",
+    "expires": 1798003880.513311,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "toutiao_sso_user_ss_doudian",
+    "value": "c007b182acad4f2281617a11678ae7f3",
+    "domain": ".doudian-sso.jinritemai.com",
+    "path": "/",
+    "expires": 1798003880.513354,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "sid_ucp_sso_v1_doudian",
+    "value": "1.0.0-KGRmZjQwNjU2OTBmMTk4MTcwODFkOGExNWNhYzZjODFiYWM4MDUzYTEKHwiompGslvT3AhCnhfHWBhiwISAMMMay2fgFOAZA9AcaAmxmIiBjMDA3YjE4MmFjYWQ0ZjIyODE2MTdhMTE2NzhhZTdmMw",
+    "domain": ".doudian-sso.jinritemai.com",
+    "path": "/",
+    "expires": 1798003880.513387,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "ssid_ucp_sso_v1_doudian",
+    "value": "1.0.0-KGRmZjQwNjU2OTBmMTk4MTcwODFkOGExNWNhYzZjODFiYWM4MDUzYTEKHwiompGslvT3AhCnhfHWBhiwISAMMMay2fgFOAZA9AcaAmxmIiBjMDA3YjE4MmFjYWQ0ZjIyODE2MTdhMTE2NzhhZTdmMw",
+    "domain": ".doudian-sso.jinritemai.com",
+    "path": "/",
+    "expires": 1798003880.513422,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "odin_tt",
+    "value": "616276a39c59f1c26917038c6d6a297f90cffce5515ce38562d0ec1e44086a69cd55bd0b7f72233ac82e364324c39c19c94950765944e3370f0ae5b54351f450",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1824355880.85179,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "passport_auth_status",
+    "value": "0c24d387a8c152d69acc3dff30cb03bf%2C",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1795411880.851914,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "passport_auth_status_ss",
+    "value": "0c24d387a8c152d69acc3dff30cb03bf%2C",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1795411880.85194,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "uid_tt",
+    "value": "2a2dc5bbe0474f8542e1affdff56cc77",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.39247,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "uid_tt_ss",
+    "value": "2a2dc5bbe0474f8542e1affdff56cc77",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.392537,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "sid_tt",
+    "value": "5d9b0252abd8540317902f10f38e606c",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.392597,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "sessionid",
+    "value": "5d9b0252abd8540317902f10f38e606c",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.392669,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "sessionid_ss",
+    "value": "5d9b0252abd8540317902f10f38e606c",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.392735,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "is_staff_user",
+    "value": "false",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.392877,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "has_biz_token",
+    "value": "false",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.392944,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "ucas_sso_c0_doudian",
+    "value": "CkEKBTEuMC4wEKSIi8Kz1JDuahjmJiDjzZDng83KAiiwITCompGslvT3AkCphfHWBkipua3ZBlCpvLuKx-bqwWVYbhIULKOxatcFlDhjDhgEN3B32iMBLmk",
+    "domain": ".doudian-sso.jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.09059,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "ucas_sso_c0_ss_doudian",
+    "value": "CkEKBTEuMC4wEKSIi8Kz1JDuahjmJiDjzZDng83KAiiwITCompGslvT3AkCphfHWBkipua3ZBlCpvLuKx-bqwWVYbhIULKOxatcFlDhjDhgEN3B32iMBLmk",
+    "domain": ".doudian-sso.jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.090686,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "PHPSESSID",
+    "value": "1693735dcad635e159b20b2490cf0185",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1793459295.388439,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "PHPSESSID_SS",
+    "value": "1693735dcad635e159b20b2490cf0185",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1793459295.388617,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "ecom_us_lt",
+    "value": "30e8fd8e1e70ce44f2e5502f2c0e84b324763ac7905537ebaf6b9eb946c030cc",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1793470980.388667,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "ecom_us_lt_ss",
+    "value": "30e8fd8e1e70ce44f2e5502f2c0e84b324763ac7905537ebaf6b9eb946c030cc",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1793470980.388695,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "ucas_c0",
+    "value": "CkEKBTEuMC4wEKOIjtjd1JDuahjmJiDjzZDng83KAiiwITCompGslvT3AkCphfHWBkipua3ZBlCpvLuKx-bqwWVYbhIUEAYugsFfA5s8f-WdzmXID1FM2PE",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.392112,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "ucas_c0_ss",
+    "value": "CkEKBTEuMC4wEKOIjtjd1JDuahjmJiDjzZDng83KAiiwITCompGslvT3AkCphfHWBkipua3ZBlCpvLuKx-bqwWVYbhIUEAYugsFfA5s8f-WdzmXID1FM2PE",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.392363,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "sid_guard",
+    "value": "5d9b0252abd8540317902f10f38e606c%7C1792819881%7C5184000%7CWed%2C+23-Dec-2026+05%3A31%3A21+GMT",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1823923882.392408,
+    "httpOnly": true,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "session_tlb_tag",
+    "value": "sttt%7C19%7CXZsCUqvYVAMXkC8Q845gbP________-yjykOb-gWwPBLwCMX3wrBD6TKFWKeiBcVu6SL4O2hXkk%3D",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.392803,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "sid_ucp_v1",
+    "value": "1.0.0-KDE1NTAwZmQyNDFlYWI1Zjg0YzZjZTdkZTQ2N2Y3NDBhMGJjMjIyMGUKGQiompGslvT3AhCphfHWBhiwISAMOAZA9AcaAmxxIiA1ZDliMDI1MmFiZDg1NDAzMTc5MDJmMTBmMzhlNjA2Yw",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.392993,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "ssid_ucp_v1",
+    "value": "1.0.0-KDE1NTAwZmQyNDFlYWI1Zjg0YzZjZTdkZTQ2N2Y3NDBhMGJjMjIyMGUKGQiompGslvT3AhCphfHWBhiwISAMOAZA9AcaAmxxIiA1ZDliMDI1MmFiZDg1NDAzMTc5MDJmMTBmMzhlNjA2Yw",
+    "domain": ".jinritemai.com",
+    "path": "/",
+    "expires": 1798003882.393057,
+    "httpOnly": true,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "zsgw_business_data",
+    "value": "%7B%22uuid%22%3A%2237d3b878-2aa2-43f8-909a-02c3e0e1ac0e%22%2C%22platform%22%3A%22pc%22%2C%22source%22%3A%22seo.fxg.jinritemai.com%22%7D",
+    "domain": "fxg.jinritemai.com",
+    "path": "/",
+    "expires": 1824355882.506845,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "source",
+    "value": "seo.fxg.jinritemai.com",
+    "domain": "fxg.jinritemai.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "doudain_safety_did",
+    "value": "3176945095917081",
+    "domain": "fxg.jinritemai.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "csrf_session_id",
+    "value": "2baea7509acdb5a2738b50231b190298",
+    "domain": "fxg.jinritemai.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "ecom_gray_shop_id",
+    "value": "147873119",
+    "domain": ".fxg.jinritemai.com",
+    "path": "/",
+    "expires": 1793079085.416248,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "gfkadpd",
+    "value": "2631,22740",
+    "domain": "buyin.jinritemai.com",
+    "path": "/",
+    "expires": 1793079086,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  },
+  {
+    "name": "x-web-secsdk-uid",
+    "value": "8e71ea51-da7e-425c-8a7f-7af553fe3c57",
+    "domain": "compass.jinritemai.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "x-web-secsdk-uid",
+    "value": "73f415ce-45d2-4b11-9618-68f60099ba65",
+    "domain": "buyin.jinritemai.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "Hm_lvt_b6520b076191ab4b36812da4c90f7a5e",
+    "value": "1792819887",
+    "domain": ".compass.jinritemai.com",
+    "path": "/",
+    "expires": 1824355886,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "Hm_lpvt_b6520b076191ab4b36812da4c90f7a5e",
+    "value": "1792819887",
+    "domain": ".compass.jinritemai.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "HMACCOUNT",
+    "value": "AEFA15EABDA3C7A3",
+    "domain": ".compass.jinritemai.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "Hm_lvt_b6520b076191ab4b36812da4c90f7a5e",
+    "value": "1792819887",
+    "domain": ".buyin.jinritemai.com",
+    "path": "/",
+    "expires": 1824355887,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "Hm_lpvt_b6520b076191ab4b36812da4c90f7a5e",
+    "value": "1792819887",
+    "domain": ".buyin.jinritemai.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "HMACCOUNT",
+    "value": "AEFA15EABDA3C7A3",
+    "domain": ".buyin.jinritemai.com",
+    "path": "/",
+    "expires": -1,
+    "httpOnly": false,
+    "secure": false,
+    "sameSite": "Lax"
+  },
+  {
+    "name": "fg_uid",
+    "value": "RID20261024133146A754D77EF3136A711F4D",
+    "domain": "api.feelgood.cn",
+    "path": "/",
+    "expires": 1824355907.584732,
+    "httpOnly": false,
+    "secure": true,
+    "sameSite": "None"
+  }
+]

@@ -1,0 +1,16 @@
+鉁?鍏抽棴 evaluate 杩斿洖 undefined 鈫?fail-closed锛屼笉寰楀綋鑷娑堝け (0.2158ms)
+鉁?鍏抽棴 evaluate 杩斿洖鐣稿舰锛堟棤 popup锛夆啋 fail-closed (0.1667ms)
+鈩?tests 48
+鈩?pass 34
+鈩?fail 14
+鉁?failing tests:
+
+reran_on_machine: yes
+cmd: node --test test/qianchuan-reader.test.js
+overall_observed: 48 tests / 34 pass / 14 fail
+popup_r3_residuals_observed_pass:
+- residual known-root present still true
+- close evaluate undefined fail-closed
+- close evaluate malformed (no popup) fail-closed
+- empty shop name + accountContent fail-closed
+14 fails: pre-existing openQianchuanHome/login-stub paths (out of scope)

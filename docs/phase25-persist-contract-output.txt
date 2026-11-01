@@ -1,0 +1,154 @@
+✔ 低于阈值 + off → should_enable (2.049ms)
+✔ 低于阈值 + on → already_on（保持） (0.2734ms)
+✔ 高于阈值 + on → should_pause (0.1889ms)
+✔ 高于阈值 + off → already_off（保持） (0.1672ms)
+✔ 等于阈值 + on/off → equal_no_action 零动作 (0.19ms)
+✔ 整数比较：9900/100 不得当作 1 元 (0.1294ms)
+✔ unknown → unknown_blocked (0.1595ms)
+✔ 零订单 / 非法指标 → data_blocked (0.2112ms)
+✔ 不同店铺互不阻塞 (0.6056ms)
+✔ identityOk 缺失/null/假值/字符串均 data_blocked (0.4217ms)
+✔ orders × thresholdCents 溢出安全整数 → data_blocked (0.1839ms)
+✔ 动作可能已发出后超时（markUnknown）→ 同向/反向请求均被拒绝 (1.5972ms)
+✔ 明确未发出（markNotSent）时可以释放并再次 tryBegin (0.2265ms)
+✔ 正常确认后可以释放（markConfirmed → markSettled CONFIRMED） (0.2057ms)
+✔ 未确认不能伪装成功释放（markSettled CONFIRMED 不得自行制造已确认） (0.1149ms)
+✔ unknown 经 confirmed:true 恢复（resolveUnknownAfterReadback） (0.1527ms)
+✔ unknown 的缺参/false 回读不释放，保持阻塞 (0.2108ms)
+✔ unknown 不能通过 markNotSent 或 markConfirmed 绕过 (0.1928ms)
+✔ 已 confirmed 的动作不得经 markNotSent 释放 (0.1001ms)
+✔ 旧 actionId 回调不能确认/释放新动作 (0.0914ms)
+✔ 修改返回对象不能绕过锁（slot/peek 为快照） (0.0583ms)
+✔ enable/pause 并发：第二个被门阻止（进程内单测，非真实相位集成） (0.0411ms)
+✔ markSettled 必须用 kind，禁止 ok 布尔混语义 (0.0731ms)
+✔ 生产 API 不提供无条件 clear (0.0335ms)
+✔ metric 与 decision 标签分离（矩阵） (0.1401ms)
+✔ mixed：above+mixed → should_pause（仅停 on 项）；below+mixed → should_enable（仅开 off 项）；equal+mixed 零动作 (0.0767ms)
+✔ mixed 不得当 unknown：超标 mixed 仍应 should_pause，不得 unknown_blocked (0.0672ms)
+✔ unknown 仍 fail-closed（含超标），不因 over 绕过 (0.0396ms)
+✔ 映射：全部开启→on；全部关闭→off；混合→mixed；空清单需空态证据 (1.1137ms)
+✔ 集成：低于阈值 + 回读 off → 进入 enable 流程恰好一次 (2.6874ms)
+✔ 集成：低于阈值 + 回读 on → 零点击（already_on，execute 不调用） (0.3531ms)
+✔ 集成：高于阈值 + 回读 on → 进入 pause 流程恰好一次 (0.6258ms)
+✔ 集成：高于阈值 + 回读 off → 零点击（already_off） (0.2247ms)
+✔ 集成：等于阈值 → 零点击（equal_no_action） (0.5778ms)
+✔ 集成：unknown / 身份失败 / 数据异常 → 零点击 (0.3682ms)
+2026-09-23T03:22:18.664Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.665Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.672Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.673Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.681Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.682Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.692Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.692Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.698Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.698Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.705Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.706Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.716Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.716Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.726Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.727Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 集成：07:00 enable 与周期 enable/pause 并发时第二个被门阻止 (5.5361ms)
+✔ 集成：动作回读失败后下一周期不补点（unknown 阻塞） (0.4471ms)
+✔ 集成：unknown 仅 confirmed:true 回读可恢复；旧 actionId 不影响新动作 (0.5701ms)
+✔ 集成：动作前复核状态已变化 → markNotSent，零点击 (0.1977ms)
+✔ 集成：execute 契约 neverSent（dryRun/realMode 门禁）→ markNotSent，不占用槽位 (0.2199ms)
+✔ 集成：重启恢复——未结束动作导入为 unknown 阻塞，不把未知写成成功 (0.1375ms)
+✔ 集成：日程开启意图——on 跳过 / off 开启 / unknown 阻止；adBelief 不参与决策 (0.0592ms)
+✔ 主链路集成：低于阈值 + 回读 off → 周期评估进入 enable 流程一次 (19.0815ms)
+✔ 主链路集成：低于阈值 + 回读 on → 零点击 (9.4152ms)
+✔ 主链路集成：高于阈值 + 回读 on → 周期评估进入 pause 流程一次 (7.376ms)
+✔ 主链路集成：高于阈值 + 回读 off → 零点击 (10.7882ms)
+✔ 主链路集成：等于阈值 → 零点击 (5.7688ms)
+✔ 主链路集成：回读 unknown → 零点击 (9.7712ms)
+✔ 主链路集成：动作回读失败（partial）→ 下一周期不补点 (8.2081ms)
+✔ 主链路集成：dryRun/realMode 门禁——execute 返回 neverSent 时串行门释放且不计成功 (9.9604ms)
+2026-09-23T03:22:18.759Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.760Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.768Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.768Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.777Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.777Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.781Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.788Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.800Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.801Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.803Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.805Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 主链路集成：07:00 日程开启与周期 pause 并发 → 第二个被串行门阻止 (32.7348ms)
+✔ 主链路集成：旧 actionId 回调不影响新动作（经 Monitor 串行门） (11.621ms)
+✔ 决策层单测契约：metric 与 decision 分离（与 orchestrator.evaluatePeriodic 一致） (0.2698ms)
+✔ mixed 目标筛选语义：above+mixed 进 pause；below+mixed 进 enable；equal+mixed 零动作 (0.4441ms)
+✔ 门禁优先级：无控制范围 → blocked（不因 already_off 包成 ok） (5.2273ms)
+✔ 门禁优先级：超标 + 07:59 → window_blocked（不因 already_off/mixed 包成 ok） (3.9744ms)
+✔ 门禁优先级：清单身份失败 → blocked（不包成 ok/unknown 零点击） (7.5583ms)
+✔ 批次单次记录：enable 成功只记一条 actions；blocked 不进 actions (17.1405ms)
+✔ 结果契约：classifyExecuteResult 三类收口 (0.4549ms)
+✔ pause + all_closed_confirmed → confirmed 并释放槽位 (0.221ms)
+✔ nothing_to_close → 未发出释放（不冒充执行成功） (0.1677ms)
+✔ enable 不得因暂停成功结果码被确认 (0.118ms)
+✔ partial / 未知结果 → 保持 unknown 阻塞，不释放 (0.1325ms)
+✔ 旧 actionId 不能在 all_closed_confirmed 路径上影响新动作 (0.1537ms)
+✔ 发出前取消可释放（cancelled + 0 已发出 → not_sent） (0.1089ms)
+✔ 发出后取消且回读未确认不得释放（counts 有已发出 → unknown） (0.0814ms)
+✔ 部分完成后中止不得被当成 zeroClick (0.0753ms)
+✔ 单纯盘点无动作不会进入已执行 actions（名称不能代替证据） (0.0598ms)
+✔ 三轮生命周期：确认关闭 → 无需关闭释放 → 恢复后再次确认 (0.1782ms)
+2026-09-23T03:22:18.655Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.657Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.665Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.666Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.684Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.684Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.688Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.689Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.692Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.693Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T03:22:18.701Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T03:22:18.701Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✖ 动作前写入失败 → persistence_blocked、零底层调用 (14.9744ms)
+✔ 原子替换失败 → 旧文件完整、零底层调用 (6.9324ms)
+✔ 三种动作入口均不能绕过保存失败 (26.1748ms)
+✔ 确认后保存失败 → 不错误释放（保持 unknown 阻塞） (0.9719ms)
+✔ 重启读取未完成记录 → unknown；存储恢复后可安全恢复 (0.3416ms)
+✔ 动作已发出后保存失败 → 不重复点击、保留阻塞、非 zeroClick (0.247ms)
+✔ 正常保存路径行为不变（persistence_blocked 不出现） (8.0768ms)
+✔ 动作前落盘→确认→重启：settled 已持久化，重建不误锁、可再次动作 (2.4773ms)
+✔ 动作前落盘→明确未发出→重启：不误锁 (1.0781ms)
+✔ 终态写入失败：保持阻塞（不释放、不重复点击） (0.1673ms)
+✔ not_sent 终态写入失败：转 unknown 保持阻塞 (0.1151ms)
+✔ partial/unknown 重启后仍阻塞 (0.8875ms)
+✔ 编排器 never_sent+双写失败：persistence_blocked / zeroClick:true / serial:unknown / dispatched:0 (0.9103ms)
+✔ resolveUnknownWithReadback 持久化失败：内存不释放，落盘仍 unknown (1.968ms)
+✔ resolveUnknownWithReadback 持久化成功：终态落盘后重启不误锁 (2.1216ms)
+✔ 编排器 confirmed：persist 成功后重启无锁；persist 失败保持 unknown (2.0708ms)
+ℹ tests 85
+ℹ suites 0
+ℹ pass 84
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 312.1655
+
+✖ failing tests:
+
+test at test\ad-switch-persist-guard.test.js:87:1
+✖ 动作前写入失败 → persistence_blocked、零底层调用 (14.9744ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'unknown'
+  - 'not_sent'
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\ad-switch-persist-guard.test.js:96:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:358:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'unknown',
+    expected: 'not_sent',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

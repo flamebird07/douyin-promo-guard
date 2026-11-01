@@ -1,0 +1,346 @@
+2026-09-22T12:32:00.066Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:00.068Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 主链路：费用 100.00元/100单 恰好=阈值 → 不进入乘方暂停（零点击、零页面会话） (495.4489ms)
+2026-09-22T12:32:08.528Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:08.529Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 主链路：费用 100.01元/100单 → 乘方全店托管+商品自选真实暂停，全部回读确认 (8452.7699ms)
+2026-09-22T12:32:10.323Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:10.324Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:32:10.332Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:10.333Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:32:10.339Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:10.339Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:32:10.344Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:10.345Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✖ 主链路：演练模式（realMode=false）→ dry 周期零业务点击 (1795.8677ms)
+✖ 主链路：realMode=true 但 pauseEnabled=false → blocked，零点击、零页面会话 (7.9675ms)
+✖ 主链路：execution.dryRun=true 即使 realMode+pauseEnabled 全开 → blocked，零点击 (6.3404ms)
+✔ 主链路：上海时间 07:59 → window_blocked，零页面会话 (5.6555ms)
+2026-09-22T12:32:16.222Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:16.223Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 主链路：操作中跨日（第2页处理时跨午夜）→ 不再发新暂停请求 (5879.4ms)
+2026-09-22T12:32:18.499Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:32:18.518Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:18.519Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:32:18.529Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:18.529Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 主链路：选择完成后收到停止信号 → 不发新暂停请求 (2295.3242ms)
+✔ 主链路：操作前重读后已不超标 → 取消（零页面会话） (9.586ms)
+2026-09-22T12:32:23.910Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:23.912Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 主链路：全量回读前新增开启对象 → 不误报全部暂停 (5384.7763ms)
+2026-09-22T12:32:24.148Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:24.150Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 主链路：删除确认弹窗 → 停止，暂停/开关/删除均零点击 (235.5097ms)
+2026-09-22T12:32:24.389Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:24.390Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 主链路：弹窗检测失败（detectDanger 抛错）→ 零点击停止 (240.0758ms)
+2026-09-22T12:32:32.703Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:32.704Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 主链路：托管开关点击结果未知但已生效 → 只回读确认，不重复切换 (8313.7971ms)
+2026-09-22T12:32:35.916Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:35.917Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 主链路：托管开关点击结果未知且未生效 → 禁止重复切换（避免反向开启），停止 (3214.824ms)
+2026-09-22T12:32:44.205Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:44.206Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:32:44.211Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:44.212Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 主链路：配置乘方范围时即使开启历史路径也不进入（只控制乘方） (8287.4081ms)
+✔ 主链路：未配置乘方范围且未开启历史路径 → blocked（fail-closed，不执行任何关闭） (4.9579ms)
+✔ 演练入口强制只读：realMode+pauseEnabled 全开也走 dryRun，托管/暂停/开启/删除均零点击 (1748.0253ms)
+✔ 演练失败透出（Runner级）：身份核验失败 → dry_failed，不显示正常枚举 (205.5656ms)
+2026-09-22T12:32:46.391Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:46.392Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✖ 主链路集成：演练身份核验失败 → trigger 透出 failed，不计为正常枚举 (228.827ms)
+2026-09-22T12:32:48.160Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:32:48.179Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:48.180Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 贴近点击：弹窗检测期间收到停止 → 不发批量暂停/开关请求 (1786.0668ms)
+2026-09-22T12:32:50.493Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:50.494Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 贴近点击：最后定位期间跨午夜 → 不发批量暂停请求 (2314.2058ms)
+2026-09-22T12:32:55.797Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:55.798Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 贴近点击 + gate 实时：批次中关闭暂停许可 → 已发出托管继续回读，不再发批量暂停 (5304.5773ms)
+2026-09-22T12:32:58.275Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:58.276Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:32:58.285Z [INFO] 监控已启动（真实执行，每日 8:00 后，每 30 分钟）
+2026-09-22T12:32:58.286Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:32:58.286Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:32:58.289Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:32:58.295Z [INFO] 监控已启动（真实执行，每日 8:00 后，每 30 分钟）
+✔ 贴近点击：页面账户变化 → beforeDispatch 身份复检拦截，零点击停止 (2479.4793ms)
+✔ 自动开启调度：07:00 前（06:00）启动 → 等待开启窗口，零开启动作、零页面会话 (10.242ms)
+2026-09-22T12:33:06.662Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:06.664Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:33:06.665Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:06.677Z [INFO] 监控已启动（真实执行，每日 8:00 后，每 30 分钟）
+✔ 自动开启调度：07:00 整 → 执行每日开启（真实 all_enabled_confirmed，只走全店托管+商品自选） (8378.9015ms)
+2026-09-22T12:33:15.309Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:15.310Z [INFO] 监控已启动（真实执行，每日 8:00 后，每 30 分钟）
+2026-09-22T12:33:15.311Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:15.312Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:33:15.313Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:15.317Z [INFO] 监控已启动（真实执行，每日 8:00 后，每 30 分钟）
+✔ 自动开启调度：当天只执行一次（同一天重启监控不重复开启） (8644.1625ms)
+2026-09-22T12:33:23.646Z [INFO] 每日开启跳过（shop-001）：本轮回读已在投放中（already_on），无需开启：跳过开启进程（不打开浏览器、零请求）
+2026-09-22T12:33:23.647Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:23.649Z [INFO] 独立每日开启任务已登记（每日 07:00 自动开启全部乘方；下次 2026-09-14 07:00 (Asia/Shanghai)；与"启动值守"相互独立）
+2026-09-22T12:33:32.825Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:32.827Z [INFO] 独立每日开启任务已停止；暂停巡查不受影响。
+2026-09-22T12:33:32.828Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:32.833Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:33:32.834Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:32.845Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:33:32.847Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:32.857Z [INFO] 监控已启动（真实执行，每日 8:00 后，每 30 分钟）
+✔ 自动开启调度：跨日重置（2026-09-21 新语义）→ 未暂停的次日跳过开启进程；中间暂停过则次日执行 (17514.8695ms)
+✔ 自动开启调度：监控未启动 → 手动 pollOnce（07:00）也不触发开启（window_blocked，零会话） (6.6689ms)
+✖ 第三轮：真实开启路径被窗口拦下 → trigger 带 targetAction=enable（动作标签不得缺失） (14.9913ms)
+2026-09-22T12:33:32.863Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:33:32.864Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:32.869Z [INFO] 监控已启动（演练模式（只记录不关闭），每日 8:00 后，每 30 分钟）
+✖ 自动开启调度：enableEnabled=false → 07:00 相位 blocked，零页面会话、零动作 (14.403ms)
+2026-09-22T12:33:42.763Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:33:42.764Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:42.769Z [INFO] 独立每日开启任务已登记（每日 07:00 自动开启全部乘方；下次 2026-09-12 07:00 (Asia/Shanghai)；与"启动值守"相互独立）
+✖ 自动开启调度：realMode=false → 开启相位为演练（枚举目标，零业务点击） (9900.2954ms)
+2026-09-22T12:33:57.777Z [INFO] 独立每日开启任务已停止；暂停巡查不受影响。
+2026-09-22T12:33:57.778Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:33:57.784Z [INFO] 独立每日开启任务已登记（每日 07:00 自动开启全部乘方；下次 2026-09-12 07:00 (Asia/Shanghai)；与"启动值守"相互独立）
+2026-09-22T12:33:57.785Z [INFO] 监控已启动（演练模式（只记录不关闭），每日 8:00 后，每 30 分钟）
+2026-09-22T12:33:57.785Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✖ 上线：未启动值守也到 07:00 自动开启（独立调度器驱动，演练零点击） (15014.6151ms)
+2026-09-22T12:34:12.795Z [INFO] 独立每日开启任务已停止；暂停巡查不受影响。
+2026-09-22T12:34:12.796Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:34:12.802Z [INFO] 独立每日开启任务已停止（用户独立停用，服务重启后不会自动恢复）（此前未在运行）；暂停巡查不受影响。
+✖ 上线：停止值守不取消每日开启；值守运行标志与开启调度器标志互不影响 (15017.6106ms)
+2026-09-22T12:34:12.845Z [INFO] 独立每日开启任务已登记（每日 07:00 自动开启全部乘方；下次 2026-09-13 07:00 (Asia/Shanghai)；与"启动值守"相互独立）
+2026-09-22T12:34:12.845Z [INFO] 独立每日开启任务已停止；暂停巡查不受影响。
+2026-09-22T12:34:12.846Z [INFO] 每日开启跳过（shop-001）：本轮回读当前状态为 unknown：每日开启 fail-closed，零点击
+2026-09-22T12:34:12.847Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:34:12.847Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:34:12.851Z [INFO] 独立每日开启任务已登记（每日 07:00 自动开启全部乘方；下次 2026-09-13 07:00 (Asia/Shanghai)；与"启动值守"相互独立）
+2026-09-22T12:34:12.852Z [WARN] 每日开启：今日开启窗口（上海 07:00–08:00）已过且当日未执行开启：不擅自补开广告，等待明日窗口
+2026-09-22T12:34:12.852Z [INFO] 独立每日开启任务已停止；暂停巡查不受影响。
+2026-09-22T12:34:12.853Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:34:12.856Z [INFO] 独立每日开启任务已登记（每日 07:00 自动开启全部乘方；下次 2026-09-13 07:00 (Asia/Shanghai)；与"启动值守"相互独立）
+✔ 上线：独立停用每日开启 → 07:00 零请求；持久化停用标记，恢复后才可运行 (50.074ms)
+✔ 上线：08:00 后启动调度器 → 记录"错过窗口"原因，不擅自补开，下次=明日 07:00 (4.9741ms)
+2026-09-22T12:34:21.187Z [INFO] 独立每日开启任务已登记（每日 07:00 自动开启全部乘方；下次 2026-09-13 07:00 (Asia/Shanghai)；与"启动值守"相互独立）
+2026-09-22T12:34:21.319Z [INFO] 独立每日开启任务已停止；暂停巡查不受影响。
+2026-09-22T12:34:21.320Z [INFO] 独立每日开启任务已停止；暂停巡查不受影响。
+2026-09-22T12:34:21.321Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:34:21.325Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:34:21.326Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 上线：当日已 success 后窗口内重启 → 不重复开启（真实模式，零新会话） (8468.7257ms)
+✔ 上线：两相位互斥——暂停周期进行中，开启相位请求被拒（不并发执行） (4.3518ms)
+2026-09-22T12:34:21.582Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:34:21.584Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:34:21.584Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 上线修复（2026-09-16）：调度漂移——定时器额外延迟不累积；休眠时钟跳跃立即返回 (258.6859ms)
+2026-09-22T12:34:21.846Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:34:21.847Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:34:21.851Z [INFO] 监控已启动（真实执行，每日 8:00 后，每 30 分钟）
+✔ 上线修复（2026-09-16）：暂停巡查延时同样以实际墙钟重算（_chunkedDelay 防漂移） (262.282ms)
+2026-09-22T12:34:21.877Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:34:21.878Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:34:21.883Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:34:21.884Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:34:21.887Z [INFO] 监控已启动（真实执行，每日 8:00 后，每 30 分钟）
+✔ 阈值联动：pollNowAndReschedule 执行一次巡查并重排下次检查（完成+30min），epoch 递增使挂起旧等待作废 (32.6494ms)
+✔ 阈值联动：阈值未变化（unchanged）时 setRuleThreshold 返回 unchanged，不触发巡查 (4.0958ms)
+2026-09-22T12:34:22.899Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:34:22.900Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:34:22.903Z [INFO] 独立每日开启任务已登记（每日 07:00 自动开启全部乘方；下次 2026-09-21 07:00 (Asia/Shanghai)；与"启动值守"相互独立）
+✔ 阈值联动：已有周期进行中 → 等待其结束后仍执行联动巡查（不静默跳过） (1016.135ms)
+2026-09-22T12:34:31.356Z [INFO] 每日开启跳过（shop-001）：本轮回读已在投放中（already_on），无需开启：跳过开启进程（不打开浏览器、零请求）
+2026-09-22T12:34:31.510Z [INFO] 独立每日开启任务已停止；暂停巡查不受影响。
+2026-09-22T12:34:31.511Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:34:31.516Z [INFO] 独立每日开启任务已登记（每日 07:00 自动开启全部乘方；下次 2026-09-21 07:00 (Asia/Shanghai)；与"启动值守"相互独立）
+✔ 每日开启前置门：第 1 天真实开启成功 → 第 2 天 07:00 跳过开启进程（会话数不增，相位=success 且注明跳过） (8612.1996ms)
+2026-09-22T12:34:39.782Z [INFO] 独立每日开启任务已停止；暂停巡查不受影响。
+2026-09-22T12:34:39.783Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:34:39.788Z [INFO] 独立每日开启任务已登记（每日 07:00 自动开启全部乘方；下次 2026-09-21 07:00 (Asia/Shanghai)；与"启动值守"相互独立）
+✔ 每日开启前置门：adBelief 未记录或为关 → 照常执行开启进程（fail-closed） (8271.3608ms)
+2026-09-22T12:34:48.159Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T12:34:48.160Z [INFO] 独立每日开启任务已停止；暂停巡查不受影响。
+2026-09-22T12:34:48.161Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 每日开启前置门：adBelief 持久化（重启后保留，跨进程有效） (8379.8911ms)
+2026-09-22T12:31:59.362Z [WARN] 店铺 shop-001 本轮停止: 店铺「测试店铺一」的抖站 Cookie 已过有效期（最近过期时间 2026-09-22T11:31:59.000Z），本轮停止自动操作
+2026-09-22T12:31:59.368Z [WARN] 店铺 shop-001 本轮停止: 未找到店铺「测试店铺一」的 Cookie 文件（已查找: C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\cookies 与 C:\Users\Administrator\AppData\Local\Temp\pg-cookies-J7Th1u）
+✔ 默认未接入：轮询明确停在"尚未接入"，不伪造数据 (10.3726ms)
+✔ 待配置/非法配置：拒绝启动与轮询 (3.7762ms)
+✔ Cookie 过期：停止本轮自动操作 (5.2268ms)
+✔ Cookie 缺失：停止并说明 (4.1653ms)
+✖ 演练模式：全店超标 → 记录"将关闭哪些广告"，绝不执行关闭 (10.9988ms)
+✔ 演练模式：100元/100单恰好等于阈值 → 不触发 (4.5041ms)
+2026-09-22T12:31:59.396Z [WARN] 店铺 shop-001 本轮停止: 全店推广费用店铺身份不匹配：配置 shop-001，全店推广费用页面实际 WRONG_SHOP。零关闭
+2026-09-22T12:31:59.400Z [WARN] 店铺 shop-001 本轮停止: 全店订单数店铺身份不匹配：配置 shop-001，全店订单数页面实际 shop-002。零关闭
+2026-09-22T12:31:59.409Z [WARN] 店铺 shop-001 本轮停止: 真实执行模式下禁止使用模拟数据（source=mock），已停止
+✔ 演练模式：零订单重读仍为 0 → 阻止并明确原因 (8.6521ms)
+✔ 回归 #3：WRONG_SHOP 费用快照 + 正确控制器身份 → 零触发零关闭 (4.2291ms)
+✔ 三源身份：订单来源店铺不匹配 → 零关闭 (3.6696ms)
+✔ 三源身份：广告清单页店铺不匹配 → 零关闭 (4.1804ms)
+✔ 真实模式 + mock 来源：直接拒绝执行 (4.5094ms)
+✔ 真实模式 07:59：读取并记录但不关闭（手动检查不绕过时间限制） (3.9336ms)
+2026-09-22T12:31:59.463Z [INFO] 监控已启动（演练模式（只记录不关闭），每日 8:00 后，每 30 分钟）
+✔ 真实模式 08:00 整：执行全店关闭并回读确认，批次按实际业务日期持久化 (42.0519ms)
+✔ 真实模式：清单页身份不匹配 → 零关闭（批次被阻止） (3.9963ms)
+2026-09-22T12:31:59.482Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:31:59.488Z [INFO] 监控已启动（演练模式（只记录不关闭），每日 8:00 后，每 30 分钟）
+✔ 调度：07:59 启动 → 等待到 08:00 先查一次，随后每 30 分钟 (23.7709ms)
+2026-09-22T12:31:59.497Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:31:59.502Z [INFO] 监控已启动（演练模式（只记录不关闭），每日 8:00 后，每 30 分钟）
+✔ 调度：23:50 巡查后跨午夜 → 等待次日 08:00 再巡查 (14.9601ms)
+2026-09-22T12:31:59.505Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T12:31:59.506Z [INFO] 监控已启动（演练模式（只记录不关闭），每日 8:00 后，每 30 分钟）
+2026-09-22T12:31:59.513Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 调度：快速停止/重新启动不会产生多个调度循环 (62.5508ms)
+✔ 跨日执行：历史已关闭不永久跳过，按最新广告状态决定操作 (64.3416ms)
+2026-09-22T12:31:59.671Z [WARN] 状态文件损坏已隔离: C:\Users\Administrator\AppData\Local\Temp\pg-data-XvE78T\state.json.corrupt-1790080319671（Expected property name or '}' in JSON at position 1 (line 1 column 2)）
+✔ 重启恢复：损坏状态文件被隔离重建，监控功能正常 (92.9607ms)
+✔ 原子写：状态目录无 .tmp 残留 (5.7954ms)
+✔ getStatus 暴露今日数据/调度/触发 (5.4765ms)
+✔ 并发防重入：轮询进行中再次触发被跳过 (4.4705ms)
+ℹ tests 67
+ℹ suites 0
+ℹ pass 57
+ℹ fail 10
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 169212.1246
+
+✖ failing tests:
+
+test at test\monitor-chengfang.test.js:184:1
+✖ 主链路：演练模式（realMode=false）→ dry 周期零业务点击 (1795.8677ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + undefined
+  - true
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\monitor-chengfang.test.js:191:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: true,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\monitor-chengfang.test.js:199:1
+✖ 主链路：realMode=true 但 pauseEnabled=false → blocked，零点击、零页面会话 (7.9675ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'ok' !== 'blocked'
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\monitor-chengfang.test.js:206:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'ok',
+    expected: 'blocked',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\monitor-chengfang.test.js:211:1
+✖ 主链路：execution.dryRun=true 即使 realMode+pauseEnabled 全开 → blocked，零点击 (6.3404ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'ok' !== 'blocked'
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\monitor-chengfang.test.js:218:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'ok',
+    expected: 'blocked',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\monitor-chengfang.test.js:511:1
+✖ 主链路集成：演练身份核验失败 → trigger 透出 failed，不计为正常枚举 (228.827ms)
+  TypeError: Cannot read properties of undefined (reading 'outcome')
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\monitor-chengfang.test.js:517:45)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7)
+
+test at test\monitor-chengfang.test.js:777:1
+✖ 第三轮：真实开启路径被窗口拦下 → trigger 带 targetAction=enable（动作标签不得缺失） (14.9913ms)
+  AssertionError [ERR_ASSERTION]: 必须产生真实 blocked_window trigger，实际：[]
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\monitor-chengfang.test.js:788:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at test\monitor-chengfang.test.js:795:1
+✖ 自动开启调度：enableEnabled=false → 07:00 相位 blocked，零页面会话、零动作 (14.403ms)
+  AssertionError [ERR_ASSERTION]: 门槛原因进入错误记录
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\monitor-chengfang.test.js:806:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at test\monitor-chengfang.test.js:810:1
+✖ 自动开启调度：realMode=false → 开启相位为演练（枚举目标，零业务点击） (9900.2954ms)
+  Error: waitFor 超时: 开启演练 trigger 记录
+      at waitFor (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\helpers.js:233:42)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\monitor-chengfang.test.js:819:3)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7)
+
+test at test\monitor-chengfang.test.js:834:1
+✖ 上线：未启动值守也到 07:00 自动开启（独立调度器驱动，演练零点击） (15014.6151ms)
+  Error: waitFor 超时: 开启演练 trigger
+      at waitFor (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\helpers.js:233:42)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\monitor-chengfang.test.js:849:3)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7)
+
+test at test\monitor-chengfang.test.js:859:1
+✖ 上线：停止值守不取消每日开启；值守运行标志与开启调度器标志互不影响 (15017.6106ms)
+  Error: waitFor 超时: 停止值守后开启仍执行
+      at waitFor (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\helpers.js:233:42)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\monitor-chengfang.test.js:876:3)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7)
+
+test at test\monitor.test.js:81:1
+✖ 演练模式：全店超标 → 记录"将关闭哪些广告"，绝不执行关闭 (10.9988ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + undefined
+  - true
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\monitor.test.js:85:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: undefined,
+    expected: true,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

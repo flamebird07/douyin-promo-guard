@@ -59,22 +59,39 @@ function msUntilHour(ms, hour) {
   return shanghaiMs(w.date, `${String(hour).padStart(2, '0')}:00`) - ms;
 }
 
+/** 距离当日 firstCheckMinute 点的毫秒数；已过返回 0。 */
+function msUntilFirstCheck(ms, firstCheckMinute) {
+  const w = shanghaiWall(ms);
+  const tod = (w.hour || 0) * 60 + (w.minute || 0);
+  if (tod >= firstCheckMinute) return 0;
+  const hh = String(Math.floor(firstCheckMinute / 60)).padStart(2, '0');
+  const mi = String(firstCheckMinute % 60).padStart(2, '0');
+  return shanghaiMs(w.date, `${hh}:${mi}`) - ms;
+}
+
 /**
  * 给定上次巡查时刻与间隔，计算下一次巡查应等待的毫秒数及目标说明。
  * - next = lastRun + intervalMinutes；
- * - next 与 now 不在同一天（跨日/跨午夜）→ 等到 next 所在日的 crossDayHour
- *   （开启窗口配置时传 enableHour，使次日 07:00 的自动开启相位能被唤醒；
- *   缺省用 startHour，保持原有"次日 08:00 后巡查"语义）；
+ * - next 与 now 不在同一天（跨日/跨午夜）→ 等到 next 所在日的目标时刻
+ *   （crossDayMinuteOfDay 优先：首查窗口配置时传 firstCheckMinuteOfDay=5，
+ *   使次日 00:05 的首查相位能被唤醒并随即进入费比巡查；缺省用 crossDayHour/startHour）；
  * - next 在今天且尚未到 → 等 next - now；
  * - next 已过（理论少见）→ 立即执行。
  */
-function nextIntervalDelayMs(nowMs, lastRunMs, intervalMinutes, startHour, crossDayHour) {
+function nextIntervalDelayMs(nowMs, lastRunMs, intervalMinutes, startHour, crossDayHour, crossDayMinuteOfDay) {
   const nextMs = lastRunMs + intervalMinutes * 60 * 1000;
   const nextWall = shanghaiWall(nextMs);
   const nowWall = shanghaiWall(nowMs);
   if (nextWall.date !== nowWall.date) {
-    const targetHour = crossDayHour !== undefined && crossDayHour !== null ? crossDayHour : startHour;
-    const target = shanghaiMs(nextWall.date, `${String(targetHour).padStart(2, '0')}:00`);
+    let target;
+    if (crossDayMinuteOfDay !== undefined && crossDayMinuteOfDay !== null) {
+      const hh = String(Math.floor(crossDayMinuteOfDay / 60)).padStart(2, '0');
+      const mi = String(crossDayMinuteOfDay % 60).padStart(2, '0');
+      target = shanghaiMs(nextWall.date, `${hh}:${mi}`);
+    } else {
+      const targetHour = crossDayHour !== undefined && crossDayHour !== null ? crossDayHour : startHour;
+      target = shanghaiMs(nextWall.date, `${String(targetHour).padStart(2, '0')}:00`);
+    }
     return { delayMs: Math.max(0, target - nowMs), nextRunAt: target, crossDay: true };
   }
   return { delayMs: Math.max(0, nextMs - nowMs), nextRunAt: nextMs, crossDay: false };
@@ -94,6 +111,7 @@ module.exports = {
   isAfterDailyStart,
   msUntilDailyStart,
   msUntilHour,
+  msUntilFirstCheck,
   nextIntervalDelayMs,
   shanghaiClockText,
 };

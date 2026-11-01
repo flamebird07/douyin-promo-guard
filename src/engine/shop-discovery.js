@@ -25,6 +25,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { isTestContext } = require('../login/session');
 
 /** 项目 cookies/ 目录（CLI 新登录的回写目标；resolveCookieFile 同源）。 */
 const PROJECT_COOKIES_DIR = path.join(__dirname, '..', '..', 'cookies');
@@ -32,6 +33,25 @@ const PROJECT_COOKIES_DIR = path.join(__dirname, '..', '..', 'cookies');
 /** 归一化匹配键：去 .json 后缀、去空白。 */
 function cookieKey(v) {
   return String(v == null ? '' : v).replace(/\.json$/i, '').trim();
+}
+
+/**
+ * 解析本次发现要扫描的项目目录（AD-WATCHDOG-TEST-ISOLATION-20261020）。
+ * - 调用方显式注入 projectCookiesDir → 只用注入目录；
+ * - 测试上下文（node --test / test/*.test.js）未注入 → fail-closed 抛错，
+ *   绝不静默扫描生产 PROJECT_COOKIES_DIR；
+ * - 生产（非测试上下文）→ 保持原默认 PROJECT_COOKIES_DIR。
+ */
+function resolveProjectDir(p) {
+  if (typeof p.projectCookiesDir === 'string' && p.projectCookiesDir.trim()) {
+    return p.projectCookiesDir.trim();
+  }
+  if (isTestContext()) {
+    throw new Error(
+      '测试上下文缺少隔离 projectCookiesDir：fail-closed，拒绝默认扫描生产 cookies/'
+    );
+  }
+  return PROJECT_COOKIES_DIR;
 }
 
 /**
@@ -45,7 +65,6 @@ function cookieKey(v) {
 function discoverShopsFromCookies(p = {}) {
   const loginCfg = p.loginCfg || {};
   const existing = Array.isArray(p.shops) ? p.shops : [];
-  const projectDir = p.projectCookiesDir || PROJECT_COOKIES_DIR;
   const sourceDir = typeof loginCfg.cookieSourceDir === 'string' && loginCfg.cookieSourceDir.trim()
     ? loginCfg.cookieSourceDir.trim() : null;
 
@@ -54,6 +73,8 @@ function discoverShopsFromCookies(p = {}) {
   if (!sourceDir) {
     return { shops: existing, added: [], skipped, scannedDirs };
   }
+  // 发现开关已开启才解析项目目录：测试上下文缺隔离目录在此 fail-closed（生产行为不变）。
+  const projectDir = resolveProjectDir(p);
   // 目录优先级与 resolveCookieFile 一致：项目目录优先，其次配置的来源目录
   const dirs = [];
   if (projectDir && fs.existsSync(projectDir)) dirs.push(projectDir);

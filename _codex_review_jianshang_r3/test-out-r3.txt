@@ -1,0 +1,257 @@
+﻿鉁?璐圭敤鍗＄墖瑙ｆ瀽锛氳处鎴锋暣浣撴秷鑰楄浆鏁存暟鍒嗭紙瀹炴祴鏂囨湰锛?(1.0517ms)
+鉁?缁熻鍛ㄦ湡锛氫袱涓?input 鍧囦负褰撳ぉ鎵嶉€氳繃 (0.5114ms)
+鉁?鏍囧噯鎶曟斁琛屽唴璁″垝ID鎻愬彇锛氬敮涓€鍛戒腑锛涜揪浜篒D锛?浣嶅甫绌烘牸锛変笉骞叉壈锛涘鍊欓€夋嫆缁?(0.2175ms)
+鉁?璇︽儏椤佃鍒扞D鎻愬彇甯︽暟瀛楄竟鐣岋紙鏃犲墠缂€/瀛愪覆璇尮閰嶏級 (0.2197ms)
+鉁?琛岀姸鎬佽瘝涓庡紑鍏宠涔夊垎绂伙細鐘舵€佽瘝涓嶆浛浠ｅ紑鍏宠瘉鎹?(0.1938ms)
+鉁?瑕嗙洊琛細鎬绘暟瀵硅处/鏈В鏋?缈婚〉澶辫触/鎴柇 浠讳竴涓嶆弧瓒?鈫?incomplete锛涙湭鎺ュ叆绫诲瀷鍒楀叆缂哄彛 (0.3647ms)
+鉁?璧勬簮娓呯悊锛氬鑸け璐?鈫?鏈鍒涘缓鐨勬祻瑙堝櫒蹇呴』琚叧闂?(11.0054ms)
+鉁?璧勬簮娓呯悊锛氬叆鍙ｇ己澶?鈫?娴忚鍣ㄥ繀椤昏鍏抽棴 (2.7307ms)
+鉁?璧勬簮娓呯悊锛欳ookie 缂哄け 鈫?娴忚鍣ㄥ皻鏈垱寤轰篃涓嶅緱璇叧鍏朵粬璧勬簮 (0.6051ms)
+鉁?鍏ュ彛鐐瑰嚮棣栨涓嶅脊鏂版爣绛撅細鍚屼細璇濆洖棣栭〉閲嶈瘯涓€娆″悗鍒拌揪鍗冨窛锛坋ntry-click锛宎ttempts=2锛?(1.4125ms)
+鉁?鍏ュ彛杩炵画 3 娆′笉寮规爣绛撅細璐︽埛ID宸茬煡 鈫?鐩磋繛鍗冨窛棣栭〉鍏滃簳鎴愬姛锛坉irect-home-url锛?(1.2268ms)
+鉁?鍏ュ彛 3 娆?+ 鐩磋繛鍏滃簳鍧囨湭鍒拌揪鍗冨窛锛氬瀹炲け璐ュ苟鍏抽棴娴忚鍣紙缁濅笉鎶婇椤?鐧诲綍椤靛綋鍗冨窛锛?(3.1365ms)
+鉁?鍏ュ彛鐐瑰嚮鍚庤惤鍒扮櫥褰?鎺堟潈涓浆椤碉細涓嶇畻鍒拌揪鍗冨窛锛屼粛璧伴噸璇曚笌鍏滃簳 (1.3218ms)
+鉁?璐圭敤璇诲彇锛歟valuate 搴忓垪椹卞姩涓嬭緭鍑鸿处鎴?鍙ｅ緞/鍒嗛」锛坰tub 椤甸潰锛?(1.566ms)
+鉁?璐圭敤璇诲彇锛氶〉闈㈣处鎴?ID 缂哄け浠嶅彲瀹屾垚锛圕ookie 褰掑睘锛孖D 浠呭彲閫夎娴嬶級 (1.3244ms)
+鉁?璐圭敤璇诲彇锛氶〉闈㈣处鎴?ID 涓庨厤缃笉鍚?鈫?浠嶈繑鍥炴暟鎹紝涓嶅洜 ID 鎶?AUTH (1.2099ms)
+鉁?Cookie 褰掑睘锛氬簵A鈫扚AKE_A 鏂囦欢銆佸簵B鈫扚AKE_B 鏂囦欢锛屽悇涓€娆′笖鏃犳贩鍚?(11.0305ms)
+鉁?鎺у埗鍣?getAd 鍙傛暟閾捐矾锛歴hopCfg.accountId 杩涘叆璇︽儏椤?URL锛涜鍒扞D 绮剧‘鏍搁獙锛堝墠缂€鎷掔粷锛?(1.7642ms)
+鉁?鎺у埗鍣?getAd锛氳鎯呴〉璐︽埛涓庨厤缃笉涓€鑷?鈫?鎷掔粷 (1.2319ms)
+鉁?鎺у埗鍣?getAd锛氶厤缃己灏?accountId 鈫?AuthError锛堝弬鏁板绾︼級 (0.1586ms)
+鉁?closeAd锛氱‖淇濋櫓鎷掔粷鎵ц锛堟湰杞笉鐪熷疄鍏抽棴锛?(0.1173ms)
+鉁?getAd锛氱己澶?鏈煡 adType 鈫?鏄庣‘鎷掔粷锛堜笉鐚滄祴璺緞锛?(0.2294ms)
+鉁?getAd 鍒嗘淳锛氬悓涓€绋冲畾ID銆佷笉鍚岀被鍨?鈫?璧颁笉鍚岃鍙栬矾寰?(1.2556ms)
+鉁?getAd 鍒嗘淳锛歴tandard 鍒楄〃涓棤璇D 鈫?found=false锛堜笉鎶婂叾浠朓D褰撶洰鏍囷級 (1.1456ms)
+鉁?scanId 蹇収锛氬悓 scanId 澶嶇敤鏃у揩鐓э紱scanId 鍙樺寲寮哄埗鏂版壂鎻忥紙TTL 鍐呭彲瑙侀〉闈㈠彉鍖栵級 (2.1374ms)
+鉁?ensureQianchuanAccountView锛氭寚閽堥伄鎸″悗娴眰涓嬩粛璇嗗埆骞跺叧闂敮涓€宸茶瘉钀ラ攢寮圭獥锛屼笅涓€杞啀鏍搁獙韬唤涓庡垏鎹?(1.028ms)
+鉁?ensureQianchuanAccountView锛氶伄鎸″悗涓嬩竴杞粛鏄笉瀹夊叏寮圭獥 鈫?DataGuardError 涓旈浂涓氬姟鐐瑰嚮 (0.3468ms)
+鉁?寮圭獥瀹夊叏鍒ゅ畾锛氬凡璇佽惀閿€寮圭獥锛堝敮涓€脳+涓や釜涓氬姟CTA+鑷冲1涓摼鎺ワ級鈫?safe 涓旀墦涓婃湰娆℃爣璁?(1.6427ms)
+鉁?寮圭獥瀹夊叏鍒ゅ畾锛氭棤閾炬帴/鏃?dialog 鐨勫凡鐭ョ粨鏋勪粛瀹夊叏锛堜笉璇潃瀹炴祴缁撴瀯锛?(1.4179ms)
+鉁?寮圭獥瀹夊叏鍒ゅ畾锛氫笟鍔＄‘璁ゆ锛堝彇娑?纭畾锛夆啋 鎷掔粷涓旈浂鎵撴爣 (1.0313ms)
+鉁?寮圭獥瀹夊叏鍒ゅ畾锛氬鍏抽棴鎸夐挳/闅愯棌鍏抽棴鎸夐挳/鍏抽棴鎸夐挳鏃犳爣璇?鈫?涓€寰嬫嫆缁?(2.9155ms)
+鉁?寮圭獥瀹夊叏鍒ゅ畾锛氬嵄闄╂枃鏈?棰濆鎺т欢/琛ㄥ崟鍐呭叧闂?绗笁涓笟鍔℃寜閽?鈫?涓€寰嬫嫆缁?(2.1036ms)
+鉁?寮圭獥瀹夊叏鍒ゅ畾锛氬閮ㄥ璇濇涓嶅惈璇ュ叧闂寜閽?/ 缂烘湰娆℃爣璁?鈫?鎷掔粷 (1.4614ms)
+鉁?寮圭獥瀹夊叏鍒ゅ畾锛氱己宸茬煡鏍?缂?type=button/缂?oc-icon-close 鈫?涓€寰嬫嫆缁?(1.9736ms)
+鉁?寮圭獥鍘熷瓙鍏抽棴锛氬悓涓€娆℃墽琛屽唴澶嶆牳骞剁偣鍑诲敮涓€宸茶瘉鍏抽棴鎸夐挳锛岀偣鍑诲悗绉婚櫎鏍囪 (2.729ms)
+鉁?寮圭獥鍘熷瓙鍏抽棴锛氳妭鐐硅澶嶇敤鏀瑰啓涓轰笟鍔℃寜閽紙鏍囪浠嶅湪锛夆啋 闆剁偣鍑?(2.1812ms)
+鉁?寮圭獥鍘熷瓙鍏抽棴锛氭爣璁板湪涓ゆ蹇収涔嬮棿涓㈠け锛堥噸娓叉煋锛夆啋 闆剁偣鍑?(2.0841ms)
+鉁?寮圭獥鍘熷瓙鍏抽棴锛氱偣鍑诲揩鐓у唴缁撴瀯鍙樺嵄闄╋紙澶氬嚭绗笁涓笟鍔℃寜閽級鈫?闆剁偣鍑?(1.7462ms)
+鉁?绠€灏氾細娴獥鍏堜簬搴楅摵瑙嗗浘鍑虹幇 鈫?鍏堝叧闂凡璇佸脊绐楀啀缁х画锛堜笉鍐嶇┖绛夊埌瓒呮椂锛?(0.2839ms)
+鉁?璐︽埛瑙嗗浘鍑虹幇鏈煡寮圭獥 鈫?澶辫触锛屼笉寰楃洿鎺ヨ繑鍥炴垚鍔燂紙闆朵笟鍔＄偣鍑伙級 (0.1912ms)
+鉁?鍘熷瓙鍏抽棴蹇収澶嶆牳涓嶉€氳繃锛堣妭鐐瑰凡涓嶅彲璇侊級鈫?闆剁偣鍑诲け璐ワ紝缁濅笉閫€鍥炵粨鏋勯€夋嫨鍣ㄧ偣鍑?(0.1632ms)
+鉁?鍏抽棴蹇収鍙戠幇寮圭獥宸茶嚜琛屾秷澶?鈫?鏈疆闆剁偣鍑伙紝涓嬩竴杞噸鏂拌瀵熷悗缁х画 (0.1901ms)
+鉁?鍒ゅ畾閫氳繃浣嗙己鏈鏍囪 鈫?闆剁偣鍑诲け璐ワ紙涓嶆帴鍙椻€滅粨鏋勫儚鈥濆氨鐐癸級 (0.1559ms)
+鉁?鍏抽棴鍚庡悓涓€寮圭獥浠嶅湪 鈫?绔嬪嵆澶辫触锛屼笉浜屾鍏抽棴 (0.1547ms)
+鉁?娈嬬暀宸茬煡鏍癸紙鍏抽棴閽笌 dialog 鐨嗘棤锛夆啋 present 浠嶄负 true锛屼笉寰楀垽娑堝け (0.5826ms)
+鉁?鍏抽棴 evaluate 杩斿洖 undefined 鈫?fail-closed锛屼笉寰楀綋鑷娑堝け (0.2158ms)
+鉁?鍏抽棴 evaluate 杩斿洖鐣稿舰锛堟棤 popup锛夆啋 fail-closed (0.1667ms)
+鉁?绌哄簵鍚?+ accountContent=true 鈫?缂哄皯鐩爣搴楅摵鍚嶏紝涓嶅緱鎴愬姛杩斿洖 (0.1471ms)
+鈩?tests 48
+鈩?suites 0
+鈩?pass 34
+鈩?fail 14
+鈩?cancelled 0
+鈩?skipped 0
+鈩?todo 0
+鈩?duration_ms 199.0597
+
+鉁?failing tests:
+
+test at test\qianchuan-reader.test.js:214:1
+鉁?璧勬簮娓呯悊锛氬叆鍙ｇ己澶?鈫?娴忚鍣ㄥ繀椤昏鍏抽棴 (2.7307ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /宸ㄩ噺鍗冨窛/. Input:
+  
+  'DataGuardError: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://fxg.jinritemai.com/ffa/mshop/homepage/index锛夛紱鏈鐧诲綍姝ｈ瘉鎹紝鎸夊鑸簨瀹炲鐞嗭紝闇€浜哄伐鏍稿疄'
+  
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:216:3)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: DataGuardError: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://fxg.jinritemai.com/ffa/mshop/homepage/index锛夛紱鏈鐧诲綍姝ｈ瘉鎹紝鎸夊鑸簨瀹炲鐞嗭紝闇€浜哄伐鏍稿疄
+        at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+        at async waitForActual (node:assert:646:5)
+        at async ok.rejects (node:assert:769:25)
+        at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:216:3)
+        at async Test.run (node:internal/test_runner/test:1125:7)
+        at async Test.processPendingSubtests (node:internal/test_runner/test:787:7),
+    expected: /宸ㄩ噺鍗冨窛/,
+    operator: 'rejects',
+    diff: 'simple'
+  }
+
+test at test\qianchuan-reader.test.js:232:1
+鉁?鍏ュ彛鐐瑰嚮棣栨涓嶅脊鏂版爣绛撅細鍚屼細璇濆洖棣栭〉閲嶈瘯涓€娆″悗鍒拌揪鍗冨窛锛坋ntry-click锛宎ttempts=2锛?(1.4125ms)
+  Error [DataGuardError]: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄
+      at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:234:13)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    code: 'DATA_GUARD',
+    reason: '鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄',
+    detail: null
+  }
+
+test at test\qianchuan-reader.test.js:242:1
+鉁?鍏ュ彛杩炵画 3 娆′笉寮规爣绛撅細璐︽埛ID宸茬煡 鈫?鐩磋繛鍗冨窛棣栭〉鍏滃簳鎴愬姛锛坉irect-home-url锛?(1.2268ms)
+  Error [DataGuardError]: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄
+      at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:244:13)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    code: 'DATA_GUARD',
+    reason: '鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄',
+    detail: null
+  }
+
+test at test\qianchuan-reader.test.js:250:1
+鉁?鍏ュ彛 3 娆?+ 鐩磋繛鍏滃簳鍧囨湭鍒拌揪鍗冨窛锛氬瀹炲け璐ュ苟鍏抽棴娴忚鍣紙缁濅笉鎶婇椤?鐧诲綍椤靛綋鍗冨窛锛?(3.1365ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /宸ㄩ噺鍗冨窛/. Input:
+  
+  'DataGuardError: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://fxg.jinritemai.com/ffa/mshop/homepage/index锛夛紱鏈鐧诲綍姝ｈ瘉鎹紝鎸夊鑸簨瀹炲鐞嗭紝闇€浜哄伐鏍稿疄'
+  
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:252:3)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: DataGuardError: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://fxg.jinritemai.com/ffa/mshop/homepage/index锛夛紱鏈鐧诲綍姝ｈ瘉鎹紝鎸夊鑸簨瀹炲鐞嗭紝闇€浜哄伐鏍稿疄
+        at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+        at async waitForActual (node:assert:646:5)
+        at async ok.rejects (node:assert:769:25)
+        at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:252:3)
+        at async Test.run (node:internal/test_runner/test:1125:7)
+        at async Test.processPendingSubtests (node:internal/test_runner/test:787:7),
+    expected: /宸ㄩ噺鍗冨窛/,
+    operator: 'rejects',
+    diff: 'simple'
+  }
+
+test at test\qianchuan-reader.test.js:259:1
+鉁?鍏ュ彛鐐瑰嚮鍚庤惤鍒扮櫥褰?鎺堟潈涓浆椤碉細涓嶇畻鍒拌揪鍗冨窛锛屼粛璧伴噸璇曚笌鍏滃簳 (1.3218ms)
+  Error [DataGuardError]: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄
+      at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:261:13)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    code: 'DATA_GUARD',
+    reason: '鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄',
+    detail: null
+  }
+
+test at test\qianchuan-reader.test.js:286:1
+鉁?璐圭敤璇诲彇锛歟valuate 搴忓垪椹卞姩涓嬭緭鍑鸿处鎴?鍙ｅ緞/鍒嗛」锛坰tub 椤甸潰锛?(1.566ms)
+  Error [DataGuardError]: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄
+      at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+      at async Object.readCostSummary (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1376:35)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:292:19)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    code: 'DATA_GUARD',
+    reason: '鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄',
+    detail: null
+  }
+
+test at test\qianchuan-reader.test.js:301:1
+鉁?璐圭敤璇诲彇锛氶〉闈㈣处鎴?ID 缂哄け浠嶅彲瀹屾垚锛圕ookie 褰掑睘锛孖D 浠呭彲閫夎娴嬶級 (1.3244ms)
+  Error [DataGuardError]: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home锛夛紱鏈鐧诲綍姝ｈ瘉鎹紝鎸夊鑸簨瀹炲鐞嗭紝闇€浜哄伐鏍稿疄
+      at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+      at async Object.readCostSummary (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1376:35)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:307:19)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    code: 'DATA_GUARD',
+    reason: '鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home锛夛紱鏈鐧诲綍姝ｈ瘉鎹紝鎸夊鑸簨瀹炲鐞嗭紝闇€浜哄伐鏍稿疄',
+    detail: null
+  }
+
+test at test\qianchuan-reader.test.js:317:1
+鉁?璐圭敤璇诲彇锛氶〉闈㈣处鎴?ID 涓庨厤缃笉鍚?鈫?浠嶈繑鍥炴暟鎹紝涓嶅洜 ID 鎶?AUTH (1.2099ms)
+  Error [DataGuardError]: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄
+      at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+      at async Object.readCostSummary (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1376:35)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:323:19)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    code: 'DATA_GUARD',
+    reason: '鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄',
+    detail: null
+  }
+
+test at test\qianchuan-reader.test.js:331:1
+鉁?Cookie 褰掑睘锛氬簵A鈫扚AKE_A 鏂囦欢銆佸簵B鈫扚AKE_B 鏂囦欢锛屽悇涓€娆′笖鏃犳贩鍚?(11.0305ms)
+  Error [DataGuardError]: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄
+      at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:376:16)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    code: 'DATA_GUARD',
+    reason: '鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄',
+    detail: null
+  }
+
+test at test\qianchuan-reader.test.js:413:1
+鉁?鎺у埗鍣?getAd 鍙傛暟閾捐矾锛歴hopCfg.accountId 杩涘叆璇︽儏椤?URL锛涜鍒扞D 绮剧‘鏍搁獙锛堝墠缂€鎷掔粷锛?(1.7642ms)
+  Error [DataGuardError]: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄
+      at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+      at async Object.getAd (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1787:44)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:424:13)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    code: 'DATA_GUARD',
+    reason: '鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄',
+    detail: null
+  }
+
+test at test\qianchuan-reader.test.js:444:1
+鉁?鎺у埗鍣?getAd锛氳鎯呴〉璐︽埛涓庨厤缃笉涓€鑷?鈫?鎷掔粷 (1.2319ms)
+  Error [DataGuardError]: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄
+      at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+      at async Object.getAd (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1787:44)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:452:13)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    code: 'DATA_GUARD',
+    reason: '鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/home?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?60 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄',
+    detail: null
+  }
+
+test at test\qianchuan-reader.test.js:486:1
+鉁?getAd 鍒嗘淳锛氬悓涓€绋冲畾ID銆佷笉鍚岀被鍨?鈫?璧颁笉鍚岃鍙栬矾寰?(1.2556ms)
+  Error [DataGuardError]: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/uni-prom/detail?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?93 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄
+      at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+      at async Object.getAd (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1787:44)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:495:14)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    code: 'DATA_GUARD',
+    reason: '鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/uni-prom/detail?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?93 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄',
+    detail: null
+  }
+
+test at test\qianchuan-reader.test.js:525:1
+鉁?getAd 鍒嗘淳锛歴tandard 鍒楄〃涓棤璇D 鈫?found=false锛堜笉鎶婂叾浠朓D褰撶洰鏍囷級 (1.1456ms)
+  Error [DataGuardError]: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/promotion-v2/standard?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?77 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄
+      at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+      at async Object.getAd (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1787:44)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:535:13)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    code: 'DATA_GUARD',
+    reason: '鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/promotion-v2/standard?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?77 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄',
+    detail: null
+  }
+
+test at test\qianchuan-reader.test.js:540:1
+鉁?scanId 蹇収锛氬悓 scanId 澶嶇敤鏃у揩鐓э紱scanId 鍙樺寲寮哄埗鏂版壂鎻忥紙TTL 鍐呭彲瑙侀〉闈㈠彉鍖栵級 (2.1374ms)
+  Error [DataGuardError]: 鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/promotion-v2/standard?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?77 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄
+      at openQianchuanHome (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1105:13)
+      at async Object._collectAll (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1640:44)
+      at async Object.listAdPage (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\src\adapters\qianchuan-reader.js:1624:51)
+      at async TestContext.<anonymous> (C:\Users\Administrator\Documents\鐢靛晢鍔╂墜\douyin-promo-guard\test\qianchuan-reader.test.js:572:14)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    code: 'DATA_GUARD',
+    reason: '鎶栧簵涓婚〉闈㈠湪鏈夌晫鑷姩鐧诲綍鏀舵暃鏈熷唴鏈埌杈鹃椤碉紙16 娆℃帰娴嬶紝褰撳墠 https://qianchuan.jinritemai.com/promotion-v2/standard?鈥︼紙鏌ヨ鍙傛暟宸查伄钄斤紝鍘?URL 鍏?77 瀛楃锛夛級锛涙湭瑙佺櫥褰曟璇佹嵁锛屾寜瀵艰埅浜嬪疄澶勭悊锛岄渶浜哄伐鏍稿疄',
+    detail: null
+  }

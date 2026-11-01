@@ -1,14 +1,13 @@
 'use strict';
 
 /**
- * 0 单正常流全链路验收（客户 2026-10-27 修正）。
+ * 0 单正常流全链路验收（规则 C，用户 2026-11-01 拍板，全店口径）。
  *
- * 修正前：rules 在公式前返回 zero_orders blocked；coordinator 对每个有效 0 单再读一次并 ok:false；
- * decision 把 zero_orders 提升为 DATA_BLOCKED；monitor 有 zero_orders 专用阻断分支；UI 隐藏旧原因。
- * 修正后：0 单与正单走同一整数公式（expectedCents=0），50 元保护线不变：
- *   - 0 费 0 单：相等 → 零动作；
- *   - 0 单有消耗 ≤50 元：spend_protected（原始 over=true，但不自动暂停）；
- *   - 0 单有消耗 >50 元：pauseEligible（on/mixed → should_pause；off → already_off）；
+ * 历史：2026-10-27 修正曾让 0 单与正单走同一整数公式（expectedCents=0、正费用即 above，
+ * 是否可暂停由 50 元保护线决定）；自 2026-11-01 规则 C 起该口径废止：
+ *   - orders === 0：一律不暂停，仅观察/告警、零点击；不得因 costCents > 0 触发暂停；
+ *     over / pauseEligible / roiTooLow 全 false；spendProtected 恒 false（D55 已取消消耗门槛）；
+ *   - orders >= 1：仍用 costCents > orders × thresholdCents（严格大于，整数分）；
  *   - unknown / 缺字段 / null / 负数 / 非整数 / 身份/日期/时效/解析故障仍是真实错误。
  *
  * 全部离线：mock reader/controller + 临时目录 + 注入时钟；无浏览器、无网络、无真实开关。
@@ -98,36 +97,20 @@ function setupMonitor(t, { costCents = 1200, orders = 0, ads = ADS_ON } = {}) {
   return { monitor, controller, reader };
 }
 
-// ── 规则层：0 单与正单同一整数公式 ────────────────────────────────
+// ── 规则层：规则 C——0 单只观察，不与正单同一公式 ─────────────────
 
-test('规则边界（orders=0）：0 / 1 / 5000 / 5001 分与 50 元保护线', () => {
-  assert.strictEqual(SPEND_FLOOR_CENTS, 5000);
+test('规则边界（orders=0）：规则 C——0 / 1 / 5000 / 5001 分一律 over=false，无消耗门槛', () => {
+  assert.strictEqual(SPEND_FLOOR_CENTS, 0, 'D55 已取消消耗门槛；规则 C 不引入新的金额门槛');
 
-  const zero = evaluateWholeShopCostPerOrder({ costCents: 0, orders: 0, thresholdCents: 100 });
-  assert.strictEqual(zero.expectedCents, 0);
-  assert.strictEqual(zero.over, false, '0 分 == 0 分：相等不关闭');
-  assert.strictEqual(zero.spendProtected, true);
-  assert.strictEqual(zero.pauseEligible, false);
-  assert.strictEqual(zero.blocked, undefined);
-
-  const one = evaluateWholeShopCostPerOrder({ costCents: 1, orders: 0, thresholdCents: 100 });
-  assert.strictEqual(one.expectedCents, 0);
-  assert.strictEqual(one.over, true, '1 分 > 0 分：严格超标');
-  assert.strictEqual(one.spendProtected, true);
-  assert.strictEqual(one.pauseEligible, false, '≤50 元不自动暂停');
-  assert.strictEqual(one.blocked, undefined);
-
-  const floor = evaluateWholeShopCostPerOrder({ costCents: 5000, orders: 0, thresholdCents: 100 });
-  assert.strictEqual(floor.over, true);
-  assert.strictEqual(floor.spendProtected, true);
-  assert.strictEqual(floor.pauseEligible, false);
-  assert.strictEqual(floor.roiTooLow, false);
-
-  const over = evaluateWholeShopCostPerOrder({ costCents: 5001, orders: 0, thresholdCents: 100 });
-  assert.strictEqual(over.over, true);
-  assert.strictEqual(over.spendProtected, false);
-  assert.strictEqual(over.pauseEligible, true);
-  assert.strictEqual(over.roiTooLow, true);
+  for (const costCents of [0, 1, 5000, 5001]) {
+    const r = evaluateWholeShopCostPerOrder({ costCents, orders: 0, thresholdCents: 100 });
+    assert.strictEqual(r.expectedCents, 0, costCents + ' 分：expectedCents 仍为 0，仅供展示');
+    assert.strictEqual(r.over, false, '规则 C：0 单不与正单同一公式，' + costCents + ' 分也不 over');
+    assert.strictEqual(r.spendProtected, false, '无消耗门槛：spendProtected 恒 false');
+    assert.strictEqual(r.pauseEligible, false, '0 单无暂停资格');
+    assert.strictEqual(r.roiTooLow, false);
+    assert.strictEqual(r.blocked, undefined, '0 单是合法观测，不是 blocked');
+  }
 });
 
 test('规则：0 单合法；缺失/null/负数/非整数/metric 非法仍是真实错误', () => {
@@ -144,51 +127,36 @@ test('规则：0 单合法；缺失/null/负数/非整数/metric 非法仍是真
 
 // ── 决策层：0 单 × 当前状态边界矩阵 ──────────────────────────────
 
-test('决策矩阵（orders=0）：0/1/5000 保护区零动作；5001 按 on/off/mixed 分流；unknown 仍阻止', () => {
+test('决策矩阵（orders=0）：规则 C——任何费用 × on/off/mixed 均 zero_order_no_pause；unknown 仍阻止', () => {
   function dec(costCents, currentAdState) {
     return decideAdSwitchAction({
       costCents, orders: 0, thresholdCents: 100, currentAdState, identityOk: true,
     });
   }
 
-  for (const st of ['on', 'off', 'mixed']) {
-    const r = dec(0, st);
-    assert.strictEqual(r.metric, METRIC.EQUAL, `0 分 + ${st}`);
-    assert.strictEqual(r.decision, DECISION.EQUAL_NO_ACTION, `0 分 + ${st}：相等保持`);
-    assert.strictEqual(r.zeroClick, true);
-  }
-  assert.strictEqual(dec(0, 'unknown').decision, DECISION.UNKNOWN_BLOCKED);
-
-  for (const cost of [1, 5000]) {
+  for (const cost of [0, 1, 5000, 5001]) {
     for (const st of ['on', 'off', 'mixed']) {
       const r = dec(cost, st);
-      assert.strictEqual(r.metric, METRIC.ABOVE, `${cost} 分 + ${st}`);
-      assert.strictEqual(r.decision, DECISION.SPEND_PROTECTED, `${cost} 分 + ${st}：50 元保护`);
-      assert.strictEqual(r.spendProtected, true);
+      assert.strictEqual(r.metric, METRIC.ZERO_ORDER, cost + ' 分 + ' + st + '：0 单单列观察');
+      assert.strictEqual(r.decision, DECISION.ZERO_ORDER_NO_PAUSE, cost + ' 分 + ' + st + '：0 单一律不暂停');
+      assert.strictEqual(r.action, null);
+      assert.strictEqual(r.targetState, null);
+      assert.strictEqual(r.zeroClick, true);
+      assert.strictEqual(r.spendProtected, false);
       assert.strictEqual(r.pauseEligible, false);
       assert.strictEqual(r.roiTooLow, false);
-      assert.strictEqual(r.zeroClick, true);
       assert.strictEqual(r.blocked, null);
     }
-    assert.strictEqual(dec(cost, 'unknown').decision, DECISION.UNKNOWN_BLOCKED);
+    const unknown = dec(cost, 'unknown');
+    assert.strictEqual(unknown.decision, DECISION.UNKNOWN_BLOCKED, cost + ' 分 + unknown：仍 fail-closed');
+    assert.strictEqual(unknown.pauseEligible, false);
+    assert.strictEqual(unknown.roiTooLow, false);
   }
-
-  const on = dec(5001, 'on');
-  assert.strictEqual(on.decision, DECISION.SHOULD_PAUSE);
-  assert.strictEqual(on.action, 'pause');
-  assert.strictEqual(on.pauseEligible, true);
-  assert.strictEqual(on.roiTooLow, true);
-  assert.strictEqual(dec(5001, 'mixed').decision, DECISION.SHOULD_PAUSE);
-  assert.strictEqual(dec(5001, 'off').decision, DECISION.ALREADY_OFF);
-  const unknown = dec(5001, 'unknown');
-  assert.strictEqual(unknown.decision, DECISION.UNKNOWN_BLOCKED);
-  assert.strictEqual(unknown.pauseEligible, false);
-  assert.strictEqual(unknown.roiTooLow, false);
 });
 
 // ── 真实 coordinator：0 单 ok:true，无零单专用重读 ────────────────
 
-test('coordinator：0 单 + 12.00 元 → ok:true、spendProtected，恰读一次订单（无专用重读）', async (t) => {
+test('coordinator：0 单 + 12.00 元 → ok:true、over=false（规则 C），恰读一次订单（无专用重读）', async (t) => {
   const { coord, reader, controller } = setupCoordinator(t, { costCents: 1200, orders: 0 });
   const data = await coord.readAndEvaluate(SHOP_CFG);
 
@@ -196,28 +164,26 @@ test('coordinator：0 单 + 12.00 元 → ok:true、spendProtected，恰读一�
   assert.strictEqual(data.blocked, undefined, '0 单不再 blocked');
   assert.strictEqual(data.orders.valueCount, 0);
   assert.strictEqual(data.rechecked, 0);
-  assert.strictEqual(data.evaluation.over, true, '1200 分 > 0×100=0 分');
-  assert.strictEqual(data.evaluation.spendProtected, true);
-  assert.strictEqual(data.evaluation.pauseEligible, false);
+  assert.strictEqual(data.evaluation.over, false, '规则 C：0 单不与正单同一公式，costCents>0 也不 over');
+  assert.strictEqual(data.evaluation.spendProtected, false, '无消耗门槛（D55）：spendProtected 恒 false');
+  assert.strictEqual(data.evaluation.pauseEligible, false, '0 单无暂停资格');
   assert.strictEqual(reader.readOrderSummaryCalls, 1, '每轮评估只读一次订单，无零单专用重读');
   assert.strictEqual(controller.state.closeCalls.length, 0);
 });
 
-test('coordinator：0 单 + 12.00 元批次 → 50 元保护取消，零关闭', async (t) => {
+test('coordinator：0 单 + 12.00 元批次 → 规则 C 操作前复核取消，零关闭', async (t) => {
   const { coord, controller } = setupCoordinator(t, { costCents: 1200, orders: 0, realMode: true });
   const r = await coord.executeWholeShopCloseBatch({ shopCfg: SHOP_CFG, cycleToken: { aborted: false } });
-  assert.strictEqual(r.outcome, 'cancelled');
-  assert.match(r.reason, /50 元保护/);
+  assert.strictEqual(r.outcome, 'cancelled', '规则 C：0 单无暂停资格 → 操作前复核取消');
+  assert.match(r.reason, /已不超标，取消关闭/);
   assert.strictEqual(controller.state.closeCalls.length, 0);
 });
 
-test('coordinator：0 单 + 50.01 元批次 → 正常关闭（保护线不被零单绕过）', async (t) => {
-  const { coord, controller, reader } = setupCoordinator(t, { costCents: 5001, orders: 0, realMode: true, ads: ADS_MIXED });
+test('coordinator：0 单 + 50.01 元批次 → 规则 C 仍取消（0 单绝不关闭），零关闭', async (t) => {
+  const { coord, controller } = setupCoordinator(t, { costCents: 5001, orders: 0, realMode: true, ads: ADS_MIXED });
   const r = await coord.executeWholeShopCloseBatch({ shopCfg: SHOP_CFG, cycleToken: { aborted: false } });
-  assert.strictEqual(r.outcome, 'all_closed_confirmed');
-  assert.strictEqual(r.counts.confirmed, 3, '3 个投放侧广告全部关闭（已暂停的不动）');
-  assert.strictEqual(controller.state.closeCalls.length, 3);
-  assert.strictEqual(reader.readOrderSummaryCalls, 1, '操作前复核也只读一次订单');
+  assert.strictEqual(r.outcome, 'cancelled', '规则 C：0 单无暂停资格，费用超过旧 50 元保护线也一律取消');
+  assert.strictEqual(controller.state.closeCalls.length, 0, '零关闭');
 });
 
 test('coordinator：0 单合法，但跨店/跨日/缺失/null/负数仍是真实错误', async (t) => {
@@ -262,27 +228,27 @@ test('Monitor.refreshShopData：0 单 + 12.00 元返回 ok/readOnly/zeroClick，
   assert.strictEqual(res.blocked, undefined);
   assert.strictEqual(res.data.orders, 0);
   assert.strictEqual(res.data.costCents, 1200);
-  assert.strictEqual(res.data.over, true);
-  assert.strictEqual(res.data.spendProtected, true);
-  assert.strictEqual(res.data.pauseEligible, false);
+  assert.strictEqual(res.data.over, false, '规则 C：0 单不 over');
+  assert.strictEqual(res.data.spendProtected, false, '无消耗门槛：spendProtected 恒 false');
+  assert.strictEqual(res.data.pauseEligible, false, '0 单无暂停资格');
   assert.strictEqual(res.data.blockedReason, undefined, '正常 0 单不产生 blockedReason');
   const shop = monitor.getStatus().shops.find((s) => s.id === 'shop-001');
   assert.strictEqual(shop.today.blockedReason, undefined);
 });
 
-test('Monitor 普通巡查：0 单 + 12.00 元 → spend_protected，不是 DATA_BLOCKED、零动作', async (t) => {
+test('Monitor 普通巡查：0 单 + 12.00 元 → zero_order_no_pause，不是 DATA_BLOCKED、零动作', async (t) => {
   const { monitor, controller, reader } = setupMonitor(t, { costCents: 1200, orders: 0, ads: ADS_ON });
   const r = await monitor.pollOnce('test');
   const res = r.results[0];
 
   assert.strictEqual(res.status, 'ok');
-  assert.strictEqual(res.decision, DECISION.SPEND_PROTECTED);
+  assert.strictEqual(res.decision, DECISION.ZERO_ORDER_NO_PAUSE);
   assert.notStrictEqual(res.decision, DECISION.DATA_BLOCKED, '正常 0 单不得标 DATA_BLOCKED');
   assert.strictEqual(res.blocked, undefined);
   assert.strictEqual(res.zeroClick, true);
-  assert.strictEqual(res.spendProtected, true);
+  assert.strictEqual(res.spendProtected, false);
   assert.strictEqual(res.pauseEligible, false);
-  assert.strictEqual(controller.state.closeCalls.length, 0, '保护区内零动作');
+  assert.strictEqual(controller.state.closeCalls.length, 0, '规则 C：0 单零动作');
   assert.strictEqual(monitor.triggers.length, 0);
   assert.strictEqual(monitor.actions.length, 0);
   assert.strictEqual(reader.readOrderSummaryCalls, 1, '无零单专用重读');

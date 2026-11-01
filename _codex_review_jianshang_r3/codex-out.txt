@@ -1,0 +1,18 @@
+VERDICT: PASS_WITH_NOTES
+KEY_FINDINGS:
+- Scoped Round-3 residuals are closed in live source; CodeBuddy鈥檚 report was independently checked against production functions and tests.
+- Popup closing remains narrowly whitelisted and atomically revalidated before clicking.
+- Focused residual tests pass. The overall file remains 34 pass / 14 unrelated failures, so this is not a full-suite green verdict.
+- No dedicated mask-only regression exists, although the production probe explicitly covers a visible `mask` beneath the known root; the required residual-root regression directly executes the real probe.
+BLOCKERS:
+- none
+SECURITY_OF_POPUP_CLOSE: No scoped path was found that closes a non-whitelisted overlay or clicks a business CTA. The click requires the known root, unique visible close button, explicit `type="button"`, exact `aria-label="鍏抽棴"`, close icon, exact two-business-button contract, safe text, current tag, and same-evaluate revalidation before `verifiedClose.click()` (`qianchuan-reader.js:632-764`). `clicked=false` with `present=true` fails closed.
+FAIL_CLOSED_GAPS: No remaining blocker in the reviewed residual paths. Undefined or missing-popup close results stop with 鈥滃叧闂粨鏋滃紓甯糕€? a residual known root remains `present=true`; empty expectedName cannot reach either account-content or shop-view success. Notes are limited to the missing mask-specific test and unrelated 14 failing tests.
+RESIDUAL_1_EXPECTED_NAME: addressed 鈥?`expectedName` is checked before the accountContent success return at `qianchuan-reader.js:856-865`; regression at `qianchuan-reader.test.js:1133-1143` invokes the real ensure function and verifies DataGuard failure with zero business/switch clicks.
+RESIDUAL_2_PRESENT_ROOT_MASK: addressed 鈥?`popup.present` now includes a visible `overall-release-modal-v2-wrap` or visible `mask` beneath that root at `qianchuan-reader.js:635-659`. The residual-root regression at `qianchuan-reader.test.js:1103-1107` runs the exported production probe through the VM DOM harness, not a `safe:true` stub.
+RESIDUAL_3_CLOSE_RESULT_FAILCLOSED: addressed 鈥?`qianchuan-reader.js:831-844` rejects absent/non-object results and absent/non-object popup results; only a structured result with `present === false` takes the self-disappeared path. Undefined and no-popup regressions at `qianchuan-reader.test.js:1110-1131` exercise the real ensure control flow.
+RESIDUAL_4_REGRESSIONS: addressed 鈥?all four claimed cases exist: residual root, undefined close result, malformed/no-popup close result, and empty-name plus accountContent. The root case exercises the real probe; the transport anomalies use controlled evaluate stubs but execute production ensure logic rather than stubbing a successful return.
+NOTES_RUNTIME_STALE: PID 15528 still reports loaded reader SHA-256 `669722鈥?652`, while reviewed disk source is `f5427b鈥b37`; no restart was requested or performed. This does not affect the code verdict, but Round-3 behavior is not loaded in that runtime.
+BALANCE_TOUCHED: no 鈥?the scoped Round-3 popup/expectedName residual edits do not change balance parsing.
+
+

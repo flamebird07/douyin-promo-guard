@@ -1,0 +1,51 @@
+5570|        const rt = (this._runtimeMap && this._runtimeMap.get(s.id)) || {};
+5571|        const t = rt.lastData || null;
+5572|        const mr = this._mixedReconcileView(s.id);
+5573|        return {
+5574|          id: s.id,
+5575|          name: s.name || s.id,
+5576|          displayName: s.displayName || s.name || s.id,
+5577|          adState: rt.lastAdState || 'unknown',
+5578|          adStateConfirmedAt: rt.adStateConfirmedAt || null,
+5579|          adStateObservedAt: rt.adStateObservedAt || null,
+5580|          adStateEvidenceKind: rt.adStateEvidenceKind || null,
+5581|          // mixed 非完成态：主控制页直接消费（待收敛/重新判定/重试中；on/off 才视为已收敛）
+5582|          mixedReconcile: {
+5583|            state: mr.reconcileState,
+5584|            text: mr.reconcileText,
+5585|            mixedIsCompletion: false,
+5586|            unknownBlock: mr.unknownBlock,
+5587|          },
+5588|          lastDataAt: rt.lastDataAt || (t && t.fetchedAt) || null,
+5589|          costCents: t && t.costCents != null ? t.costCents : null,
+5590|          costText: t ? t.costText : null,
+5591|          orders: t && t.orders != null ? t.orders : null,
+5592|          // 千川可用余额（2026-09-27，账户级只读展示字段；null=本轮未读到，界面显示"未知"）
+5593|          balanceCents: t && t.balanceCents != null ? t.balanceCents : null,
+5594|          balanceAt: t && t.balanceAt ? t.balanceAt : null,
+5595|          // 余额终态（2026-10-31 竞态修正）：ok/error/missing/skipped + 非 ok 具体原因
+5596|          balanceStatus: (t && t.balanceStatus) || null,
+5597|          balanceReason: (t && t.balanceStatus && t.balanceStatus !== 'ok') ? t.balanceReason || null : null,
+5598|          // 本轮刷新在途（candidate 未提交）：界面可显示"刷新中"，而非把陈旧读数当新读数
+5599|          refreshing: rt.dataRefreshing === true || (t && t.refreshing === true),
+5600|          thresholdCents: this._thresholdCents(s),
+5601|          over: t ? t.over === true : null,
+5602|          // 同店同日 ROI 提示投影（t.businessDate 必须等于今日；消耗门槛已取消）
+5603|          spendFloorCents: SPEND_FLOOR_CENTS,
+5604|          spendProtected: (t && t.businessDate === today) ? t.spendProtected === true : null,
+5605|          pauseEligible: (t && t.businessDate === today) ? t.pauseEligible === true : false,
+5606|          roiTooLow: !!(t && t.businessDate === today && t.roiTooLow === true),
+5607|          lastError: rt.lastError || (t && t.blockedReason) || null,
+5608|          readRecovery: this._readRecoveryView(s.id),
+5609|          // 状态供界面兼容；正常配置店铺不显示待核验标记。
+5610|          identityPending: this._shopIdentityState(s).pending,
+5611|          identityNote: this._shopIdentityState(s).reason,
+5612|          // D56：有效启用状态等价于"未删除"，避免把历史 enabled=false 的正常店误示为未启用。
+5613|          enabled: s.deleted !== true,
+5614|          platform: s.platform || 'douyin',
+5615|        };
+5616|      }),
+5617|      rules: this.config.rules || [],
+5618|      // 事件流（2026-09-15 修复第 1 项）：附带单调序号，供消费方可靠增量。
+5619|      evtSeq: this._evtSeq || 0,
+5620|      cycleNo: this.cycleNo || 0,

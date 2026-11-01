@@ -1,0 +1,185 @@
+2026-09-23T04:34:37.752Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:37.757Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✖ 默认读取：全开→on；全关→off；混合→mixed（不注入 readAdState） (836.998ms)
+2026-09-23T04:34:38.228Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:38.229Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 默认读取：身份失败 / 读取失败 → error(blocked)，零动作 (471.5446ms)
+2026-09-23T04:34:38.484Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:38.484Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✖ 08:00 后低于阈值且已暂停 → 默认链路开启一次并回读 (253.9771ms)
+2026-09-23T04:34:38.697Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:38.698Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✖ 已开启（on）低于阈值 → 零点击 (211.8603ms)
+2026-09-23T04:34:38.914Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:38.915Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✖ mixed 只开启暂停项（不点已开） (217.3418ms)
+2026-09-23T04:34:39.197Z [INFO] 每日开启跳过（shop-001）：本轮回读当前状态为 unknown：每日开启 fail-closed，零点击
+2026-09-23T04:34:39.198Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:39.199Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T04:34:39.205Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:39.206Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✖ 07:00 定时开启仍受原窗口（窗外 blocked_window） (283.888ms)
+✔ threshold_recovery 在值守窗口外（07:30）被拒 (8.5932ms)
+2026-09-23T04:34:39.426Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:39.427Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✖ 今日定时开启成功后，周期 threshold_recovery 仍可执行 (219.9927ms)
+2026-09-23T04:34:39.903Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:39.905Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T04:34:39.907Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:39.908Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T04:34:39.914Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:39.915Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T04:34:39.923Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:39.924Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T04:34:39.930Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:39.931Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T04:34:39.936Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:39.937Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T04:34:39.942Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:39.943Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T04:34:39.949Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:39.950Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-23T04:34:39.956Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-23T04:34:39.956Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✔ 演练 / enableEnabled=false → 零点击 (479.9193ms)
+✔ 隔离：refreshView 抛错 → blocked/unknown，零开关调用 (8.5398ms)
+✔ 隔离：新 UI 刷新未成功 / 重设每页条数失败 → blocked，零开关 (7.5337ms)
+✔ 隔离：分页 hasNext 缺失 → blocked；完整分页 → mixed (7.0636ms)
+✔ 隔离清单完整性：refresh null / warning / total 缺行 / 重复 ID → blocked (5.5374ms)
+✔ 隔离 pollOnce 全链：清单不完整 → blocked/unknown，零 enable/pause/switch (5.9971ms)
+✖ 隔离分页契约：activePage 重复/缺序/total 不一致须阻止；1→2 且 total 一致通过 (6.6771ms)
+✔ 隔离 pollOnce：activePage 重复 → blocked，零 enable/pause/switch (6.0778ms)
+ℹ tests 16
+ℹ suites 0
+ℹ pass 9
+ℹ fail 7
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 9853.637
+
+✖ failing tests:
+
+test at test\ad-switch-default-chain.test.js:84:1
+✖ 默认读取：全开→on；全关→off；混合→mixed（不注入 readAdState） (836.998ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'unknown' !== 'on'
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\ad-switch-default-chain.test.js:92:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:358:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'unknown',
+    expected: 'on',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\ad-switch-default-chain.test.js:129:1
+✖ 08:00 后低于阈值且已暂停 → 默认链路开启一次并回读 (253.9771ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'unknown_blocked'
+  - 'should_enable'
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\ad-switch-default-chain.test.js:136:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'unknown_blocked',
+    expected: 'should_enable',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\ad-switch-default-chain.test.js:143:1
+✖ 已开启（on）低于阈值 → 零点击 (211.8603ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'unknown_blocked'
+  - 'already_on'
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\ad-switch-default-chain.test.js:150:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'unknown_blocked',
+    expected: 'already_on',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\ad-switch-default-chain.test.js:156:1
+✖ mixed 只开启暂停项（不点已开） (217.3418ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'unknown_blocked'
+  - 'should_enable'
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\ad-switch-default-chain.test.js:168:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'unknown_blocked',
+    expected: 'should_enable',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\ad-switch-default-chain.test.js:174:1
+✖ 07:00 定时开启仍受原窗口（窗外 blocked_window） (283.888ms)
+  AssertionError [ERR_ASSERTION]: {"status":"ok","skipped":true,"zeroClick":true,"decision":"unknown_blocked","currentAdState":"unknown","reason":"本轮回读当前状态为 unknown：每日开启 fail-closed，零点击"}
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\ad-switch-default-chain.test.js:182:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at test\ad-switch-default-chain.test.js:198:1
+✖ 今日定时开启成功后，周期 threshold_recovery 仍可执行 (219.9927ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'unknown_blocked'
+  - 'should_enable'
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\ad-switch-default-chain.test.js:214:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'unknown_blocked',
+    expected: 'should_enable',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\ad-switch-default-chain.test.js:397:1
+✖ 隔离分页契约：activePage 重复/缺序/total 不一致须阻止；1→2 且 total 一致通过 (6.6771ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'unknown' !== 'mixed'
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\ad-switch-default-chain.test.js:450:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'unknown',
+    expected: 'mixed',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

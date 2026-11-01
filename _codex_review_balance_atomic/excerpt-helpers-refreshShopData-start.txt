@@ -1,0 +1,176 @@
+1585|   * 删除后店铺拒绝；未知/身份失败/分页不完整返回 blocked，零动作。
+1586|   */
+1587|  /**
+1588|   * 余额（2026-09-27，账户级只读展示字段）写入 target（可为未提交的 candidate）：
+1589|   * 本轮读取失败/缺失 → balanceCents=null（界面显示"未知"），不沿用旧值伪装成本轮新读数；
+1590|   * 终态三字段：balanceStatus='ok'|'error'|'missing'|'skipped'，balanceReason 仅非 ok 时有值。
+1591|   * 绝不进入费用/订单/阈值/开关判定与通知判断。
+1592|   */
+1593|  _applyBalanceToLastData(target, stateRead) {
+1594|    if (!target) return;
+1595|    const bal = stateRead && stateRead.balance ? stateRead.balance : null;
+1596|    if (bal && bal.balanceCents != null) {
+1597|      target.balanceCents = bal.balanceCents;
+1598|      target.balanceAt = bal.balanceAt || null;
+1599|      target.balanceStatus = 'ok';
+1600|      target.balanceReason = null;
+1601|    } else if (bal && bal.reason) {
+1602|      target.balanceCents = null;
+1603|      target.balanceAt = bal.balanceAt || null;
+1604|      target.balanceStatus = 'error';
+1605|      target.balanceReason = String(bal.reason);
+1606|    } else {
+1607|      target.balanceCents = null;
+1608|      target.balanceAt = bal && bal.balanceAt ? bal.balanceAt : null;
+1609|      target.balanceStatus = 'missing';
+1610|      target.balanceReason = '本轮未返回余额读数';
+1611|    }
+1612|  }
+1613|
+1614|  // 在途可见性（2026-10-31 竞态修正）：本轮 candidate 组装期间只置 refreshing 标记，
+1615|  // 绝不把半成品（无余额终态的新读数）提前提交为 rt.lastData。
+1616|  _markShopDataRefreshing(rt) {
+1617|    rt.dataRefreshing = true;
+1618|    if (rt.lastData && typeof rt.lastData === 'object') rt.lastData.refreshing = true;
+1619|  }
+1620|
+1621|  // 原子提交：整轮读数（含余额终态）组装完成后一次性替换 lastData 并清除在途标记。
+1622|  _commitShopLastData(rt, candidate) {
+1623|    candidate.refreshing = false;
+1624|    rt.lastData = candidate;
+1625|    rt.lastDataAt = new Date(this.nowFn()).toISOString();
+1626|    rt.dataRefreshing = false;
+1627|  }
+1628|
+1629|  // 早退路径（门禁/窗口/读取失败，未回读广告状态）：candidate 先写余额终态 skipped，
+1630|  // 避免提交后 UI 把缺失读数和未读混淆；再原子提交。
+1631|  _commitShopLastDataSkippedBalance(rt, candidate, reason) {
+1632|    candidate.balanceCents = null;
+1633|    candidate.balanceStatus = 'skipped';
+1634|    candidate.balanceReason = reason;
+1635|    candidate.balanceAt = null;
+1636|    this._commitShopLastData(rt, candidate);
+1637|  }
+1638|
+1639|  async refreshShopData(shopId) {
+1640|    const shopCfg = this._findShop(shopId);
+1641|    if (!shopCfg) return { ok: false, reason: '店铺不存在' };
+1642|    // F4（2026-10-24）：删除店仍拒绝；D56 起未删除店铺（历史 enabled=false 亦视为正常店）允许本
+1643|    // **只读**更新（登录后一次只读数据刷新）。本方法只读，不进入任何广告操作。
+1644|    if (shopCfg.deleted === true) {
+1645|      return { ok: false, reason: '店铺已删除，不再值守/更新', deleted: true };
+1646|    }
+1647|    if (this.pending.length > 0) {
+1648|      return { ok: false, reason: `存在待配置/非法配置项，不允许更新: ${this.pending.join('；')}` };
+1649|    }
+1650|    // 同店互斥：恢复链正在执行物理读取时，手动刷新不得叠加另一路读取（返回真实进度，稍后可再试）。
+1651|    const activeRec = this._readRecoveryFor(shopId);
+1652|    if (activeRec && activeRec.phase === 'running') {
+1653|      const view = this._readRecoveryView(shopId);
+1654|      return {
+1655|        ok: true, readOnly: true, shopId, adState: 'unknown',
+1656|        blocked: 'recovery_inflight',
+1657|        reason: `本店有限恢复执行中（${view.attempts}/${view.maxRetries}），本次手动更新未叠加新读取`,
+1658|        readRecovery: view, zeroClick: true,
+1659|      };
+1660|    }
+1661|    // 用户手动更新可重置恢复事件：先取消旧链的等待 timer，再按本次真实读取重新开始。
+1662|    this._clearReadRecovery(shopId, 'manual-refresh');
+1663|    // D24R 跨入口串行：巡查/每日开启周期进行中时，即使目标店不同也不叠加并发处理
+1664|    // （同店在途仍走下方 shop_busy 既有语义，返回真实进度）。如实 blocked，稍后可重试。
+1665|    if (this._cycleRunning && !this._shopBusy(shopId)) {
+1666|      return {
+1667|        ok: true, readOnly: true, shopId, adState: 'unknown',
+1668|        blocked: 'cycle_busy',
+1669|        reason: '巡查/每日开启周期进行中（跨店串行），本次手动更新未执行，稍后可重试',
+1670|        zeroClick: true,
+1671|      };
+1672|    }
+1673|    // D24S 周期外同样串行：他店仍在处理在途或真实资源收口未证明 → 复用既有 busy 响应，
+1674|    // 不叠加新的并发处理；待在途处理结束/收口实际证明后可重试。同店在途仍走下方 shop_busy。
+1675|    const otherBusy = this._otherBusyOrUnprovenShop(shopId);
+1676|    if (otherBusy && !this._shopBusy(shopId)) {
+1677|      return {
+1678|        ok: true, readOnly: true, shopId, adState: 'unknown',
+1679|        blocked: 'shop_busy',
+1680|        reason: `店 ${otherBusy} 处理在途/真实资源收口未证明（一次一家店，跨店串行），本次手动更新未执行，稍后可重试`,
+1681|        zeroClick: true,
+1682|      };
+1683|    }
+1684|    // D24 逐店串行（跨入口收口）：目标店正被巡查周期/每日开启/登录接管在途处理时，
+1685|    // 本只读刷新不叠加并发同店处理，如实返回可稍后重试（复用既有每店处理互斥，不另造锁）。
+1686|    if (!this._tryAcquireShop(shopId)) {
+1687|      return {
+1688|        ok: true, readOnly: true, shopId, adState: 'unknown',
+1689|        blocked: 'shop_busy',
+1690|        reason: '该店已有处理在途（巡查/每日开启/登录接管/恢复链），本次手动更新未叠加新读取',
+1691|        zeroClick: true,
+1692|      };
+1693|    }
+1694|    const rt = this._runtime(shopId);
+1695|    try {
+1696|      const coord = this._getCoordinator(shopCfg);
+1697|      let data;
+1698|      try {
+1699|        data = await coord.readAndEvaluate(shopCfg, { readOnlyRefresh: true });
+1700|      } catch (e) {
+1701|        if (e instanceof NotConnectedError) {
+1702|          rt.lastError = '推广数据读取尚未接入';
+1703|          return { ok: false, reason: rt.lastError, zeroClick: true };
+1704|        }
+1705|        throw e;
+1706|      }
+1707|      rt.lastError = null;
+1708|      // 竞态修正（2026-10-31）：本轮读数先组装为 candidate，_readCurrentAdState（含余额）
+1709|      // 完成并把余额终态写入 candidate 后才原子提交为 rt.lastData；在途仅 refreshing 标记。
+1710|      const candidate = this._summarizeData(data);
+1711|      if (data.ok !== false && data.evaluation) {
+1712|        candidate.spendFloorCents = SPEND_FLOOR_CENTS;
+1713|        candidate.spendProtected = data.evaluation.spendProtected === true;
+1714|        candidate.pauseEligible = data.evaluation.pauseEligible === true;
+1715|        candidate.roiTooLow = data.evaluation.roiTooLow === true;
+1716|      }
+1717|      this._markShopDataRefreshing(rt);
+1718|      // 只读回读广告状态（on/off/mixed/unknown）；失败 → unknown + blocked 说明
+1719|      const stateRead = await this._readCurrentAdState(shopCfg);
+1720|      this._applyBalanceToLastData(candidate, stateRead);
+1721|      if (stateRead.error) {
+1722|        // 新错误覆盖旧因；Auth 失败同时撤销旧 on 证据；未知保持零广告开关。
+1723|        this._applyReadFailure(shopCfg.id, stateRead.error);
+1724|        candidate.roiTooLow = false;
+1725|        candidate.pauseEligible = false;
+1726|        // 返回的 blocked 与 lastReadError.kind 同源（F5-R9）：注入/适配器给出的通用
+1727|        // blocked=auth 若被具体原因推翻（Cookie/身份/读取失败），不得继续对外冒充 auth。
+1728|        const errKind = this._readErrorKind(stateRead.error);
+1729|        let blocked = stateRead.error.blocked || 'ad_state_read';
+1730|        if (errKind === 'cookie_invalid' || errKind === 'cookie_blocked' || errKind === 'identity') blocked = errKind;
+1731|        else if (blocked === 'auth' && errKind !== 'auth') blocked = errKind;
+1732|        if (data.blocked === 'orders_unavailable') candidate.blockedReason = data.reason;
+1733|        // 竞态修正：先提交带余额终态的本轮读数，再返回，UI 不再看到陈旧/半成品混合。
+1734|        this._commitShopLastData(rt, candidate);
+1735|        return {
+1736|          ok: data.blocked !== 'orders_unavailable',
+1737|          readOnly: true,
+1738|          shopId,
+1739|          data: rt.lastData,
+1740|          adState: rt.lastAdState,
+1741|          blocked,
+1742|          reason: stateRead.error.reason,
+1743|          zeroClick: true,
+1744|        };
+1745|      }
+1746|      // 成功同店新回读：清除旧错误/旧阻断原因，再写入本轮只读观测。
+1747|      this._clearReadFailure(shopCfg.id);
+1748|      // 只读观测更新状态；失败/unknown 也不得保留旧动作确认时间去配对新状态
+1749|      this._applyObservedAdState(shopCfg.id, stateRead.state || 'unknown', '只读清单/页面回读');
+1750|      this._commitShopLastData(rt, candidate);
+1751|      if (data.ok === false) {
+1752|        rt.lastData.blockedReason = data.reason;
+1753|        return {
+1754|          ok: data.blocked !== 'orders_unavailable',
+1755|          readOnly: true,
+1756|          shopId,
+1757|          data: rt.lastData,
+1758|          adState: rt.lastAdState,
+1759|          blocked: data.blocked || 'data',
+1760|          reason: data.reason,

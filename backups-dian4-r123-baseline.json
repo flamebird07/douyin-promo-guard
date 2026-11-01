@@ -1,0 +1,28 @@
+[
+ {
+  "file": "douyin-promo-guard/src/login/session-cookie-checkpoint.js",
+  "sha256": "338e5f3cb9a4d9093aeb2dec8eb3479b8fb33c84033b265d33a78d5bb082bdf3",
+  "bytes": 56229,
+  "mtime": "2026-10-20T10:17:03.614Z",
+  "backup": "douyin-promo-guard/src/login/session-cookie-checkpoint.js.bak-DIAN4-R123-20261022"
+ },
+ {
+  "file": "douyin-promo-guard/src/login/cookie-writeback.js",
+  "sha256": "8ec5aebd612febb088c6a6b1dd99e0c677c4142bc5ab5a5055f07667bcd6b64d",
+  "bytes": 45297,
+  "mtime": "2026-10-20T09:52:24.160Z",
+  "backup": "douyin-promo-guard/src/login/cookie-writeback.js.bak-DIAN4-R123-20261022"
+ },
+ {
+  "file": "bill-manager/cookie-vault.js",
+  "sha256": "dbe7020b46d99fc4a17f500b6ce72971735040c41889401cd9415b70e6ed7c57",
+  "bytes": 31036,
+  "mtime": "2026-10-19T04:26:21.133Z",
+  "backup": "bill-manager/cookie-vault.js.bak-DIAN4-R123-20261022"
+ },
+ {
+  "file": "douyin-promo-guard/config/config.json",
+  "sha256": "bdb68b24846483c7…",
+  "note": "未修改（本任务不改生产 gate），仅记录基线"
+ }
+]

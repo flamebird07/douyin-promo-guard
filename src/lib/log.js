@@ -30,10 +30,37 @@ const SENSITIVE_VALUE_RE = /((?:cookie|cookies|token|access_token|refresh_token|
 // 仅会话 Cookie 名 + "="（与原版整段遮蔽语义一致；键后带空格的中文说明不触发）
 const SENSITIVE_HINT_RE = /\b(sessionid|sessionid_ss|ttwid|csrf)=/i;
 
-function scrubSensitiveText(v) {
+/**
+ * URL 查询段统一遮蔽（2026-10-23 DIAN-4 长期 unknown 门修复）：页面地址的查询串可能携带
+ * 会话票据/埋点身份（登录中转页尤其如此），完整查询串一律不得进入审计、日志或展示原因。
+ * 与 compactUrls 的区别：**不看长度**——只要 URL 带 `?`/`#` 就遮蔽查询段，保留可定位的
+ * scheme://host/path；无查询段的 URL 原样返回（页面导航/回读定位仍需要它）。
+ * 只做文本遮蔽，不改动任何业务请求。
+ */
+const URL_MASK_MARK = '…（查询参数已遮蔽';
+
+function maskUrlQueries(text) {
+  return String(text).replace(LONG_URL_RE, (raw, offset, whole) => {
+    const trail = /[.,。；;）)]+$/.exec(raw);
+    const u = trail ? raw.slice(0, raw.length - (trail[0] || '').length) : raw;
+    if (!/[?#]/.test(u)) return raw;
+    // 幂等：源侧已遮过的 URL（`?` 后紧跟遮蔽标记）整段原样保留，落盘/展示边界二次处理不叠标记。
+    // 只跳过"已被遮的这一个"，同串里其它未遮 URL 仍照常遮蔽（不做整串短路，避免漏遮）。
+    if (String(whole).slice(offset + raw.length).startsWith(URL_MASK_MARK)) return raw;
+    const cut = /^(https?:\/\/[^/?#]+\/[^?#]*)/.exec(u);
+    const base = cut ? cut[1] : u.slice(0, 48);
+    return `${base}?${URL_MASK_MARK}，原 URL 共 ${u.length} 字符）${trail ? trail[0] : ''}`;
+  });
+}
+
+function scrubCredentialText(v) {
   return String(v)
     .replace(SENSITIVE_VALUE_RE, '$1***')
     .replace(/(Bearer\s+)(?![\u4e00-\u9fff])[^\s]{20,}/gi, '$1***');
+}
+
+function scrubSensitiveText(v) {
+  return maskUrlQueries(scrubCredentialText(v));
 }
 
 function sanitizeValue(v, depth = 0) {
@@ -48,11 +75,12 @@ function sanitizeValue(v, depth = 0) {
     return out;
   }
   if (typeof v === 'string') {
-    // 兜底：值级脱敏（key=值 → key=***）；无法值级遮蔽的成对 cookie 形态整段脱敏
-    const scrubbed = scrubSensitiveText(v);
-    if (scrubbed !== v) return scrubbed;
+    // 兜底：值级脱敏（key=值 → key=***）；无法值级遮蔽的成对 cookie 形态整段脱敏。
+    // 判定顺序保持原语义（整段脱敏优先于"仅遮蔽"），URL 查询段遮蔽在其后统一施加。
+    const credScrubbed = scrubCredentialText(v);
+    if (credScrubbed !== v) return maskUrlQueries(credScrubbed);
     if (SENSITIVE_HINT_RE.test(v)) return '[疑似凭证，已脱敏]';
-    return v;
+    return maskUrlQueries(v);
   }
   return v;
 }
@@ -145,28 +173,12 @@ function write(level, args) {
   } catch (_) { /* 日志落盘失败不阻塞业务 */ }
 }
 
-const URL_MASK_MARK = '…（查询参数已遮蔽';
-
-function maskUrlQueries(text) {
-  return String(text).replace(LONG_URL_RE, (raw, offset, whole) => {
-    const trail = /[.,。；;）)]+$/.exec(raw);
-    const u = trail ? raw.slice(0, raw.length - (trail[0] || '').length) : raw;
-    if (!/[?#]/.test(u)) return raw;
-    // 幂等：源侧已遮过的 URL（`?` 后紧跟遮蔽标记）整段原样保留，落盘/展示边界二次处理不叠标记。
-    // 只跳过"已被遮的这一个"，同串里其它未遮 URL 仍照常遮蔽（不做整串短路，避免漏遮）。
-    if (String(whole).slice(offset + raw.length).startsWith(URL_MASK_MARK)) return raw;
-    const cut = /^(https?:\/\/[^/?#]+\/[^?#]*)/.exec(u);
-    const base = cut ? cut[1] : u.slice(0, 48);
-    return `${base}?${URL_MASK_MARK}，原 URL 共 ${u.length} 字符）${trail ? trail[0] : ''}`;
-  });
-}
-
 module.exports = {
-  maskUrlQueries,
   sanitize,
   scrubSensitiveText,
   scrubDeep,
   compactUrls,
+  maskUrlQueries,
   info: (...a) => write('INFO', a),
   warn: (...a) => write('WARN', a),
   error: (...a) => write('ERROR', a),

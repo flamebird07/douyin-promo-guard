@@ -525,6 +525,35 @@ function releaseProcessLock(file, token) {
   } catch (_) { /* 释放失败交由陈旧锁回收机制处理 */ }
 }
 
+
+/**
+ * 共享 shop/day lease 键：accountId 优先，缺省回落 shop identity；再与业务日绑定。
+ * 返回稳定 64hex（用于 lease 文件名），两侧入口必须用同一规则。
+ */
+function shopDayLeaseKey({ accountId, shopId, businessDate }) {
+  const date = String(businessDate == null ? '' : businessDate);
+  const acct = accountId != null && String(accountId).trim() !== '' ? String(accountId).trim() : '';
+  const shop = String(shopId == null ? '' : shopId);
+  const identity = acct !== '' ? ('account:' + acct) : ('shop:' + shop);
+  return sha256Hex(identity + '|date:' + date);
+}
+
+/** lease 文件路径：leaseDir/shop-day-<key>.lock */
+function shopDayLeasePath(leaseDir, key) {
+  return path.join(String(leaseDir), 'shop-day-' + String(key) + '.lock');
+}
+
+/**
+ * 精确 publisher 锁忙让位判据（HYBRID_MINIMAL）：
+ * status=unsubmitted + reason 精确匹配 + publicationProofBindsRun。
+ * 无严格证明一律 false（fail-closed，绝不能因文本含 lock 就让位/清 in-progress）。
+ */
+function isExactPublisherLockOwnerActiveYield(r, ctx) {
+  if (!r || r.status !== 'unsubmitted') return false;
+  if (String(r.reason || '') !== 'scheduled-pre-navigation-open-failed:publisher-lock-owner-active') return false;
+  return publicationProofBindsRun(r.publicationProof, ctx) === true;
+}
+
 /**
  * 创建排程器。opts:
  * - planPublishing: 原始配置（会严格校验）
@@ -550,6 +579,10 @@ function releaseProcessLock(file, token) {
  *              份数继续派发，诚实记 enable 状态并继续其它店
  * - onLog: (level, msg) => void，可选
  * - intervalMs: 轮询周期，默认 30000；测试可注入极小值或直接调用 tick()
+ * - leaseDir: 可选。共享 shop/day lease 目录（与其它 createScheduler 入口约定同一绝对路径）。
+ *              未传 → 不启用共享 lease（旧行为）；传入非空字符串 → 写 in-progress 前非阻塞 acquire；
+ *              传入空串/非字符串 → fail-closed（本店 coordination-yield，不派发）。
+ * - leaseStaleMs: shop/day lease 陈旧接管阈值（默认同 lockStaleMs）
  */
 function createScheduler(opts = {}) {
   const o = opts || {};
@@ -558,6 +591,14 @@ function createScheduler(opts = {}) {
   const ledgerFile = o.ledgerFile || path.join(__dirname, 'promo-plan-scheduler-ledger.json');
   const lockFile = o.lockFile || (ledgerFile + '.lock');
   const lockStaleMs = Number.isFinite(o.lockStaleMs) && o.lockStaleMs > 0 ? o.lockStaleMs : 30 * 60 * 1000;
+  // HYBRID_MINIMAL：可选共享 shop/day lease（与 daily-runner / watch-drill 同一 leaseDir+键规则）。
+  // undefined/null = 关闭（旧测试兼容）；非空字符串 = 启用；其它值（含 ''）= 损坏 → 派发前 fail-closed。
+  const leaseDirRaw = Object.prototype.hasOwnProperty.call(o, 'leaseDir') ? o.leaseDir : undefined;
+  const leaseEnabled = leaseDirRaw !== undefined && leaseDirRaw !== null;
+  const leaseDirOk = leaseEnabled && typeof leaseDirRaw === 'string' && leaseDirRaw.trim() !== '';
+  const leaseDir = leaseDirOk ? leaseDirRaw : null;
+  const leaseMisconfigured = leaseEnabled && !leaseDirOk;
+  const leaseStaleMs = Number.isFinite(o.leaseStaleMs) && o.leaseStaleMs > 0 ? o.leaseStaleMs : lockStaleMs;
   const validated = validatePlanPublishing(o.planPublishing);
   let cfg = validated.value;
   const listShops = typeof o.listShops === 'function' ? o.listShops : () => [];
@@ -811,8 +852,33 @@ function createScheduler(opts = {}) {
         const roi = (typeof business.roi === 'number' && Number.isFinite(business.roi) && business.roi > 0) ? business.roi : 15;
         business = { ...business, dailyBudget: cfg.dailyBudget, roi };
 
+        // HYBRID_MINIMAL：写本地 in-progress **之前** 非阻塞 acquire 共享 shop/day lease。
+        // 忙 → coordination-yield（不写 in-progress、不烧 retry）；损坏配置 → fail-closed 同形让位。
+        let shopLease = null;
+        let shopLeaseFile = null;
+        if (leaseMisconfigured) {
+          results.push({ shopId, status: 'coordination-yield', plans: rec.plans, error: rec.error || null, reason: 'shop-day-lease-misconfigured', stopped: 'coordination-yield' });
+          continue;
+        }
+        if (leaseDir) {
+          const leaseKey = shopDayLeaseKey({ accountId: business.accountId, shopId, businessDate: t.date });
+          shopLeaseFile = shopDayLeasePath(leaseDir, leaseKey);
+          try {
+            shopLease = acquireProcessLock(shopLeaseFile, nowMs, leaseStaleMs);
+          } catch (e) {
+            results.push({ shopId, status: 'coordination-yield', plans: rec.plans, error: rec.error || null, reason: 'shop-day-lease-acquire-failed:' + ((e && e.message) || e), stopped: 'coordination-yield' });
+            continue;
+          }
+          if (!shopLease || !shopLease.held) {
+            results.push({ shopId, status: 'coordination-yield', plans: rec.plans, error: rec.error || null, reason: 'shop-day-lease-busy', stopped: 'coordination-yield' });
+            continue;
+          }
+        }
+
         let stopped = null;
         let finalLimit = shopLimit;
+        let yieldedCoordination = false;
+        try {
         // 每份派发前 fresh 重取**同一店**当前配置并据此派发（2026-10-26 patrol-plan-refill）：
         // 页面在本次 tick 内保存的数量/ROI/每店上限立即生效（降份数立即停发、改 ROI 到达后续
         // 份）；店被删除/名单移除/身份（名称或显式账号）变化 → 停止本店后续派发，绝不静默
@@ -840,6 +906,10 @@ function createScheduler(opts = {}) {
           business = { ...freshBusiness, accountId: business.accountId, dailyBudget: cfg.dailyBudget, roi: freshRoi };
 
           const planNumber = rec.plans + 1;
+          // 保存 dispatch 前账本形状：精确 publisher-lock-owner-active 让位时原样恢复。
+          const preDispatchHadEntry = Object.prototype.hasOwnProperty.call(rec.entries, planNumber);
+          const preDispatchEntry = preDispatchHadEntry ? rec.entries[planNumber] : undefined;
+          const preDispatchLastAt = rec.lastAt;
           // dispatch 前**原子落盘 in-progress**：崩溃重启据此判 unknown，绝不裸重发。
           rec.entries[planNumber] = { planNumber, status: 'in-progress', startedAt: new Date(nowMs()).toISOString() };
           rec.lastAt = new Date(nowMs()).toISOString();
@@ -856,6 +926,21 @@ function createScheduler(opts = {}) {
           } catch (e) { r = { status: 'unknown', reason: 'dispatch-exception:' + ((e && e.message) || e) }; }
           const status = (r && r.status) || 'unknown';
           const reason = (r && r.reason) || null;
+
+          // HYBRID_MINIMAL：精确 publisher-lock-owner-active + 严格未提交证明 → 调度让位，
+          // 恢复本次 dispatch 前 entry/lastAt；不新建 unsubmitted、不增 attempts、不追加 retryHistory。
+          if (isExactPublisherLockOwnerActiveYield(r, {
+            businessDate: t.date, shop: shopId, accountId: business.accountId,
+            planNumber, runId: r && r.runId,
+          })) {
+            if (preDispatchHadEntry) rec.entries[planNumber] = preDispatchEntry;
+            else delete rec.entries[planNumber];
+            rec.lastAt = preDispatchLastAt;
+            saveLedger(ledgerFile, ledger);
+            stopped = 'coordination-yield';
+            yieldedCoordination = true;
+            break;
+          }
 
           if (status === 'success') {
             // 每条成功**立即持久**（planId/日期/一次性消费），不只计总数。
@@ -945,29 +1030,40 @@ function createScheduler(opts = {}) {
           break;
         }
 
-        if (stopped === 'preparation-stopped') {
-          // 已按严格证明在本次锁内收口：mapper 已诚实重算 rec.status/plans（未消费不虚构成功）。
-          // R50：保持 unsubmitted 可重试状态与原始 reason（上面已记账 attempts/退避），
-          // 由既有退避分支统一决定等待/封顶，绝不无限零退避重试、也绝不封当天。
-          rec.status = 'unsubmitted';
-        } else if (stopped === 'unsubmitted') {
-          // 已证明从未发布：保持可重试状态与原始 reason，由上方退避分支决定后续重试（不封当天）。
-          rec.status = 'unsubmitted';
-        } else if (stopped === 'failed') rec.status = 'failed';
-        else if (stopped === 'unknown') rec.status = 'unknown';
-        // fresh 重取发现的店身份/配置漂移：诚实 failed 并停止本店后续派发（绝不静默换店换号）。
-        else if (stopped === 'shop-missing' || stopped === 'shop-identity-changed'
-          || stopped === 'shop-account-changed' || stopped === 'business-profile-failed') rec.status = 'failed';
-        else if (stopped === 'disabled' || stopped === 'cross-day') rec.status = 'partial';
-        else if (rec.plans >= finalLimit) { rec.status = 'success'; rec.error = null; }
-        else rec.status = 'unknown';
-        if (stopped !== 'preparation-stopped' && stopped !== 'unsubmitted' && rec.status !== 'success') {
-          rec.error = stopped ? (stopped + ((rec.entries && rec.entries[rec.plans + 1] && rec.entries[rec.plans + 1].reason) ? ':' + rec.entries[rec.plans + 1].reason : '')) : (rec.error || null);
+        if (yieldedCoordination || stopped === 'coordination-yield') {
+          // 调度让位：账本已恢复 dispatch 前形状；不改 status/retry；只记结果让位。
+          results.push({ shopId, status: 'coordination-yield', plans: rec.plans, error: rec.error || null, reason: 'publisher-lock-owner-active', stopped: 'coordination-yield' });
+        } else {
+          if (stopped === 'preparation-stopped') {
+            // 已按严格证明在本次锁内收口：mapper 已诚实重算 rec.status/plans（未消费不虚构成功）。
+            // R50：保持 unsubmitted 可重试状态与原始 reason（上面已记账 attempts/退避），
+            // 由既有退避分支统一决定等待/封顶，绝不无限零退避重试、也绝不封当天。
+            rec.status = 'unsubmitted';
+          } else if (stopped === 'unsubmitted') {
+            // 已证明从未发布：保持可重试状态与原始 reason，由上方退避分支决定后续重试（不封当天）。
+            rec.status = 'unsubmitted';
+          } else if (stopped === 'failed') rec.status = 'failed';
+          else if (stopped === 'unknown') rec.status = 'unknown';
+          // fresh 重取发现的店身份/配置漂移：诚实 failed 并停止本店后续派发（绝不静默换店换号）。
+          else if (stopped === 'shop-missing' || stopped === 'shop-identity-changed'
+            || stopped === 'shop-account-changed' || stopped === 'business-profile-failed') rec.status = 'failed';
+          else if (stopped === 'disabled' || stopped === 'cross-day') rec.status = 'partial';
+          else if (rec.plans >= finalLimit) { rec.status = 'success'; rec.error = null; }
+          else rec.status = 'unknown';
+          if (stopped !== 'preparation-stopped' && stopped !== 'unsubmitted' && rec.status !== 'success') {
+            rec.error = stopped ? (stopped + ((rec.entries && rec.entries[rec.plans + 1] && rec.entries[rec.plans + 1].reason) ? ':' + rec.entries[rec.plans + 1].reason : '')) : (rec.error || null);
+          }
+          saveLedger(ledgerFile, ledger);
+          results.push({ shopId, status: rec.status, plans: rec.plans, error: rec.error || null, stopped: stopped || null });
         }
-        saveLedger(ledgerFile, ledger);
-        results.push({ shopId, status: rec.status, plans: rec.plans, error: rec.error || null, stopped: stopped || null });
         if (stopped === 'disabled' || stopped === 'cross-day') { interrupted = stopped; break; }
+        } finally {
+          if (shopLease && shopLease.held && shopLeaseFile) {
+            releaseProcessLock(shopLeaseFile, shopLease.token);
+          }
+        }
       }
+
       // 当日容器必须先于 lastRunAt 存在：空店/全删除名单循环零执行时旧代码在此
       // TypeError（不得因此把删店改活避错）；此处只初始化容器，不派发任何发布。
       dayRecord(ledger, t.date).lastRunAt = new Date(nowMs()).toISOString();
@@ -1133,4 +1229,7 @@ module.exports = {
   sha256Hex,
   acquireProcessLock,
   releaseProcessLock,
+  shopDayLeaseKey,
+  shopDayLeasePath,
+  isExactPublisherLockOwnerActiveYield,
 };

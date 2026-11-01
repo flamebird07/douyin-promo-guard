@@ -1,0 +1,82 @@
+2026-09-22T14:05:25.917Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T14:05:25.919Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T14:05:25.926Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T14:05:25.927Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T14:05:25.932Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T14:05:25.932Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+2026-09-22T14:05:25.941Z [INFO] 独立每日开启任务已停止（此前未在运行）；暂停巡查不受影响。
+2026-09-22T14:05:25.942Z [INFO] 监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）
+✖ 动作前写入失败 → persistence_blocked、零底层调用 (10.3765ms)
+✖ 原子替换失败 → 旧文件完整、零底层调用 (7.6426ms)
+✖ 三种动作入口均不能绕过保存失败 (5.472ms)
+✔ 确认后保存失败 → 不错误释放（保持 unknown 阻塞） (0.6797ms)
+✔ 重启读取未完成记录 → unknown；存储恢复后可安全恢复 (0.2288ms)
+✔ 动作已发出后保存失败 → 不重复点击、保留阻塞、非 zeroClick (0.2732ms)
+✔ 正常保存路径行为不变（persistence_blocked 不出现） (8.3983ms)
+ℹ tests 7
+ℹ suites 0
+ℹ pass 4
+ℹ fail 3
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 145.3004
+
+✖ failing tests:
+
+test at test\ad-switch-persist-guard.test.js:87:1
+✖ 动作前写入失败 → persistence_blocked、零底层调用 (10.3765ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + null
+  - 'persistence_blocked'
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\ad-switch-persist-guard.test.js:94:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:358:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: null,
+    expected: 'persistence_blocked',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\ad-switch-persist-guard.test.js:102:1
+✖ 原子替换失败 → 旧文件完整、零底层调用 (7.6426ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + null
+  - 'persistence_blocked'
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\ad-switch-persist-guard.test.js:112:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: null,
+    expected: 'persistence_blocked',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\ad-switch-persist-guard.test.js:119:1
+✖ 三种动作入口均不能绕过保存失败 (5.472ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + null
+  - 'persistence_blocked'
+  
+      at TestContext.<anonymous> (C:\Users\Administrator\Documents\电商助手\douyin-promo-guard\test\ad-switch-persist-guard.test.js:124:10)
+      at async Test.run (node:internal/test_runner/test:1125:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: null,
+    expected: 'persistence_blocked',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

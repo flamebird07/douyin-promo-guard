@@ -1,0 +1,30 @@
+VERDICT: FAIL
+
+KEY_FINDINGS:
+- 白名单和点击原子性已明显收紧：精确根、`type="button"`、非空精确 aria、关闭图标均必需；第二次 `evaluate` 会在同一同步执行内复核同一节点后直接点击，没有退回宽泛 Playwright locator。
+- 空 `expectedName` 并非全路径 fail-closed：账户内容已就绪时，[qianchuan-reader.js:828](</C:/Users/Administrator/Documents/电商助手/douyin-promo-guard/src/adapters/qianchuan-reader.js:828>) 会直接成功返回，早于 [店名缺失检查](</C:/Users/Administrator/Documents/电商助手/douyin-promo-guard/src/adapters/qianchuan-reader.js:830>)。
+- 关闭后消失证明仍不完整。[popup.present](</C:/Users/Administrator/Documents/电商助手/douyin-promo-guard/src/adapters/qianchuan-reader.js:632>) 只观察可见关闭按钮或语义 dialog，不观察 `overall-release-modal-v2-wrap` 根本身。若点击后关闭按钮消失/隐藏但根和遮罩仍残留，下一轮可被当成无弹窗。
+- [关闭结果分支](</C:/Users/Administrator/Documents/电商助手/douyin-promo-guard/src/adapters/qianchuan-reader.js:807>) 把 `closed` 为 `undefined`、缺少 `popup` 和明确 `present=false` 等同处理为“自行消失”，不符合 fail-closed。
+- DOM 负例确实构造 mock DOM 并运行真实 probe；不是仅注入 `safe:true`。但 ensure 接线层仍使用 `safe:true` stub，且没有覆盖残留根、异常空返回、空店名直达账户视图。
+
+BLOCKERS:
+- 在任何成功返回之前无条件拒绝空 `expectedName`，包括已经处于账户视图的路径。
+- 将已知根、语义 dialog、关闭控件和相关遮罩纳入关闭后新鲜存在性证明；残留任一项都不得切换或返回成功。
+- `evaluate` 返回空值或结构不完整必须报错停止，不能解释成弹窗自行消失。
+- 增加“关闭控件消失但已知根仍在”“关闭 evaluate 返回 undefined”“空店名且 accountContent=true”的回归测试。
+
+SECURITY_OF_POPUP_CLOSE: 点击目标本身已充分收紧；在本轮审查的 probe/ensure 路径中未发现点击业务 CTA 或通过宽泛 selector 关闭非白名单浮层的路径。不过关闭成功后的状态证明仍可能漏掉残留浮层，因此整体安全闭环仍不充分。
+
+FAIL_CLOSED_GAPS: 空店名账户视图可直接成功；空或畸形关闭结果被视作自行消失；已知根保留但关闭按钮/dialog 消失时，探针会报告 `present=false`。`view.popup.present` 在实际切换分支基本是冗余检查，不能补足这些缺口。
+
+REMEDIATION_1_ROOT_ARIA_ICON: addressed — [根、精确 aria、type 和 icon 校验](</C:/Users/Administrator/Documents/电商助手/douyin-promo-guard/src/adapters/qianchuan-reader.js:647>) 均已落地；无 dialog 时也依靠已知根，不再依赖 vacuous `every()`。
+
+REMEDIATION_2_ATOMIC_CLICK: addressed — [标记复核](</C:/Users/Administrator/Documents/电商助手/douyin-promo-guard/src/adapters/qianchuan-reader.js:707>) 与 [同次同步执行内的 `verifiedClose.click()`](</C:/Users/Administrator/Documents/电商助手/douyin-promo-guard/src/adapters/qianchuan-reader.js:730>) 已落地。剩余问题属于点击后证明，而非点击前 TOCTOU。
+
+REMEDIATION_3_EXPECTED_NAME: partial — 店铺视图分支会拒绝空名称，但账户内容直返分支绕过该检查，未实现所声称的全路径 fail-closed。
+
+REMEDIATION_4_DOM_NEGATIVES: addressed — [DOM 构造器](</C:/Users/Administrator/Documents/电商助手/douyin-promo-guard/test/qianchuan-reader.test.js:828>) 和 [真实 probe 执行器](</C:/Users/Administrator/Documents/电商助手/douyin-promo-guard/test/qianchuan-reader.test.js:866>) 覆盖缺根、错根、空 aria、缺 type、缺 icon及完整正例；但上述三项残余缺口尚无测试。
+
+NOTES_RUNTIME_STALE: 运行进程 PID 15528 加载的 SHA-256 为 `669722…3652`，当前磁盘文件为 `c71a54…aae0`，两者不一致。按本轮范围不要求重启，因此不影响代码裁决；当前修订尚未部署。全文件测试为 30 pass / 14 fail，popup 相关 18/18 通过；其余失败按指定范围不作为本裁决阻断项。
+
+

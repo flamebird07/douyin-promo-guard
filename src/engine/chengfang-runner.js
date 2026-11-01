@@ -10,7 +10,9 @@
  *   0) 前置门槛（集中校验，见 chengfang-gate.js）：realMode=true + pauseEnabled=true +
  *      非演练（dryRun!==true）→ 上海时段 08:00 后 → 未停止；任一不过 → 零请求。
  *   1) 批次开始前重新读取费用与全店订单（复用 close-coordinator.readAndEvaluate 的
- *      身份/日期/时效/来源核验链与零订单重读）：仍严格超过 1 元/单才执行，否则取消。
+ *      身份/日期/时效/来源核验链与零订单重读）：仍严格超过 1 元/单才执行，否则取消；
+ *      例外 mixedConvergePause=true（调用方证明本轮完整回读为 mixed 且重判 metric 仍等于阈值，
+ *      客户 2026-10-10「统一暂停」）——新鲜数据必须**恰等于**阈值才放行，低于阈值仍取消。
  *   2) 打开乘方页（pageOpener 注入：生产=openChengfangShop 真实页；测试=本地 DOM fixture），
  *      由 executeChengfangPause 完成身份核验 → 全店托管 → 商品自选 → 全量回读。
  *   3) 关闭浏览器会话，汇总批次（details 按「区域:稳定ID」键，见 verifyAllPaused）。
@@ -22,18 +24,29 @@
  * 否则关闭 browser。
  */
 
-const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed } = require('./chengfang-gate');
+const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed, resolveFirstCheckMinuteOfDay, firstCheckTimeText } = require('./chengfang-gate');
 const { executeChengfangPause, executeChengfangEnable, V_READ_FAILED, V_PARTIAL_FAILED } = require('./chengfang-executor');
 const { isAfterDailyStart, shanghaiDate, shanghaiWall } = require('../lib/time');
-const { compactUrls } = require('../lib/log');
+const { compactUrls, sanitize } = require('../lib/log');
 const { perOrderDisplayText } = require('./rules');
 
 /** 生产默认会话开启器：真实乘方管理页（openChengfangShop + 真实控制器）。 */
-async function defaultChengfangOpener({ loginCfg, shopCfg }) {
+async function defaultChengfangOpener({ loginCfg, shopCfg, audit, onResource, readOnlyStatus, cancelToken }) {
   const { openChengfangShop, createChengfangController, watchChengfangControlsForManualReview } = require('../adapters/chengfang-reader');
-  const { browser, target, account, context, cookieSession } = await openChengfangShop({ loginCfg, shopCfg });
+  // audit 透传给 openChengfangShop（打开/检查点/浮窗审计）与 manual-review watch 包装器
+  //（控件失败恢复路径的浮窗审计）；调用方未传时下游各自 fail-safe 为无操作。
+  // cancelToken（D22R）：Monitor 回读截止的协作取消令牌；必须经本**真实生产开启器**
+  // 透传到 openChengfangShop → openQianchuanHome——只在测试注入的 opener 里生效不算传播。
+  const { browser, target, account, context, cookieSession, readOnlyEmpty } = await openChengfangShop({
+    loginCfg, shopCfg, audit, onResource,
+    ...(readOnlyStatus === true ? { readOnlyStatus: true } : {}),
+    ...(cancelToken ? { cancelToken } : {}),
+  });
+  if (readOnlyStatus === true && readOnlyEmpty) {
+    return { browser, page: target, account, context, cookieSession, readOnlyEmpty };
+  }
   const controller = watchChengfangControlsForManualReview(createChengfangController({}), {
-    context, target, shopCfg, loginCfg,
+    context, target, shopCfg, loginCfg, audit,
   });
   // context / cookieSession 一并透出：批次结束（浏览器关闭前）用于**本次实际加载的**
   // 店铺 Cookie 文件回写（见 _closeSession → writebackSessionCookies）。
@@ -75,7 +88,7 @@ class ChengfangRunner {
   }
 
   async _openSession(pageOpener, shopCfg, loginCfg) {
-    const session = await pageOpener({ loginCfg, shopCfg });
+    const session = await pageOpener({ loginCfg, shopCfg, audit: this.audit });
     if (!session || !session.page || !session.controller) {
       throw new Error('页面会话不完整（缺 page/controller），拒绝继续');
     }
@@ -137,7 +150,7 @@ class ChengfangRunner {
       this.audit({ kind: 'cookie-writeback', shopId, ok: false, skipped: true, reason });
       return { ok: false, skipped: true, reason };
     }
-    return writebackSessionCookies({
+    const res = await writebackSessionCookies({
       context: session.context,
       cookieFilePath: session.cookieSession.filePath,
       sessionStartFingerprint: session.cookieSession.startFingerprint,
@@ -146,6 +159,53 @@ class ChengfangRunner {
       shopId,
       audit: this.audit,
     });
+    if (res && res.ok === true) {
+      res.propagate = await this._propagateCommittedWriteback(session, res, shopId);
+    }
+    return res;
+  }
+
+  /**
+   * L4 提交之后的四层同步入口（DIAN-4 阶段一，2026-10-22 瑾漂亮 10:56:34Z 缺口）。
+   *
+   * 本路径只有 exact-bytes 提交、没有独立写前验证句柄（`writebackSessionCookies` 仅在
+   * 落盘"已验证最终集合"时才挂上 finalCookies），因此共享传播函数按它自己的同源闸门
+   * **必然拒绝**把本路径字节升为恢复基准——这是刻意的：未独立验证的工作副本不得当恢复基准，
+   * 也不得手工复制到 L3/L1。价值在于每次都留下 `checkpoint-propagate` 审计并给出原因，
+   * 恢复基准由下一次**独立验证成功**的检查点写回重新与 L4 同源（可重试，不靠人工补写）。
+   * 传播异常绝不冒泡，也绝不改写已确认的写回/广告结果。
+   * @returns {Promise<object|null>} 传播结果（只含计数与 sha 前缀，无 Cookie 值）
+   */
+  async _propagateCommittedWriteback(session, res, shopId) {
+    let propagate = null;
+    try {
+      const { propagateCommittedCheckpoint } = require('../login/session-cookie-checkpoint');
+      propagate = await propagateCommittedCheckpoint({
+        context: session.context,
+        cookieFilePath: session.cookieSession.filePath,
+        expectedSha256: (res && res.expectedSha256) || null,
+        finalCookies: res && res.finalCookies,
+        audit: this.audit,
+      });
+    } catch (e) {
+      this.audit({
+        kind: 'cookie-propagation', shopId, ok: false,
+        phase: 'propagate-error', retryable: true,
+        reason: sanitize('四层传播入口异常（详情可能含敏感值不回显）：' + (e && e.code ? e.code : '未知')),
+      });
+      return null;
+    }
+    const rec = propagate && propagate.recovery;
+    if (!rec || rec.ok !== true) {
+      // 明确失败审计 + 可重试标记（独立 kind：写回本身是成功的，绝不得被误读为回写失败）。
+      this.audit({
+        kind: 'cookie-propagation', shopId, ok: false,
+        phase: 'propagate-deferred', retryable: true,
+        sha256Prefix: String((res && res.expectedSha256) || '').slice(0, 12),
+        reason: sanitize(String((rec && rec.reason) || '本次写回未传播到恢复/归档层')),
+      });
+    }
+    return propagate;
   }
 
   /**
@@ -299,7 +359,7 @@ class ChengfangRunner {
   /**
    * 真实批次（接入 monitor 主链路）。返回与 Monitor._recordBatch/_summarizeBatch 兼容的批次结果。
    */
-  async executeChengfangBatch({ shopCfg, cycleToken, trigger, pageOpener, loginCfg }) {
+  async executeChengfangBatch({ shopCfg, cycleToken, trigger, pageOpener, loginCfg, mixedConvergePause = false }) {
     const batchDate = shanghaiDate(this.now());
     const counts = { confirmed: 0, failed: 0, unknown: 0, skipped: 0, cancelled: 0 };
     const base = { kind: 'chengfang-batch', shopId: shopCfg.id, batchDate };
@@ -309,13 +369,20 @@ class ChengfangRunner {
     if (!realAllowed.ok) {
       return { outcome: 'blocked', reason: realAllowed.reason, counts, batchDate, error: null };
     }
-    if (!isAfterDailyStart(this.now(), this.config.schedule.dailyStartHour)) {
-      const hh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
-      return {
-        outcome: 'blocked_window',
-        reason: `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai），本轮不执行真实暂停`,
-        counts, batchDate,
-      };
+    // 2026-10-09 R1：首查窗口后放行（首查完成后费比暂停，不再等 dailyStartHour）
+    {
+      const cf = (this.config.monitor && this.config.monitor.chengfang) || {};
+      const firstCheckMinute = resolveFirstCheckMinuteOfDay(cf);
+      const w = shanghaiWall(this.now());
+      const tod = (w.hour || 0) * 60 + (w.minute || 0);
+      if (tod < firstCheckMinute) {
+        const hhmm = firstCheckTimeText(cf);
+        return {
+          outcome: 'blocked_window',
+          reason: `未到每日首查时刻（每日 ${hhmm} 后，Asia/Shanghai），本轮不执行真实暂停`,
+          counts, batchDate,
+        };
+      }
     }
     if (cycleToken && cycleToken.aborted) {
       return { outcome: 'blocked_stopped', reason: '监控已停止，本轮不执行真实暂停', counts, batchDate };
@@ -348,12 +415,28 @@ class ChengfangRunner {
       return { outcome: 'cancelled', reason, counts, pre, batchDate };
     }
     if (!fresh.evaluation.over) {
-      const reason = `操作前重新核实：已不超标，取消暂停。${fresh.evaluation.reason}`;
-      this.audit({ ...base, step: 'pre-batch-revalidate', ok: true, cancelled: true, reason });
-      counts.cancelled = 1;
-      return { outcome: 'cancelled', reason, counts, pre, batchDate };
+      // 客户 2026-10-10 答复：equal + mixed 统一暂停收敛 off。调用方（Monitor 串行门）只有在
+      // 本轮完整清单回读确为 mixed、且重判 metric 仍为 equal 时才置 mixedConvergePause；
+      // 这里仍用**独立的新鲜数据**复核「恰等于阈值」，低于阈值一律取消（那是 enable 方向）。
+      const exactlyEqual = fresh.evaluation.orders > 0
+        && fresh.evaluation.costCents === fresh.evaluation.expectedCents;
+      if (!(mixedConvergePause === true && exactlyEqual)) {
+        const reason = `操作前重新核实：已不超标，取消暂停。${fresh.evaluation.reason}`;
+        this.audit({ ...base, step: 'pre-batch-revalidate', ok: true, cancelled: true, reason });
+        counts.cancelled = 1;
+        return { outcome: 'cancelled', reason, counts, pre, batchDate };
+      }
+      this.audit({
+        ...base,
+        step: 'pre-batch-revalidate',
+        ok: true,
+        stillOver: false,
+        mixedConvergePause: true,
+        reason: `操作前重新核实：新鲜数据仍恰等于阈值，且本轮完整回读为 mixed → 按「统一暂停」收敛 off（仅点击仍开启的项）：${fresh.evaluation.reason}`,
+      });
+    } else {
+      this.audit({ ...base, step: 'pre-batch-revalidate', ok: true, stillOver: true, reason: fresh.evaluation.reason });
     }
-    this.audit({ ...base, step: 'pre-batch-revalidate', ok: true, stillOver: true, reason: fresh.evaluation.reason });
 
     // ── 2) 打开乘方页并执行（executor 内部再做身份核验/每请求门槛/全量回读）──
     let session = null;
@@ -392,15 +475,16 @@ class ChengfangRunner {
   }
 
   /**
-   * 真实开启批次（每日 07:00 相位接入 monitor 主链路）。
+   * 真实开启批次（每日首次开启检查相位接入 monitor 主链路）。
    * 与暂停批次的关键差异：开启不依赖费用/订单阈值（不读费用与订单），
-   * 门槛 = realMode + enableEnabled + 上海 enableHour 起窗口 + 未停止 + 未跨日。
+   * 门槛 = realMode + enableEnabled + 上海 firstCheckMinuteOfDay（默认 00:05）起窗口
+   *   + 未停止 + 未跨日（2026-10-09 取消 enableHour/07:00 固定开启，改 00:05 后检查）。
    * 返回与 Monitor._recordBatch/_summarizeBatch 兼容的批次结果。
    */
   /**
    * @param {'daily_schedule'|'threshold_recovery'|'manual_verify'} [p.enableSource]
-   *   缺省 daily_schedule（旧定时开启，enableHour 起至当日结束——2026-09-29 第 10 阶段去除
-   *   dailyStartHour 上界，支持 enableHour 晚于 dailyStartHour 的配置）；
+   *   缺省 daily_schedule（每日首次开启检查：firstCheckMinuteOfDay 起至当日结束——
+   *   2026-10-09 取消 enableHour/07:00 固定开启、改 00:05 后检查，无小时上界，晚开机补检查）；
    *   threshold_recovery 走值守窗口 dailyStartHour 起；
    *   manual_verify 人工按需验证（无时段门槛，其余门槛照常，fail-closed 不变）。
    */
@@ -409,7 +493,7 @@ class ChengfangRunner {
     const counts = { confirmed: 0, failed: 0, unknown: 0, skipped: 0, cancelled: 0 };
     const base = { kind: 'chengfang-enable-batch', shopId: shopCfg.id, batchDate };
     const cf = (this.config.monitor && this.config.monitor.chengfang) || {};
-    const enableHour = cf.enableHour !== undefined && cf.enableHour !== null ? cf.enableHour : 7;
+    const firstCheckMinute = resolveFirstCheckMinuteOfDay(cf);
     const dailyStartHour = this.config.schedule.dailyStartHour;
     const src = enableSource === undefined || enableSource === null ? 'daily_schedule' : enableSource;
 
@@ -423,19 +507,23 @@ class ChengfangRunner {
     }
     const w = shanghaiWall(this.now());
     if (src === 'daily_schedule') {
-      if (!(w.hour >= enableHour)) {
-        const hh = String(enableHour).padStart(2, '0');
+      // 00:00–00:04:59（或自定义 firstCheckMinute 前）不执行当天首次强制开启；
+      // 之后至当日结束均为窗口（无小时上界，晚开机也补检查）。
+      const tod = (w.hour || 0) * 60 + (w.minute || 0);
+      if (tod < firstCheckMinute) {
+        const hhmm = firstCheckTimeText(cf);
         return {
           outcome: 'blocked_window',
-          reason: `未到允许开启时段（每日 ${hh}:00 起至当日结束，Asia/Shanghai），本轮不执行真实开启`,
+          reason: `未到每日首次开启检查时刻（每日 ${hhmm} 起至当日结束，Asia/Shanghai），本轮不执行真实开启`,
           counts, batchDate,
         };
       }
-    } else if (src === 'threshold_recovery' && !isAfterDailyStart(this.now(), dailyStartHour)) {
-      const hh = String(dailyStartHour).padStart(2, '0');
+    } else if (src === 'threshold_recovery' && (w.hour * 60 + (w.minute || 0)) < firstCheckMinute) {
+      // 2026-10-09 R1：首查窗口后放行（首查完成后费比恢复，不再等 dailyStartHour）
+      const hhmm = firstCheckTimeText(cf);
       return {
         outcome: 'blocked_window',
-        reason: `未到值守窗口（每日 ${hh}:00 后，Asia/Shanghai），周期恢复开启被拒绝`,
+        reason: `未到每日首查时刻（每日 ${hhmm} 后，Asia/Shanghai），周期恢复开启被拒绝`,
         counts, batchDate,
       };
     }

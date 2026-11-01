@@ -1,0 +1,51 @@
+5470|      const todayData = rt.lastData || null;
+5471|      const todaySameDay = !!(todayData && todayData.businessDate === today);
+5472|      return {
+5473|        id: s.id,
+5474|        name: s.name || null,
+5475|        displayName: s.displayName || s.name || s.id,
+5476|        cookieFile: s.cookieFile,
+5477|        // D56：单店停用取消，有效启用状态等价于"未删除"（全局开关另由 monitor.running 表达）。
+5478|        enabled: s.deleted !== true,
+5479|        deleted: s.deleted === true,
+5480|        deletedAt: s.deletedAt || null,
+5481|        thresholdCents,
+5482|        // 目标 ROI（2026-10-12 S6）：真实状态输出必须携带本店**已保存**的 targetRoi，
+5483|        // 未配置时回落 DEFAULT_TARGET_ROI（15）；不写死店铺名/账号或 14/15 特例。
+5484|        targetRoi: s.targetRoi !== undefined ? s.targetRoi : DEFAULT_TARGET_ROI,
+5485|        platform: s.platform || 'douyin',
+5486|        cookieInfo,
+5487|        lastError: rt.lastError || null,
+5488|        // 读取失败结构化状态（完整原因 + 分类：retrying/read_failed/auth/timeout）。
+5489|        // 只用于如实展示与重试/扫码判定，绝不被当作 on/off 或成功证据。
+5490|        lastReadError: rt.lastReadError || null,
+5491|        // 按店有限恢复进度（真实 timer/计数投影；active=等待/执行中，exhausted=已重试10次仍失败）
+5492|        readRecovery: this._readRecoveryView(s.id),
+5493|        today: rt.lastData || null,
+5494|        dataRefreshing: rt.dataRefreshing === true,
+5495|        lastDataAt: rt.lastDataAt || (rt.lastData && rt.lastData.fetchedAt) || null,
+5496|        // 兼容门槛字段（无消耗门槛，恒 0/false）：只展示同店同日有效投影，不把 null 当 0 重算
+5497|        spendFloorCents: SPEND_FLOOR_CENTS,
+5498|        spendProtected: todaySameDay ? todayData.spendProtected === true : null,
+5499|        pauseEligible: todaySameDay ? todayData.pauseEligible === true : false,
+5500|        roiTooLow: !!(todaySameDay && todayData.roiTooLow === true),
+5501|        lastAdState: rt.lastAdState || null,
+5502|        // 证据时间语义分离：动作确认 vs 只读观测；互斥（观测覆盖后旧确认失效）
+5503|        adStateConfirmedAt: rt.adStateConfirmedAt || null,
+5504|        adStateConfirmEvidence: rt.adStateConfirmEvidence || null,
+5505|        adStateObservedAt: rt.adStateObservedAt || null,
+5506|        adStateObserveEvidence: rt.adStateObserveEvidence || null,
+5507|        adStateEvidenceKind: rt.adStateEvidenceKind || null,
+5508|        // mixed 收敛视图（mixed 非完成态：界面呈现待收敛/重新判定/重试中）
+5509|        mixedReconcile: this._mixedReconcileView(s.id),
+5510|        // 自动发现店使用 Cookie 会话，缺少预填账户号不产生待核验状态。
+5511|        identityPending: this._shopIdentityState(s).pending,
+5512|        identityNote: this._shopIdentityState(s).reason,
+5513|        enablePhase: enableRec || null,
+5514|        batchToday: dateRec ? { runs: dateRec.runs.length, totals: { confirmed: dateRec.totals.confirmed.length, failed: dateRec.totals.failed.length, unknown: dateRec.totals.unknown.length, skipped: dateRec.totals.skipped.length }, allClosedConfirmed: projClosed, allPausedConfirmed: projPaused, allEnabledConfirmed: projEnabled, confirmedAt: (projClosed || projEnabled) ? (lastRun.at || dateRec.lastBatchAt) : null, lastBatchAt: dateRec.lastBatchAt, lastRuns: dateRec.runs.slice(-3) } : null,
+5515|      };
+5516|    });
+5517|      return {
+5518|        mode: this.modeLabel,
+5519|        realMode: this.realMode,
+5520|        ready: this.cfgResult.ready,

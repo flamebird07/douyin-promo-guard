@@ -1,0 +1,141 @@
+4400|      const cookieMeta = loadShopCookieMeta(this.config.login, shopCfg);
+4401|      rt.cookieCheckedAt = new Date(this.nowFn()).toISOString();
+4402|      rt.cookieMeta = { count: cookieMeta.count, readOnly: cookieMeta.readOnly, maxExpires: cookieMeta.maxExpires };
+4403|
+4404|      // 2) 读取+核验费用/订单并评估规则（零订单与正单同一公式，2026-10-27 修正）
+4405|      const coord = this._getCoordinator(shopCfg);
+4406|      let data;
+4407|      try {
+4408|        data = await coord.readAndEvaluate(shopCfg);
+4409|      } catch (e) {
+4410|        if (e instanceof NotConnectedError) {
+4411|          rt.lastError = '推广数据读取尚未接入（等待用户提供推广页面）';
+4412|          this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: rt.lastError }, undefined, 'error');
+4413|          this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: rt.lastError });
+4414|          return { status: 'blocked', reason: rt.lastError };
+4415|        }
+4416|        throw e;
+4417|      }
+4418|      rt.lastError = null;
+4419|      // 竞态修正（2026-10-31）：本轮读数组装为 candidate；_readCurrentAdState 之前绝不提交
+4420|      // rt.lastData，避免在途出现「新费用 + balanceCents=null（未写终态）」的半成品视图。
+4421|      const candidate = this._summarizeData(data);
+4422|      this._markShopDataRefreshing(rt);
+4423|
+4424|      // 有效同日费用/订单的规则评估先投影兼容字段；后续决策以同值覆盖（仍在 candidate 上）。
+4425|      if (data.ok !== false && data.evaluation) {
+4426|        candidate.spendFloorCents = SPEND_FLOOR_CENTS;
+4427|        candidate.spendProtected = data.evaluation.spendProtected === true;
+4428|        candidate.pauseEligible = data.evaluation.pauseEligible === true;
+4429|        candidate.roiTooLow = data.evaluation.roiTooLow === true;
+4430|      }
+4431|
+4432|      // 早退路径不读广告状态/余额：candidate 先写余额终态（skipped）再提交，保持终态完整。
+4433|      if (data.ok === false) {
+4434|        candidate.blockedReason = data.reason;
+4435|        this._commitShopLastDataSkippedBalance(rt, candidate, '本轮数据读取失败，未读取千川余额');
+4436|        this._emitJudgement(shopCfg, { data, over: null, status: 'blocked', reason: data.reason });
+4437|        this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: data.reason, blocked: data.blocked });
+4438|        return { status: 'blocked', reason: data.reason, blocked: data.blocked };
+4439|      }
+4440|
+4441|      // 3) 门禁优先：有效控制路径/范围（already_* 不得把门禁失败包成 ok）
+4442|      if (!this._chengfangScopeConfigured() && !this._legacyWholeShopAllowed()) {
+4443|        const scopeBlockedReason = '未配置乘方控制范围（monitor.chengfang.scope）且未显式开启历史全店路径：监控不执行任何关闭';
+4444|        candidate.blockedReason = scopeBlockedReason;
+4445|        this._commitShopLastDataSkippedBalance(rt, candidate, '控制范围门禁未通过，未读取千川余额');
+4446|        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: scopeBlockedReason }, undefined, 'error');
+4447|        this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: scopeBlockedReason });
+4448|        return { status: 'blocked', reason: scopeBlockedReason };
+4449|      }
+4450|
+4451|      // 4) 执行时间窗口（超标=暂停意图）：
+4452|      // 2026-10-09 R1：首查调度器启用时，首查未完成则费比暂停被首查安全门禁拦截
+4453|      // （客户：未知/失败/未确认动作必须先核验，不能通过费比路径绕过首查安全门禁）；
+4454|      // 首查已完成（success）则直接放行费比暂停（不再等 dailyStartHour）。
+4455|      // 调度器未启用时（如纯费比测试）保留旧 dailyStartHour 门禁。
+4456|      // D53（2026-10-30）：门禁以**实际生效**的调度器判定为准（enableSchedulerShouldRun）——
+4457|      // 独立停用每日开启只停开启任务，绝不连带停费比暂停巡查；停用后走原 dailyStartHour 门禁。
+4458|      const enableWindowCfg = this.enableSchedulerShouldRun();
+4459|      const todayDate = shanghaiDate(this.nowFn());
+4460|      if (data.evaluation.pauseEligible === true) {
+4461|        if (enableWindowCfg && !this._enablePhaseDone(shopCfg.id, todayDate)) {
+4462|          const reason = `当日首次开启检查未完成（首查安全门禁），费比暂停暂不执行：已读取并记录，未执行真实关闭`;
+4463|          this.schedule.lastWindowBlockReason = reason;
+4464|          this._commitShopLastDataSkippedBalance(rt, candidate, '首查安全门禁拦截暂停，未读取千川余额');
+4465|          this._memPush(this.triggers, {
+4466|            shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason,
+4467|            targetCount: 0,
+4468|          }, undefined, 'trigger');
+4469|          this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason });
+4470|          this._emitJudgement(shopCfg, { data, over: true, status: 'window_blocked', reason });
+4471|          return { status: 'window_blocked', reason };
+4472|        }
+4473|        if (!enableWindowCfg && !isAfterDailyStart(this.nowFn(), this.config.schedule.dailyStartHour)) {
+4474|          const hh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
+4475|          const reason = `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：已读取并记录，未执行真实关闭（手动检查不绕过时间限制）`;
+4476|          this.schedule.lastWindowBlockReason = reason;
+4477|          this._commitShopLastDataSkippedBalance(rt, candidate, '未到允许执行时段，未读取千川余额');
+4478|          this._memPush(this.triggers, {
+4479|            shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason,
+4480|            targetCount: 0,
+4481|          }, undefined, 'trigger');
+4482|          this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason });
+4483|          this._emitJudgement(shopCfg, { data, over: true, status: 'window_blocked', reason });
+4484|          return { status: 'window_blocked', reason };
+4485|        }
+4486|      }
+4487|
+4488|      // 5) 本轮回读 currentAdState（清单身份/完整性失败 → blocked，不得包成 ok）
+4489|      const stateRead = await this._readCurrentAdState(shopCfg);
+4490|      this._applyBalanceToLastData(candidate, stateRead);
+4491|      if (stateRead.error) {
+4492|        const err = stateRead.error;
+4493|        // 失败/unknown：新错误覆盖旧因，撤销旧 on 证据；只读观测不得伪称动作确认。
+4494|        this._applyReadFailure(shopCfg.id, err);
+4495|        // 本轮没有可信决策 → 不保留上一轮的 ROI 提示（避免陈旧警告）
+4496|        candidate.roiTooLow = false;
+4497|        candidate.pauseEligible = false;
+4498|        // 竞态修正：带余额终态的本轮读数先原子提交，再返回 blocked。
+4499|        this._commitShopLastData(rt, candidate);
+4500|        this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: err.reason }, undefined, 'error');
+4501|        this._emitJudgement(shopCfg, { data, over: data.evaluation.over === true, status: 'blocked', reason: err.reason, currentAdState: stateRead.state });
+4502|        this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: err.reason, blocked: err.blocked, zeroClick: true });
+4503|        // 状态回读失败发生在任何开关之前：blocked + 原因 + zeroClick；不伪造成 already_* / 成功
+4504|        return {
+4505|          status: 'blocked',
+4506|          reason: err.reason,
+4507|          blocked: err.blocked || 'ad_state_read',
+4508|          zeroClick: true,
+4509|          decision: DECISION.UNKNOWN_BLOCKED,
+4510|          currentAdState: stateRead.state || 'unknown',
+4511|        };
+4512|      }
+4513|      const currentAdState = stateRead.state;
+4514|      this._clearReadFailure(shopCfg.id);
+4515|      this._applyObservedAdState(shopCfg.id, currentAdState, '只读清单/页面回读');
+4516|      // 竞态修正：余额终态已写入 candidate，此刻一次性原子提交为本轮可见读数。
+4517|      this._commitShopLastData(rt, candidate);
+4518|      const thresholdCents = this._thresholdCents(shopCfg);
+4519|      const decision = this._switchOrchestrator.evaluatePeriodic({
+4520|        costCents: data.cost.valueCents,
+4521|        orders: data.orders.valueCount,
+4522|        thresholdCents,
+4523|        currentAdState,
+4524|        identityOk: true,
+4525|      });
+4526|      // 同店同日有效判定 → 页面/日志的 ROI 提示投影（不由 UI 重算；消耗门槛已取消）
+4527|      rt.lastData.spendFloorCents = SPEND_FLOOR_CENTS;
+4528|      rt.lastData.spendProtected = decision.spendProtected === true;
+4529|      rt.lastData.pauseEligible = decision.pauseEligible === true;
+4530|      rt.lastData.roiTooLow = decision.roiTooLow === true;
+4531|      // 最近一次决策（供 getStatus/mixed 收敛视图如实区分「有修复安排」与「合法零动作」）。
+4532|      rt.lastDecision = {
+4533|        decision: decision.decision,
+4534|        metric: decision.metric,
+4535|        action: decision.action,
+4536|        targetState: decision.targetState,
+4537|        at: new Date(this.nowFn()).toISOString(),
+4538|      };
+4539|
+4540|      // 等于阈值保持：合法零动作，本轮没有任何收敛动作被安排。

@@ -219,6 +219,10 @@ function createDailyRunner(o = {}) {
 
   const onLog = typeof opts.onLog === 'function' ? opts.onLog : () => {};
   const ledgerFile = path.join(dataDir, 'ledger.json');
+  // HYBRID_MINIMAL：与 watch-drill ensurePlanScheduler 共用同一 shop/day lease 目录。
+  // 生产 VBS 从本 RUNNER_DIR（ChatGPT\\推广广告控制\\plan-publisher）启动；
+  // watch-drill 经 PUBLISHER_DIR 解析到同一路径下的 shop-day-leases。
+  const leaseDir = opts.leaseDir || path.join(RUNNER_DIR, 'shop-day-leases');
 
   // 每次调用都 fresh 读自己的配置文件（不缓存）：policy / 店名单 / 登录视图全用当前字节；
   // 停用（enabled/autoConfirm false）后 listShops 返回空 → 零未来派发，绝不继承值守开关。
@@ -438,6 +442,8 @@ function createDailyRunner(o = {}) {
     ledgerFile,
     lockFile: ledgerFile + '.lock',
     lockStaleMs: opts.lockStaleMs,
+    leaseDir,
+    leaseStaleMs: opts.leaseStaleMs,
     // 2026-10-26 patrol-plan-refill 返修：删除自造的 48 次/日封顶（客户从未要求任一新的
     // 任意上限）。值守模式下，**严格证明从未提交**的缺额可在后续每次巡逻检查重试，直到
     // 配置的成功目标；unknown/已消费/已成功一律不重放，既有退避/成功账本原样保留。

@@ -414,3 +414,48 @@ test('R5 脚本契约：显式当前用户 Interactive/Limited Principal（按�
   assert.ok(!/\$firstAt/.test(ps1), '不得再构造当日本地触发 DateTime（触发器已移除）');
   assert.ok(!ps1.includes('AddDays(1)'), '不得再顺延次日触发时刻（触发器已移除）');
 });
+
+
+
+// ── HYBRID_MINIMAL：daily-runner 共享 lease 接线 ──────────────────────────────
+
+test('HYBRID：daily-runner 传入 leaseDir；他方持有同店同日 lease 时零 runPlan、零 in-progress', async () => {
+  const env = makeEnv();
+  env.writeCfg();
+  const leaseDir = path.join(env.root, 'shop-day-leases');
+  fs.mkdirSync(leaseDir, { recursive: true });
+  const clock = { ms: Date.UTC(2026, 9, 26, 1, 0, 0) }; // 上海 2026-10-26 09:00
+  const businessDate = '2026-10-26';
+  const jin = SHOPS.find((s) => String(s.name).includes('瑾'));
+  assert.ok(jin, 'fixture 必须含瑾漂亮');
+  const shopId = String(jin.id != null ? jin.id : jin.name);
+  // accountId 空时 runner 会先 discover（spy 返回 123456789），lease 在身份确认后按 accountId 取。
+  const accountId = '123456789';
+  const key = realScheduler.shopDayLeaseKey({ accountId, shopId, businessDate });
+  const leaseFile = realScheduler.shopDayLeasePath(leaseDir, key);
+  const held = realScheduler.acquireProcessLock(leaseFile, () => clock.ms, 30 * 60 * 1000);
+  assert.strictEqual(held.held, true);
+
+  const spy = makeSpyDeps({ [jin.name]: 0 });
+  const runner = RUNNER.createDailyRunner({
+    configFile: env.cfgFile,
+    dataDir: env.dataDir,
+    stateRoot: path.join(env.dataDir, 'publisher-state'),
+    schedulerPath: SCHEDULER_PATH,
+    deps: spy.deps,
+    nowMs: () => clock.ms,
+    onLog: () => {},
+    leaseDir,
+  });
+  const result = await runner.tick();
+  assert.strictEqual(result.ran, true, JSON.stringify(result));
+  const jinResult = (result.results || []).find((x) => x.shopId === shopId);
+  assert.ok(jinResult, '应有瑾漂亮结果: ' + JSON.stringify(result.results));
+  assert.strictEqual(jinResult.status, 'coordination-yield');
+  assert.strictEqual(spy.calls.runPlan.filter((c) => c.shop === jin.name).length, 0, 'lease 忙不得进入 runPlan');
+  const ledger = realScheduler.loadLedger(path.join(env.dataDir, 'ledger.json'));
+  const rec = (((ledger.days || {})[businessDate] || {}).shops || {})[shopId] || {};
+  assert.strictEqual(Object.keys(rec.entries || {}).length, 0, '零 in-progress');
+  assert.deepStrictEqual(rec.retryHistory || [], []);
+  realScheduler.releaseProcessLock(leaseFile, held.token);
+});

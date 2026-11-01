@@ -82,6 +82,27 @@ const MIXED_RECONCILE_TEXT = Object.freeze({
   no_repair_scheduled: '混合（未安排收敛，非完成态）',
 });
 
+// ── AUTH-60S 登录证据硬化（FINAL 2026-11-02）─────────────────────────────
+// **所有正向证据**（登录页 URL / 可见登录表单 / 可见登录控件 / 可见登录对话框）都必须
+// 跨轮次**连续**观测 ≥ 本窗口才允许 AUTH 升级（requiresLogin=true / AuthError 文案①）；
+// 短暂 /login（重定向延迟、SSO /login/common）与瞬时强 UI 一律不得立即 AUTH。
+// body 文本「扫码登录」等与 hidden 控件永不单独构成 AUTH。中断时段不累计
+// （离开正向证据/读取成功/无证据轮次 → 清零重计）。未满窗口：kind=read_failed、
+// requiresLogin=false、用户可见文案固定「读取失败」（不显示观测进度类文案）。
+const AUTH_LOGIN_URL_HOLD_MS = 60000;
+// 四条固定文案（与 bill-manager 页面主提示同源；kind → 文案）：
+//  ① 登录已失效，请重新扫码   ② Cookie 缺失，请重新导入
+//  ③ 读取失败                 ④ 读取超时，将自动重试
+const READ_FAILURE_HINTS = Object.freeze({
+  auth: '登录已失效，请重新扫码',
+  cookie_invalid: 'Cookie 缺失，请重新导入',
+  cookie_blocked: 'Cookie 缺失，请重新导入',
+  identity: '读取失败',
+  read_failed: '读取失败',
+  timeout: '读取超时，将自动重试',
+  retrying: null, // 行内 note 已带"正在重试"，不覆盖主文案
+});
+
 class Monitor {
   /**
    * @param cfgResult loadConfig() 返回值
@@ -108,6 +129,10 @@ class Monitor {
     this._readRecoveries = new Map(); // shopId -> 每店独立的活动恢复链（内存态；绝不持久化 timer/句柄）
     this._readRecoverySeq = 0;
     this._readAttemptSeq = 0; // 实际发起物理读取的次数（恢复链据此只对真实读取计数）
+    // AUTH-60S FINAL：shopId -> { key, kind, firstSeenAt }（正向证据连续观测窗口；
+    // loginUrl 的 key 用 origin+pathname，纯强 UI 用稳定伪 key ui:form/ui:control/ui:dialog；
+    // 同 key 连续命中保持起点，key 变化/离开正向证据/读取成功即清除，中断不累计）。
+    this._authEvidenceWatch = new Map();
 
     this.adapters = adapters || null;
     this._injectedReader = (adapters && adapters.reader) || null;
@@ -1725,7 +1750,7 @@ class Monitor {
         candidate.pauseEligible = false;
         // 返回的 blocked 与 lastReadError.kind 同源（F5-R9）：注入/适配器给出的通用
         // blocked=auth 若被具体原因推翻（Cookie/身份/读取失败），不得继续对外冒充 auth。
-        const errKind = this._readErrorKind(stateRead.error);
+        const errKind = this._readErrorKind(stateRead.error, shopCfg.id);
         let blocked = stateRead.error.blocked || 'ad_state_read';
         if (errKind === 'cookie_invalid' || errKind === 'cookie_blocked' || errKind === 'identity') blocked = errKind;
         else if (blocked === 'auth' && errKind !== 'auth') blocked = errKind;
@@ -1775,10 +1800,11 @@ class Monitor {
       // F5-R9：AuthError/blocked=auth 只是"读取被拒绝"，不是登录失效的充分证据。
       // 按具体原因分类（Cookie 解析/结构、Cookie 读取受阻、身份），无正证据的通用
       // auth 一律按读取失败保留原 reason，绝不要求扫码。
-      const cls = this._readFailureClass(reason);
+      // AUTH-60S：携带 loginEvidence 时按结构性证据 + 连续观测窗口分类。
+      const cls = this._failureClassWithError(shopId, e, reason);
       const authType = (e instanceof AuthError || (e && e.code === 'AUTH'));
       const blocked = cls || (authType ? 'read_failed' : 'data');
-      this._applyReadFailure(shopId, { reason, blocked, auth: cls === 'auth' || undefined });
+      this._applyReadFailure(shopId, { reason, blocked, auth: cls === 'auth' || undefined, loginEvidence: (e && e.loginEvidence) || undefined });
       this._memPush(this.recentErrors, { scope: `shop:${shopId}`, error: reason }, undefined, 'error');
       this._audit({ kind: 'shop-refresh', shopId, ok: false, reason, blocked, zeroClick: true });
       return { ok: false, reason, zeroClick: true };
@@ -2067,6 +2093,80 @@ class Monitor {
     return null;
   }
 
+  // ── AUTH-60S 正向证据连续观测（按店铺，FINAL 2026-11-02）─────────────────
+  // 结构性瞬时证据（err.loginEvidence，由 qianchuan-reader collectLoginExpiryEvidence
+  // 产出）优先于 reason 文本分类：**任一正向证据**（loginUrl / 可见表单 / 可见控件 /
+  // 可见对话框）都必须跨轮连续观测 ≥ AUTH_LOGIN_URL_HOLD_MS 才判 auth（强 UI 无旁路）；
+  // 证据中途消失/key 变化即清零重计，中断时段不累计；证据无任何正向项（含裸 AuthError
+  // 文本、body「扫码登录」字样、hidden 控件）一律 read_failed，绝不要求扫码。
+
+  _authEvidenceWatchFor(shopId) {
+    return this._authEvidenceWatch.get(String(shopId)) || null;
+  }
+
+  _clearAuthEvidenceWatch(shopId) {
+    this._authEvidenceWatch.delete(String(shopId));
+  }
+
+  /**
+   * 本轮正向证据 → 稳定观测 key（FINAL 规则 3/4）：
+   * loginUrl 用 origin+pathname（strip query）；纯强 UI 用伪 key ui:form/ui:control/ui:dialog。
+   * body 文本与 hidden 控件不是正向证据（reader 侧已只报可见结构性布尔）。
+   */
+  _positiveAuthEvidence(evidence) {
+    const ev = (evidence && typeof evidence === 'object') ? evidence : null;
+    if (!ev) return null;
+    if (ev.loginUrl === true && typeof ev.loginUrlKey === 'string' && ev.loginUrlKey) return { key: ev.loginUrlKey, kind: 'url' };
+    if (ev.loginFormVisible === true) return { key: 'ui:form', kind: 'form' };
+    if (ev.loginControlVisible === true) return { key: 'ui:control', kind: 'control' };
+    if (ev.loginDialogVisible === true) return { key: 'ui:dialog', kind: 'dialog' };
+    return null;
+  }
+
+  /**
+   * 观测一轮证据并维护连续窗口：
+   * - 正向证据 key 与在观 key 相同 → 保持 firstSeenAt 起点（连续命中）；
+   * - key 变化（含 URL↔强 UI 切换、URL pathname 变化）→ 以本轮为新起点（旧窗口作废）；
+   * - 无正向证据（离开登录页/强 UI 消失/无证据轮次）→ 清除窗口，返回 null。
+   */
+  _observeAuthEvidenceWatch(shopId, evidence, now) {
+    const k = String(shopId);
+    const pos = this._positiveAuthEvidence(evidence);
+    if (pos) {
+      const rec = this._authEvidenceWatch.get(k);
+      if (rec && rec.key === pos.key) {
+        return { key: rec.key, kind: rec.kind, firstSeenAt: rec.firstSeenAt, heldMs: Math.max(0, now - rec.firstSeenAt) };
+      }
+      const fresh = { key: pos.key, kind: pos.kind, firstSeenAt: now };
+      this._authEvidenceWatch.set(k, fresh);
+      return { key: fresh.key, kind: fresh.kind, firstSeenAt: fresh.firstSeenAt, heldMs: 0 };
+    }
+    this._authEvidenceWatch.delete(k);
+    return null;
+  }
+
+  /**
+   * 组合判定（唯一 AUTH 升级入口，FINAL）：返回 { kind, evidenceKind, heldMs, observingSec? }。
+   * 任一正向证据（URL 或强 UI）都必须 heldMs ≥ AUTH_LOGIN_URL_HOLD_MS 才 kind=auth；
+   * 未满窗口一律 read_failed（requiresLogin=false，用户可见文案固定「读取失败」）。
+   */
+  _loginEvidenceDecision(shopId, evidence) {
+    const w = this._observeAuthEvidenceWatch(shopId, evidence, this.nowFn());
+    if (!w) return { kind: 'read_failed', evidenceKind: null, heldMs: 0 };
+    if (w.heldMs >= AUTH_LOGIN_URL_HOLD_MS) return { kind: 'auth', evidenceKind: w.kind, heldMs: w.heldMs };
+    return { kind: 'read_failed', evidenceKind: w.kind, heldMs: w.heldMs, observingSec: Math.floor(w.heldMs / 1000) };
+  }
+
+  /** 构造失败对象处的证据感知分类：有 loginEvidence → 组合判定；否则回退 reason 文本分类。 */
+  _failureClassWithError(shopId, e, reason) {
+    const ev = e && e.loginEvidence;
+    if (ev && typeof ev === 'object' && shopId != null) {
+      const d = this._loginEvidenceDecision(shopId, ev);
+      return d.kind === 'auth' ? 'auth' : null;
+    }
+    return this._readFailureClass(reason);
+  }
+
   /**
    * 读取错误分类（页面展示与重试门共用）：
    * - auth：正式登录检测已证明持续登录页/登录失效（只有此类可要求重新登录）；
@@ -2077,12 +2177,17 @@ class Monitor {
    * - timeout：总截止已到（收口/清理结果另见 error.cleanup）；
    * - read_failed：其他读取失败（导航未稳定、清单不一致等），不得冒充登录失效。
    * 无正证据的通用 auth（blocked=auth / auth=true）一律降为 read_failed，绝不据此要求扫码。
+   * AUTH-60S FINAL：传入 shopId 且 err.loginEvidence 存在时，结构性证据 + 连续观测窗口优先于
+   * reason 文本分类（任一正向证据未满 60s → read_failed；跨轮连续 ≥60s 且证据仍在 → auth）。
    */
-  _readErrorKind(err) {
+  _readErrorKind(err, shopId) {
     if (!err) return null;
     if (err.retrying === true) return 'retrying';
     if (err.blocked === 'cookie_invalid' || err.blocked === 'cookie_blocked' || err.blocked === 'identity') return err.blocked;
     if (err.timeout === true) return 'timeout';
+    if (shopId != null && err.loginEvidence && typeof err.loginEvidence === 'object') {
+      return this._loginEvidenceDecision(shopId, err.loginEvidence).kind;
+    }
     const cls = this._readFailureClass(err.reason);
     if (cls) return cls;
     return 'read_failed';
@@ -2093,13 +2198,13 @@ class Monitor {
    * 只保留 status/blocked/reason(截断)/timeout/lastStep，绝不写入裸 Cookie/URL 参数/令牌。
    * 通过 log.sanitize 做值级兜底脱敏；临时错误保持其分类，不改写为登录失效。
    */
-  _maskReadError(err) {
+  _maskReadError(err, shopId) {
     if (!err) return null;
     const masked = log.sanitize({
       status: err.status || 'blocked',
       // 分类与页面 lastReadError.kind 同源：auth 仅在正式登录检测正证据下出现；
       // Cookie/身份/超时/瞬态分别归类，通用 auth 不会在这里被升级为登录失效。
-      kind: this._readErrorKind(err),
+      kind: this._readErrorKind(err, shopId),
       blocked: err.blocked || 'ad_state_read',
       reason: String(err.reason || '').slice(0, 200),
       lastStep: err.lastStep || null,
@@ -2750,7 +2855,7 @@ class Monitor {
     const rt = this._runtime(rec.shopId);
     const view = this._readRecoveryView(rec.shopId);
     rt.lastReadError = {
-      kind: this._readErrorKind(error),
+      kind: this._readErrorKind(error, rec && rec.shopId),
       reason: rec.lastReason,
       blocked: (error && error.blocked) || rec.lastBlocked || 'ad_state_read',
       retrying: false,
@@ -2870,12 +2975,30 @@ class Monitor {
   _applyReadFailure(shopId, err) {
     const rt = this._runtime(shopId);
     // 页面展示的错误详情同样脱敏：保留业务原因与分类，但绝不出站裸 Cookie/令牌/会话值。
-    const reason = log.sanitize(String((err && err.reason) || '未知读取失败'));
+    const baseReason = log.sanitize(String((err && err.reason) || '未知读取失败'));
     const recovery = (err && err.recovery) || this._readRecoveryView(shopId);
-    const kind = (recovery && recovery.active) ? 'retrying' : this._readErrorKind(err);
+    const hasEvidence = !!(err && err.loginEvidence && typeof err.loginEvidence === 'object');
+    const kind = (recovery && recovery.active) ? 'retrying' : this._readErrorKind(err, shopId);
+    // AUTH-60S FINAL：连续观测窗口只统计**带正向结构性证据**的轮次；本轮无证据
+    // （Cookie/超时/裸异常等）即窗口中断，清除计时（中断时段不累计）。
+    if (!hasEvidence) this._clearAuthEvidenceWatch(shopId);
+    // FINAL 规则 5：未满 60s 用户可见文案固定「读取失败」（hint），reason 不追加
+    // 「登录页观测中 Xs/60s」类进度文案；观测进度仅保留在内部调试字段 loginUrlObserv。
+    let loginUrlObserv = null;
+    if (hasEvidence && kind !== 'auth') {
+      const w = this._authEvidenceWatchFor(shopId);
+      if (w) {
+        loginUrlObserv = { key: w.key, kind: w.kind, heldMs: Math.max(0, this.nowFn() - w.firstSeenAt), holdMs: AUTH_LOGIN_URL_HOLD_MS };
+      }
+    }
+    const reason = baseReason;
     rt.lastReadError = {
       kind,
+      // 四条固定文案（单一来源）：页面/bill-manager 直接消费，不再各自猜文案。
+      hint: READ_FAILURE_HINTS[kind] !== undefined ? READ_FAILURE_HINTS[kind] : null,
+      requiresLogin: kind === 'auth',
       reason,
+      loginUrlObserv,
       blocked: (err && err.blocked) || 'ad_state_read',
       lastStep: (err && err.lastStep) || null,
       retrying: kind === 'retrying',
@@ -2900,6 +3023,8 @@ class Monitor {
     rt.lastReadError = null;
     rt.lastError = null;
     if (rt.lastData) delete rt.lastData.blockedReason;
+    // AUTH-60S：读取成功即离开正向证据 → 清除连续观测窗口（下次命中重新计时）。
+    this._clearAuthEvidenceWatch(shopId);
     // 正常新成功可重置恢复事件：清 timer/进度/旧错误（幂等；无链时无动作）。
     this._clearReadRecovery(shopId, 'read-success');
   }
@@ -2938,7 +3063,9 @@ class Monitor {
         const isIdentity = /身份/.test(String(reason));
         const authType = (e instanceof AuthError || (e && e.code === 'AUTH')) && !isIdentity;
         // F5-R9：通用 AuthError 不升级为 auth；Cookie 解析/结构/读取受阻、身份按具体故障分类。
-        const cls = this._readFailureClass(reason);
+        // AUTH-60S FINAL：携带 loginEvidence 时按结构性证据 + 连续观测窗口判定（任一正向
+        // 证据未满 60s → cls=null → read_failed，不冒充登录失效；强 UI 无即时旁路）。
+        const cls = this._failureClassWithError(shopCfg.id, e, reason);
         const blocked = cls || (isIdentity ? 'identity' : (authType ? 'read_failed' : ((e && e.code === 'DATA_GUARD') ? 'inventory' : 'ad_state_read')));
         return {
           state: 'unknown',
@@ -2947,6 +3074,7 @@ class Monitor {
             reason,
             blocked,
             auth: cls === 'auth' || undefined,
+            loginEvidence: (e && e.loginEvidence) || undefined,
           },
         };
       }
@@ -2972,13 +3100,14 @@ class Monitor {
     } catch (e) {
       // 身份/分页/完整性/Cookie 故障：blocked，不得映射成 ok/unknown 零点击
       const reason = e.reason || e.message;
-      const cls = this._readFailureClass(reason);
+      const cls = this._failureClassWithError(shopCfg.id, e, reason);
       return {
         state: 'unknown',
         error: {
           status: 'blocked',
           reason,
-          blocked: cls || (/身份/.test(String(reason)) ? 'identity' : 'inventory'),
+          blocked: cls || (/身份/.test(String(reason)) ? 'identity' : ((e && e.loginEvidence) ? 'read_failed' : 'inventory')),
+          loginEvidence: (e && e.loginEvidence) || undefined,
         },
       };
     }
@@ -3678,7 +3807,7 @@ class Monitor {
           const lastStep = steps.length ? steps[steps.length - 1] : null;
           const doneEvent = { kind: 'ad-state-read', shopId: shopCfg.id, event: 'done', outcome: result && result.error ? 'error' : 'ok', lastStep, attempt: attempt + 1 };
           if (result && result.error) {
-            const m = this._maskReadError(result.error);
+            const m = this._maskReadError(result.error, shopCfg.id);
             doneEvent.status = m.status;
             // 分类放 errorKind：kind 已被审计类型 ad-state-read 占用，不能互相覆盖。
             doneEvent.errorKind = m.kind;
@@ -3781,7 +3910,7 @@ class Monitor {
           const rt = this._runtime(shopCfg.id);
           if (out && out.error) {
             rt.lastReadError = {
-              kind: this._readErrorKind(out.error),
+              kind: this._readErrorKind(out.error, shopCfg.id),
               reason: String(out.error.reason || ''),
               blocked: out.error.blocked || 'ad_state_read',
               retrying: false,
@@ -4087,7 +4216,9 @@ class Monitor {
       }
       // F5-R9：Cookie 解析/结构/读取受阻、身份、通用 Auth 均按具体故障分类；
       // 只有正式登录检测的正证据才是 auth（可要求重新登录），其余保持原 reason。
-      const cls = this._readFailureClass(reason);
+      // AUTH-60S FINAL：携带 loginEvidence 时由结构性证据 + 连续观测窗口决定 cls（任一
+      // 正向证据未满 60s → null → read_failed；跨轮连续 ≥60s 才 auth）。
+      const cls = this._failureClassWithError(shopCfg && shopCfg.id, e, reason);
       const blocked = cls || (isIdentity ? 'identity' : (authType ? 'read_failed' : 'inventory'));
       return {
         state: 'unknown',
@@ -4096,6 +4227,7 @@ class Monitor {
           reason,
           blocked,
           auth: cls === 'auth' || undefined,
+          loginEvidence: (e && e.loginEvidence) || undefined,
         },
       };
     } finally {
@@ -4940,7 +5072,7 @@ class Monitor {
       beliefOn: belief ? belief.on === true : null,
       // 区分两类 unknown（2026-09-29 08:00 事件）：readError=带 error 的读取失败；readNote=清单完成但开关不可识别（无 error）
       // 缺口 B：readError 必须带脱敏后的分类/原因/最后步骤，便于页面定位真实失败原因。
-      readError: this._maskReadError(stateRead0.error),
+      readError: this._maskReadError(stateRead0.error, shopCfg.id),
       readNote: stateRead0.switchEvidence || null,
     });
 
@@ -4954,9 +5086,9 @@ class Monitor {
         currentAdState,
         decision: dailyDecision.decision,
         // 缺口 B：预检读取失败的详细原因随相位记录保留（成功/already_on 不携带）。
-        readError: phaseStatus === 'failed' ? this._maskReadError(stateRead0.error) : null,
+        readError: phaseStatus === 'failed' ? this._maskReadError(stateRead0.error, shopCfg.id) : null,
       });
-      this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-zero-click', trigger: source, note: reason, currentAdState, decision: dailyDecision.decision, beliefAt: belief && belief.at, readError: this._maskReadError(stateRead0.error), readNote: stateRead0.switchEvidence || null });
+      this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-zero-click', trigger: source, note: reason, currentAdState, decision: dailyDecision.decision, beliefAt: belief && belief.at, readError: this._maskReadError(stateRead0.error, shopCfg.id), readNote: stateRead0.switchEvidence || null });
       try { log.info(`每日开启跳过（${shopCfg.id}）：${reason}`); } catch (_) { /* 日志失败不影响 */ }
       return { status: 'ok', skipped: true, zeroClick: true, decision: dailyDecision.decision, currentAdState, reason };
     }
@@ -5006,7 +5138,7 @@ class Monitor {
       readState: async () => {
         const r = await this._readCurrentAdState(shopCfg);
         if (r && r.error) {
-          enableReadError = this._maskReadError(r.error);
+          enableReadError = this._maskReadError(r.error, shopCfg.id);
           this._applyReadFailure(shopCfg.id, r.error);
         } else {
           enableReadError = null;
@@ -5629,4 +5761,4 @@ class Monitor {
   }
 }
 
-module.exports = { Monitor, STATE_VERSION };
+module.exports = { Monitor, STATE_VERSION, AUTH_LOGIN_URL_HOLD_MS, READ_FAILURE_HINTS };

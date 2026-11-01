@@ -459,14 +459,29 @@ async function reachQianchuanHome({ page, context, shopCfg, overlayOpts = {} }) 
  * 教程/帮助正文出现「扫码登录」等字样**绝不是**失效证据：任何 body 文本 includes
  * 都不参与判定；普通段落、隐藏控件、纯文字链接一律按导航事实处理。
  * 本函数内嵌的页面探针会被序列化到真实页面上下文执行，必须自包含（无外部闭包）。
+ *
+ * AUTH-60S（FINAL 2026-11-02）：本函数只报告**瞬时**结构性证据（含 loginUrlKey=origin+pathname，
+ * 去掉 query）；是否升级为最终登录失效（requiresLogin/AuthError）由 Monitor 的跨轮次
+ * 连续观测决定——**任一正向证据**（URL / 可见表单 / 控件 / 对话框）连续 ≥60s 才 AUTH，
+ * 强 UI 无即时旁路。loginUrl 命中时不再提前 return——必须继续探测可见表单/控件/对话框，
+ * 供 Monitor 按稳定 key 连续计时。
  */
 async function collectLoginExpiryEvidence(page) {
   const url = String(typeof page.url === 'function' ? page.url() : '');
   const ev = {
     loginUrl: /\/login|passport|signin|sso\.[a-z]*jinritemai|account\.[a-z]*doudian|verify.*login/i.test(url),
+    loginUrlKey: null,
     loginFormVisible: false, loginControlVisible: false, loginDialogVisible: false,
   };
-  if (ev.loginUrl) return ev;
+  if (ev.loginUrl) {
+    // 跨轮次连续观测的 key：origin+pathname（strip query；query 含 token/redirect 等易变参数）。
+    try {
+      const u = new URL(url);
+      ev.loginUrlKey = `${u.origin}${u.pathname}`;
+    } catch (_) {
+      ev.loginUrlKey = url.split('?')[0].split('#')[0] || null;
+    }
+  }
   try {
     const probe = await page.evaluate(() => {
       const needles = ['扫码登录', '登录抖音', '立即登录', '手机号登录', '请先登录'];
@@ -576,6 +591,25 @@ async function collectLoginExpiryEvidence(page) {
     } catch (_) { ev.loginControlVisible = ev.loginControlVisible === true; }
   }
   return ev;
+}
+
+/**
+ * AUTH-60S（FINAL 2026-11-02）：把**瞬时**结构性登录证据挂到即将外抛的错误上，供 Monitor
+ * 的跨轮次连续观测（任一正向证据按稳定 key 连续 ≥60s）做最终 AUTH 判定。reader 自身
+ * 不给出最终登录失效结论；证据只含结构性布尔与去 query 的 URL key，
+ * 绝不含 Cookie/令牌/完整 URL 参数。
+ */
+function withLoginEvidence(err, evidence) {
+  if (err && evidence && typeof evidence === 'object') {
+    err.loginEvidence = {
+      loginUrl: evidence.loginUrl === true,
+      loginUrlKey: typeof evidence.loginUrlKey === 'string' && evidence.loginUrlKey ? evidence.loginUrlKey : null,
+      loginFormVisible: evidence.loginFormVisible === true,
+      loginControlVisible: evidence.loginControlVisible === true,
+      loginDialogVisible: evidence.loginDialogVisible === true,
+    };
+  }
+  return err;
 }
 
 /**
@@ -780,9 +814,9 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
   const fail = async message => {
     const evidence = await collectLoginExpiryEvidence(target);
     if (evidence.loginUrl || evidence.loginControlVisible || evidence.loginFormVisible || evidence.loginDialogVisible) {
-      throw new AuthError('千川视图读取遇到登录页或登录控件：尚未取得账户数据');
+      throw withLoginEvidence(new AuthError('千川视图读取遇到登录页或登录控件：尚未取得账户数据'), evidence);
     }
-    throw new DataGuardError(message);
+    throw withLoginEvidence(new DataGuardError(message), evidence);
   };
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const before = target.url();
@@ -803,7 +837,7 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
     const shopView = view.shopView || view.switchPresent;
     const evidence = await collectLoginExpiryEvidence(target);
     if (evidence.loginUrl || evidence.loginControlVisible || evidence.loginFormVisible || evidence.loginDialogVisible) {
-      throw new AuthError('千川视图读取遇到登录页或登录控件：尚未取得账户数据');
+      throw withLoginEvidence(new AuthError('千川视图读取遇到登录页或登录控件：尚未取得账户数据'), evidence);
     }
     if (target.url() !== before) return fail('千川视图核验期间发生导航：未取得账户数据');
     const popup = view.popup || { present: false, safe: false, reason: 'none', closeTag: null };
@@ -1021,13 +1055,14 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
       }
     };
     // 收敛失败的既有分类（与旧实现逐字同口径）：page-closed / 登录正证据 / 导航事实。
+    // AUTH-60S：分类结果携带瞬时结构性证据（含 loginUrlKey），最终 AUTH 判定归 Monitor。
     const classifySettleFailure = async (sess) => {
-      if (sess.settled.reason === 'settle-page-closed') return { kind: 'page-closed', restore: null };
+      if (sess.settled.reason === 'settle-page-closed') return { kind: 'page-closed', restore: null, evidence: null };
       const evidence = await collectLoginExpiryEvidence(sess.pg);
       if (evidence.loginUrl || evidence.loginControlVisible || evidence.loginFormVisible || evidence.loginDialogVisible) {
-        return { kind: 'login', restore: null };
+        return { kind: 'login', restore: null, evidence };
       }
-      return { kind: 'nav', restore: null };
+      return { kind: 'nav', restore: null, evidence };
     };
     let sess = await openFxgSession();
     let fail = sess.settled.ok ? null : await classifySettleFailure(sess);
@@ -1100,9 +1135,9 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
         const restoreNote = fail.restore
           ? `；四层恢复未取得可验证候选（${fail.restore.reason || '未提升'}），工作副本现状未被盲覆盖`
           : '';
-        throw new AuthError(`登录失效：抖店页面在 ${sess.settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(opts.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${maskUrlQueries(page.url())}），请重新扫码登录${restoreNote}`);
+        throw withLoginEvidence(new AuthError(`登录失效：抖店页面在 ${sess.settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(opts.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${maskUrlQueries(page.url())}），请重新扫码登录${restoreNote}`), fail.evidence);
       }
-      throw new DataGuardError(`抖店主页面在有界自动登录收敛期内未到达首页（${sess.settled.attempts} 次探测，当前 ${maskUrlQueries(sess.settled.url || page.url())}）；未见登录正证据，按导航事实处理，需人工核实`);
+      throw withLoginEvidence(new DataGuardError(`抖店主页面在有界自动登录收敛期内未到达首页（${sess.settled.attempts} 次探测，当前 ${maskUrlQueries(sess.settled.url || page.url())}）；未见登录正证据，按导航事实处理，需人工核实`), fail.evidence);
     }
     // S8 2026-10-26：千川账户视图阶段补齐同一四层恢复链。此前 ensureQianchuanAccountView
     // 在千川入口抛出的 AuthError 直接外抛，已保存的有效同店候选从未被尝试（已核读源码
@@ -1146,13 +1181,13 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
           try { if (sess.pg.isClosed() !== true) closedOk = false; } catch (_) { closedOk = false; }
         }
         if (!closedOk) {
-          qcFailure = new AuthError(`${e.message}；原会话上下文关闭未获证明：阻断四层恢复重开，绝不重叠会话`);
+          qcFailure = withLoginEvidence(new AuthError(`${e.message}；原会话上下文关闭未获证明：阻断四层恢复重开，绝不重叠会话`), e.loginEvidence);
           break;
         }
         // 会话中段恢复同样先关闭当前店铺浏览器进程：候选切换与重载都不得复用旧 Cookie 进程。
         const browserClosed = await closeShopBrowserProven();
         if (!browserClosed) {
-          qcFailure = new AuthError(`${e.message}；原店铺浏览器进程关闭未获证明：阻断四层恢复重开，绝不重叠会话`);
+          qcFailure = withLoginEvidence(new AuthError(`${e.message}；原店铺浏览器进程关闭未获证明：阻断四层恢复重开，绝不重叠会话`), e.loginEvidence);
           break;
         }
         assertReadNotCancelled();
@@ -1164,7 +1199,7 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
           break;
         }
         if (!restore.ok) {
-          qcFailure = new AuthError(`${e.message}；四层恢复未取得可验证候选（${restore.reason || '未提升'}），工作副本现状未被盲覆盖`);
+          qcFailure = withLoginEvidence(new AuthError(`${e.message}；四层恢复未取得可验证候选（${restore.reason || '未提升'}），工作副本现状未被盲覆盖`), e.loginEvidence);
           break;
         }
         // 恢复提升已更新工作副本：刷新指纹基线（提升后字节即新基线），启动全新店铺浏览器
@@ -1176,8 +1211,8 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
         if (!sess.settled.ok) {
           const reopenFail = await classifySettleFailure(sess);
           qcFailure = reopenFail.kind === 'login'
-            ? new AuthError(`恢复重开后抖店登录仍失效（当前 ${maskUrlQueries(sess.pg.url())}）：本次恢复已结束，当前会话仍未通过验证`)
-            : new DataGuardError(`恢复重开后抖店主页面在有界自动登录收敛期内未到达首页（当前 ${maskUrlQueries(sess.settled.url || sess.pg.url())}）；未见登录正证据，按导航事实处理，需人工核实`);
+            ? withLoginEvidence(new AuthError(`恢复重开后抖店登录仍失效（当前 ${maskUrlQueries(sess.pg.url())}）：本次恢复已结束，当前会话仍未通过验证`), reopenFail.evidence)
+            : withLoginEvidence(new DataGuardError(`恢复重开后抖店主页面在有界自动登录收敛期内未到达首页（当前 ${maskUrlQueries(sess.settled.url || sess.pg.url())}）；未见登录正证据，按导航事实处理，需人工核实`), reopenFail.evidence);
           break;
         }
         context = sess.ctx;
@@ -1905,6 +1940,7 @@ module.exports = {
   isDoudianHomepageUrl,
   waitForDoudianHomepageSettled,
   collectLoginExpiryEvidence,
+  withLoginEvidence,
   DEFAULT_SETTLE_TIMEOUT_MS,
   DEFAULT_SETTLE_INTERVAL_MS,
   MAX_SETTLE_ATTEMPTS,

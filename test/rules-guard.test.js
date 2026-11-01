@@ -32,19 +32,38 @@ test('规则边界：禁止四舍五入每单成本（0.99 元/单不得因舍�
   assert.strictEqual(r.over, false);
 });
 
-test('规则：费用为 0 永不触发；订单为 0 与正单同一公式（不再阻断）', () => {
-  const zero = evaluateWholeShopCostPerOrder({ costCents: 0, orders: 50, thresholdCents: 100 });
-  assert.strictEqual(zero.over, false);
-  // 客户 2026-10-27 修正：0 单有消耗也正常，expectedCents=0，走同一公式与 50 元保护线
+test('规则 C：0 单一律不暂停（正费用 / 0 费用均 over=false、pauseEligible=false）', () => {
+  // 规则 C（2026-11-01）：0 单只观察/告警，绝不因 costCents>0 判超标或进入暂停资格。
   const zeroOrders = evaluateWholeShopCostPerOrder({ costCents: 5000, orders: 0, thresholdCents: 100 });
-  assert.strictEqual(zeroOrders.over, true, '5000 分 > 0×100=0 分：原始费比超标');
-  assert.strictEqual(zeroOrders.blocked, undefined, '零订单不再是 blocked');
-  assert.strictEqual(zeroOrders.spendProtected, true, '5000 分 ≤ 5000 分：50 元保护生效');
-  assert.strictEqual(zeroOrders.pauseEligible, false);
+  assert.strictEqual(zeroOrders.over, false, '规则 C：0 单不再与正单同一公式，costCents>0 也不 over');
+  assert.strictEqual(zeroOrders.pauseEligible, false, '0 单无暂停资格');
   assert.strictEqual(zeroOrders.roiTooLow, false);
+  assert.strictEqual(zeroOrders.spendProtected, false, '无消耗门槛（D55）：spendProtected 恒 false');
+  assert.strictEqual(zeroOrders.spendFloorCents, 0);
+  assert.strictEqual(zeroOrders.expectedCents, 0, 'expectedCents 仍为 0，仅供展示');
+  assert.strictEqual(zeroOrders.blocked, undefined, '0 单是合法观测，不是数据异常');
+  // 0 单 + 0 费用：同样不暂停。
   const zeroCostZeroOrders = evaluateWholeShopCostPerOrder({ costCents: 0, orders: 0, thresholdCents: 100 });
-  assert.strictEqual(zeroCostZeroOrders.over, false, '0 分 == 0 分：恰好相等不关闭');
+  assert.strictEqual(zeroCostZeroOrders.over, false);
+  assert.strictEqual(zeroCostZeroOrders.pauseEligible, false);
   assert.strictEqual(zeroCostZeroOrders.blocked, undefined);
+});
+
+test('规则 C：orders>=1 仍用严格大于公式（超标 over=true；恰好相等 / 0 费用 over=false）', () => {
+  // 费用为 0（orders>=1）永不触发。
+  const zeroCost = evaluateWholeShopCostPerOrder({ costCents: 0, orders: 50, thresholdCents: 100 });
+  assert.strictEqual(zeroCost.over, false);
+  assert.strictEqual(zeroCost.pauseEligible, false);
+  // 恰好相等不关闭（严格大于）。
+  const equal = evaluateWholeShopCostPerOrder({ costCents: 10000, orders: 100, thresholdCents: 100 });
+  assert.strictEqual(equal.over, false, '10000 分 == 100×100：恰好相等不暂停');
+  assert.strictEqual(equal.pauseEligible, false);
+  // 严格超标仍暂停（无消耗门槛）。
+  const over = evaluateWholeShopCostPerOrder({ costCents: 10001, orders: 100, thresholdCents: 100 });
+  assert.strictEqual(over.over, true, '10001 分 > 100×100=10000 分：严格超标');
+  assert.strictEqual(over.pauseEligible, true);
+  assert.strictEqual(over.roiTooLow, true);
+  assert.strictEqual(over.spendProtected, false);
 });
 
 test('规则：非法输入必须抛错而不是当 0', () => {

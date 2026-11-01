@@ -76,20 +76,37 @@ test('unknown → unknown_blocked', () => {
   assert.strictEqual(r.zeroClick, true);
 });
 
-test('零订单与正单同一公式（不再 data_blocked）；非法指标仍 data_blocked', () => {
-  const protectedZero = dec({ orders: 0, costCents: 5000 });
-  assert.strictEqual(protectedZero.decision, DECISION.SPEND_PROTECTED, '0 单 + 50.00 元：50 元保护，零暂停');
-  assert.strictEqual(protectedZero.blocked, null);
-  assert.strictEqual(protectedZero.expectedCents, 0);
-  assert.strictEqual(protectedZero.pauseEligible, false);
+test('规则 C：0 单 + 正费用 → zero_order_no_pause（观察/告警、零点击），绝不 should_pause', () => {
+  for (const currentAdState of ['on', 'off', 'mixed']) {
+    const r = dec({ orders: 0, costCents: 5000, currentAdState });
+    assert.strictEqual(r.metric, METRIC.ZERO_ORDER, `${currentAdState}：0 单不参与费比比较`);
+    assert.strictEqual(r.decision, DECISION.ZERO_ORDER_NO_PAUSE);
+    assert.strictEqual(r.action, null);
+    assert.strictEqual(r.zeroClick, true);
+    assert.strictEqual(r.pauseEligible, false);
+    assert.strictEqual(r.roiTooLow, false);
+    assert.notStrictEqual(r.decision, DECISION.SHOULD_PAUSE);
+  }
+});
 
-  const pausableZero = dec({ orders: 0, costCents: 5001, currentAdState: 'on' });
-  assert.strictEqual(pausableZero.decision, DECISION.SHOULD_PAUSE, '0 单 + 50.01 元 + on：暂停资格成立');
-  assert.strictEqual(pausableZero.pauseEligible, true);
+test('规则 C：0 单 + 0 费用 → zero_order_no_pause（不 pause）', () => {
+  for (const currentAdState of ['on', 'off', 'mixed']) {
+    const r = dec({ orders: 0, costCents: 0, currentAdState });
+    assert.strictEqual(r.metric, METRIC.ZERO_ORDER);
+    assert.strictEqual(r.decision, DECISION.ZERO_ORDER_NO_PAUSE);
+    assert.strictEqual(r.action, null);
+    assert.strictEqual(r.zeroClick, true);
+  }
+});
 
+test('规则 C：0 单仍先走 unknown fail-closed', () => {
+  const r = dec({ orders: 0, costCents: 5000, currentAdState: 'unknown' });
+  assert.strictEqual(r.decision, DECISION.UNKNOWN_BLOCKED);
+  assert.strictEqual(r.zeroClick, true);
+});
+
+test('非法指标 → data_blocked（0 单本身不再视为数据异常）', () => {
   assert.strictEqual(dec({ costCents: 12.5 }).decision, DECISION.DATA_BLOCKED);
-  assert.strictEqual(dec({ orders: -1 }).decision, DECISION.DATA_BLOCKED);
-  assert.strictEqual(dec({ orders: null }).decision, DECISION.DATA_BLOCKED);
   assert.strictEqual(dec({ dataError: 'parse' }).decision, DECISION.DATA_BLOCKED);
 });
 
@@ -355,6 +372,9 @@ test('metric 与 decision 标签分离（矩阵）', () => {
   const rows = [
     [1, 1, 'off', METRIC.BELOW, DECISION.SHOULD_ENABLE],
     [1, 1, 'on', METRIC.BELOW, DECISION.ALREADY_ON],
+    // D55（2026-10-30 取消消耗门槛）：严格超标即暂停资格；1.01 元（101 分 > 1×100 分）
+    // 在 on 状态应直接 should_pause，不再有保护区零动作分支。
+    [101, 1, 'on', METRIC.ABOVE, DECISION.SHOULD_PAUSE],
     [10001, 1, 'on', METRIC.ABOVE, DECISION.SHOULD_PAUSE],
     [10001, 1, 'off', METRIC.ABOVE, DECISION.ALREADY_OFF],
     [100, 1, 'on', METRIC.EQUAL, DECISION.EQUAL_NO_ACTION],
@@ -368,7 +388,7 @@ test('metric 与 decision 标签分离（矩阵）', () => {
 });
 
 // ── mixed（部分 on、部分 off）────────────────────────────────────
-test('mixed：above+mixed → should_pause（仅停 on 项）；below+mixed → should_enable（仅开 off 项）；equal+mixed 零动作', () => {
+test('mixed：above+mixed → should_pause（仅停 on 项）；below+mixed → should_enable（仅开 off 项）；equal+mixed → should_pause（统一暂停收敛）', () => {
   const above = dec({ costCents: 10001, currentAdState: 'mixed' });
   assert.strictEqual(above.metric, METRIC.ABOVE);
   assert.strictEqual(above.decision, DECISION.SHOULD_PAUSE);
@@ -381,10 +401,14 @@ test('mixed：above+mixed → should_pause（仅停 on 项）；below+mixed → 
   assert.strictEqual(below.action, 'enable');
   assert.match(below.reason, /mixed/);
 
-  const eq = dec({ costCents: 10000, currentAdState: 'mixed' });
+  const eq = dec({ costCents: 5000, orders: 50, currentAdState: 'mixed' });
   assert.strictEqual(eq.metric, METRIC.EQUAL);
-  assert.strictEqual(eq.decision, DECISION.EQUAL_NO_ACTION);
-  assert.strictEqual(eq.zeroClick, true);
+  // D55（2026-10-30 取消 50 元下限）：equal+mixed 仍按原「统一暂停」策略收敛到 off（仅点 on 项），
+  // 不再被消耗门槛阻挡；spendProtected 兼容字段恒 false。
+  assert.strictEqual(eq.decision, DECISION.SHOULD_PAUSE);
+  assert.strictEqual(eq.zeroClick, false);
+  assert.strictEqual(eq.action, 'pause');
+  assert.strictEqual(eq.spendProtected, false);
 });
 
 test('mixed 不得当 unknown：超标 mixed 仍应 should_pause，不得 unknown_blocked', () => {

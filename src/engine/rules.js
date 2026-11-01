@@ -1,28 +1,33 @@
 'use strict';
 
 /**
- * 规则判断 v2 —— 用户明确的唯一规则（全店口径）：
+ * 规则判断 v3 —— 用户 2026-11-01 拍板的「规则 C」（全店口径）：
  *
- *   当天累计推广费用 ÷ 当天累计全店订单数 > 每单成本阈值（用户规则 1 元/单 = 100 分）
+ *   orders >= 1：当天累计推广费用 > 订单数 × 每单成本阈值（严格大于，整数分）
+ *   orders === 0：一律不暂停（仅观察/告警、零点击），不因 costCents > 0 判为超标
  *
- * 判定实现：费用整数分 > 订单数 × thresholdCents（整数运算）。
+ * 判定实现（整数运算）：
+ * - 订单数必须是非负整数；0 单是合法观测，不是数据异常；
+ * - 只有 orders >= 1 才计算 over = costCents > orders × thresholdCents；
+ *   0 单时 over / pauseEligible / roiTooLow 一律 false（expectedCents 仍为 0，仅供展示）；
  * - 恰好等于阈值不关闭（严格大于）；
  * - 禁止先算出"每单成本"四舍五入再比较（浮点精度陷阱）；
- * - 订单数必须是非负整数；0 单与正单走同一公式（客户 2026-10-27 修正：
- *   0 单有消耗也正常，expectedCents=0，是否超标只看费用与 50 元保护线）；
  * - 费用与订单必须同一店铺、同一业务日期（由 guard 校验后传入）。
  *
- * 50 元保护（客户 2026-10-17）：
- * - 当天账户整体消耗 <= 5000 分（50.00 元）时，不因费比超标自动暂停；
- * - 只有消耗 > 5000 分（50.01 元起）且费比严格超标，才具备暂停资格并提示「ROI设置过低」；
- * - over 保留原始费比语义（cost > orders×threshold），保护门槛另以
- *   spendProtected / pauseEligible / roiTooLow 显式表达，避免把保护误标成数据异常。
+ * 取代旧口径：2026-10-27 零单修正与 2026-10-30 D55 中「0 单与正单同一公式、
+ * 0 单正费用即 above / pauseEligible」的部分，自 2026-11-01 规则 C 起不再适用；
+ * D55 取消 50 元消耗门槛的其余部分保持不变。
+ *
+ * 消耗门槛仍未恢复（方案 A 未采用）：
+ * - SPEND_FLOOR_CENTS / spendFloorCents / spendProtected 仅为既有 API 兼容保留，
+ *   恒为 0 / false，如实表达「无消耗门槛」；
+ * - 规则 C 不引入新的金额门槛：暂停资格只由 orders >= 1 且严格超标决定。
  */
 
 const { DataGuardError } = require('../lib/errors');
 
-/** 当天消耗保护线：5000 分 = 50.00 元（<= 保护，> 才允许自动暂停）。 */
-const SPEND_FLOOR_CENTS = 5000;
+/** 兼容字段：消耗保护线已取消（D55），恒为 0；spendProtected 恒为 false。 */
+const SPEND_FLOOR_CENTS = 0;
 
 /**
  * @param {object} p
@@ -43,16 +48,18 @@ function evaluateWholeShopCostPerOrder({ costCents, orders, thresholdCents }) {
     throw new DataGuardError(`每单成本阈值不是有效正整数分: ${JSON.stringify(thresholdCents)}`);
   }
   const expectedCents = orders * thresholdCents; // 整数运算：订单数×阈值分（0 单 → 0）
-  const spendProtected = costCents <= SPEND_FLOOR_CENTS;
-  const over = costCents > expectedCents;
+  // 无消耗门槛：保护线为 0 时 spendProtected 恒 false（0 费用本身也不会 over）。
+  const spendProtected = SPEND_FLOOR_CENTS > 0 && costCents <= SPEND_FLOOR_CENTS;
+  // 规则 C（2026-11-01）：0 单只观察/告警，绝不进入暂停资格，即使 costCents > 0。
+  const zeroOrders = orders === 0;
+  const over = !zeroOrders && costCents > expectedCents;
   const pauseEligible = over && !spendProtected;
   const roiTooLow = pauseEligible;
   let reason;
-  if (over) {
-    reason = `全店触发：当天推广费用 ${costCents} 分 > 订单数 ${orders} × 阈值 ${thresholdCents} 分 = ${expectedCents} 分（严格大于，恰好相等不关闭）`;
-    reason += spendProtected
-      ? `；当天消耗 ${costCents} 分 ≤ ${SPEND_FLOOR_CENTS} 分（50 元）：50 元保护生效，本轮不自动暂停`
-      : `；当天消耗 ${costCents} 分 > ${SPEND_FLOOR_CENTS} 分（50 元）：暂停资格成立`;
+  if (zeroOrders) {
+    reason = `0 单观察：当天推广费用 ${costCents} 分，不暂停（规则 C：0 单一律仅观察/告警、零点击；expectedCents=0 仅作展示）`;
+  } else if (over) {
+    reason = `全店触发：当天推广费用 ${costCents} 分 > 订单数 ${orders} × 阈值 ${thresholdCents} 分 = ${expectedCents} 分（严格大于，恰好相等不关闭；无消耗门槛，暂停资格成立）`;
   } else {
     reason = `未触发：当天推广费用 ${costCents} 分 ≤ 订单数 ${orders} × 阈值 ${thresholdCents} 分 = ${expectedCents} 分`;
   }

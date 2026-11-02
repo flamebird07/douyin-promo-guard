@@ -25,7 +25,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { loadShopCookieMeta } = require('../login/session');
+const { loadShopCookieMeta, resolveCookieFile, checkLoginByBrowser } = require('../login/session');
 const { validateTargetRoi, DEFAULT_TARGET_ROI } = require('../config');
 const { createPromoReaderNotConnected, createMockPromoReader } = require('../adapters/promo-reader');
 const { createAdControllerNotConnected, createMockAdController } = require('../adapters/ad-controller');
@@ -62,6 +62,9 @@ const SERIAL_GATE_MAX_WAIT_MS = 30 * 60 * 1000;
 const READ_RECOVERY_MAX_RETRIES = 10;
 const READ_RECOVERY_GROUP_SIZE = 2;
 const READ_RECOVERY_GROUP_WAIT_MS = 5 * 60 * 1000; // 300000ms
+// fix3 对照店 checkLogin 的对照上限：串行窗口内最多启动 2 家已配置且 cookie 可用的对照店
+// （每次一个新浏览器进程，checkLoginByBrowser 自带 finally 关闭）。都不通过 → 未结案。
+const AUTH_CONTROL_MAX_SHOPS = 2;
 // 收口门有界探测节奏（2026-10-23 DIAN-4 长期 unknown 门修复）：探测**只做收口**（等待 work
 // settle、关闭已登记会话、凭句柄真实关闭并独立核验连接），绝不发起读取、绝不开新 opener。
 // 1s→5s→30s 三次探测都拿不到"已证明关闭/已证明未创建"就转 terminal：门保持阻断、需人工处置；
@@ -144,6 +147,12 @@ class Monitor {
     // loginUrl 的 key 用 origin+pathname，纯强 UI 用稳定伪 key ui:form/ui:control/ui:dialog；
     // 同 key 连续命中保持起点，key 变化/离开正向证据/读取成功即清除，中断不累计）。
     this._authEvidenceWatch = new Map();
+    // fix3：对照店 checkLogin 实现（测试注入；生产默认 session.checkLoginByBrowser）。
+    // 只用于「当前店浏览器已关闭、下一店未启动」的串行窗口内排除全局误判。
+    this._authControlLogin = typeof opts.authControlLogin === 'function' ? opts.authControlLogin : null;
+    // fix3：结案证据对象 → 证据文件路径（同一份证据经 onAuthClosedOut 与错误路径各到一次，
+    // 只落盘一次；写盘失败不缓存，后续路径可重试）。
+    this._authClosureEvidenceFiles = new WeakMap();
 
     this.adapters = adapters || null;
     this._injectedReader = (adapters && adapters.reader) || null;
@@ -452,6 +461,108 @@ class Monitor {
       reason: (r && r.reason) || reason,
     });
     return r;
+  }
+
+  /**
+   * fix3：结案证据的统一收口（幂等）。onAuthClosedOut 回调与错误路径（err.authClosure）
+   * 携带的是同一份证据对象：只写一次证据包；authClosedOut===true 时再释放该店串行门。
+   * 证据未落盘则保持串行门阻塞（fail-closed），不改变读取错误语义。
+   *
+   * @returns {{written:boolean, file:string|null}}
+   */
+  _settleAuthClosure(shopId, closure) {
+    if (!closure || !closure.evidence || typeof closure.evidence !== 'object') {
+      return { written: false, file: null };
+    }
+    const evidence = closure.evidence;
+    let file = this._authClosureEvidenceFiles.get(evidence) || null;
+    if (!file) {
+      try { file = this._writeAuthClosureEvidence(shopId, evidence); } catch (_) { file = null; }
+      if (file) this._authClosureEvidenceFiles.set(evidence, file);
+    }
+    if (file && closure.authClosedOut === true) {
+      try { this._releaseSerialGateForAuthClosure(shopId, closure); } catch (_) { /* 释放失败不改变结案事实 */ }
+    }
+    return { written: !!file, file };
+  }
+
+  /**
+   * fix3：读取器恢复链的对照店接线（按店铺绑定）。
+   *
+   * - restoreControlCheck：全候选不可用时，在「当前店浏览器已关闭、下一店未启动」的串行
+   *   窗口内，对另一家已配置且 cookie 可用的对照店跑 checkLogin；通过才允许 auth 结案。
+   * - onAuthClosedOut：结案证据一到即走 _settleAuthClosure（落盘 + 释放该店串行门），
+   *   与错误路径共用幂等收口，不重复写盘。
+   *
+   * 未登记 authRecoveryPolicy 的店铺不会进入 fix3 恢复链，这两个选项对其零影响。
+   */
+  _authRecoveryWiring(shopCfg) {
+    const shopId = shopCfg && shopCfg.id ? String(shopCfg.id) : null;
+    if (!shopId) return {};
+    return {
+      restoreControlCheck: (ctx) => this._authControlCheck(shopCfg, ctx || {}),
+      onAuthClosedOut: async (evidence) => {
+        this._settleAuthClosure(shopId, { authClosedOut: true, evidence });
+      },
+    };
+  }
+
+  /**
+   * fix3：对照店 checkLogin（排除代码误判/全局登录失效）。
+   *
+   * 调用窗口由读取器保证：当前店店铺浏览器已关闭并获证明后才进入恢复链，且巡查跨店严格
+   * 串行（下一家店尚未启动）。此处再做一次窗口断言：只要有他店处理在途/收口未证明，
+   * 即保持 fail-closed（不结案）。对照店必须已配置、未删除、cookie 文件可解析且未过期；
+   * checkLogin 用独立浏览器进程，函数返回前必然关闭。
+   *
+   * @returns {Promise<{ok:boolean, reason:string, shop:string|null}>}
+   */
+  async _authControlCheck(shopCfg, ctx = {}) {
+    const selfId = shopCfg && shopCfg.id ? String(shopCfg.id) : null;
+    const shopSafeName = ctx && ctx.shopSafeName ? String(ctx.shopSafeName) : null;
+    const fail = (reason) => {
+      this._audit({ kind: 'auth-closure', step: 'control-check', shopId: selfId, shopSafeName, ok: false, reason });
+      return { ok: false, reason, shop: null };
+    };
+    const other = selfId ? this._otherBusyOrUnprovenShop(selfId) : null;
+    if (other) {
+      return fail(`对照店检查窗口不成立：店 ${other} 处理在途/收口未证明（不结案）`);
+    }
+    const loginCfg = this.config.login || {};
+    const shops = (this.config.shops || [])
+      .filter((s) => s && s.deleted !== true && s.cookieFile && String(s.id) !== selfId)
+      // 已启用的店优先，其余保持配置顺序（确定性选择，不随机挑对照店）。
+      .sort((a, b) => Number(b.enabled !== false) - Number(a.enabled !== false));
+    if (shops.length === 0) {
+      return fail('无其他已配置店铺可作对照：未完成误判排除（不结案）');
+    }
+    const login = this._authControlLogin || checkLoginByBrowser;
+    const tried = [];
+    for (const s of shops.slice(0, AUTH_CONTROL_MAX_SHOPS)) {
+      let resolved;
+      try {
+        // 过期/缺失/不可解析 → 该店 cookie 不可用，换下一家（绝不据此结案）。
+        loadShopCookieMeta(loginCfg, s);
+        resolved = resolveCookieFile(loginCfg, s.cookieFile);
+      } catch (_) {
+        tried.push(`${s.id}（cookie 不可用）`);
+        continue;
+      }
+      let r;
+      try {
+        r = await login(loginCfg, resolved.path);
+      } catch (_) {
+        tried.push(`${s.id}（checkLogin 异常）`);
+        continue;
+      }
+      if (r && r.loggedIn === true) {
+        const reason = `对照店「${s.id}」checkLogin 通过：排除全局误判`;
+        this._audit({ kind: 'auth-closure', step: 'control-check', shopId: selfId, shopSafeName, ok: true, controlShop: s.id, reason });
+        return { ok: true, reason, shop: s.id };
+      }
+      tried.push(`${s.id}（checkLogin 未通过）`);
+    }
+    return fail(`对照店 checkLogin 未通过/不可用（${tried.join('、')}）：未完成误判排除（不结案）`);
   }
 
   /**
@@ -1355,7 +1466,7 @@ class Monitor {
   }
 
   // ── 适配器/协调器 ────────────────────────────────────────────────
-  _makeReader() {
+  _makeReader(shopCfg) {
     if (this.config.monitor.mockDataSource === true) {
       const md = this.config.monitor.mockData || {};
       return createMockPromoReader(
@@ -1366,6 +1477,9 @@ class Monitor {
     const useQc = this.config.monitor.costDataSource === 'qianchuan' || this.config.monitor.adListDataSource === 'qianchuan';
     const useCompass = this.config.monitor.orderDataSource === 'compass';
     if (!useQc && !useCompass) return createPromoReaderNotConnected();
+    // fix3 生产接线：千川 cost/ad 与罗盘 order 的恢复链共享同一对按店铺绑定的选项。
+    // 未登记 authRecoveryPolicy 的店铺不会进入 fix3 恢复链，接线对其零影响。
+    const authRecovery = this._authRecoveryWiring(shopCfg);
     const { createCompositeReader } = require('../adapters/promo-reader');
     let costReader = null;
     let adReader = null;
@@ -1380,6 +1494,8 @@ class Monitor {
         // 2026-10-18：会话 Cookie 检查点/回写审计接入既有 _audit（此前未传，回写事件
         // 不落到审计文件与事件流）。仅接线，不改调度/动作/读取语义。
         audit: (e) => this._audit(e),
+        // fix3：全候选不可用时对照店 checkLogin + 结案回调（详见 _authRecoveryWiring）。
+        ...authRecovery,
       };
       if (this.config.monitor.costDataSource === 'qianchuan') {
         costReader = qc.createQianchuanCostReader(qcOpts);
@@ -1394,7 +1510,9 @@ class Monitor {
     if (useCompass) {
       const { createCompassOrderReader } = require('../adapters/compass-order-reader');
       // 2026-10-18：罗盘收尾检查点回写审计同样接入 _audit（此前未传，事件不落审计）。
-      orderReader = createCompassOrderReader({ loginCfg: this.config.login, nowFn: this.nowFn, audit: (e) => this._audit(e) });
+      orderReader = createCompassOrderReader({
+        loginCfg: this.config.login, nowFn: this.nowFn, audit: (e) => this._audit(e), ...authRecovery,
+      });
     }
     return createCompositeReader({ costReader, orderReader, adReader });
   }
@@ -1418,7 +1536,7 @@ class Monitor {
     let c = this._coordinators.get(shopCfg.id);
     if (!c) {
       c = new WholeShopCloseCoordinator({
-        reader: this._injectedReader || this._makeReader(),
+        reader: this._injectedReader || this._makeReader(shopCfg),
         controller: this._injectedController || this._makeController(shopCfg),
         config: this.config,
         now: this.nowFn,
@@ -3188,13 +3306,10 @@ class Monitor {
       // fix3：全候选不可用且对照店 checkLogin 已排除误判（authClosure.authClosedOut）→
       // 先落盘证据包，再按未确认终态释放该店旧 unknown 串行槽，避免 auth 结案后仍堵本店/后续店铺。
       // 无结案证据时不触碰任何门（保持既有 fail-closed 语义）。
-      if (err && err.authClosure && err.authClosure.evidence) {
-        let evidenceWritten = false;
-        try { evidenceWritten = !!this._writeAuthClosureEvidence(shopId, err.authClosure.evidence); } catch (_) { evidenceWritten = false; }
-        // 「先交证据包，再结案」：证据未落盘则保持串行门阻塞（fail-closed）。
-        if (evidenceWritten && err.authClosure.authClosedOut === true) {
-          try { this._releaseSerialGateForAuthClosure(shopId, err.authClosure); } catch (_) { /* 释放失败不掩盖读取错误 */ }
-        }
+      if (err && err.authClosure) {
+        // 结案证据先落盘、再释放该店串行门；证据未落盘则保持门阻塞（fail-closed）。
+        // 与 onAuthClosedOut 回调共用幂等收口：同一份证据只写一次盘。
+        try { this._settleAuthClosure(shopId, err.authClosure); } catch (_) { /* 收口失败不掩盖读取错误 */ }
       }
       if (this.adBelief) delete this.adBelief[shopId];
       try { this._saveState(); } catch (_) { /* 持久化失败不掩盖本次错误 */ }

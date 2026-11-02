@@ -26,7 +26,7 @@ const { runFix3Recovery, inspectCookieHealth, isWrittenBad } = require('../src/l
 const { buildAuthFailureSuffix } = require('../src/login/auth-failure-text');
 const session = require('../src/login/session');
 const { Monitor } = require('../src/engine/monitor');
-const { makeCfgResult } = require('./helpers');
+const { makeCfgResult, writeTempCookie } = require('./helpers');
 
 const SHOP = '简尚衣橱优品店';
 const NOW = Date.UTC(2026, 10, 2, 4, 0, 0); // 2026-11-02T04:00:00Z
@@ -468,4 +468,195 @@ test('F 有界核验：多账号+候选最多 4 次；.prev-* 不入候选', asy
   assert.ok(!res.attempts.some((a) => a.fileName && a.fileName.includes('.prev-')), '.prev-* 不得入候选');
   const accountSlots = res.attempts.filter((a) => String(a.slot).startsWith('account:'));
   assert.strictEqual(accountSlots.length, 3, '已登记账号候选上限 3');
+});
+
+// ── G. 生产 opt-in 接线（2026-11-02）──────────────────────────────────
+// 覆盖：配置只给简尚登记 fix3-four；对照店 checkLogin 注入；未提供/未通过 → 未结案；
+// 对照店通过 → 可结案；onAuthClosedOut 显式落盘+释放门且不重复写盘；
+// 未登记 policy 的店铺仍走默认五层恢复。
+
+test('G1 配置 opt-in：仅简尚登记 authRecoveryPolicy=fix3-four，他店不动', () => {
+  const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config', 'config.json'), 'utf8'));
+  const js = (cfg.shops || []).find((s) => s && s.id === SHOP);
+  assert.ok(js, '配置必须包含简尚衣橱优品店');
+  assert.strictEqual(js.authRecoveryPolicy, 'fix3-four');
+  for (const s of cfg.shops) {
+    if (s.id === SHOP) continue;
+    assert.strictEqual(s.authRecoveryPolicy, undefined, `店 ${s.id} 不得登记 fix3-four`);
+  }
+});
+
+test('G2 策略路由：简尚 opt-in → fix3-four；无 policy 的店仍走默认五层', async () => {
+  const d = mkBase();
+  fs.writeFileSync(path.join(d.workDir, `${SHOP}.json`), bytesOf(makeCookies('work', 1900000000)));
+  const loginCfg = { cookieWorkDir: d.workDir, douyinHomeUrl: 'https://fxg.jinritemai.com/ffa/mshop/homepage/index' };
+  const common = {
+    workDir: d.workDir,
+    excludeWorkCopy: true,
+    recoveryDir: d.recoveryDir,
+    archiveRoot: d.archiveRoot,
+    nowFn: () => NOW,
+    nowMs: NOW,
+    verify: async () => ({ ok: false, classification: 'login-invalid', reason: '桩：失败' }),
+  };
+
+  const fix3 = await session.restoreDutyWorkCopy(loginCfg, SHOP, {
+    ...common,
+    shopCfg: { name: SHOP, compassShopName: SHOP, authRecoveryPolicy: 'fix3-four' },
+    candidatePolicy: 'fix3-four',
+  });
+  assert.strictEqual(fix3.ok, false);
+  assert.strictEqual(fix3.policy, 'fix3-four', '简尚 opt-in 必须走 fix3-four');
+  assert.strictEqual(fix3.authClosedOut, false, '未注入对照店 checkLogin → 未结案');
+
+  const legacy = await session.restoreDutyWorkCopy(loginCfg, SHOP, {
+    ...common,
+    shopCfg: { name: SHOP, compassShopName: SHOP },
+    candidatePolicy: undefined,
+  });
+  assert.strictEqual(legacy.ok, false);
+  assert.strictEqual(legacy.policy, undefined, '未登记 policy 的店不得被 fix3-four 接管');
+  assert.ok(Array.isArray(legacy.attempts), '默认五层恢复必须给出候选尝试记录');
+});
+
+function buildControlMonitor(opts = {}) {
+  const cookieDir = opts.cookieDir || fs.mkdtempSync(path.join(os.tmpdir(), 'fix3-ctl-cookies-'));
+  const dataDir = opts.dataDir || fs.mkdtempSync(path.join(os.tmpdir(), 'fix3-ctl-data-'));
+  const shops = opts.shops || [
+    { id: SHOP, name: SHOP, cookieFile: SHOP, enabled: true },
+    { id: '瑾漂亮潮流服饰', name: '瑾漂亮潮流服饰', cookieFile: '瑾漂亮潮流服饰', enabled: true },
+  ];
+  const cfgResult = makeCfgResult({
+    shops,
+    cookieWorkDir: cookieDir,
+    monitor: { legacyWholeShopCloseEnabled: true, chengfang: { scope: ['全店托管', '商品自选'] } },
+  });
+  const calls = [];
+  const monitor = new Monitor(cfgResult, null, {
+    dataDir,
+    nowFn: () => NOW,
+    readAdState: async () => ({ state: 'unknown' }),
+    authControlLogin: opts.authControlLogin || (async (loginCfg, cookiePath) => {
+      calls.push(cookiePath);
+      return { loggedIn: opts.loggedIn !== false, url: 'https://fxg.jinritemai.com/ffa/mshop/homepage/index' };
+    }),
+  });
+  return { monitor, cookieDir, dataDir, calls, shops };
+}
+
+test('G3 对照店 checkLogin：可用 → ok；未提供对照店/他店在途 → fail-closed 未结案', async () => {
+  const { monitor, cookieDir, shops } = buildControlMonitor();
+  writeTempCookie(cookieDir, SHOP);
+  writeTempCookie(cookieDir, '瑾漂亮潮流服饰');
+  const self = shops[0];
+
+  const ok = await monitor._authControlCheck(self, { shopSafeName: SHOP });
+  assert.strictEqual(ok.ok, true, JSON.stringify(ok));
+  assert.strictEqual(ok.shop, '瑾漂亮潮流服饰');
+  assert.match(ok.reason, /排除全局误判/);
+
+  // 他店处理在途 → 串行窗口不成立 → 不结案
+  monitor._shopProcessing.add('瑾漂亮潮流服饰');
+  const busy = await monitor._authControlCheck(self, { shopSafeName: SHOP });
+  assert.strictEqual(busy.ok, false, JSON.stringify(busy));
+  assert.strictEqual(busy.shop, null);
+  assert.match(busy.reason, /窗口不成立/);
+  monitor._shopProcessing.delete('瑾漂亮潮流服饰');
+
+  // 对照店 checkLogin 未通过 → 未结案
+  const { monitor: m2, cookieDir: dir2 } = buildControlMonitor({ loggedIn: false });
+  writeTempCookie(dir2, SHOP);
+  writeTempCookie(dir2, '瑾漂亮潮流服饰');
+  const denied = await m2._authControlCheck(m2.config.shops[0], { shopSafeName: SHOP });
+  assert.strictEqual(denied.ok, false, JSON.stringify(denied));
+  assert.match(denied.reason, /未完成误判排除/);
+
+  // 对照店 cookie 过期 → 不可用 → 未结案
+  const { monitor: m3, cookieDir: dir3 } = buildControlMonitor();
+  writeTempCookie(dir3, SHOP);
+  writeTempCookie(dir3, '瑾漂亮潮流服饰', { expired: true });
+  const expired = await m3._authControlCheck(m3.config.shops[0], { shopSafeName: SHOP });
+  assert.strictEqual(expired.ok, false, JSON.stringify(expired));
+
+  // 无其他已配置店铺 → 未结案
+  const { monitor: m4, cookieDir: dir4 } = buildControlMonitor({
+    shops: [{ id: SHOP, name: SHOP, cookieFile: SHOP, enabled: true }],
+  });
+  writeTempCookie(dir4, SHOP);
+  const alone = await m4._authControlCheck(m4.config.shops[0], { shopSafeName: SHOP });
+  assert.strictEqual(alone.ok, false, JSON.stringify(alone));
+  assert.match(alone.reason, /无其他已配置店铺/);
+
+  monitor.stop(); m2.stop(); m3.stop(); m4.stop();
+});
+
+test('G4 onAuthClosedOut 显式接线：结案证据落盘 + 释放串行门；错误路径不重复写盘', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fix3-mon-'));
+  seedUnknownSlot(dataDir);
+  const monitor = buildMonitor(dataDir);
+  const orch = monitor._switchOrchestrator;
+  assert.strictEqual(orch.hasUnknownBlock('shop-a'), true);
+
+  const wiring = monitor._authRecoveryWiring({ id: 'shop-a', name: '简尚' });
+  assert.strictEqual(typeof wiring.restoreControlCheck, 'function');
+  assert.strictEqual(typeof wiring.onAuthClosedOut, 'function');
+
+  const evidence = {
+    kind: 'fix3-auth-closure', policy: 'fix3-four', authClosedOut: true,
+    conclusion: 'auth 结案：固定四份候选均不可用（不要求重新登录旁路）',
+  };
+  await wiring.onAuthClosedOut(evidence);
+  assert.strictEqual(orch.hasUnknownBlock('shop-a'), false, '结案回调必须释放该店串行门');
+  const evDir = path.join(dataDir, 'auth-evidence');
+  const filesOf = () => fs.readdirSync(evDir).filter((f) => f.endsWith('.json'));
+  assert.strictEqual(filesOf().length, 1, '结案证据必须落盘一次');
+
+  // 同一份证据随后经错误路径到达：不重复写盘，门保持释放。
+  monitor._applyReadFailure('shop-a', {
+    kind: 'auth', blocked: 'auth', reason: '登录失效：持续登录页；auth 结案（不要求重新登录旁路）',
+    authClosure: { authClosedOut: true, evidence },
+  });
+  assert.strictEqual(filesOf().length, 1, '错误路径不得重复写结案证据');
+  assert.strictEqual(orch.hasUnknownBlock('shop-a'), false);
+
+  // 无店铺 id 时不接线（不伪造对照店/结案能力）。
+  assert.deepStrictEqual(monitor._authRecoveryWiring(null), {});
+  monitor.stop();
+});
+
+test('G5 _makeReader 给千川 cost/ad 与罗盘 order 注入 restoreControlCheck + onAuthClosedOut', () => {
+  const qc = require('../src/adapters/qianchuan-reader');
+  const cp = require('../src/adapters/compass-order-reader');
+  const captured = { cost: null, ad: null, order: null };
+  const oCost = qc.createQianchuanCostReader;
+  const oAd = qc.createQianchuanAdListReader;
+  const oOrder = cp.createCompassOrderReader;
+  const stub = { connected: true, readCostSummary: async () => ({}), readOrderSummary: async () => ({}), listAdPage: async () => ({}) };
+  qc.createQianchuanCostReader = (o) => { captured.cost = o; return stub; };
+  qc.createQianchuanAdListReader = (o) => { captured.ad = o; return stub; };
+  cp.createCompassOrderReader = (o) => { captured.order = o; return stub; };
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fix3-wire-'));
+  const cfgResult = makeCfgResult({
+    shops: [
+      { id: SHOP, name: SHOP, cookieFile: SHOP, enabled: true, authRecoveryPolicy: 'fix3-four' },
+      { id: '他店', name: '他店', cookieFile: '他店', enabled: true },
+    ],
+    cookieWorkDir: fs.mkdtempSync(path.join(os.tmpdir(), 'fix3-wire-cookies-')),
+    monitor: { costDataSource: 'qianchuan', adListDataSource: 'qianchuan', orderDataSource: 'compass' },
+  });
+  const monitor = new Monitor(cfgResult, null, { dataDir, nowFn: () => NOW });
+  try {
+    monitor._makeReader(cfgResult.config.shops[0]);
+    for (const k of ['cost', 'ad', 'order']) {
+      assert.ok(captured[k], `${k} 创建选项必须被捕获`);
+      assert.strictEqual(typeof captured[k].restoreControlCheck, 'function', `${k} 必须注入 restoreControlCheck`);
+      assert.strictEqual(typeof captured[k].onAuthClosedOut, 'function', `${k} 必须注入 onAuthClosedOut`);
+    }
+    assert.strictEqual(captured.cost.restoreControlCheck, captured.order.restoreControlCheck, '同一店铺共享同一对照店接线');
+  } finally {
+    qc.createQianchuanCostReader = oCost;
+    qc.createQianchuanAdListReader = oAd;
+    cp.createCompassOrderReader = oOrder;
+    monitor.stop();
+  }
 });

@@ -51,6 +51,11 @@ const DEFAULT_DATA_DIR = path.join(__dirname, '..', '..', 'data');
 const STATE_VERSION = 2;
 // 首查未完成/未确认时的有界重试节奏（与独立每日开启调度器 _enableLoop 的 RETRY_MS 一致）。
 const ENABLE_RETRY_MS = 5 * 60 * 1000;
+// fix2 有界收口：旧 enable 动作停在 unknown 串行门、且本轮回读始终 mixed（无法确认目标 on）时，
+// 到达下列任一上限即按「未确认终态」结案（unknown_expired，confirmed 恒 false）并释放串行门，
+// 今日不再自动补点——禁止无限等待一个永远无法核验的旧动作。
+const SERIAL_GATE_MAX_ATTEMPTS = 3;
+const SERIAL_GATE_MAX_WAIT_MS = 30 * 60 * 1000;
 // 有限恢复周期（2026-10-18 F4-R8，用户口径）：首次读取不算；连续失败最多重试 10 次，
 // 每 2 次一组，组内可立即，组结束后至少等待 5 分钟再下一组（等待从该组末次完成时算起）。
 // 物理完整回读 = 首次 1 + 重试 10 = 11 次；满 10 后该链停止，不再自行第 11 次。
@@ -312,14 +317,92 @@ class Monitor {
   }
 
   /**
+   * fix2：登记一次「serial_gate / ad=mixed 未收口」尝试（持久化，供有界收口判定）。
+   * 只累计次数/首末时刻/最近观测，**不改相位状态**（状态仍由本轮真实结果落账）。
+   * @returns {number} 当日累计尝试次数
+   */
+  _noteSerialGateAttempt(shopId, date, observedState) {
+    if (!this.enablePhase[shopId]) this.enablePhase[shopId] = {};
+    const nowIso = new Date(this.nowFn()).toISOString();
+    if (!this.enablePhase[shopId][date]) {
+      this.enablePhase[shopId][date] = { status: 'in_progress', at: nowIso };
+    }
+    const rec = this.enablePhase[shopId][date];
+    rec.serialGateAttempts = (Number(rec.serialGateAttempts) || 0) + 1;
+    rec.serialGateFirstAt = rec.serialGateFirstAt || nowIso;
+    rec.serialGateLastAt = nowIso;
+    rec.serialGateObserved = observedState || null;
+    this._saveState();
+    return rec.serialGateAttempts;
+  }
+
+  /**
+   * fix2：serial_gate / ad=mixed 的**有界收口**判定与执行。
+   *
+   * 触发前提（全部满足才可能收口）：
+   *   1) 自动路径（手动验证不参与，避免人工操作被自动结案）；
+   *   2) 本轮 unknown 槽位核验**未释放**（_tryResolveUnknownSlotWithFreshRead 未返回 resolved===true；
+   *      该入口不可用时同样按槽位事实判定，不得因核验链缺失而永久阻塞）；
+   *   3) 本轮回读严格为 mixed（旧 enable 目标 on 无法确认，也不是全量 off 可结案）；
+   *   4) 槽位仍是 unknown、未结束、且 action=enable；
+   *   5) 当日尝试次数 ≥ SERIAL_GATE_MAX_ATTEMPTS 或 槽位等待 ≥ SERIAL_GATE_MAX_WAIT_MS。
+   *
+   * 收口语义：走 gate.expireUnknown（settledAs=unknown_expired，confirmed 恒 false）——
+   * 只结束无限阻塞，不声明目标达成、不声明历史点击因果；本轮零点击，今日不再自动补点。
+   * 未达上限则只累计次数并返回 null（保持既有 unknown 有界重试）。
+   *
+   * @returns {null|{actionId:string, attempts:number, waitedMs:number, reason:string}}
+   */
+  _expireUnresolvedSerialGateIfBounded(shopCfg, today, unknownResolve, observedState, source) {
+    if (source === 'manual_verify') return null;
+    // unknownResolve=null 表示核验入口不可用/无槽位，不等于「已释放」：仍须按槽位事实有界收口。
+    if (unknownResolve && unknownResolve.resolved === true) return null;
+    if (observedState !== 'mixed') return null;
+    const orch = this._switchOrchestrator;
+    if (!orch || typeof orch.peek !== 'function' || typeof orch.expireUnknownSlot !== 'function') return null;
+    const slot = orch.peek(shopCfg.id);
+    if (!slot || slot.unknown !== true || slot.settled === true || slot.action !== 'enable') return null;
+
+    const attempts = this._noteSerialGateAttempt(shopCfg.id, today, observedState);
+    const startedAt = Number(slot.startedAt);
+    const waitedMs = Number.isFinite(startedAt) ? Math.max(0, this.nowFn() - startedAt) : 0;
+    const maxAttempts = Number(this._serialGateMaxAttempts) || SERIAL_GATE_MAX_ATTEMPTS;
+    const maxWaitMs = Number(this._serialGateMaxWaitMs) || SERIAL_GATE_MAX_WAIT_MS;
+    if (attempts < maxAttempts && waitedMs < maxWaitMs) return null;
+
+    const reason = `serial_gate 有界收口：旧 enable 动作 ${slot.actionId} 在 ${attempts} 次尝试 / 等待 ${Math.round(waitedMs / 60000)} 分钟后结果仍未确认（本轮回读 mixed，既不能确认目标 on，也不是全量 off 可结案）；按「未确认终态」结案（unknown_expired，未确认、不声明历史点击因果）并释放串行门，本轮零点击、今日不再自动补点，下次开启窗口按新鲜回读重新判定`;
+    const r = orch.expireUnknownSlot(shopCfg.id, slot.actionId, {
+      reason,
+      actions: ['enable'],
+      persist: () => this._saveState(),
+    });
+    if (!r || r.ok !== true) {
+      this._audit({
+        kind: 'ad-switch', step: 'serial-gate-bounded', shopId: shopCfg.id, ok: false,
+        actionId: slot.actionId, attempts, waitedMs,
+        reason: `有界收口未生效（保持阻塞）：${(r && r.reason) || '未知'}`,
+      });
+      return null;
+    }
+    this._audit({
+      kind: 'ad-switch', step: 'serial-gate-bounded', shopId: shopCfg.id, ok: true,
+      actionId: slot.actionId, attempts, waitedMs, observedAdState: observedState,
+      settledAs: 'unknown_expired', confirmed: false, reason,
+    });
+    return { actionId: slot.actionId, attempts, waitedMs, reason };
+  }
+
+  /**
    * 今日是否仍需执行开启相位。
    * success（正常开启确认）或 mixed_converged（首查入口经有证据的 mixed 交接、本轮完整回读
    * 确认已收敛到统一态）均视为"今日已处理"（不再强制重开）；失败/unknown 允许在窗口内按规则
    * 再处理，但 unknown 必须先回读确认，见 _runEnablePhase。
+   * exhausted（fix2 有界收口：serial_gate 超次数/超时后按未确认终态结案）同样是**当日终态**：
+   * 不再自动补点，避免对同一个永远无法核验的旧动作无限重试；次日窗口按新鲜回读重新判定。
    */
   _enablePhaseDone(shopId, date) {
     const rec = this.getEnablePhaseRecord(shopId, date);
-    return !!(rec && (rec.status === 'success' || rec.status === 'mixed_converged'));
+    return !!(rec && (rec.status === 'success' || rec.status === 'mixed_converged' || rec.status === 'exhausted'));
   }
 
   // ── 持久化（原子写 + 损坏隔离）────────────────────────────────────
@@ -5116,6 +5199,39 @@ class Monitor {
       this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-zero-click', trigger: source, note: reason, currentAdState, decision: dailyDecision.decision, beliefAt: belief && belief.at, readError: this._maskReadError(stateRead0.error, shopCfg.id), readNote: stateRead0.switchEvidence || null });
       try { log.info(`每日开启跳过（${shopCfg.id}）：${reason}`); } catch (_) { /* 日志失败不影响 */ }
       return { status: 'ok', skipped: true, zeroClick: true, decision: dailyDecision.decision, currentAdState, reason };
+    }
+
+    // fix2：serial_gate / ad=mixed 有界收口（超 N 次尝试或超时 → 未确认终态，今日不再无限重试）。
+    // 必须在 mixed 交接之前判定：交接依赖的旧槽位若永远无法核验，只会每 5 分钟重复拒绝。
+    const bounded = this._expireUnresolvedSerialGateIfBounded(shopCfg, today, unknownResolve, currentAdState, source);
+    if (bounded) {
+      this._setEnablePhase(shopCfg.id, today, 'exhausted', {
+        phase: 'serial_gate',
+        blocked: 'serial_gate_bounded',
+        settledAs: 'unknown_expired',
+        oldEnableActionId: bounded.actionId,
+        serialGateAttempts: bounded.attempts,
+        serialGateWaitedMs: bounded.waitedMs,
+        currentAdState,
+        firstCheckTime,
+        viaMixedReconcile: false,
+        mixedState: null,
+        prevNote: null,
+        actionId: null,
+        allEnabledConfirmed: false,
+        readError: null,
+        reason: bounded.reason,
+      });
+      this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: bounded.reason }, undefined, 'error');
+      return {
+        status: 'exhausted', shopId: shopCfg.id, zeroClick: true,
+        decision: dailyDecision.decision, currentAdState,
+        blocked: 'serial_gate_bounded', exhausted: true,
+        oldEnableActionId: bounded.actionId,
+        serialGateAttempts: bounded.attempts, serialGateWaitedMs: bounded.waitedMs,
+        reason: bounded.reason,
+        enable: { outcome: 'unknown_expired', serial: 'unknown_expired' },
+      };
     }
 
     // F7：真实服务启动后首查/值守联动入口——旧 unknown 阻塞槽 + 本轮可信 mixed 且旧执行/读取

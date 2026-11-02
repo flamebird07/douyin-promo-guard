@@ -434,6 +434,29 @@ class AdSwitchOrchestrator {
     return r;
   }
 
+  /**
+   * 有界收口（fix2）：unknown 槽位超过有界次数/超时后按「未确认终态」结案并释放串行门。
+   * 仅结束无限阻塞，**不声明目标达成**；由调用方给出可解释 reason 与 action 白名单。
+   */
+  expireUnknownSlot(shopId, actionId, { reason, actions, persist } = {}) {
+    const r = this.gate.expireUnknown(shopId, actionId, {
+      reason: reason || '',
+      actions: actions || ['enable'],
+      persist: persist || undefined,
+    });
+    this.audit({
+      kind: 'ad-switch',
+      step: 'expire-unknown',
+      shopId,
+      actionId,
+      ok: r.ok === true,
+      settledAs: r.ok === true ? (r.settledAs || 'unknown_expired') : null,
+      confirmed: false,
+      reason: r.reason || reason || null,
+    });
+    return r;
+  }
+
   isBusy(shopId) {
     return this.gate.isBusy(shopId);
   }

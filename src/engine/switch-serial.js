@@ -36,6 +36,11 @@ const SETTLE_KIND = Object.freeze({
   UNKNOWN: 'unknown',
   /** 已确认结果：结束当前动作并释放（unknown 须走 resolveUnknownAfterReadback） */
   CONFIRMED: 'confirmed',
+  /**
+   * 有界收口（fix2）：unknown 槽位在有限次数/超时后按「未确认终态」结案并释放。
+   * **不声明目标达成**（confirmed 恒 false），只结束无限阻塞；须调用方给出可解释 reason。
+   */
+  UNKNOWN_EXPIRED: 'unknown_expired',
 });
 
 let _seq = 0;
@@ -54,6 +59,7 @@ function snapshot(slot) {
     confirmed: slot.confirmed,
     settled: slot.settled,
     unknown: slot.unknown,
+    settledAs: slot.settledAs || null,
     blockedReason: slot.blockedReason,
   };
 }
@@ -66,6 +72,7 @@ function snapshot(slot) {
  *   markUnknown:(shopId:string, actionId:string, reason?:string)=>{ok:boolean,reason?:string},
  *   markSettled:(shopId:string, actionId:string, opts:{kind:string, reason?:string})=>{ok:boolean,reason?:string},
  *   resolveUnknownAfterReadback:(shopId:string, actionId:string, p:{confirmed:boolean, note?:string})=>{ok:boolean,reason?:string},
+ *   expireUnknown:(shopId:string, actionId:string, opts:{reason:string, actions?:string[], persist?:()=>object})=>{ok:boolean,reason?:string},
  *   isBusy:(shopId:string)=>boolean,
  *   peek:(shopId:string)=>object|null,
  *   hasUnknownBlock:(shopId:string)=>boolean,
@@ -105,6 +112,7 @@ function createSwitchSerialGate(opts = {}) {
         confirmed: s.confirmed === true,
         settled: s.settled === true,
         unknown: s.unknown === true,
+        settledAs: s.settledAs || null,
         blockedReason: s.blockedReason || null,
       })),
     };
@@ -137,6 +145,7 @@ function createSwitchSerialGate(opts = {}) {
       confirmed: false,
       settled: false,
       unknown: false,
+      settledAs: null,
       blockedReason: null,
     };
     slots.set(shopId, slot);
@@ -300,6 +309,68 @@ function createSwitchSerialGate(opts = {}) {
   }
 
   /**
+   * 有界收口（fix2）：unknown 槽位在**有限次数/超时**后按「未确认终态」结案并释放，
+   * 让每日开启不再无限等一个永远无法核验的旧动作。
+   *
+   * 与 resolveUnknownAfterReadback 的严格区别：
+   *   - 不要求（也不声明）目标态已达成：confirmed 恒 false，settledAs=unknown_expired；
+   *   - 只结束"无限阻塞"，不制造成功证据；reason 必须由调用方给出（禁止静默释放）；
+   *   - 仅 unknown 且未结束、且 action 在 opts.actions 白名单内（缺省仅 enable）可收口；
+   *   - 终态先落盘（settled=true 可安全恢复），成功后才删内存槽（与其它结束路径同序）。
+   */
+  function expireUnknown(shopId, actionId, opts = {}) {
+    const m = requireMatch(shopId, actionId);
+    if (!m.ok) return m;
+    if (m.slot.settled) {
+      return { ok: false, reason: '动作已结束，不能再做有界收口' };
+    }
+    if (m.slot.unknown !== true) {
+      return { ok: false, reason: '仅 unknown 槽位可做有界收口（当前不是 unknown，走各自正常收口）' };
+    }
+    const allow = Array.isArray(opts.actions) ? opts.actions : ['enable'];
+    if (!allow.includes(m.slot.action)) {
+      return { ok: false, reason: `有界收口仅适用于 ${allow.join('/')}，当前为 ${String(m.slot.action)}` };
+    }
+    const reason = String(opts.reason || '').trim();
+    if (!reason) {
+      return { ok: false, reason: '有界收口必须给出可解释的 reason（禁止静默释放）' };
+    }
+    m.slot.settled = true;
+    m.slot.unknown = false;
+    m.slot.confirmed = false;
+    m.slot.settledAs = SETTLE_KIND.UNKNOWN_EXPIRED;
+    m.slot.blockedReason = reason;
+    if (typeof opts.persist === 'function') {
+      let persist;
+      try {
+        persist = opts.persist();
+        if (persist && typeof persist.then === 'function') persist = null;
+      } catch (e) {
+        persist = { ok: false, reason: e.message };
+      }
+      if (!persist || persist.ok !== true) {
+        m.slot.settled = false;
+        m.slot.unknown = true;
+        m.slot.settledAs = null;
+        m.slot.blockedReason = (persist && persist.reason) || '有界收口终态持久化失败，保持阻塞';
+        return {
+          ok: false,
+          persistFailed: true,
+          reason: `persistence_blocked: ${m.slot.blockedReason}`,
+          slot: snapshot(m.slot),
+        };
+      }
+    }
+    slots.delete(shopId);
+    return {
+      ok: true,
+      kind: SETTLE_KIND.UNKNOWN_EXPIRED,
+      settledAs: SETTLE_KIND.UNKNOWN_EXPIRED,
+      confirmed: false,
+    };
+  }
+
+  /**
    * 通用结束入口：必须给出明确 kind，禁止用 ok 布尔混语义。
    * kind=NOT_SENT → markNotSent（仅 in-flight）；
    * kind=UNKNOWN → markUnknown（保留阻塞）；
@@ -383,6 +454,7 @@ function createSwitchSerialGate(opts = {}) {
     markUnknown,
     markSettled,
     resolveUnknownAfterReadback,
+    expireUnknown,
     isBusy,
     hasUnknownBlock,
     peek,

@@ -7816,8 +7816,19 @@ async function discoverShopAccountByLiveSession(shopCfg, business, opts) {
     } catch (_) { loginCfg = null; }
   }
   let opened = null, account = null;
+  // 加严（2026-11-02）：discovery 打开链必须把店铺显式登记的 authRecoveryPolicy
+  // （简尚=fix3-four）透传到 openShop → openQianchuanHome 的恢复链，最终进入
+  // buildAuthFailureSuffix；缺省时仍由 reader 回退 shopCfg.authRecoveryPolicy。
+  const restoreCandidatePolicy = o.restoreCandidatePolicy
+    || (shopCfg && shopCfg.authRecoveryPolicy)
+    || undefined;
   try {
-    opened = await openShopFn({ loginCfg, shopCfg: navigationShopCfg(shopCfg, business && business.accountId), headless: o.headless === true });
+    opened = await openShopFn({
+      loginCfg,
+      shopCfg: navigationShopCfg(shopCfg, business && business.accountId),
+      headless: o.headless === true,
+      restoreCandidatePolicy,
+    });
     if (!opened || !opened.target) return { error: 'discovery-open-incomplete' };
     const identity = await opened.target.evaluate(readAccountFn);
     const check = shopProfile.verifyLiveIdentity(business || { accountId: null }, String(identity && identity.accountId));

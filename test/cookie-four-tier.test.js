@@ -935,7 +935,8 @@ test('千川真实入口：恢复无可验证候选 → AuthError 原语义保�
     ),
     (e) => {
       assert.ok(e instanceof AuthError);
-      assert.match(e.message, /登录失效：抖店页面在 .* 次有界收敛（上限 \d+s）后仍命中登录页地址或可见登录控件\/表单（当前 .+），请重新扫码登录/);
+      assert.match(e.message, /登录失效：抖店页面在 .* 次有界收敛（上限 \d+s）后仍命中登录页地址或可见登录控件\/表单（当前 .+）；auth 未结案：无可用会话候选或对照店检查未通过（不要求重新登录旁路）/);
+      assert.ok(!/扫码/.test(e.message), `对外 AuthError 不得含扫码：${e.message}`);
       assert.match(e.message, /四层恢复未取得可验证候选（全部候选未通过验证或提升失败/);
       assert.match(e.message, /工作副本现状未被盲覆盖/);
       return true;

@@ -702,7 +702,7 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
       continue;
     }
     if (cur.exists !== frozenBaseline.exists || (cur.exists && cur.sha256 !== frozenBaseline.sha256)) {
-      attempts.push({ source: cand.source, result: 'promote-failed', conflict: true, reason: '候选验证期间值守工作副本被并发更新（如新扫码登录）：放弃提升，保留并发新文件（较新登录胜出，不覆盖）' });
+      attempts.push({ source: cand.source, result: 'promote-failed', conflict: true, reason: '候选验证期间值守工作副本被并发更新（如新登录写入）：放弃提升，保留并发新文件（较新登录胜出，不覆盖）' });
       continue;
     }
     // 保留上一版（fail-closed）+ CAS（rename 前复验冻结基线）+ 回读比对

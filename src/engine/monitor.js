@@ -99,10 +99,11 @@ const MIXED_RECONCILE_TEXT = Object.freeze({
 // requiresLogin=false、用户可见文案固定「读取失败」（不显示观测进度类文案）。
 const AUTH_LOGIN_URL_HOLD_MS = 60000;
 // 四条固定文案（与 bill-manager 页面主提示同源；kind → 文案）：
-//  ① 登录已失效，请重新扫码   ② Cookie 缺失，请重新导入
+//  ① 登录已失效，请重新登录   ② Cookie 缺失，请重新导入
 //  ③ 读取失败                 ④ 读取超时，将自动重试
+// CODE_FAIL 加严（2026-11-02）：对外提示一律不含扫码类结论（fix3-four 与默认路径同口径）。
 const READ_FAILURE_HINTS = Object.freeze({
-  auth: '登录已失效，请重新扫码',
+  auth: '登录已失效，请重新登录',
   cookie_invalid: 'Cookie 缺失，请重新导入',
   cookie_blocked: 'Cookie 缺失，请重新导入',
   identity: '读取失败',

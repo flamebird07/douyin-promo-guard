@@ -24,6 +24,7 @@ const path = require('path');
 
 const { runFix3Recovery, inspectCookieHealth, isWrittenBad } = require('../src/login/auth-recovery-fix3');
 const { buildAuthFailureSuffix } = require('../src/login/auth-failure-text');
+const { discoverShopAccountByLiveSession } = require('../plan-publisher/run-plans.cjs');
 const session = require('../src/login/session');
 const { Monitor } = require('../src/engine/monitor');
 const { makeCfgResult, writeTempCookie } = require('./helpers');
@@ -293,7 +294,7 @@ test('D 已登记多账号副本可切换：只切有配置的账号，不硬补
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(d.workDir, `${SHOP}-2.json`), 'utf8')), account2);
 });
 
-test('G 对外登录失效文案：fix3-four 结案/未结案均不含扫码字样（默认五层保持原样）', () => {
+test('G 对外登录失效文案：fix3-four 与默认五层结案/未结案均不含扫码字样', () => {
   const closed = buildAuthFailureSuffix({ policy: 'fix3-four', authClosedOut: true, restoreReason: '桩' });
   const open = buildAuthFailureSuffix({ policy: 'fix3-four', authClosedOut: false, restoreReason: '固定四份候选均不可用（验证调用 0 次）：对照店 checkLogin 未通过/未提供，未完成误判排除，不结案（保持原读取失败语义，不要求重新登录旁路）' });
   for (const [name, s] of [['已结案', closed], ['未结案', open]]) {
@@ -302,9 +303,63 @@ test('G 对外登录失效文案：fix3-four 结案/未结案均不含扫码字�
   }
   assert.match(open.tail, /未结案/, '未结案文案必须显式标注未结案');
   assert.match(open.tail, /不要求重新登录旁路/, '未结案文案必须给出非扫码旁路');
-  // 非 fix3-four（默认五层恢复）文案保持既有契约不变
-  const legacy = buildAuthFailureSuffix({ policy: undefined, authClosedOut: false, restoreReason: '桩' });
-  assert.strictEqual(legacy.tail, '，请重新扫码登录');
+  // 全仓加严（2026-11-02）：默认五层恢复的对外文案同样不得出现扫码类结论。
+  for (const policy of [undefined, 'five-layer']) {
+    for (const authClosedOut of [true, false]) {
+      const s = buildAuthFailureSuffix({ policy, authClosedOut, restoreReason: '桩' });
+      assert.ok(!/扫码/.test(s.tail), `policy=${policy} closed=${authClosedOut} tail 含扫码：${s.tail}`);
+      assert.ok(!/扫码/.test(s.restoreNote), `policy=${policy} closed=${authClosedOut} restoreNote 含扫码：${s.restoreNote}`);
+      assert.match(s.tail, /不要求重新登录旁路/);
+    }
+  }
+});
+
+// ── H. discovery 打开链：policy 透传 + discovery-open-failed 文案锁死 ──────────
+test('H discovery 打开链透传 authRecoveryPolicy=fix3-four，discovery-open-failed 文案无扫码', async () => {
+  const seen = [];
+  const res = await discoverShopAccountByLiveSession(
+    { id: SHOP, name: SHOP, cookieFile: SHOP, authRecoveryPolicy: 'fix3-four' },
+    { accountId: null },
+    {
+      projectRoot: path.join(__dirname, '..'),
+      loginCfg: {},
+      openShop: async (p) => {
+        seen.push(p);
+        const suffix = buildAuthFailureSuffix({
+          policy: p.restoreCandidatePolicy || (p.shopCfg && p.shopCfg.authRecoveryPolicy),
+          authClosedOut: false,
+          restoreReason: '桩：discovery 打开链',
+        });
+        throw new Error(`登录失效：桩${suffix.tail}${suffix.restoreNote}`);
+      },
+    },
+  );
+  assert.strictEqual(seen.length, 1);
+  assert.strictEqual(seen[0].shopCfg.authRecoveryPolicy, 'fix3-four', 'shopCfg 必须原样携带 policy');
+  assert.strictEqual(seen[0].restoreCandidatePolicy, 'fix3-four', '打开参数必须显式透传 policy');
+  assert.match(String(res.error), /^discovery-open-failed:/);
+  assert.ok(!/扫码/.test(String(res.error)), `discovery-open-failed 不得含扫码：${res.error}`);
+});
+
+test('H2 discovery 默认（未登记 policy）失败文案同样无扫码', async () => {
+  const res = await discoverShopAccountByLiveSession(
+    { id: '其他店', name: '其他店', cookieFile: '其他店' },
+    { accountId: null },
+    {
+      projectRoot: path.join(__dirname, '..'),
+      loginCfg: {},
+      openShop: async (p) => {
+        const suffix = buildAuthFailureSuffix({
+          policy: p.restoreCandidatePolicy || (p.shopCfg && p.shopCfg.authRecoveryPolicy),
+          authClosedOut: false,
+          restoreReason: '桩：默认五层',
+        });
+        throw new Error(`登录失效：桩${suffix.tail}${suffix.restoreNote}`);
+      },
+    },
+  );
+  assert.match(String(res.error), /^discovery-open-failed:/);
+  assert.ok(!/扫码/.test(String(res.error)), `默认路径 discovery-open-failed 不得含扫码：${res.error}`);
 });
 
 // ── E. Monitor：auth 结案释放 serial_gate ──────────────────────────────

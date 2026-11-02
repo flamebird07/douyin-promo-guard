@@ -243,7 +243,7 @@ async function holdOnMissingChengfangControl(error, session) {
     cookieSession: session.cookieSession,
   });
   const suffix = held.held
-    ? '；已保留可见千川页面供人工检查：请在保留窗口里点**浮窗右上角的 ❌** 关闭引导/介绍浮层（不是关闭整个浏览器，也不需要重新扫码）；'
+    ? '；已保留可见千川页面供人工检查：请在保留窗口里点**浮窗右上角的 ❌** 关闭引导/介绍浮层（不是关闭整个浏览器，也不需要重新登录）；'
       + '下一轮自动尝试会先核验同店身份与浮窗是否真的消失，核验通过才继续，未通过继续阻断'
     : `；未能打开人工检查窗口（${held.reason}），该轮仍停止自动操作`;
   error.reason = `${error.reason || error.message}${suffix}`;
@@ -2292,7 +2292,7 @@ async function releaseChengfangManualReviewForReadOnlyOpen({ shopCfg, audit }) {
 function chengfangManualReviewError(reason) {
   return new DataGuardError(
     '该店千川页面正在等待人工检查：请在保留的检查窗口里点**浮窗右上角的 ❌** 关闭引导/介绍浮层'
-    + '（不是关闭整个浏览器，也不需要重新扫码）；下一轮会先核验同店身份与浮窗是否真的消失，'
+    + '（不是关闭整个浏览器，也不需要重新登录）；下一轮会先核验同店身份与浮窗是否真的消失，'
     + `核验通过才继续。本轮不解除、不自动操作。未继续原因：${reason}`
   );
 }

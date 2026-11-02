@@ -91,7 +91,7 @@ test('H2 跨轮次连续 ≥60s（同一 loginUrlKey）→ AUTH，文案①', ()
   const hit = applyWith(mon, urlOnlyEvidence());
   assert.equal(hit.kind, 'auth', '连续满 60s 必须 AUTH');
   assert.equal(hit.requiresLogin, true);
-  assert.equal(hit.hint, '登录已失效，请重新扫码');
+  assert.equal(hit.hint, '登录已失效，请重新登录');
   assert.equal(hit.loginUrlObserv, null, 'AUTH 后不再保留观测备注');
 
   // 同 key 继续命中：保持 auth，且窗口起点不变（连续窗口）
@@ -130,7 +130,7 @@ test('H3 URL + 可见登录控件：<60s 不 AUTH；跨轮连续 ≥60s 才 AUTH
   const hit = applyWith(mon, ev);
   assert.equal(hit.kind, 'auth', '同一证据连续满 60s 才 AUTH');
   assert.equal(hit.requiresLogin, true);
-  assert.equal(hit.hint, '登录已失效，请重新扫码');
+  assert.equal(hit.hint, '登录已失效，请重新登录');
 });
 
 test('H4 无 URL 仅强 UI（可见表单/对话框）：<60s 不 AUTH；跨轮 ≥60s 才 AUTH（伪 key ui:*）', () => {
@@ -147,7 +147,7 @@ test('H4 无 URL 仅强 UI（可见表单/对话框）：<60s 不 AUTH；跨轮 
   clock.advance(1);
   const hit = applyWith(mon, form);
   assert.equal(hit.kind, 'auth', '连续满 60s 才 AUTH');
-  assert.equal(hit.hint, '登录已失效，请重新扫码');
+  assert.equal(hit.hint, '登录已失效，请重新登录');
 
   // 对话框：另一伪 key ui:dialog，同样需跨轮 ≥60s（切换 kind 会重计）
   const { mon: m2, clock: c2 } = buildMonitor();
@@ -363,7 +363,7 @@ test('H9 真实 catch：URL-only <60s → blocked=read_failed；≥60s → block
   const re = mon._runtime(SHOP.id).lastReadError;
   assert.equal(re.kind, 'auth');
   assert.equal(re.requiresLogin, true);
-  assert.equal(re.hint, '登录已失效，请重新扫码');
+  assert.equal(re.hint, '登录已失效，请重新登录');
   assert.ok(calls >= 1);
 });
 

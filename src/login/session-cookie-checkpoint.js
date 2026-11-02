@@ -426,7 +426,7 @@ function createCheckpointCandidateVerifier(p = {}) {
         let back = null;
         try { back = await ctx.cookies(); } catch (_) { back = null; }
         if (!Array.isArray(back) || back.length === 0) {
-          return { ok: false, classification: 'verify-error', reason: '独立验证上下文未返回非空最终 Cookie 集合（读取异常或空）：fail-closed 拒绝验证/写入（待重试，不要求扫码）' };
+          return { ok: false, classification: 'verify-error', reason: '独立验证上下文未返回非空最终 Cookie 集合（读取异常或空）：fail-closed 拒绝验证/写入（待重试，不要求重新登录旁路）' };
         }
         const byKey = new Map();
         for (const c of back) {
@@ -458,16 +458,16 @@ function createCheckpointCandidateVerifier(p = {}) {
       // 未通过：区分「明确登录页/登录控件（登录无效）」与「身份探针未取得唯一店名/错店（需核实/重试）」，
       // 不把两者都误写成要求重新扫码。
       if (sawLoginEvidence) {
-        return { ok: false, classification: 'login-invalid', reason: '候选在独立新上下文命中登录页地址或可见登录控件（登录无效，需重新扫码）' };
+        return { ok: false, classification: 'login-invalid', reason: '候选在独立新上下文命中登录页地址或可见登录控件（登录无效，需重新登录）' };
       }
       if (reachedVerifiedIdentityUrl) {
-        return { ok: false, classification: 'identity-unverified', reason: `候选在独立新上下文到达受信抖店首页但未取得唯一本店语义身份/疑错店（${lastIdentityReason || '身份未核实'}）：待核实/重试，不要求扫码` };
+        return { ok: false, classification: 'identity-unverified', reason: `候选在独立新上下文到达受信抖店首页但未取得唯一本店语义身份/疑错店（${lastIdentityReason || '身份未核实'}）：待核实/重试，不要求重新登录旁路` };
       }
-      return { ok: false, classification: 'identity-unverified', reason: '候选未在独立新上下文到达受信抖店首页取得唯一本店语义身份（登录无效/错店/待核实，不要求扫码）' };
+      return { ok: false, classification: 'identity-unverified', reason: '候选未在独立新上下文到达受信抖店首页取得唯一本店语义身份（登录无效/错店/待核实，不要求重新登录旁路）' };
     } catch (_) {
       // 外部异常（浏览器/页面驱动）可能回显 Cookie 值或带 token 的完整 URL：
       // 只记录固定脱敏原因，绝不拼接 e.message / String(e）。验证异常绝不判为"登录无效"。
-      return { ok: false, classification: 'verify-error', reason: '候选验证异常（异常详情可能含 Cookie/令牌等敏感值，已脱敏不回显）：拒绝验证/写入，待重试不要求扫码' };
+      return { ok: false, classification: 'verify-error', reason: '候选验证异常（异常详情可能含 Cookie/令牌等敏感值，已脱敏不回显）：拒绝验证/写入，待重试不要求重新登录旁路' };
     } finally {
       if (ctx) { try { await ctx.close(); } catch (_) { /* 关闭失败不掩盖结果 */ } }
     }

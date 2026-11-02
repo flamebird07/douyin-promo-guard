@@ -10,6 +10,8 @@
  *   C. 写坏窄定义：缺 auth 三键 / 不可解析才算写坏；文件健康但源端不认 ≠ 写坏；
  *   D. 已登记多账号副本可切换（有才用，不硬补第二账号）；
  *   E. auth 结案后 Monitor 释放该店 serial_gate（不堵后续店铺），无结案证据时不释放。
+ *   G/B2/E4（CODE_FAIL 加严 2026-11-02）：fix3-four 对外/AuthError/结案文案在**已结案
+ *      与未结案**两种终态下都不含「扫码」类字样；Monitor 对外提示同样不含。
  *
  * 全部使用 os.tmpdir() 隔离目录；浏览器/验证器一律桩对象；不含任何真实 Cookie 值。
  */
@@ -21,6 +23,7 @@ const os = require('os');
 const path = require('path');
 
 const { runFix3Recovery, inspectCookieHealth, isWrittenBad } = require('../src/login/auth-recovery-fix3');
+const { buildAuthFailureSuffix } = require('../src/login/auth-failure-text');
 const session = require('../src/login/session');
 const { Monitor } = require('../src/engine/monitor');
 const { makeCfgResult } = require('./helpers');
@@ -159,13 +162,51 @@ test('B 四份全不可用 + 对照店通过 → auth 结案、证据包完整�
   assert.strictEqual(res.evidence.candidates.length, 4, '固定四份候选必须齐全');
   assert.strictEqual(res.evidence.falsePositiveExclusion.controlShopNotFalselyKilled, true);
   assert.strictEqual(res.evidence.falsePositiveExclusion.healthyFileNotOverwritten, true);
-  assert.ok(!/扫码/.test(res.evidence.conclusion) || /不要求扫码/.test(res.evidence.conclusion));
+  // CODE_FAIL 加严：结案文案一律不含扫码类字样
+  assert.ok(!/扫码/.test(res.evidence.conclusion), `结案结论不得含扫码字样：${res.evidence.conclusion}`);
+  assert.ok(!/扫码/.test(res.reason), `结案原因不得含扫码字样：${res.reason}`);
   assert.ok(closed && closed.authClosedOut === true, 'auth 结案必须触发回调');
 
   // 零覆盖、零备份
   assert.ok(fs.readFileSync(path.join(d.workDir, `${SHOP}.json`)).equals(workBytes));
   assert.ok(!fs.readdirSync(d.workDir).some((f) => f.includes('.bak-fix3-')));
   assert.ok(!JSON.stringify(res.evidence).includes('SECRET'));
+});
+
+test('B2 四份全不可用 + 对照店未提供 → 未结案：文案同样不得含扫码字样', async () => {
+  const d = mkBase();
+  const work = makeCookies('work', 1900000000);
+  const workBytes = bytesOf(work);
+  fs.writeFileSync(path.join(d.workDir, `${SHOP}.json`), workBytes);
+  fs.writeFileSync(path.join(d.sourceDir, `${SHOP}.json`), workBytes);
+  writeJson(path.join(d.recoveryDir, SHOP, 'v20261101T000000Z-1-aaaa.json'), work);
+  writeJson(path.join(d.archiveRoot, SHOP, 'v20261020T000000Z-1-bbbb.json'), work);
+
+  let closedCalled = false;
+  const res = await runFix3Recovery(
+    { cookieWorkDir: d.workDir, cookieSourceDir: d.sourceDir },
+    SHOP,
+    {
+      workDir: d.workDir,
+      shopCfg: { name: SHOP, compassShopName: SHOP },
+      excludeWorkCopy: true,
+      recoveryDir: d.recoveryDir,
+      archiveRoot: d.archiveRoot,
+      nowFn: () => NOW,
+      nowMs: NOW,
+      verify: async () => { throw new Error('同会话候选不得被送验'); },
+      // 未注入对照店 checkLogin → 未完成误判排除 → 不结案
+      onAuthClosedOut: async () => { closedCalled = true; },
+    },
+  );
+
+  assert.strictEqual(res.ok, false);
+  assert.strictEqual(res.authClosedOut, false, JSON.stringify(res));
+  assert.strictEqual(closedCalled, false, '未结案不得触发结案回调');
+  assert.ok(!/扫码/.test(res.evidence.conclusion), `未结案结论不得含扫码字样：${res.evidence.conclusion}`);
+  assert.ok(!/扫码/.test(res.reason), `未结案原因不得含扫码字样：${res.reason}`);
+  assert.ok(!JSON.stringify(res.evidence).includes('扫码'), '未结案证据包整体不得含扫码字样');
+  assert.ok(fs.readFileSync(path.join(d.workDir, `${SHOP}.json`)).equals(workBytes), '未结案不得覆盖工作副本');
 });
 
 test('C 写坏窄定义：缺 auth 三键/不可解析才算写坏；文件健康但源端不认 ≠ 写坏', async () => {
@@ -252,6 +293,20 @@ test('D 已登记多账号副本可切换：只切有配置的账号，不硬补
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(d.workDir, `${SHOP}-2.json`), 'utf8')), account2);
 });
 
+test('G 对外登录失效文案：fix3-four 结案/未结案均不含扫码字样（默认五层保持原样）', () => {
+  const closed = buildAuthFailureSuffix({ policy: 'fix3-four', authClosedOut: true, restoreReason: '桩' });
+  const open = buildAuthFailureSuffix({ policy: 'fix3-four', authClosedOut: false, restoreReason: '固定四份候选均不可用（验证调用 0 次）：对照店 checkLogin 未通过/未提供，未完成误判排除，不结案（保持原读取失败语义，不要求重新登录旁路）' });
+  for (const [name, s] of [['已结案', closed], ['未结案', open]]) {
+    assert.ok(!/扫码/.test(s.tail), `${name} tail 不得含扫码字样：${s.tail}`);
+    assert.ok(!/扫码/.test(s.restoreNote), `${name} restoreNote 不得含扫码字样：${s.restoreNote}`);
+  }
+  assert.match(open.tail, /未结案/, '未结案文案必须显式标注未结案');
+  assert.match(open.tail, /不要求重新登录旁路/, '未结案文案必须给出非扫码旁路');
+  // 非 fix3-four（默认五层恢复）文案保持既有契约不变
+  const legacy = buildAuthFailureSuffix({ policy: undefined, authClosedOut: false, restoreReason: '桩' });
+  assert.strictEqual(legacy.tail, '，请重新扫码登录');
+});
+
 // ── E. Monitor：auth 结案释放 serial_gate ──────────────────────────────
 const DAY = '2026-11-02';
 
@@ -297,8 +352,8 @@ test('E1 auth 结案证据 → 释放该店 unknown serial_gate；他店不受�
   monitor._applyReadFailure('shop-a', {
     kind: 'auth',
     blocked: 'auth',
-    reason: '登录失效：持续登录页',
-    authClosure: { authClosedOut: true, evidence: { conclusion: 'auth 结案：固定四份候选均不可用（不要求扫码）' } },
+    reason: '登录失效：持续登录页；auth 结案（不要求重新登录旁路）',
+    authClosure: { authClosedOut: true, evidence: { policy: 'fix3-four', conclusion: 'auth 结案：固定四份候选均不可用（不要求重新登录旁路）' } },
   });
 
   assert.strictEqual(orch.hasUnknownBlock('shop-a'), false, 'auth 结案后该店串行门必须释放');
@@ -314,6 +369,30 @@ test('E1 auth 结案证据 → 释放该店 unknown serial_gate；他店不受�
   const evFiles = fs.readdirSync(evDir).filter((f) => f.endsWith('.json'));
   assert.strictEqual(evFiles.length, 1, JSON.stringify(evFiles));
   assert.ok(!fs.readFileSync(path.join(evDir, evFiles[0]), 'utf8').includes('SECRET'));
+  // 对外提示：fix3 结案路径不得含扫码字样
+  const hint = monitor._runtime('shop-a').lastReadError.hint;
+  assert.ok(typeof hint === 'string' && hint.length > 0);
+  assert.ok(!/扫码/.test(hint), `已结案对外提示不得含扫码字样：${hint}`);
+  monitor.stop();
+});
+
+test('E4 未结案（authClosedOut=false）→ 不释放串行门，对外提示同样不得含扫码字样', () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fix3-mon-'));
+  seedUnknownSlot(dataDir);
+  const monitor = buildMonitor(dataDir);
+  const orch = monitor._switchOrchestrator;
+
+  monitor._applyReadFailure('shop-a', {
+    kind: 'auth',
+    blocked: 'auth',
+    reason: '登录失效：持续登录页；auth 未结案：无可用会话候选或对照店检查未通过（不要求重新登录旁路）',
+    authClosure: { authClosedOut: false, evidence: { policy: 'fix3-four', authClosedOut: false, conclusion: '未结案：全候选不可用，但对照片 checkLogin 未通过或未提供，保持原读取失败语义（不释放串行门，不要求重新登录旁路）' } },
+  });
+
+  assert.strictEqual(orch.hasUnknownBlock('shop-a'), true, '未结案不得释放未知槽');
+  const hint = monitor._runtime('shop-a').lastReadError.hint;
+  assert.ok(typeof hint === 'string' && hint.length > 0);
+  assert.ok(!/扫码/.test(hint), `未结案对外提示不得含扫码字样：${hint}`);
   monitor.stop();
 });
 
@@ -334,9 +413,9 @@ test('E3 读取器抛出的 authClosure 证据必须原样进入 _readCurrentAdS
   const monitor = buildMonitor(dataDir, {
     readAdState: async () => {
       const e = new Error('登录失效：持续登录页');
-      e.reason = '登录失效：持续登录页';
+      e.reason = '登录失效：持续登录页；auth 结案（不要求重新登录旁路）';
       e.code = 'AUTH';
-      e.authClosure = { authClosedOut: true, evidence: { conclusion: 'auth 结案：不要求扫码' } };
+      e.authClosure = { authClosedOut: true, evidence: { policy: 'fix3-four', conclusion: 'auth 结案：不要求重新登录旁路' } };
       throw e;
     },
   });

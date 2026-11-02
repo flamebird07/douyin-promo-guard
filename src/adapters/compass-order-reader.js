@@ -32,6 +32,7 @@ const { AuthError, DataGuardError } = require('../lib/errors');
 const { parseIntegerCount } = require('../lib/money');
 const { shanghaiDate, shanghaiMs } = require('../lib/time');
 const { resolveCookieFile, restoreDutyWorkCopy } = require('../login/session');
+const { buildAuthFailureSuffix } = require('../login/auth-failure-text');
 const { fingerprintFile } = require('../login/cookie-writeback');
 // R87：关闭前罗盘会话收尾检查点（同 context 严格语义店名 + 目标文件名绑定 + 既有写入器 CAS）。
 const { checkpointCompassSessionCookies } = require('../login/session-cookie-checkpoint');
@@ -398,14 +399,16 @@ function createCompassOrderReader(p) {
           throw new DataGuardError(`抖店主页面在自动登录收敛期内被关闭（最后地址 ${sess.settled.url || '未知'}）；按导航事实处理，需人工核实`);
         }
         if (fail.kind === 'login') {
-          // fix3：全候选不可用且对照店 checkLogin 已排除误判 → auth 结案，不要求扫码。
+          // fix3：全候选不可用且对照店 checkLogin 已排除误判 → auth 结案。fix3-four
+          // 路径的文案一律不含扫码类结论（结案/未结案都不含），见 auth-failure-text。
           const closed = !!(fail.restore && fail.restore.authClosedOut === true);
-          const restoreNote = fail.restore
-            ? (closed
-              ? '；固定四份候选均不可用且已排除代码误判（对照店 checkLogin 通过）：auth 结案，不要求扫码'
-              : `；四层恢复未取得可验证候选（${fail.restore.reason || '未提升'}），工作副本现状未被盲覆盖`)
-            : '';
-          const tail = closed ? '；auth 结案（不要求扫码）' : '，请重新扫码登录';
+          const suffix = buildAuthFailureSuffix({
+            policy: fail.restore ? fail.restore.policy : undefined,
+            authClosedOut: closed,
+            restoreReason: fail.restore ? fail.restore.reason : undefined,
+          });
+          const restoreNote = fail.restore ? suffix.restoreNote : '';
+          const tail = suffix.tail;
           const authErr = new AuthError(`登录失效：抖店页面在 ${sess.settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(p.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${page.url()}）${tail}${restoreNote}`);
           if (fail.restore && fail.restore.policy === 'fix3-four') {
             // 即使未结案也随错误交付证据包，供值守审计与人工复核。

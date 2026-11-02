@@ -946,6 +946,94 @@ test('千川真实入口：恢复无可验证候选 → AuthError 原语义保�
   assert.strictEqual(counters.browserCloses, 1);
 });
 
+// CODE_FAIL 加严（2026-11-02）：fix3-four 路径的对外 AuthError 文案一律禁止扫码类结论，
+// 未结案与已结案两种都必须锁死。恢复链用 restoreRunner 注入，只验证文案装配。
+function fix3RestoreResult(closed) {
+  return {
+    ok: false,
+    policy: 'fix3-four',
+    authClosedOut: closed,
+    reason: closed
+      ? '固定四份候选均不可用（验证调用 0 次）：文件健康但源端不认或写坏，已排除代码误判（对照店 checkLogin 通过）；auth 结案，不要求重新登录旁路'
+      : '固定四份候选均不可用（验证调用 0 次）：对照店 checkLogin 未通过/未提供，未完成误判排除，不结案（保持原读取失败语义，不要求重新登录旁路）',
+    evidence: {
+      policy: 'fix3-four',
+      authClosedOut: closed,
+      conclusion: closed
+        ? 'auth 结案：固定四份候选均不可用（写坏或文件健康但源端不认，已排除代码误判/对照店未误杀），不要求重新登录旁路'
+        : '未结案：全候选不可用，但对照片 checkLogin 未通过或未提供，保持原读取失败语义（不释放串行门，不要求重新登录旁路）',
+    },
+  };
+}
+
+function assertNoQrText(message, label) {
+  assert.ok(!/扫码/.test(message), `${label}文案不得含扫码字样：${message}`);
+  assert.ok(!/扫码登录/.test(message), `${label}文案不得含扫码登录字样：${message}`);
+}
+
+test('千川 fix3-four：未结案/已结案两种 AuthError 文案均不含扫码字样', async () => {
+  for (const closed of [false, true]) {
+    const d = mkDirs();
+    const fileName = closed ? '千川fix3-closed.json' : '千川fix3-open.json';
+    fs.writeFileSync(path.join(d.workDir, fileName), bytesOf(makeCookies('expired')));
+    const counters = { contexts: 0, pages: 0, gotos: 0, ctxCloses: 0, browserCloses: 0, addedCookieSets: 0 };
+    await assert.rejects(
+      () => openQianchuanHome(
+        { cookieWorkDir: d.workDir, edgePath: null },
+        { id: 's3', name: '千川fix3', compassShopName: '千川fix3', cookieFile: fileName },
+        {
+          browserFactory: async () => stubBrowser(() => LOGIN_URL, counters),
+          settleTimeoutMs: 30, settleIntervalMs: 10,
+          restoreRunner: async () => fix3RestoreResult(closed),
+          nowFn: () => 20000,
+        },
+      ),
+      (e) => {
+        assert.ok(e instanceof AuthError, `应为 AuthError：${e && e.message}`);
+        const label = closed ? '已结案' : '未结案';
+        assertNoQrText(e.message, label);
+        assert.match(e.message, closed ? /auth 结案/ : /auth 未结案/);
+        assert.ok(e.authClosure, 'fix3-four 未结案也必须交付结案证据');
+        assert.strictEqual(e.authClosure.authClosedOut, closed);
+        assert.ok(!/扫码/.test(JSON.stringify(e.authClosure)), `${label}证据包不得含扫码字样`);
+        return true;
+      },
+    );
+  }
+});
+
+test('罗盘 fix3-four：未结案/已结案两种 AuthError 文案均不含扫码字样', async () => {
+  for (const closed of [false, true]) {
+    const d = mkDirs();
+    const fileName = closed ? '罗盘fix3-closed.json' : '罗盘fix3-open.json';
+    fs.writeFileSync(path.join(d.workDir, fileName), bytesOf(makeCookies('expired')));
+    const counters = { contexts: 0, pages: 0, gotos: 0, ctxCloses: 0, browserCloses: 0, addedCookieSets: 0 };
+    const reader = createCompassOrderReader({
+      loginCfg: { cookieWorkDir: d.workDir, edgePath: null },
+      evidenceDir: path.join(d.base, 'evidence'),
+      browserFactory: async () => stubBrowser(() => LOGIN_URL, counters),
+      settleTimeoutMs: 30, settleIntervalMs: 10,
+      restoreRunner: async () => fix3RestoreResult(closed),
+      nowFn: () => 20000,
+    });
+    await assert.rejects(
+      () => reader.readOrderSummary({
+        shopCfg: { id: 's4', name: '罗盘fix3', compassShopName: '罗盘fix3', cookieFile: fileName },
+      }),
+      (e) => {
+        assert.ok(e instanceof AuthError, `应为 AuthError：${e && e.message}`);
+        const label = closed ? '已结案' : '未结案';
+        assertNoQrText(e.message, label);
+        assert.match(e.message, closed ? /auth 结案/ : /auth 未结案/);
+        assert.ok(e.authClosure, 'fix3-four 未结案也必须交付结案证据');
+        assert.strictEqual(e.authClosure.authClosedOut, closed);
+        assert.ok(!/扫码/.test(JSON.stringify(e.authClosure)), `${label}证据包不得含扫码字样`);
+        return true;
+      },
+    );
+  }
+});
+
 test('罗盘真实入口：登录失效 → 排除当前工作字节 → 恢复副本验证提升后重开；收尾检查点零写不伪装过期', async () => {
   const d = mkDirs();
   const fileName = '罗盘店.json';

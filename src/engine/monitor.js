@@ -107,6 +107,12 @@ const READ_FAILURE_HINTS = Object.freeze({
   timeout: '读取超时，将自动重试',
   retrying: null, // 行内 note 已带"正在重试"，不覆盖主文案
 });
+// CODE_FAIL 加严（2026-11-02）：fix3-four 路径（读取器已交付 authClosure 证据，结案与
+// 未结案都会交付）的对外提示一律不含扫码类结论；两种终态各自固定一条文案。
+const FIX3_AUTH_HINTS = Object.freeze({
+  closed: '登录已失效（auth 已结案，不要求重新登录旁路）',
+  open: '登录已失效（auth 未结案，不要求重新登录旁路）',
+});
 
 class Monitor {
   /**
@@ -3155,10 +3161,15 @@ class Monitor {
       }
     }
     const reason = baseReason;
+    // fix3-four 路径（authClosure 证据随错误交付）：对外提示不含扫码类结论，结案/未结案分列。
+    const fix3Auth = kind === 'auth' && !!(err && err.authClosure);
+    const hint = fix3Auth
+      ? (err.authClosure.authClosedOut === true ? FIX3_AUTH_HINTS.closed : FIX3_AUTH_HINTS.open)
+      : (READ_FAILURE_HINTS[kind] !== undefined ? READ_FAILURE_HINTS[kind] : null);
     rt.lastReadError = {
       kind,
       // 四条固定文案（单一来源）：页面/bill-manager 直接消费，不再各自猜文案。
-      hint: READ_FAILURE_HINTS[kind] !== undefined ? READ_FAILURE_HINTS[kind] : null,
+      hint,
       requiresLogin: kind === 'auth',
       reason,
       loginUrlObserv,

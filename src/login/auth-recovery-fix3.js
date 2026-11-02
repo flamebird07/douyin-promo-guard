@@ -441,9 +441,10 @@ function buildEvidence(p) {
       readFailureNotMislabeledAsAuth: '由调用方 AUTH-60S 正证据门负责（本模块不升级 auth）',
     },
     authClosedOut: p.authClosedOut === true,
+    // CODE_FAIL 加严（2026-11-02）：fix3-four 结案/未结案文案一律不含扫码类结论。
     conclusion: p.authClosedOut === true
-      ? 'auth 结案：固定四份候选均不可用（写坏或文件健康但源端不认，已排除代码误判/对照店未误杀），不要求扫码'
-      : '未结案：全候选不可用，但对照片 checkLogin 未通过或未提供，保持原读取失败语义（不释放串行门）',
+      ? 'auth 结案：固定四份候选均不可用（写坏或文件健康但源端不认，已排除代码误判/对照店未误杀），不要求重新登录旁路'
+      : '未结案：全候选不可用，但对照片 checkLogin 未通过或未提供，保持原读取失败语义（不释放串行门，不要求重新登录旁路）',
   };
 }
 
@@ -698,8 +699,8 @@ async function runFix3Recovery(loginCfg, cookieFile, opts = {}) {
     authClosedOut,
     controlCheck: control,
     reason: authClosedOut
-      ? `固定四份候选均不可用（验证调用 ${verificationCalls} 次）：文件健康但源端不认或写坏，已排除代码误判（对照店 checkLogin 通过）；auth 结案，不要求扫码`
-      : `固定四份候选均不可用（验证调用 ${verificationCalls} 次）：对照店 checkLogin 未通过/未提供，未完成误判排除，不结案（保持原读取失败语义）`,
+      ? `固定四份候选均不可用（验证调用 ${verificationCalls} 次）：文件健康但源端不认或写坏，已排除代码误判（对照店 checkLogin 通过）；auth 结案，不要求重新登录旁路`
+      : `固定四份候选均不可用（验证调用 ${verificationCalls} 次）：对照店 checkLogin 未通过/未提供，未完成误判排除，不结案（保持原读取失败语义，不要求重新登录旁路）`,
     attempts,
     notes,
     verificationCalls,

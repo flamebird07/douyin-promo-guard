@@ -359,7 +359,7 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
         let back = null;
         try { back = await ctx.cookies(); } catch (_) { back = null; }
         if (!Array.isArray(back) || back.length === 0) {
-          outcome = { ok: false, classification: 'verify-error', reason: '独立验证上下文未返回非空最终 Cookie 集合（读取异常或空）：fail-closed 拒绝验证/提升（待重试，不要求扫码）' };
+          outcome = { ok: false, classification: 'verify-error', reason: '独立验证上下文未返回非空最终 Cookie 集合（读取异常或空）：fail-closed 拒绝验证/提升（待重试，不要求重新登录旁路）' };
           break;
         }
         const afterCapture = await page.evaluate(probeDoudianShopIdentityInPage);
@@ -378,16 +378,16 @@ function createDefaultCandidateVerifier(loginCfg, opts = {}) {
       }
       if (!outcome) {
         if (sawLoginEvidence) {
-          outcome = { ok: false, classification: 'login-invalid', reason: '候选在独立浏览器进程命中登录页地址或可见登录控件（登录无效，需重新扫码）' };
+          outcome = { ok: false, classification: 'login-invalid', reason: '候选在独立浏览器进程命中登录页地址或可见登录控件（登录无效，需重新登录）' };
         } else if (reachedVerifiedIdentityUrl) {
-          outcome = { ok: false, classification: 'identity-unverified', reason: `候选在独立浏览器进程到达受信抖店首页但未取得唯一本店语义身份/疑错店（${lastIdentityReason || '身份未核实'}）：待核实/重试，不要求扫码` };
+          outcome = { ok: false, classification: 'identity-unverified', reason: `候选在独立浏览器进程到达受信抖店首页但未取得唯一本店语义身份/疑错店（${lastIdentityReason || '身份未核实'}）：待核实/重试，不要求重新登录旁路` };
         } else {
-          outcome = { ok: false, classification: 'identity-unverified', reason: '候选未在独立浏览器进程取得受信抖店首页的唯一本店语义身份（登录无效/错店/待核实，不要求扫码）' };
+          outcome = { ok: false, classification: 'identity-unverified', reason: '候选未在独立浏览器进程取得受信抖店首页的唯一本店语义身份（登录无效/错店/待核实，不要求重新登录旁路）' };
         }
       }
     } catch (_) {
       // 外部异常可能回显 Cookie 值/带 token 的 URL：只记录固定脱敏原因。验证异常绝不判"登录无效"。
-      outcome = { ok: false, classification: 'verify-error', reason: '候选验证异常（异常详情可能含 Cookie/令牌等敏感值，已脱敏不回显）：拒绝验证/提升，待重试不要求扫码' };
+      outcome = { ok: false, classification: 'verify-error', reason: '候选验证异常（异常详情可能含 Cookie/令牌等敏感值，已脱敏不回显）：拒绝验证/提升，待重试不要求重新登录旁路' };
     }
     if (ctx) { try { await ctx.close(); } catch (_) { /* 关闭失败不掩盖结果 */ } }
     // 本候选专属浏览器进程用毕必须真正关闭：close 抛错或仍连接 → 绝不判成功，并停止恢复链。

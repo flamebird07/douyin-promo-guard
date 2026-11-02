@@ -40,6 +40,8 @@ const { finalPreservesCandidateAuth, serializeCookies, sameCookieSet } = require
 const {
   waitForDoudianHomepageSettled, settlePacing, sanitizePositiveMs,
 } = require('../lib/settle-policy');
+// fix3：固定四份候选的有界恢复（简尚收紧口径）。本模块不依赖 session，避免循环引用。
+const { runFix3Recovery } = require('./auth-recovery-fix3');
 
 const PROJECT_COOKIES_DIR = path.join(__dirname, '..', '..', 'cookies');
 
@@ -513,6 +515,18 @@ async function restoreDutyWorkCopy(loginCfg, cookieFile, opts = {}) {
   const expectedNames = shopNamesOf(opts.shopCfg || {});
   if (expectedNames.length === 0) {
     return { ok: false, reason: '未配置店铺名（compassShopName/name）：无法验证候选身份，拒绝恢复', attempts };
+  }
+  // fix3（简尚收紧口径）：固定四份候选 + 已登记多账号；写坏窄定义；同会话不重复送验；
+  // .bak-fix3-* 字节备份；全失败证据包 + 对照店 checkLogin 后才 auth 结案。
+  // 默认（未显式指定 policy）保持既有五层恢复语义不变。
+  if (opts.candidatePolicy === 'fix3-four') {
+    const verify = opts.verify || createDefaultCandidateVerifier(loginCfg, opts);
+    return runFix3Recovery(loginCfg, cookieFile, {
+      ...opts,
+      workDir,
+      shopCfg: opts.shopCfg || {},
+      verify,
+    });
   }
   // 冻结基线（验证开始前）：目标指纹在此定格；任何候选提升前必须仍与该基线一致，
   // 验证期间发生的并发新扫码登录写入胜出（拒绝提升、保留并发新文件，不覆盖）。

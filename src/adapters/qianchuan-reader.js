@@ -1082,6 +1082,13 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
         return await runner(loginCfg, shopCfg.cookieFile, {
           shopCfg,
           excludeWorkCopy: true,
+          // fix3：店铺显式登记 authRecoveryPolicy=fix3-four 时走固定四份收紧口径；
+          // 未登记店铺保持既有五层恢复语义不变。
+          candidatePolicy: opts.restoreCandidatePolicy || (shopCfg && shopCfg.authRecoveryPolicy) || undefined,
+          // fix3：对照店 checkLogin（排除全局误判）与 auth 结案回调由调用方注入；
+          // 未注入时模块保持「未结案」fail-closed，绝不擅自宣告 auth 结案。
+          controlCheck: opts.restoreControlCheck,
+          onAuthClosedOut: opts.onAuthClosedOut,
           candidateBrowserFactory,
           forbiddenBrowsers: shopBrowserIdentities.slice(),
           verify: opts.restoreVerify,
@@ -1132,10 +1139,21 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
         throw new DataGuardError(`抖店主页面在自动登录收敛期内被关闭（最后地址 ${sess.settled.url ? maskUrlQueries(sess.settled.url) : '未知'}）；按导航事实处理，需人工核实`);
       }
       if (fail.kind === 'login') {
+        // fix3：全候选不可用且对照店 checkLogin 已排除误判 → auth 结案，不要求扫码，
+        // 并把证据挂到错误对象上供 Monitor 释放该店串行门（不堵其他店）。
+        const closed = !!(fail.restore && fail.restore.authClosedOut === true);
         const restoreNote = fail.restore
-          ? `；四层恢复未取得可验证候选（${fail.restore.reason || '未提升'}），工作副本现状未被盲覆盖`
+          ? (closed
+            ? '；固定四份候选均不可用且已排除代码误判（对照店 checkLogin 通过）：auth 结案，不要求扫码'
+            : `；四层恢复未取得可验证候选（${fail.restore.reason || '未提升'}），工作副本现状未被盲覆盖`)
           : '';
-        throw withLoginEvidence(new AuthError(`登录失效：抖店页面在 ${sess.settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(opts.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${maskUrlQueries(page.url())}），请重新扫码登录${restoreNote}`), fail.evidence);
+        const tail = closed ? '；auth 结案（不要求扫码）' : '，请重新扫码登录';
+        const authErr = new AuthError(`登录失效：抖店页面在 ${sess.settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(opts.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${maskUrlQueries(page.url())}）${tail}${restoreNote}`);
+        if (fail.restore && fail.restore.policy === 'fix3-four') {
+          // 即使未结案也随错误交付证据包（含四份健康表/判定），供值守审计与人工复核。
+          authErr.authClosure = { authClosedOut: fail.restore.authClosedOut === true, evidence: fail.restore.evidence || null };
+        }
+        throw withLoginEvidence(authErr, fail.evidence);
       }
       throw withLoginEvidence(new DataGuardError(`抖店主页面在有界自动登录收敛期内未到达首页（${sess.settled.attempts} 次探测，当前 ${maskUrlQueries(sess.settled.url || page.url())}）；未见登录正证据，按导航事实处理，需人工核实`), fail.evidence);
     }

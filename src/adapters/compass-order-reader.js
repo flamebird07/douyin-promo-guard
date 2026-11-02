@@ -363,6 +363,10 @@ function createCompassOrderReader(p) {
           restore = await runner(loginCfg, shopCfg.cookieFile, {
             shopCfg,
             excludeWorkCopy: true,
+            // fix3：店铺显式登记 authRecoveryPolicy=fix3-four 时走固定四份收紧口径。
+            candidatePolicy: p.restoreCandidatePolicy || (shopCfg && shopCfg.authRecoveryPolicy) || undefined,
+            controlCheck: p.restoreControlCheck,
+            onAuthClosedOut: p.onAuthClosedOut,
             candidateBrowserFactory,
             forbiddenBrowsers: shopBrowserIdentities.slice(),
             verify: p.restoreVerify,
@@ -394,10 +398,20 @@ function createCompassOrderReader(p) {
           throw new DataGuardError(`抖店主页面在自动登录收敛期内被关闭（最后地址 ${sess.settled.url || '未知'}）；按导航事实处理，需人工核实`);
         }
         if (fail.kind === 'login') {
+          // fix3：全候选不可用且对照店 checkLogin 已排除误判 → auth 结案，不要求扫码。
+          const closed = !!(fail.restore && fail.restore.authClosedOut === true);
           const restoreNote = fail.restore
-            ? `；四层恢复未取得可验证候选（${fail.restore.reason || '未提升'}），工作副本现状未被盲覆盖`
+            ? (closed
+              ? '；固定四份候选均不可用且已排除代码误判（对照店 checkLogin 通过）：auth 结案，不要求扫码'
+              : `；四层恢复未取得可验证候选（${fail.restore.reason || '未提升'}），工作副本现状未被盲覆盖`)
             : '';
-          throw new AuthError(`登录失效：抖店页面在 ${sess.settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(p.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${page.url()}），请重新扫码登录${restoreNote}`);
+          const tail = closed ? '；auth 结案（不要求扫码）' : '，请重新扫码登录';
+          const authErr = new AuthError(`登录失效：抖店页面在 ${sess.settled.attempts} 次有界收敛（上限 ${Math.round(sanitizePositiveMs(p.settleTimeoutMs, DEFAULT_SETTLE_TIMEOUT_MS) / 1000)}s）后仍命中登录页地址或可见登录控件/表单（当前 ${page.url()}）${tail}${restoreNote}`);
+          if (fail.restore && fail.restore.policy === 'fix3-four') {
+            // 即使未结案也随错误交付证据包，供值守审计与人工复核。
+            authErr.authClosure = { authClosedOut: fail.restore.authClosedOut === true, evidence: fail.restore.evidence || null };
+          }
+          throw authErr;
         }
         throw new DataGuardError(`抖店主页面在有界自动登录收敛期内未到达首页（${sess.settled.attempts} 次探测，当前 ${sess.settled.url || page.url()}）；未见登录正证据，按导航事实处理，需人工核实`);
       }

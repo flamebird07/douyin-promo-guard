@@ -393,6 +393,62 @@ class Monitor {
   }
 
   /**
+   * fix3：auth 结案前先落盘证据包（四份健康表/判定/对照店结论，绝不含 Cookie value）。
+   * 写盘失败不改变结案判定，但会留审计；返回证据文件路径（失败 null）。
+   */
+  _writeAuthClosureEvidence(shopId, evidence) {
+    if (!evidence || typeof evidence !== 'object') return null;
+    try {
+      const dir = path.join(this.dataDir, 'auth-evidence');
+      fs.mkdirSync(dir, { recursive: true });
+      const ts = new Date(this.nowFn()).toISOString().replace(/[:.]/g, '-');
+      const safe = String(shopId).replace(/[^\w\u4e00-\u9fa5.-]/g, '_');
+      const file = path.join(dir, `${safe}-${ts}.json`);
+      fs.writeFileSync(file, JSON.stringify(evidence, null, 2), 'utf8');
+      this._audit({
+        kind: 'auth-closure', shopId, step: 'evidence-written',
+        file: path.basename(file), authClosedOut: evidence.authClosedOut === true,
+      });
+      return file;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * fix3：auth 结案后的串行门释放（不是动作达成声明）。
+   *
+   * 仅当读取器已交付 `authClosure.authClosedOut === true`（固定四份候选均不可用 +
+   * 对照店 checkLogin 已排除全局误判）时调用：把该店遗留的 unknown 串行槽按
+   * unknown_expired（confirmed 恒 false）结案并释放，避免登录失效把本店后续动作
+   * 永久堵在门上。只影响该店，不动其他店的门；无 unknown 槽则零动作。
+   *
+   * @returns {null|{ok:boolean, reason?:string, settledAs?:string}}
+   */
+  _releaseSerialGateForAuthClosure(shopId, closure) {
+    const orch = this._switchOrchestrator;
+    if (!orch || typeof orch.peek !== 'function' || typeof orch.expireUnknownSlot !== 'function') return null;
+    const slot = orch.peek(shopId);
+    if (!slot || slot.settled === true || slot.unknown !== true) return null;
+    const conclusion = closure && closure.evidence && closure.evidence.conclusion
+      ? String(closure.evidence.conclusion)
+      : '固定四份候选均不可用且已排除代码误判';
+    const reason = `auth 结案后释放串行门：${conclusion}；按未确认终态结案（不声明动作达成），本轮零点击，不堵后续店铺`;
+    const r = orch.expireUnknownSlot(shopId, slot.actionId, {
+      reason,
+      actions: ['enable', 'pause'],
+      persist: () => this._saveState(),
+    });
+    this._audit({
+      kind: 'auth-closure', shopId, step: 'release-serial-gate',
+      ok: !!(r && r.ok === true), actionId: slot.actionId,
+      settledAs: (r && r.settledAs) || null, confirmed: false,
+      reason: (r && r.reason) || reason,
+    });
+    return r;
+  }
+
+  /**
    * 今日是否仍需执行开启相位。
    * success（正常开启确认）或 mixed_converged（首查入口经有证据的 mixed 交接、本轮完整回读
    * 确认已收敛到统一态）均视为"今日已处理"（不再强制重开）；失败/unknown 允许在窗口内按规则
@@ -1905,7 +1961,13 @@ class Monitor {
       const cls = this._failureClassWithError(shopId, e, reason);
       const authType = (e instanceof AuthError || (e && e.code === 'AUTH'));
       const blocked = cls || (authType ? 'read_failed' : 'data');
-      this._applyReadFailure(shopId, { reason, blocked, auth: cls === 'auth' || undefined, loginEvidence: (e && e.loginEvidence) || undefined });
+      this._applyReadFailure(shopId, {
+        reason, blocked,
+        auth: cls === 'auth' || undefined,
+        loginEvidence: (e && e.loginEvidence) || undefined,
+        // fix3：auth 结案证据必须随错误对象进入 _applyReadFailure，否则无法释放串行门。
+        authClosure: (e && e.authClosure) || undefined,
+      });
       this._memPush(this.recentErrors, { scope: `shop:${shopId}`, error: reason }, undefined, 'error');
       this._audit({ kind: 'shop-refresh', shopId, ok: false, reason, blocked, zeroClick: true });
       return { ok: false, reason, zeroClick: true };
@@ -3112,6 +3174,17 @@ class Monitor {
     if (rt.lastData) rt.lastData.blockedReason = reason;
     // 新 Auth 失败撤销旧 on 证据：旧 adBelief/旧确认时间不得继续作为本轮可信依据。
     if (kind === 'auth') {
+      // fix3：全候选不可用且对照店 checkLogin 已排除误判（authClosure.authClosedOut）→
+      // 先落盘证据包，再按未确认终态释放该店旧 unknown 串行槽，避免 auth 结案后仍堵本店/后续店铺。
+      // 无结案证据时不触碰任何门（保持既有 fail-closed 语义）。
+      if (err && err.authClosure && err.authClosure.evidence) {
+        let evidenceWritten = false;
+        try { evidenceWritten = !!this._writeAuthClosureEvidence(shopId, err.authClosure.evidence); } catch (_) { evidenceWritten = false; }
+        // 「先交证据包，再结案」：证据未落盘则保持串行门阻塞（fail-closed）。
+        if (evidenceWritten && err.authClosure.authClosedOut === true) {
+          try { this._releaseSerialGateForAuthClosure(shopId, err.authClosure); } catch (_) { /* 释放失败不掩盖读取错误 */ }
+        }
+      }
       if (this.adBelief) delete this.adBelief[shopId];
       try { this._saveState(); } catch (_) { /* 持久化失败不掩盖本次错误 */ }
     }
@@ -3176,6 +3249,9 @@ class Monitor {
             blocked,
             auth: cls === 'auth' || undefined,
             loginEvidence: (e && e.loginEvidence) || undefined,
+            // fix3：保留读取器交付的 auth 结案证据（含四份健康表/对照店结论），
+            // 供 _applyReadFailure 在确认结案后释放该店串行门。
+            authClosure: (e && e.authClosure) || undefined,
           },
         };
       }
@@ -3209,6 +3285,7 @@ class Monitor {
           reason,
           blocked: cls || (/身份/.test(String(reason)) ? 'identity' : ((e && e.loginEvidence) ? 'read_failed' : 'inventory')),
           loginEvidence: (e && e.loginEvidence) || undefined,
+          authClosure: (e && e.authClosure) || undefined,
         },
       };
     }

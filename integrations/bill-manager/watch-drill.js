@@ -327,6 +327,7 @@ function createWatchDrill(opts = {}) {
     lastStatus: null, // 'ok' | 'failed'
     lastError: null,
   };
+  const mixedStuckNotifyKeys = new Set();
 
   function defaultSpawnNotify(args, input) {
     return new Promise((resolve) => {
@@ -479,6 +480,38 @@ function createWatchDrill(opts = {}) {
       n.lastStatus = 'failed';
       n.lastError = scrub(String((r && (r.stderr || r.error)) || `hermes send 退出码 ${r ? r.code : '未知'}`));
       pushLog('warn', `飞书通知发送失败（第 ${j.cycleNo} 轮）：${n.lastError.slice(0, 200)}`);
+    }
+  }
+
+  async function notifyMixedStuckGate(evt) {
+    const n = drill._notify;
+    if (!n.enabled || !evt) return;
+    const shopId = String(evt.shopId == null ? '' : evt.shopId);
+    const businessDate = String(evt.businessDate || '');
+    const key = `mixed-stuck-gate:${shopId}:${businessDate}`;
+    if (mixedStuckNotifyKeys.has(key)) return;
+    mixedStuckNotifyKeys.add(key); // 同店同业务日只尝试一次；Monitor 侧另有持久去重。
+    const shop = (drill.shops || []).find((s) => String(s.id) === shopId);
+    const shopText = scrub(String((shop && shop.name) || shopId || '未知店铺'));
+    const subject = scrub('[推广值守] mixed 连续 3 轮被首查门禁拦截');
+    const body = scrub([
+      `店铺：${shopText}`,
+      `业务日期：${businessDate || '—'}`,
+      '状态：广告状态连续 3 轮为 mixed，且费比控制被当日首查安全门禁拦截',
+      '处置：仅告警与审计，未自动点击；请检查每日首查收敛链',
+    ].join('\n'));
+    const r = await spawnNotify(
+      ['send', '--to', n.target, '--subject', subject, '--file', '-'],
+      body + '\n'
+    );
+    n.lastAt = new Date(drill._now()).toISOString();
+    if (r && r.code === 0) {
+      n.lastStatus = 'ok';
+      n.lastError = null;
+    } else {
+      n.lastStatus = 'failed';
+      n.lastError = scrub(String((r && (r.stderr || r.error)) || `hermes send 退出码 ${r ? r.code : '未知'}`));
+      pushLog('warn', `mixed 卡首查门禁告警发送失败（${shopText}/${businessDate || '—'}）：${n.lastError.slice(0, 200)}`);
     }
   }
 
@@ -1042,6 +1075,9 @@ function createWatchDrill(opts = {}) {
           } else if (isProcess) {
             // 真实过程事件（runner/executor 的 retry/paused/view/identity/abort/done/step…）
             pushLog((evt.failed === true || evt.error) ? 'error' : 'info', describeProcess(evt));
+            if (evt.kind === 'poll' && evt.step === 'mixed-stuck-gate') {
+              notifyMixedStuckGate(evt).catch(() => {});
+            }
           } else if (isError) {
             pushLog('error', describeError(evt));
           }

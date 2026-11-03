@@ -248,12 +248,17 @@ class Monitor {
     // 不以"数据是否变化"为记录条件（旧实现靠 changed 判定 → 连续相同数据会漏判断日志）。
     this.judgements = [];
 
+    // 首查门禁连续 mixed 观测：streak 仅保留进程内连续轮次；同店同业务日已告警键持久化，
+    // 防止进程重启后对同一天重复告警。只做审计/通知信号，绝不参与任何开关决策。
+    this._mixedStuckGateStreaks = new Map();
+
     const loaded = this._loadState();
     this.batches = loaded.batches || {}; // shopId -> date -> { runs:[], totals:{} }
     // 最近一次会话 Cookie 回写结果（仅元信息：条数/域名/冲突；绝不保存任何 Cookie 值）。
     // 不持久化：重启后清空，避免把上一进程的凭据状态当作本次会话的事实。
     this.lastCookieWriteback = null;
     this.enablePhase = loaded.enablePhase || {};
+    this.mixedStuckGateAlerts = loaded.mixedStuckGateAlerts || {};
     // 广告开/关状态标记（2026-09-21，每日 07:00 开启前置门依据）：
     // 仅由**回读确认**的批次更新（暂停确认→off；开启确认→on），持久化跨重启。
     // 未知/失败批次不更新（不臆断）；无记录 → 前置门不拦（照常执行开启，fail-closed）。
@@ -612,6 +617,7 @@ class Monitor {
         version: STATE_VERSION,
         batches: this.batches,
         enablePhase: this.enablePhase || {},
+        mixedStuckGateAlerts: this.mixedStuckGateAlerts || {},
         adBelief: this.adBelief || {},
         enableScheduler: {
           stoppedByUser: this._enableSchedule.stoppedByUser === true,
@@ -1121,17 +1127,25 @@ class Monitor {
    */
   async _enableLoop(gen) {
     const sch = this.config.schedule;
-    const RETRY_MS = 5 * 60 * 1000;
     while (gen === this._enableGen && this.enableRunning) {
       const now = this.nowFn();
       const w = shanghaiWall(now);
       const nrMs = Date.parse(this._enableSchedule.nextRunAt || '');
-      const arrived = Number.isFinite(nrMs) && now >= nrMs;
-      if (this._dailyFirstCheckOpen(w) && arrived) {
-        const today = w.date;
-        const shopsToRun = this._activeShops().filter(
+      const windowOpen = this._dailyFirstCheckOpen(w);
+      const today = w.date;
+      const shopsToRun = windowOpen
+        ? this._activeShops().filter(
           (s) => !this._enablePhaseDone(s.id, today),
-        );
+        )
+        : [];
+      // 活动店在首查窗口开启后加入/恢复时，旧 nextRunAt 可能仍指向次日。
+      // 只要今天尚有未完成店，就视为已到点，复用既有首查链；nextRunAt 不得把它挂到次日。
+      const scheduledDue = Number.isFinite(nrMs) && now >= nrMs;
+      const scheduledBeyondRetryBound = !Number.isFinite(nrMs) || nrMs - now > ENABLE_RETRY_MS;
+      // 合法的当日 +5min 重试点仍须等到点；只有缺失/超出有界复查范围（典型为误排到次日）
+      // 才由未完成活动店覆盖，以免提前唤醒导致无间隔重复首查。
+      const arrived = scheduledDue || (shopsToRun.length > 0 && scheduledBeyondRetryBound);
+      if (windowOpen && arrived) {
         if (shopsToRun.length > 0) {
           this._enableSchedule.phase = 'enable_window';
           if (this._cycleRunning) {
@@ -1155,15 +1169,15 @@ class Monitor {
         const still = this._activeShops().some((s) => !this._enablePhaseDone(s.id, today));
         if (still) {
           // 有未完成店：有界重试（RETRY_MS 后再试；跨日由回环窗口判定自然停止）
-          const retryAt = afterMs + RETRY_MS;
+          const retryAt = afterMs + ENABLE_RETRY_MS;
           this._enableSchedule.nextRunAt = new Date(retryAt).toISOString();
-          await this._enableDelay(RETRY_MS, gen);
+          await this._enableDelay(ENABLE_RETRY_MS, gen);
           continue;
         }
         const targetMs = this._nextEnableWindowStartMs(afterMs);
         this._enableSchedule.phase = 'waiting_window';
         this._enableSchedule.nextRunAt = new Date(targetMs).toISOString();
-        await this._enableDelay(Math.max(0, targetMs - afterMs), gen);
+        await this._enableDelay(Math.min(ENABLE_RETRY_MS, Math.max(0, targetMs - afterMs)), gen);
         continue;
       }
       // ── 窗口外 / 未到点 ──
@@ -1182,7 +1196,7 @@ class Monitor {
       const targetMs = hasFutureRun ? nrFutureMs : this._nextEnableWindowStartMs(now);
       this._enableSchedule.phase = 'waiting_window';
       this._enableSchedule.nextRunAt = new Date(targetMs).toISOString();
-      await this._enableDelay(Math.max(0, targetMs - now), gen);
+      await this._enableDelay(Math.min(ENABLE_RETRY_MS, Math.max(0, targetMs - now)), gen);
     }
   }
 
@@ -1338,6 +1352,55 @@ class Monitor {
     }
   }
 
+  _pruneMixedStuckGateStreaks() {
+    const active = new Set(this._activeShops().map((s) => String(s.id)));
+    for (const key of this._mixedStuckGateStreaks.keys()) {
+      const shopId = String(key).split('\u0000', 1)[0];
+      if (!active.has(shopId)) this._mixedStuckGateStreaks.delete(key);
+    }
+  }
+
+  /**
+   * 同店同业务日连续 3 个完整 poll 结论均为 mixed + 首查门禁时，只发一次审计信号。
+   * 通知由 watch-drill 消费该 process event 并复用既有 Hermes 通道；本方法不触发任何广告动作。
+   */
+  _observeMixedStuckGate(shopId, result) {
+    const id = String(shopId == null ? '' : shopId);
+    if (!id || !this._isShopActive(shopId)) {
+      for (const key of this._mixedStuckGateStreaks.keys()) {
+        if (String(key).startsWith(`${id}\u0000`)) this._mixedStuckGateStreaks.delete(key);
+      }
+      return;
+    }
+    const businessDate = (result && /^\d{4}-\d{2}-\d{2}$/.test(String(result.businessDate || '')))
+      ? String(result.businessDate)
+      : shanghaiDate(this.nowFn());
+    const key = `${id}\u0000${businessDate}`;
+    // 业务日切换后旧 streak 不得继续累计；daily alerted 另行持久化并保留有限历史。
+    for (const oldKey of this._mixedStuckGateStreaks.keys()) {
+      if (oldKey !== key && String(oldKey).startsWith(`${id}\u0000`)) this._mixedStuckGateStreaks.delete(oldKey);
+    }
+    const matched = !!(result && result.status === 'window_blocked' && result.currentAdState === 'mixed');
+    if (!matched) {
+      this._mixedStuckGateStreaks.delete(key);
+      return;
+    }
+    const consecutive = (this._mixedStuckGateStreaks.get(key) || 0) + 1;
+    this._mixedStuckGateStreaks.set(key, consecutive);
+    const byDate = (this.mixedStuckGateAlerts[id] = this.mixedStuckGateAlerts[id] || {});
+    if (consecutive < 3 || byDate[businessDate]) return;
+
+    byDate[businessDate] = { at: new Date(this.nowFn()).toISOString(), consecutive };
+    const dates = Object.keys(byDate).sort();
+    while (dates.length > 7) delete byDate[dates.shift()];
+    this._saveState(); // 告警去重尽力持久化；失败也不得阻塞巡查或引入任何点击。
+    this._audit({
+      kind: 'poll', step: 'mixed-stuck-gate', shopId, businessDate,
+      consecutive, status: 'window_blocked', currentAdState: 'mixed', zeroClick: true,
+      reason: '连续 3 轮广告状态 mixed 且被当日首查安全门禁拦截，需人工关注首查收敛链',
+    });
+  }
+
   /** 立即轮询一次（与定时轮询互斥；真实关闭受时间窗口限制）。 */
   async pollOnce(trigger = 'manual') {
     if (this.pending.length > 0) {
@@ -1436,6 +1499,10 @@ class Monitor {
           results[i] = { shopId: shops[i].id, status: 'skipped', reason: '本轮未处理（并行收口遗漏，如实记录）' };
         }
       }
+
+      // 只观察每店本轮最终结论；非匹配轮重置 streak，已告警的同日去重键保持。
+      this._pruneMixedStuckGateStreaks();
+      for (let i = 0; i < shops.length; i += 1) this._observeMixedStuckGate(shops[i].id, results[i]);
 
       this.lastCycleAt = new Date(this.nowFn()).toISOString();
       completed = { ok: true, trigger, cycleNo, results };
@@ -5035,7 +5102,10 @@ class Monitor {
               || (decision.decision === DECISION.ALREADY_OFF && data.evaluation.over === true))) {
         const reason = `当日首次开启检查未完成（首查安全门禁），费比控制暂不执行：已读取并记录`;
         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'window_blocked', reason, decision: decision.decision, zeroClick: true });
-        return { status: 'window_blocked', reason, decision: decision.decision, zeroClick: true };
+        return {
+          status: 'window_blocked', reason, decision: decision.decision, zeroClick: true,
+          currentAdState, businessDate: data.cost.businessDate || todayDate,
+        };
       }
       if (decision.decision === DECISION.SHOULD_PAUSE) {
         return this._runShopSwitchAction(shopCfg, 'pause', data, cycleToken, trigger, {

@@ -29,9 +29,13 @@ const { compactUrls } = require('../lib/log');
 const { perOrderDisplayText } = require('./rules');
 
 /** 生产默认会话开启器：真实乘方管理页（openChengfangShop + 真实控制器）。 */
-async function defaultChengfangOpener({ loginCfg, shopCfg }) {
+async function defaultChengfangOpener({ loginCfg, shopCfg, restoreControlCheck, onAuthClosedOut }) {
   const { openChengfangShop, createChengfangController, watchChengfangControlsForManualReview } = require('../adapters/chengfang-reader');
-  const { browser, target, account, context, cookieSession } = await openChengfangShop({ loginCfg, shopCfg });
+  // fix3：对照店 checkLogin（排除全局误判）与 auth 结案回调由 Monitor 按店铺注入，
+  // 经 openChengfangShop → openQianchuanHome 透传进恢复链；未注入时保持未结案 fail-closed。
+  const { browser, target, account, context, cookieSession } = await openChengfangShop({
+    loginCfg, shopCfg, restoreControlCheck, onAuthClosedOut,
+  });
   const controller = watchChengfangControlsForManualReview(createChengfangController({}), {
     context, target, shopCfg, loginCfg,
   });

@@ -207,6 +207,45 @@ test('B2 四份全不可用 + 对照店未提供 → 未结案：文案同样不
   assert.ok(!/扫码/.test(res.evidence.conclusion), `未结案结论不得含扫码字样：${res.evidence.conclusion}`);
   assert.ok(!/扫码/.test(res.reason), `未结案原因不得含扫码字样：${res.reason}`);
   assert.ok(!JSON.stringify(res.evidence).includes('扫码'), '未结案证据包整体不得含扫码字样');
+  // fix3 文案拆分：未注入对照店检查 = 「未提供」，不得再与「未通过」合并误导
+  assert.ok(res.reason.includes('对照店 checkLogin 未提供'), `未注入对照店时文案必须是「未提供」：${res.reason}`);
+  assert.ok(!res.reason.includes('未通过'), `未注入对照店时不得出现「未通过」混淆：${res.reason}`);
+  assert.ok(fs.readFileSync(path.join(d.workDir, `${SHOP}.json`)).equals(workBytes), '未结案不得覆盖工作副本');
+});
+
+test('B3 四份全不可用 + 对照店已提供但 checkLogin 未通过 → 未结案且文案只说「未通过」', async () => {
+  const d = mkBase();
+  const work = makeCookies('work', 1900000000);
+  const workBytes = bytesOf(work);
+  fs.writeFileSync(path.join(d.workDir, `${SHOP}.json`), workBytes);
+  fs.writeFileSync(path.join(d.sourceDir, `${SHOP}.json`), workBytes);
+  writeJson(path.join(d.recoveryDir, SHOP, 'v20261101T000000Z-1-aaaa.json'), work);
+  writeJson(path.join(d.archiveRoot, SHOP, 'v20261020T000000Z-1-bbbb.json'), work);
+
+  const res = await runFix3Recovery(
+    { cookieWorkDir: d.workDir, cookieSourceDir: d.sourceDir },
+    SHOP,
+    {
+      workDir: d.workDir,
+      shopCfg: { name: SHOP, compassShopName: SHOP },
+      excludeWorkCopy: true,
+      recoveryDir: d.recoveryDir,
+      archiveRoot: d.archiveRoot,
+      nowFn: () => NOW,
+      nowMs: NOW,
+      verify: async () => { throw new Error('同会话候选不得被送验'); },
+      // 对照店检查已注入但未通过 → 与「未提供」必须可区分
+      controlCheck: async () => ({ ok: false, reason: '对照店 checkLogin 未通过（测试）' }),
+    },
+  );
+
+  assert.strictEqual(res.ok, false);
+  assert.strictEqual(res.authClosedOut, false, JSON.stringify(res));
+  assert.strictEqual(res.controlCheck.ok, false);
+  assert.strictEqual(res.controlCheck.skipped, undefined, '已注入对照店检查时不得标记 skipped');
+  assert.ok(res.reason.includes('对照店 checkLogin 未通过'), `已跑对照店时文案必须是「未通过」：${res.reason}`);
+  assert.ok(!res.reason.includes('未提供'), `已跑对照店时不得出现「未提供」混淆：${res.reason}`);
+  assert.ok(!/扫码/.test(res.reason), `未结案原因不得含扫码字样：${res.reason}`);
   assert.ok(fs.readFileSync(path.join(d.workDir, `${SHOP}.json`)).equals(workBytes), '未结案不得覆盖工作副本');
 });
 
@@ -713,5 +752,86 @@ test('G5 _makeReader 给千川 cost/ad 与罗盘 order 注入 restoreControlChec
     qc.createQianchuanAdListReader = oAd;
     cp.createCompassOrderReader = oOrder;
     monitor.stop();
+  }
+});
+
+test('G6 乘方读取路径接线：_readChengfangAdState 把 restoreControlCheck + onAuthClosedOut 传入 opener（与 poll 同款）', async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fix3-cfwire-'));
+  seedUnknownSlot(dataDir);
+  const monitor = buildMonitor(dataDir);
+  let captured = null;
+  monitor._chengfangOpener = async (o) => { captured = o; throw new Error('会话开启失败（测试桩）'); };
+  try {
+    const r = await monitor._readChengfangAdState({ id: 'shop-a', name: '简尚', cookieFile: '简尚' });
+    assert.strictEqual(r.state, 'unknown');
+    assert.ok(captured, '乘方读取路径 opener 选项必须被捕获');
+    assert.strictEqual(typeof captured.restoreControlCheck, 'function', '乘方读取路径必须注入 restoreControlCheck');
+    assert.strictEqual(typeof captured.onAuthClosedOut, 'function', '乘方读取路径必须注入 onAuthClosedOut');
+
+    // 接线必须是活的（与 poll 同款语义）：结案回调落盘证据 + 释放该店串行门。
+    const evidence = {
+      kind: 'fix3-auth-closure', policy: 'fix3-four', authClosedOut: true,
+      conclusion: 'auth 结案：固定四份候选均不可用（不要求重新登录旁路）',
+    };
+    await captured.onAuthClosedOut(evidence);
+    assert.strictEqual(monitor._switchOrchestrator.hasUnknownBlock('shop-a'), false, '读取路径的结案回调必须能释放串行门');
+    const evDir = path.join(dataDir, 'auth-evidence');
+    assert.strictEqual(fs.readdirSync(evDir).filter((f) => f.endsWith('.json')).length, 1, '读取路径结案证据必须落盘');
+  } finally {
+    monitor.stop();
+  }
+});
+
+test('G7 defaultChengfangOpener 透传 fix3 选项到 openChengfangShop（不丢接线）', async () => {
+  const cf = require('../src/adapters/chengfang-reader');
+  const oOpen = cf.openChengfangShop;
+  const oCtrl = cf.createChengfangController;
+  const oWatch = cf.watchChengfangControlsForManualReview;
+  const captured = [];
+  const sentinelCheck = () => {};
+  const sentinelClosed = () => {};
+  cf.openChengfangShop = async (p) => { captured.push(p); return { browser: null, target: {}, account: {}, context: {}, cookieSession: null }; };
+  cf.createChengfangController = () => ({});
+  cf.watchChengfangControlsForManualReview = (c) => c;
+  const { defaultChengfangOpener } = require('../src/engine/chengfang-runner');
+  try {
+    await defaultChengfangOpener({
+      loginCfg: {}, shopCfg: { id: 'shop-a' },
+      restoreControlCheck: sentinelCheck, onAuthClosedOut: sentinelClosed,
+    });
+    assert.strictEqual(captured.length, 1);
+    assert.strictEqual(captured[0].restoreControlCheck, sentinelCheck, 'restoreControlCheck 必须透传到 openChengfangShop');
+    assert.strictEqual(captured[0].onAuthClosedOut, sentinelClosed, 'onAuthClosedOut 必须透传到 openChengfangShop');
+    // 批次等未注入场景：透传 undefined，不伪造对照店/结案能力。
+    await defaultChengfangOpener({ loginCfg: {}, shopCfg: { id: 'shop-a' } });
+    assert.strictEqual(captured[1].restoreControlCheck, undefined);
+    assert.strictEqual(captured[1].onAuthClosedOut, undefined);
+  } finally {
+    cf.openChengfangShop = oOpen;
+    cf.createChengfangController = oCtrl;
+    cf.watchChengfangControlsForManualReview = oWatch;
+  }
+});
+
+test('G8 fix3 未结案文案拆分：「未提供」（未注入）vs「未通过」（跑但失败）两态分明', () => {
+  const notProvided = buildAuthFailureSuffix({
+    policy: 'fix3-four', authClosedOut: false, controlCheckSkipped: true,
+    restoreReason: '固定四份候选均不可用（验证调用 0 次）：对照店 checkLogin 未提供，未完成误判排除，不结案（保持原读取失败语义，不要求重新登录旁路）',
+  });
+  assert.ok(notProvided.tail.includes('对照店检查未提供'), `必须写「未提供」：${notProvided.tail}`);
+  assert.ok(!notProvided.tail.includes('未通过'), `未注入时不得出现「未通过」：${notProvided.tail}`);
+
+  const denied = buildAuthFailureSuffix({
+    policy: 'fix3-four', authClosedOut: false, controlCheckSkipped: false,
+    restoreReason: '固定四份候选均不可用（验证调用 2 次）：对照店 checkLogin 未通过，未完成误判排除，不结案（保持原读取失败语义，不要求重新登录旁路）',
+  });
+  assert.ok(denied.tail.includes('对照店检查未通过'), `跑过但失败必须写「未通过」：${denied.tail}`);
+  assert.ok(!denied.tail.includes('未提供'), `跑过但失败时不得出现「未提供」：${denied.tail}`);
+
+  // 结案与默认五层口径保持不变
+  assert.ok(buildAuthFailureSuffix({ policy: 'fix3-four', authClosedOut: true }).tail.includes('auth 结案'));
+  assert.ok(buildAuthFailureSuffix({ authClosedOut: false }).tail.includes('对照店检查未通过'));
+  for (const s of [notProvided, denied]) {
+    assert.ok(!/扫码/.test(s.tail + s.restoreNote), `未结案文案不得含扫码字样：${s.tail}${s.restoreNote}`);
   }
 });

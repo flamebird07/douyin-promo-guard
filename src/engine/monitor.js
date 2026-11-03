@@ -4314,6 +4314,10 @@ class Monitor {
       // audit 透传：只读状态开会话与批次开会话同链（默认开启器 → openChengfangShop/检查点）
       session = await opener({
         loginCfg, shopCfg, audit: (e) => this._audit(e), readOnlyStatus: true,
+        // fix3：乘方/enable-phase 读取路径与 poll 同款对照店接线（restoreControlCheck +
+        // onAuthClosedOut 经 defaultChengfangOpener → openChengfangShop → openQianchuanHome
+        // 透传进恢复链）。未登记 authRecoveryPolicy 的店铺不进 fix3，对其零影响。
+        ...this._authRecoveryWiring(shopCfg),
         ...( (_meta && _meta.cancelToken) ? { cancelToken: _meta.cancelToken } : {} ),
         // 所有权早登记（2026-10-23）：适配器必须在**创建资源之后、任何后续 await 之前**同步回调。
         // 截止先于 opener 返回时，门里已经握着可核验的 close/isConnected 句柄。
@@ -4534,6 +4538,9 @@ class Monitor {
           blocked,
           auth: cls === 'auth' || undefined,
           loginEvidence: (e && e.loginEvidence) || undefined,
+          // fix3：与 _readCurrentAdState 两个 catch 对齐——保留读取器交付的 auth 结案证据，
+          // 供 _applyReadFailure 落盘证据包并在结案后释放该店串行门（不再丢弃）。
+          authClosure: (e && e.authClosure) || undefined,
         },
       };
     } finally {

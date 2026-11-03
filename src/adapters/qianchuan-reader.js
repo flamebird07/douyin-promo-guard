@@ -1147,6 +1147,8 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
         const suffix = buildAuthFailureSuffix({
           policy: fail.restore ? fail.restore.policy : undefined,
           authClosedOut: closed,
+          // fix3 文案拆分：区分「对照店检查未提供」与「未通过」，见 auth-failure-text。
+          controlCheckSkipped: !!(fail.restore && fail.restore.controlCheck && fail.restore.controlCheck.skipped === true),
           restoreReason: fail.restore ? fail.restore.reason : undefined,
         });
         const restoreNote = fail.restore ? suffix.restoreNote : '';

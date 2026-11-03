@@ -10,6 +10,7 @@
  * @param {object} p
  *   - policy {string} 恢复策略（fix3-four 走固定四份证据口径）
  *   - authClosedOut {boolean} 是否已 auth 结案
+ *   - controlCheckSkipped {boolean} fix3-four 未结案时对照店检查是否「未提供」（未注入/未跑）
  *   - restoreReason {string} 恢复链原因（未结案时如实拼接）
  * @returns {{tail:string, restoreNote:string}} 追加到登录失效消息尾部的两段文案
  */
@@ -17,10 +18,15 @@ function buildAuthFailureSuffix(p = {}) {
   const closed = p.authClosedOut === true;
   const fix3 = p.policy === 'fix3-four';
   if (fix3) {
+    // fix3 文案拆分（2026-11-02）：「对照店检查未提供」（检查根本没注入/没跑）与
+    // 「对照店检查未通过」（跑了但 checkLogin 失败）是两种不同态势，必须区分，
+    // 不得再合并误导值守；未传 controlCheckSkipped 时保持旧口径（按「未通过」）。
     return {
       tail: closed
         ? '；auth 结案（不要求重新登录旁路）'
-        : '；auth 未结案：无可用会话候选或对照店检查未通过（不要求重新登录旁路）',
+        : (p.controlCheckSkipped === true
+          ? '；auth 未结案：无可用会话候选或对照店检查未提供（不要求重新登录旁路）'
+          : '；auth 未结案：无可用会话候选或对照店检查未通过（不要求重新登录旁路）'),
       restoreNote: closed
         ? '；固定四份候选均不可用且已排除代码误判（对照店 checkLogin 通过）：auth 结案，不要求重新登录旁路'
         : `；四层恢复未取得可验证候选（${p.restoreReason || '未提升'}），工作副本现状未被盲覆盖`,

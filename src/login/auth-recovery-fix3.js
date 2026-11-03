@@ -700,7 +700,11 @@ async function runFix3Recovery(loginCfg, cookieFile, opts = {}) {
     controlCheck: control,
     reason: authClosedOut
       ? `固定四份候选均不可用（验证调用 ${verificationCalls} 次）：文件健康但源端不认或写坏，已排除代码误判（对照店 checkLogin 通过）；auth 结案，不要求重新登录旁路`
-      : `固定四份候选均不可用（验证调用 ${verificationCalls} 次）：对照店 checkLogin 未通过/未提供，未完成误判排除，不结案（保持原读取失败语义，不要求重新登录旁路）`,
+      // fix3 文案拆分（2026-11-02）：「未提供」（对照店检查根本没注入/没跑）与「未通过」
+      // （对照店跑了但 checkLogin 失败）是两种不同态势，必须区分，不得再合并误导值守。
+      : `固定四份候选均不可用（验证调用 ${verificationCalls} 次）：${
+        control.skipped === true ? '对照店 checkLogin 未提供' : '对照店 checkLogin 未通过'
+      }，未完成误判排除，不结案（保持原读取失败语义，不要求重新登录旁路）`,
     attempts,
     notes,
     verificationCalls,

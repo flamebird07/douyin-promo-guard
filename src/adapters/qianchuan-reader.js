@@ -78,6 +78,57 @@ const DEFAULT_READINESS_INTERVAL_MS = 3000;
 // 冻结/回拨（或 interval 非法导致 deadline 永不越过），必须靠限次收敛，绝不空转。
 // maxAttempts = ceil(timeout/interval)+1，并夹到 [1, MAX_READINESS_ATTEMPTS]。
 const MAX_READINESS_ATTEMPTS = 1000;
+// SWITCH-CLICK-RETRY-20261103：切至账户视图点击的**有界**重试上限（只对非遮挡类瞬时错误）。
+// 独立计数，不复用 attempt；同时受 maxAttempts/deadline 双重约束，绝不放大点击次数。
+const SWITCH_CLICK_MAX_RETRIES = 2;
+
+/**
+ * 点击错误落盘清洗（SWITCH-CLICK-ERROR-20261103）：只留首行 + 前 300 字符，
+ * URL 只留 origin+path（去 query/hash），cookie/token 一律打码。绝不把凭据写进 audit/app.log。
+ */
+function sanitizeClickErrorMessage(raw) {
+  let s = String(raw == null ? '' : raw);
+  s = s.split(/\r?\n/)[0] || '';
+  s = s.replace(/https?:\/\/[^\s"'<>）)]+/gi, (u) => {
+    try {
+      const parsed = new URL(u);
+      return `${parsed.origin}${parsed.pathname}`;
+    } catch (_) {
+      return '<url>';
+    }
+  });
+  s = s.replace(/\b(cookie|set-cookie|token|access_token|refresh_token|sessionid|session_id|authorization)\b\s*[:=]\s*[^\s;,]+/gi, '$1=<redacted>');
+  s = s.replace(/\bBearer\s+[A-Za-z0-9._\-]+/gi, 'Bearer <redacted>');
+  if (s.length > 300) s = `${s.slice(0, 300)}…`;
+  return s;
+}
+
+/** 点击错误摘要：{ name, text, detail }，detail 直接拼进 fail message。 */
+function describeSwitchClickError(error) {
+  const name = String((error && error.name) || 'Error').replace(/[^\w.$-]/g, '').slice(0, 60) || 'Error';
+  const text = sanitizeClickErrorMessage(error && error.message);
+  return { name, text, detail: `｜click 错误：${name}: ${text}` };
+}
+
+/** target/page 已关闭：立即 fail，绝不重试（重试只会制造无意义点击）。 */
+function isPageClosedError(error) {
+  if (!error) return false;
+  const name = String(error.name || '');
+  if (name === 'TargetClosedError') return true;
+  return /Target page, context or browser has been closed|Target closed|page has been closed/i.test(String(error.message || ''));
+}
+
+/**
+ * Playwright 可重试的**瞬时**错误（不含遮挡类）：TimeoutError（非 intercepts）与
+ * detached / not stable / not enabled / not visible。未知类型一律不可重试。
+ */
+function isRetryableSwitchClickError(error) {
+  if (!error) return false;
+  const name = String(error.name || '');
+  const msg = String(error.message || '');
+  if (name === 'TimeoutError') return !/intercepts pointer events/i.test(msg);
+  return /not attached to the DOM|element is detached|element is not stable|not stable|element is not enabled|not enabled|element is not visible|not visible|element is outside of the viewport/i.test(msg);
+}
 
 /** 已知投放类型（来自首页 summaryCard 分项实测：乘方+标准+全域+品牌=整体）。 */
 const KNOWN_AD_TYPES = [
@@ -811,6 +862,8 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
   let switched = false;
   let popupClosed = false;
   let blockedSwitchUrl = null;
+  // SWITCH-CLICK-RETRY-20261103：独立的有界重试计数（只对非遮挡类瞬时错误）。
+  let switchClickRetries = 0;
   let reason = '千川视图内容未就绪或结构未识别：未取得账户数据';
   const fail = async message => {
     const evidence = await collectLoginExpiryEvidence(target);
@@ -927,12 +980,30 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
           switched = true;
           reason = '千川切换后账户视图内容未就绪或结构未识别：未读取店铺汇总，未取得账户数据';
         } catch (error) {
-          if (popupClosed || blockedSwitchUrl !== null || !error || error.name !== 'TimeoutError'
-            || !/intercepts pointer events/i.test(String(error.message)) || target.url() !== before) {
-            return fail('千川“切至账户视图”按钮不可操作或切换导航失败：未尝试其他按钮');
+          // SWITCH-CLICK-ERROR-20261103：真实错误（name+清洗后 message）必须落盘，禁止吞掉。
+          const errInfo = describeSwitchClickError(error);
+          const failSwitch = message => fail(`${message}${errInfo.detail}`);
+          const urlChanged = target.url() !== before;
+          const popupStillOpen = !!(view.popup && view.popup.present);
+          // 遮挡类（原有路径，行为不变）：TimeoutError + intercepts pointer events → 有界再观察。
+          if (!popupClosed && blockedSwitchUrl === null && error && error.name === 'TimeoutError'
+            && /intercepts pointer events/i.test(String(error.message)) && !urlChanged) {
+            blockedSwitchUrl = before;
+            reason = '千川视图切换被遮挡：未在有界再观察内确认并关闭唯一已证营销弹窗';
+          } else if (urlChanged || isPageClosedError(error) || switched) {
+            // 导航已发生 / 页面已关闭 / 已 switched：立即停，绝不重试。
+            return failSwitch('千川“切至账户视图”按钮不可操作或切换导航失败：未尝试其他按钮');
+          } else if (popupStillOpen || blockedSwitchUrl !== null || popupClosed) {
+            // 弹窗未证安全 / 遮挡再观察中 / 弹窗已关：维持原 fail-closed，不重试。
+            return failSwitch('千川“切至账户视图”按钮不可操作或切换导航失败：未尝试其他按钮');
+          } else if (isRetryableSwitchClickError(error) && switchClickRetries < SWITCH_CLICK_MAX_RETRIES) {
+            // 非遮挡类瞬时错误：走循环下一轮（重新 evaluate 视图 / 核对身份 / 校验唯一性 / 检查弹窗）。
+            switchClickRetries += 1;
+            reason = `千川“切至账户视图”点击瞬时失败（已重试 ${switchClickRetries}/${SWITCH_CLICK_MAX_RETRIES} 次，未尝试其他按钮）${errInfo.detail}`;
+          } else {
+            // 未知错误类型或重试次数用尽：立即 fail，message 带最后一次真实错误文本。
+            return failSwitch('千川“切至账户视图”按钮不可操作或切换导航失败：未尝试其他按钮');
           }
-          blockedSwitchUrl = before;
-          reason = '千川视图切换被遮挡：未在有界再观察内确认并关闭唯一已证营销弹窗';
         }
       }
     }

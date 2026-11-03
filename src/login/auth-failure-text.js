@@ -44,4 +44,23 @@ function buildAuthFailureSuffix(p = {}) {
   };
 }
 
-module.exports = { buildAuthFailureSuffix };
+/**
+ * 登录失效日志的 60s 保护字段（fix4，2026-11-03）：只做日志字段拼接，不改判定与既有文案。
+ *
+ * heldMs = 正向证据连续观测的实际持续时长（与 loginUrlObserv.heldMs 同源，monitor.js
+ * 用 now - firstSeenAt 计算）；holdMs = 判定窗口 AUTH_LOGIN_URL_HOLD_MS。两者都是数值，
+ * 便于 PROD 日志直接取证「是否真的持续满 60s」。
+ *
+ * @param {object} p
+ *   - heldMs {number} 实际持续时长（毫秒）
+ *   - holdMs {number} 判定窗口（毫秒）
+ * @returns {string} 形如「；heldMs=61234 holdMs=60000」；无有效数值时返回空串
+ */
+function buildHoldLogFields(p = {}) {
+  const heldMs = Number(p.heldMs);
+  const holdMs = Number(p.holdMs);
+  if (!Number.isFinite(heldMs) || !Number.isFinite(holdMs) || heldMs < 0 || holdMs < 0) return '';
+  return `；heldMs=${Math.round(heldMs)} holdMs=${Math.round(holdMs)}`;
+}
+
+module.exports = { buildAuthFailureSuffix, buildHoldLogFields };

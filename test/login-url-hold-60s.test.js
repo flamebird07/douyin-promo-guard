@@ -68,6 +68,8 @@ test('H1 URL-only 30s → 不 AUTH：read_failed + requiresLogin=false + 文案�
   // 观测进度仅保留在内部调试字段
   assert.equal(first.loginUrlObserv.key, LOGIN_KEY);
   assert.equal(first.loginUrlObserv.holdMs, 60000);
+  // fix4：未确认 auth 的日志行不得出现 60s 保护字段（只加在 auth 行）
+  assert.doesNotMatch(first.reason, /heldMs=|holdMs=/);
 
   clock.advance(30_000);
   const second = applyWith(mon, urlOnlyEvidence());
@@ -93,11 +95,14 @@ test('H2 跨轮次连续 ≥60s（同一 loginUrlKey）→ AUTH，文案①', ()
   assert.equal(hit.requiresLogin, true);
   assert.equal(hit.hint, '登录已失效，请重新登录');
   assert.equal(hit.loginUrlObserv, null, 'AUTH 后不再保留观测备注');
+  // fix4：auth 用户可见日志行必须带 60s 保护字段（heldMs=实际持续 / holdMs=判定窗口）
+  assert.match(hit.reason, /；heldMs=60000 holdMs=60000$/);
 
   // 同 key 继续命中：保持 auth，且窗口起点不变（连续窗口）
   clock.advance(30_000);
   const still = applyWith(mon, urlOnlyEvidence());
   assert.equal(still.kind, 'auth');
+  assert.match(still.reason, /；heldMs=90000 holdMs=60000$/, 'heldMs 随持续时长增长，holdMs 恒为 60000');
   const w = mon._authEvidenceWatchFor(SHOP.id);
   assert.ok(w && w.key === LOGIN_KEY && w.kind === 'url');
 });
@@ -364,6 +369,7 @@ test('H9 真实 catch：URL-only <60s → blocked=read_failed；≥60s → block
   assert.equal(re.kind, 'auth');
   assert.equal(re.requiresLogin, true);
   assert.equal(re.hint, '登录已失效，请重新登录');
+  assert.match(re.reason, /；heldMs=61000 holdMs=60000$/, '端到端 auth 日志行同样带 60s 保护字段');
   assert.ok(calls >= 1);
 });
 

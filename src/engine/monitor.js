@@ -43,6 +43,7 @@ const { mapAdStateFromAdList, mapAdStateFromSwitchRows, normalizeAdState } = req
 const { discoverShopsFromCookies } = require('./shop-discovery');
 const guard = require('./guard');
 const { NotConnectedError, AuthError } = require('../lib/errors');
+const { buildHoldLogFields } = require('../login/auth-failure-text');
 const { shanghaiDate, shanghaiClockText, shanghaiWall, shanghaiMs, isAfterDailyStart, msUntilDailyStart, msUntilHour, msUntilFirstCheck, nextIntervalDelayMs } = require('../lib/time');
 const { centsToYuan } = require('../lib/money');
 const log = require('../lib/log');
@@ -3279,7 +3280,19 @@ class Monitor {
         loginUrlObserv = { key: w.key, kind: w.kind, heldMs: Math.max(0, this.nowFn() - w.firstSeenAt), holdMs: AUTH_LOGIN_URL_HOLD_MS };
       }
     }
-    const reason = baseReason;
+    // fix4（2026-11-03）：只在**已确认 auth** 的日志行追加 60s 保护字段，纯日志、不改判定：
+    // heldMs 与 loginUrlObserv.heldMs 同源（now - firstSeenAt），holdMs=AUTH_LOGIN_URL_HOLD_MS。
+    let holdLogFields = '';
+    if (kind === 'auth') {
+      const w = this._authEvidenceWatchFor(shopId);
+      if (w) {
+        holdLogFields = buildHoldLogFields({
+          heldMs: Math.max(0, this.nowFn() - w.firstSeenAt),
+          holdMs: AUTH_LOGIN_URL_HOLD_MS,
+        });
+      }
+    }
+    const reason = `${baseReason}${holdLogFields}`;
     // fix3-four 路径（authClosure 证据随错误交付）：对外提示不含扫码类结论，结案/未结案分列。
     const fix3Auth = kind === 'auth' && !!(err && err.authClosure);
     const hint = fix3Auth

@@ -31,8 +31,7 @@ const { createPromoReaderNotConnected, createMockPromoReader } = require('../ada
 const { createAdControllerNotConnected, createMockAdController } = require('../adapters/ad-controller');
 const { WholeShopCloseCoordinator } = require('./close-coordinator');
 const { ChengfangRunner, defaultChengfangOpener } = require('./chengfang-runner');
-const { readQianchuanBalanceInPage, balanceCentsFromPageResult, readChengfangCleanupEvidence, readChengfangCleanupHandle, verifyChengfangReadOnlyEmpty } = require('../adapters/chengfang-reader');
-const { resourceNotCreatedProof } = require('../lib/resource-attestation');
+const { readQianchuanBalanceInPage, balanceCentsFromPageResult, readChengfangCleanupEvidence, verifyChengfangReadOnlyEmpty } = require('../adapters/chengfang-reader');
 const { resolvePollingConfig } = require('../lib/bounded-poll');
 const { evidenceCode, isEmptyTableCode } = require('../lib/empty-inventory-evidence');
 const { resolveChengfangRealAllowed, resolveChengfangEnableAllowed, resolveFirstCheckMinuteOfDay, firstCheckTimeText } = require('./chengfang-gate');
@@ -53,24 +52,12 @@ const STATE_VERSION = 2;
 // 首查未完成/未确认时的有界重试节奏（与独立每日开启调度器 _enableLoop 的 RETRY_MS 一致）。
 const ENABLE_RETRY_MS = 5 * 60 * 1000;
 // fix2 有界收口：旧 enable 动作停在 unknown 串行门、且本轮回读始终 mixed（无法确认目标 on）时，
-// 到达下列任一上限即按「未确认终态」结案（unknown_expired，confirmed 恒 false）并释放串行门，
+// 等待达到下列上限即按「未确认终态」结案（unknown_expired，confirmed 恒 false）并释放串行门，
 // 今日不再自动补点——禁止无限等待一个永远无法核验的旧动作。
-const SERIAL_GATE_MAX_ATTEMPTS = 3;
 const SERIAL_GATE_MAX_WAIT_MS = 30 * 60 * 1000;
-// 有限恢复周期（2026-10-18 F4-R8，用户口径）：首次读取不算；连续失败最多重试 10 次，
-// 每 2 次一组，组内可立即，组结束后至少等待 5 分钟再下一组（等待从该组末次完成时算起）。
-// 物理完整回读 = 首次 1 + 重试 10 = 11 次；满 10 后该链停止，不再自行第 11 次。
-const READ_RECOVERY_MAX_RETRIES = 10;
-const READ_RECOVERY_GROUP_SIZE = 2;
-const READ_RECOVERY_GROUP_WAIT_MS = 5 * 60 * 1000; // 300000ms
 // fix3 对照店 checkLogin 的对照上限：串行窗口内最多启动 2 家已配置且 cookie 可用的对照店
 // （每次一个新浏览器进程，checkLoginByBrowser 自带 finally 关闭）。都不通过 → 未结案。
 const AUTH_CONTROL_MAX_SHOPS = 2;
-// 收口门有界探测节奏（2026-10-23 DIAN-4 长期 unknown 门修复）：探测**只做收口**（等待 work
-// settle、关闭已登记会话、凭句柄真实关闭并独立核验连接），绝不发起读取、绝不开新 opener。
-// 1s→5s→30s 三次探测都拿不到"已证明关闭/已证明未创建"就转 terminal：门保持阻断、需人工处置；
-// 绝不按时间盲放行（无证明就放行等于在没有关闭证明时启动新读取）。
-const READ_GATE_PROBE_DELAYS_MS = Object.freeze([1000, 5000, 30000]);
 // 传输层网络失败（Chromium/Playwright net::ERR_* 与底层 socket 错误码）：与页面内容、登录态、
 // 清单完整性无关的瞬时链路故障（连接被关闭/重置、断网、DNS 解析失败、socket hang up 等）。
 // 这类原因必须由同轮一次重读 + 每店有限恢复链接管，否则本店挂到下一个 30 分钟周期。
@@ -139,12 +126,6 @@ class Monitor {
     this._onPollComplete = typeof opts.onPollComplete === 'function' ? opts.onPollComplete : null;
     this.delayFn = opts.delayFn || ((ms) => this._chunkedDelay(ms));
     this._injectedDelayFn = opts.delayFn || null; // 测试可控时钟：开启调度循环复用同一时钟门
-    // 有限恢复链的可注入 timer（测试用 fake clock；生产即全局 setTimeout/clearTimeout）。
-    this._setTimeoutFn = opts.setTimeoutFn || ((fn, ms) => setTimeout(fn, ms));
-    this._clearTimeoutFn = opts.clearTimeoutFn || ((h) => clearTimeout(h));
-    this._readRecoveries = new Map(); // shopId -> 每店独立的活动恢复链（内存态；绝不持久化 timer/句柄）
-    this._readRecoverySeq = 0;
-    this._readAttemptSeq = 0; // 实际发起物理读取的次数（恢复链据此只对真实读取计数）
     // AUTH-60S FINAL：shopId -> { key, kind, firstSeenAt }（正向证据连续观测窗口；
     // loginUrl 的 key 用 origin+pathname，纯强 UI 用稳定伪 key ui:form/ui:control/ui:dialog；
     // 同 key 连续命中保持起点，key 变化/离开正向证据/读取成功即清除，中断不累计）。
@@ -162,18 +143,6 @@ class Monitor {
     this._coordinators = new Map(); // shopId -> WholeShopCloseCoordinator（跨周期保留在途请求登记）
     this._chengfangRunners = new Map(); // shopId -> ChengfangRunner（乘方主链路）
     this._chengfangOpener = opts.chengfangOpener || null; // 测试注入：本地 DOM fixture 会话开启器
-    // 每店回读收口门（2026-10-18 状态未知修复）：读取许可按店隔离（他店门不拦本店新读取）。
-    // D24S（2026-10-29 用户一次一家店要求，主脑否决 D24R 跨周期豁免）：只要有**任何**他店的
-    // 真实资源收口未证明，就不启动下一家店（见 _cycleNewCleanupBlocker）——登记簿/门是
-    // 唯一事实源，与门的登记周期新旧无关；不得为"防饿死"虚构清理或提前放行。
-    // 旧属性 _pendingReadGate 仅保留兼容别名。
-    this._pendingReadGates = new Map();
-    this._pendingReadGate = null;
-    this._readGateSeq = 0; // gateId 单调递增：清门只做身份 CAS，迟到 epoch 不得清掉新门
-    // 收口登记簿与"当前门"分离（2026-10-23 r13 缺口 3）：当前门只代表**读取许可**（是否允许新开
-    // opener），登记簿代表**尚未证明收口的真实资源**（旧 epoch 的句柄/会话也必须关闭并核验）。
-    this._cleanupRegistry = new Map(); // shopId -> 未收口门数组（登记顺序）
-    this._readPermits = new Map(); // shopId -> 队列尾 promise（每店读取许可：推进→CAS→opener 串行）
     // 决策层 + 串行门外层（2026-09-22）：每日 07:00 开启 / 低于阈值开启 / 高于阈值暂停统一入口
     this._readAdState = opts.readAdState || null; // 测试注入：本轮回读 currentAdState
     this._switchOrchestrator = opts.switchOrchestrator || null; // 测试注入
@@ -339,26 +308,6 @@ class Monitor {
   }
 
   /**
-   * fix2：登记一次「serial_gate / ad=mixed 未收口」尝试（持久化，供有界收口判定）。
-   * 只累计次数/首末时刻/最近观测，**不改相位状态**（状态仍由本轮真实结果落账）。
-   * @returns {number} 当日累计尝试次数
-   */
-  _noteSerialGateAttempt(shopId, date, observedState) {
-    if (!this.enablePhase[shopId]) this.enablePhase[shopId] = {};
-    const nowIso = new Date(this.nowFn()).toISOString();
-    if (!this.enablePhase[shopId][date]) {
-      this.enablePhase[shopId][date] = { status: 'in_progress', at: nowIso };
-    }
-    const rec = this.enablePhase[shopId][date];
-    rec.serialGateAttempts = (Number(rec.serialGateAttempts) || 0) + 1;
-    rec.serialGateFirstAt = rec.serialGateFirstAt || nowIso;
-    rec.serialGateLastAt = nowIso;
-    rec.serialGateObserved = observedState || null;
-    this._saveState();
-    return rec.serialGateAttempts;
-  }
-
-  /**
    * fix2：serial_gate / ad=mixed 的**有界收口**判定与执行。
    *
    * 触发前提（全部满足才可能收口）：
@@ -367,13 +316,13 @@ class Monitor {
    *      该入口不可用时同样按槽位事实判定，不得因核验链缺失而永久阻塞）；
    *   3) 本轮回读严格为 mixed（旧 enable 目标 on 无法确认，也不是全量 off 可结案）；
    *   4) 槽位仍是 unknown、未结束、且 action=enable；
-   *   5) 当日尝试次数 ≥ SERIAL_GATE_MAX_ATTEMPTS 或 槽位等待 ≥ SERIAL_GATE_MAX_WAIT_MS。
+   *   5) 槽位等待 ≥ SERIAL_GATE_MAX_WAIT_MS。
    *
    * 收口语义：走 gate.expireUnknown（settledAs=unknown_expired，confirmed 恒 false）——
    * 只结束无限阻塞，不声明目标达成、不声明历史点击因果；本轮零点击，今日不再自动补点。
-   * 未达上限则只累计次数并返回 null（保持既有 unknown 有界重试）。
+   * 未达等待上限则返回 null（保持既有 unknown 有界重试）。
    *
-   * @returns {null|{actionId:string, attempts:number, waitedMs:number, reason:string}}
+   * @returns {null|{actionId:string, waitedMs:number, reason:string}}
    */
   _expireUnresolvedSerialGateIfBounded(shopCfg, today, unknownResolve, observedState, source) {
     if (source === 'manual_verify') return null;
@@ -385,14 +334,12 @@ class Monitor {
     const slot = orch.peek(shopCfg.id);
     if (!slot || slot.unknown !== true || slot.settled === true || slot.action !== 'enable') return null;
 
-    const attempts = this._noteSerialGateAttempt(shopCfg.id, today, observedState);
     const startedAt = Number(slot.startedAt);
     const waitedMs = Number.isFinite(startedAt) ? Math.max(0, this.nowFn() - startedAt) : 0;
-    const maxAttempts = Number(this._serialGateMaxAttempts) || SERIAL_GATE_MAX_ATTEMPTS;
     const maxWaitMs = Number(this._serialGateMaxWaitMs) || SERIAL_GATE_MAX_WAIT_MS;
-    if (attempts < maxAttempts && waitedMs < maxWaitMs) return null;
+    if (waitedMs < maxWaitMs) return null;
 
-    const reason = `serial_gate 有界收口：旧 enable 动作 ${slot.actionId} 在 ${attempts} 次尝试 / 等待 ${Math.round(waitedMs / 60000)} 分钟后结果仍未确认（本轮回读 mixed，既不能确认目标 on，也不是全量 off 可结案）；按「未确认终态」结案（unknown_expired，未确认、不声明历史点击因果）并释放串行门，本轮零点击、今日不再自动补点，下次开启窗口按新鲜回读重新判定`;
+    const reason = `serial_gate 有界收口：旧 enable 动作 ${slot.actionId} 等待 ${Math.round(waitedMs / 60000)} 分钟后结果仍未确认（本轮回读 mixed，既不能确认目标 on，也不是全量 off 可结案）；按「未确认终态」结案（unknown_expired，未确认、不声明历史点击因果）并释放串行门，本轮零点击、今日不再自动补点，下次开启窗口按新鲜回读重新判定`;
     const r = orch.expireUnknownSlot(shopCfg.id, slot.actionId, {
       reason,
       actions: ['enable'],
@@ -401,17 +348,17 @@ class Monitor {
     if (!r || r.ok !== true) {
       this._audit({
         kind: 'ad-switch', step: 'serial-gate-bounded', shopId: shopCfg.id, ok: false,
-        actionId: slot.actionId, attempts, waitedMs,
+        actionId: slot.actionId, waitedMs,
         reason: `有界收口未生效（保持阻塞）：${(r && r.reason) || '未知'}`,
       });
       return null;
     }
     this._audit({
       kind: 'ad-switch', step: 'serial-gate-bounded', shopId: shopCfg.id, ok: true,
-      actionId: slot.actionId, attempts, waitedMs, observedAdState: observedState,
+      actionId: slot.actionId, waitedMs, observedAdState: observedState,
       settledAs: 'unknown_expired', confirmed: false, reason,
     });
-    return { actionId: slot.actionId, attempts, waitedMs, reason };
+    return { actionId: slot.actionId, waitedMs, reason };
   }
 
   /**
@@ -517,10 +464,9 @@ class Monitor {
   /**
    * fix3：对照店 checkLogin（排除代码误判/全局登录失效）。
    *
-   * 调用窗口由读取器保证：当前店店铺浏览器已关闭并获证明后才进入恢复链，且巡查跨店严格
-   * 串行（下一家店尚未启动）。此处再做一次窗口断言：只要有他店处理在途/收口未证明，
-   * 即保持 fail-closed（不结案）。对照店必须已配置、未删除、cookie 文件可解析且未过期；
-   * checkLogin 用独立浏览器进程，函数返回前必然关闭。
+   * 调用窗口由读取器保证：当前店店铺浏览器已关闭并获证明后才进入恢复链。
+   * 跨店互不阻塞（他店处理在途不影响本店对照检查）。对照店必须已配置、未删除、
+   * cookie 文件可解析且未过期；checkLogin 用独立浏览器进程，函数返回前必然关闭。
    *
    * @returns {Promise<{ok:boolean, reason:string, shop:string|null}>}
    */
@@ -531,10 +477,6 @@ class Monitor {
       this._audit({ kind: 'auth-closure', step: 'control-check', shopId: selfId, shopSafeName, ok: false, reason });
       return { ok: false, reason, shop: null };
     };
-    const other = selfId ? this._otherBusyOrUnprovenShop(selfId) : null;
-    if (other) {
-      return fail(`对照店检查窗口不成立：店 ${other} 处理在途/收口未证明（不结案）`);
-    }
     const loginCfg = this.config.login || {};
     const shops = (this.config.shops || [])
       .filter((s) => s && s.deleted !== true && s.cookieFile && String(s.id) !== selfId)
@@ -955,10 +897,6 @@ class Monitor {
     if (this.running) return { ok: true, alreadyRunning: true, activeShopCount };
     this._gen += 1;
     this.running = true;
-    // 代数变化：上一代遗留的恢复等待/迟到结果一律取消，绝不跨代继续打开页面或覆盖新状态。
-    this._cancelAllReadRecoveries('generation-change');
-    // 上一代遗留的收口门继续有效（句柄仍在、只是尚未证明收口）：恢复其有界收口探测。
-    this._resumeReadGateProbes();
     this.startedAt = new Date(this.nowFn()).toISOString();
     const gen = this._gen;
     this._audit({ kind: 'monitor', event: 'start', mode: this.modeLabel, activeShopCount });
@@ -970,10 +908,6 @@ class Monitor {
   stop() {
     this._gen += 1;          // 使旧循环退出、旧 delay 中断（仅暂停巡查循环）
     this.running = false;
-    // 停止值守：取消本店恢复链的等待 timer；在途读取的迟到结果由代数/取消标记丢弃，不再打开页面。
-    this._cancelAllReadRecoveries('monitor-stop');
-    // 收口门：停 timer 但**保留门**（阻断事实跨 stop/start 不丢），start() 再续有界探测。
-    this._pauseAllReadGateProbes('monitor-stop');
     // 停止在途**暂停巡查**周期：周期内不再发起新的关闭请求（已发出的继续回读确认）。
     // 按动作区分令牌：每日开启（kind:'enable'）不受"停止值守"影响——它是独立任务。
     for (const t of this._activeTokens) if (t.kind !== 'enable') t.aborted = true;
@@ -1122,8 +1056,8 @@ class Monitor {
    * 00:05 之后启动时 nextRunAt=now（已到点），立即判断当日是否已完成：已完成（per-shop+date
    * success）→ 登记次日 00:05；未完成 → 立即首查（晚开机补检查）。
    * 执行后：全部 success → 登记次日 firstCheckTime；仍有未完成 → 5 分钟后有界重试（跨日自然停）。
-   * 与暂停巡查循环（_intervalLoop）并存：共享 _cycleRunning 互斥与执行器，
-   * 但生命周期独立——"停止值守"不影响本循环。
+   * 与暂停巡查循环（_intervalLoop）并存；生命周期独立——"停止值守"不影响本循环。
+   * 并发安全由每店 _shopProcessing 互斥保证，不再使用全局周期布尔（批次二收敛）。
    */
   async _enableLoop(gen) {
     const sch = this.config.schedule;
@@ -1148,11 +1082,6 @@ class Monitor {
       if (windowOpen && arrived) {
         if (shopsToRun.length > 0) {
           this._enableSchedule.phase = 'enable_window';
-          if (this._cycleRunning) {
-            // 与暂停/其他周期互斥：绝不并发执行，稍后重试（仍在窗口内会继续处理）
-            await this._enableDelay(5000, gen);
-            continue;
-          }
           try {
             await this._runEnablePhase(gen, today);
             this._enableSchedule.lastRunAt = new Date(this.nowFn()).toISOString();
@@ -1214,23 +1143,18 @@ class Monitor {
   }
 
   /**
-   * 每日相位调度（2026-10-09 R1）：
-   * - 首查窗口 [firstCheckTime, 当日结束]：每天一次自动开启（跨日重置，持久化见 this.enablePhase）；
-   *   执行后直接进入费比巡查（不再等待 dailyStartHour；客户要求首查后立即费比控制）。
-   *   仅当独立调度器未运行（enableRunning=false）且未被用户独立停用时由本循环兜底；
-   *   调度器运行时本循环在窗口内直接进入巡查，避免双循环重复开启。
+   * 费比暂停巡查循环（2026-10-09 R1，S2 2026-11-08）：
    * - 费比巡查无首查/时段门槛：启动即查，之后严格按 intervalMinutes；跨日也不等待固定时刻。
-   * - 每日开启只是独立相位，成功、失败或未完成都不得阻塞费比暂停巡查。
+   * - 每日开启是独立相位，统一由独立 _enableLoop 调度，本循环不承载任何开启路径。
    * 停止/重启通过代数防止多循环；所有等待用 delayFn（可注入时钟门）。
    */
   async _intervalLoop(gen) {
     const sch = this.config.schedule;
     const enableWindow = this._enableWindowConfigured();
-    // R5：nextPatrolDueMs 是本循环"所有分支共享"的已完成店费比巡查到期时刻（绝对 ms）。
+    // R5：nextPatrolDueMs 是本循环的已完成店费比巡查到期时刻（绝对 ms）。
     // 规则：
-    //  0 = 尚未建立 → 首次有机会（窗口开启）立即巡查一次；
-    //  任何分支转入费比巡查前都必须先检查 due；未到点绝不 pollOnce（不拉已完成店费用/订单/广告、不派发动作）；
-    //  首查尝试/重试"只决定较早唤醒去重试 pending"，绝不改动/提前该到期，也绝不让已完成店提前 poll；
+    //  0 = 尚未建立 → 首次有机会立即巡查一次；
+    //  未到点绝不 pollOnce（不拉已完成店费用/订单/广告、不派发动作）；
     //  仅"实际完成一次费比 poll"后按 intervalMinutes 更新到期；
     //  外部阈值重排（_scheduleEpoch 变化）把到期 rebase 到最新 schedule.nextRunAt 的"精确目标"（不用 min，
     //  以免保留已过时的旧到期 → R5-2）。
@@ -1238,48 +1162,10 @@ class Monitor {
     let nextPatrolDueMs = 0;
     while (gen === this._gen && this.running) {
       const now = this.nowFn();
-      const w = shanghaiWall(now);
-      // 值守回退路径：首查窗口内、独立每日调度器未接管（enableRunning=false）、且未被用户独立停用。
-      const enableFallbackActive = enableWindow && this._dailyFirstCheckOpen(w) && !this.enableRunning && this._enableSchedule.stoppedByUser !== true;
-
-      // ── 首查窗口（回退）：只处理"未完成店的每日开启/有界重试"，绝不在这里 poll 费比 ──
-      if (enableFallbackActive) {
-        const today = w.date;
-        const shopsToRun = this._activeShops().filter((s) => !this._enablePhaseDone(s.id, today));
-        if (shopsToRun.length > 0) {
-          this.schedule.phase = 'enable_window';
-          this.schedule.waitingFor08 = false;
-          try {
-            await this._runEnablePhase(gen, today, { scope: 'pause' });
-          } catch (e) {
-            this._memPush(this.recentErrors, { scope: 'cycle', error: `乘方自动开启相位失败：${e.message}` }, undefined, 'error');
-          }
-          if (gen !== this._gen || !this.running) return;
-          const afterMs = this.nowFn();
-          const afterWall = shanghaiWall(afterMs);
-          if (afterWall.date !== w.date) {
-            // 跨日（含虚拟时钟快进）：不做固定等待，回环让下一轮按次日相位重新判定
-            this.schedule.lastWindowBlockReason = `开启相位执行至 ${shanghaiClockText(afterMs)}，已跨日，重新判定下次相位`;
-            continue;
-          }
-          const activeShops = this._activeShops();
-          const pendingNow = activeShops.filter((s) => !this._enablePhaseDone(s.id, today));
-          if (pendingNow.length > 0) {
-            this.schedule.lastWindowBlockReason = `${pendingNow.length} 家每日开启未完成；不阻塞费比暂停巡查，稍后独立重试`;
-          }
-          // 不论每日开启是否完成，都落入下方费比巡查；暂停优先级最高。
-          this.schedule.waitingFor08 = false;
-        }
-      }
-
       // 费比暂停巡查无每日窗口门槛：启动即查，之后只按 intervalMinutes 节流。
+      // 每日开启统一由独立 _enableLoop 调度，本循环不再承载开启路径。
       this.schedule.phase = 'running';
       this.schedule.waitingFor08 = false;
-
-      // 是否仍有未完成店（仅回退混合轮有意义）→ 只决定"是否提前唤醒重试 pending"，不影响已完成店到期。
-      const pendingRemain = enableFallbackActive
-        ? this._activeShops().filter((s) => !this._enablePhaseDone(s.id, w.date)).length
-        : 0;
 
       // 到期才实际巡查（pollOnce 内部按店首查安全门禁：pending 店 window_blocked/零广告写入，done 店正常费比）。
       const dueNow = nextPatrolDueMs === 0 || now >= nextPatrolDueMs;
@@ -1300,14 +1186,11 @@ class Monitor {
         this.schedule.lastRunAt = new Date(lastRun).toISOString();
         // 完成一次真实费比巡查后严格按配置间隔更新；跨日不等待首查或 dailyStartHour。
         nextPatrolDueMs = lastRun + (sch.intervalMinutes * 60 * 1000);
-      } else if (pendingRemain > 0) {
-        this.schedule.lastWindowBlockReason = `${pendingRemain} 家未完成店 ${Math.round(ENABLE_RETRY_MS / 60000)} 分钟有界重试等待中；已完成店费比巡查未到点（下次 ${new Date(nextPatrolDueMs).toISOString()}），不提前拉取`;
       }
 
-      // 下一次唤醒：默认到费比巡查到期；若仍有 pending（回退混合）→ 提前到 min(到期, 5 分钟重试) 仅重试 pending。
+      // 下一次唤醒：到费比巡查到期。
       const nowAfter = this.nowFn();
-      let wakeMs = nextPatrolDueMs;
-      if (pendingRemain > 0) wakeMs = Math.min(nextPatrolDueMs, nowAfter + ENABLE_RETRY_MS);
+      const wakeMs = nextPatrolDueMs;
       const waitMs = Math.max(0, wakeMs - nowAfter);
       const epochBefore = this._scheduleEpoch || 0;
       this.schedule.nextRunAt = new Date(wakeMs).toISOString();
@@ -1412,19 +1295,6 @@ class Monitor {
           results[idx] = { shopId: shopCfg.id, status: 'skipped', reason: '店铺已删除，跳过值守/轮询' };
           return;
         }
-        // D24S 跨店串行启动门：任何他店的真实资源（浏览器/会话）收口未证明 →
-        // 本店不启动，如实 skipped 顺延；实际关闭证明后由后续周期正常处理，绝不伪造完成。
-        // 登记簿与门是唯一事实源，与登记周期新旧无关（跨周期遗留门同样阻断）。
-        const cleanupBlocker = this._cycleNewCleanupBlocker(shopCfg.id);
-        if (cleanupBlocker) {
-          results[idx] = {
-            shopId: shopCfg.id,
-            status: 'skipped',
-            reason: `店 ${cleanupBlocker} 的真实资源收口未证明，本轮顺延不并发启动；待实际关闭证明后下一周期处理`,
-          };
-          this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'skipped', reason: 'serial-cleanup-blocked', blockedBy: cleanupBlocker });
-          return;
-        }
         // 同店处理互斥（WD-NEW-1 并发收口）：该店正被登录接管/每日开启/手动验证处理 → 本轮跳过
         // （零派发、如实记录；不阻塞其他店铺；该店由在途处理负责，下一轮常规巡查再核）
         if (this._shopBusy(shopCfg.id)) {
@@ -1434,20 +1304,6 @@ class Monitor {
         }
         if (!this._tryAcquireShop(shopCfg.id)) {
           results[idx] = { shopId: shopCfg.id, status: 'skipped', reason: '同店处理互斥获取失败（并发防御），本轮跳过' };
-          return;
-        }
-        // D24T 跨入口一次一家店：任何他店已在处理在途（_shopProcessing，如手动验证/只读
-        // 刷新/登录接管在周期外取得的每店锁）→ 本店不启动，如实 skipped 顺延；待其处理
-        // 结束后下一周期处理。只拦新业务启动：收口探测/恢复链关闭自有资源不经此门，照常推进。
-        const otherBusy = this._otherBusyOrUnprovenShop(shopCfg.id);
-        if (otherBusy) {
-          this._releaseShop(shopCfg.id);
-          results[idx] = {
-            shopId: shopCfg.id,
-            status: 'skipped',
-            reason: `店 ${otherBusy} 处理在途（一次一家店，跨店串行），本轮顺延不并发启动；待其处理结束后下一周期处理`,
-          };
-          this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'skipped', reason: 'serial-other-shop-busy', blockedBy: otherBusy });
           return;
         }
         try {
@@ -1995,40 +1851,6 @@ class Monitor {
     if (this.pending.length > 0) {
       return { ok: false, reason: `存在待配置/非法配置项，不允许更新: ${this.pending.join('；')}` };
     }
-    // 同店互斥：恢复链正在执行物理读取时，手动刷新不得叠加另一路读取（返回真实进度，稍后可再试）。
-    const activeRec = this._readRecoveryFor(shopId);
-    if (activeRec && activeRec.phase === 'running') {
-      const view = this._readRecoveryView(shopId);
-      return {
-        ok: true, readOnly: true, shopId, adState: 'unknown',
-        blocked: 'recovery_inflight',
-        reason: `本店有限恢复执行中（${view.attempts}/${view.maxRetries}），本次手动更新未叠加新读取`,
-        readRecovery: view, zeroClick: true,
-      };
-    }
-    // 用户手动更新可重置恢复事件：先取消旧链的等待 timer，再按本次真实读取重新开始。
-    this._clearReadRecovery(shopId, 'manual-refresh');
-    // D24R 跨入口串行：巡查/每日开启周期进行中时，即使目标店不同也不叠加并发处理
-    // （同店在途仍走下方 shop_busy 既有语义，返回真实进度）。如实 blocked，稍后可重试。
-    if (this._cycleRunning && !this._shopBusy(shopId)) {
-      return {
-        ok: true, readOnly: true, shopId, adState: 'unknown',
-        blocked: 'cycle_busy',
-        reason: '巡查/每日开启周期进行中（跨店串行），本次手动更新未执行，稍后可重试',
-        zeroClick: true,
-      };
-    }
-    // D24S 周期外同样串行：他店仍在处理在途或真实资源收口未证明 → 复用既有 busy 响应，
-    // 不叠加新的并发处理；待在途处理结束/收口实际证明后可重试。同店在途仍走下方 shop_busy。
-    const otherBusy = this._otherBusyOrUnprovenShop(shopId);
-    if (otherBusy && !this._shopBusy(shopId)) {
-      return {
-        ok: true, readOnly: true, shopId, adState: 'unknown',
-        blocked: 'shop_busy',
-        reason: `店 ${otherBusy} 处理在途/真实资源收口未证明（一次一家店，跨店串行），本次手动更新未执行，稍后可重试`,
-        zeroClick: true,
-      };
-    }
     // D24 逐店串行（跨入口收口）：目标店正被巡查周期/每日开启/登录接管在途处理时，
     // 本只读刷新不叠加并发同店处理，如实返回可稍后重试（复用既有每店处理互斥，不另造锁）。
     if (!this._tryAcquireShop(shopId)) {
@@ -2205,19 +2027,6 @@ class Monitor {
     if (!this._isShopActive(shopId)) {
       return { ok: false, status: 'blocked', reason: '店铺已删除或停用，不再值守（软删除不复活）', deleted: shopCfg.deleted === true };
     }
-    // 明确新会话/用户登录接管可重置恢复事件：取消旧链等待 timer，避免与本次接管叠加。
-    this._clearReadRecovery(shopId, 'login-takeover');
-    // D24R 跨入口串行：巡查/每日开启周期进行中时，即使目标店不同也不叠加并发处理；
-    // 同店在途保留下方既有有界等待语义。如实 skipped（零动作），常规巡查稍后处理该店。
-    if (this._cycleRunning && !this._shopBusy(shopId)) {
-      return { ok: false, status: 'skipped', reason: '巡查/每日开启周期进行中（跨店串行），本次立即处理未派发；常规巡查会处理该店' };
-    }
-    // D24S 周期外同样串行：他店仍在处理在途或真实资源收口未证明 → 如实 skipped（零动作），
-    // 复用既有跨店 busy 语义；待在途处理结束/收口实际证明后常规巡查会处理该店。
-    const otherBusy = this._otherBusyOrUnprovenShop(shopId);
-    if (otherBusy && !this._shopBusy(shopId)) {
-      return { ok: false, status: 'skipped', reason: `店 ${otherBusy} 处理在途/真实资源收口未证明（一次一家店，跨店串行），本次立即处理未派发；常规巡查会处理该店` };
-    }
     // 同店处理互斥：目标店正在被处理 → 有界等待释放；等待结束后先复核 running，再取得资格
     if (this._shopBusy(shopId)) {
       const sch = this.config.schedule || {};
@@ -2232,15 +2041,7 @@ class Monitor {
         return { ok: false, status: 'skipped', reason: '目标店处理长时间未释放，本次立即处理未派发（店铺已在列表，常规巡查会处理）' };
       }
     }
-    // D24T 等待期间复核：有界等待本店释放的 await 间隙里，他店入口可能已取得处理权
-    //（或周期已启动）。取得资格前重查跨店串行门，绝不让两个入口同时各持一家店。
-    if (this._cycleRunning && !this._shopBusy(shopId)) {
-      return { ok: false, status: 'skipped', reason: '巡查/每日开启周期进行中（跨店串行），本次立即处理未派发；常规巡查会处理该店' };
-    }
-    const otherBusyNow = this._otherBusyOrUnprovenShop(shopId);
-    if (otherBusyNow && !this._shopBusy(shopId)) {
-      return { ok: false, status: 'skipped', reason: `店 ${otherBusyNow} 处理在途/真实资源收口未证明（一次一家店，跨店串行），本次立即处理未派发；常规巡查会处理该店` };
-    }
+    // D24T 等待期间复核：取得资格前重新尝试同店锁，绝不让两个入口同时各持一家店。
     if (!this._tryAcquireShop(shopId)) {
       return { ok: false, status: 'skipped', reason: '该店已有处理在途（并发去重）' };
     }
@@ -2377,10 +2178,6 @@ class Monitor {
       this._audit({ kind: 'shop-delete', shopId, ok: false, reason: persist.reason, persisted: false, rolledBack: true });
       return { ok: false, reason: persist.reason, rolledBack: true, persisted: false };
     }
-    // 删除店：取消该店恢复链等待 timer；迟到结果按 cancelled 丢弃，绝不打开页面或覆盖新状态。
-    this._cancelReadRecovery(shopId, 'shop-deleted');
-    // 该店已登记的收口门保留：探测只做关闭/核验（不是读取），已创建的浏览器仍须真实关闭。
-    this._noteReadGateForDeletedShop(shopId);
     // 绝不 abort 其他店的在途令牌；只在后续动作入口复核 _isShopActive
     this._audit({
       kind: 'shop-delete',
@@ -2576,740 +2373,13 @@ class Monitor {
     return /末页已读行数\s*\d+\s*与\s*total\s*\d+\s*不一致|分页 total 不一致|导航"乘方"未到达管理页|乘方页未找到.*子标签|刷新后未能恢复商品计划视图|回读前刷新乘方管理页失败|乘方「[^」]+」刷新失败/.test(reason);
   }
 
-  _pendingReadGateFor(shopId) {
-    const key = String(shopId);
-    if (this._pendingReadGates && this._pendingReadGates.has(key)) return this._pendingReadGates.get(key);
-    if (this._pendingReadGate && String(this._pendingReadGate.shopId) === key) return this._pendingReadGate;
-    return null;
-  }
-
-  _hasPendingReadGate(shopId) {
-    // 判定按**收口登记簿**（r13 缺口 3）：只要本店还有任何一条未证明收口的旧 epoch（哪怕当前门
-    // 已被更新的读取替换），都必须视为"存在未收口读取"，不得据此再开物理读取。
-    return this._pendingReadGateFor(shopId) != null || this._hasUnprovenCleanup(shopId);
-  }
-
-  _setPendingReadGate(shopId, gate) {
-    const key = String(shopId);
-    gate.shopId = key;
-    if (!this._pendingReadGates) this._pendingReadGates = new Map();
-    this._pendingReadGates.set(key, gate);
-    this._pendingReadGate = gate;
-  }
-
-  _clearPendingReadGate(shopId) {
-    const key = String(shopId);
-    const gate = this._pendingReadGateFor(key);
-    if (gate) {
-      this._cancelReadGateProbe(gate, 'gate-cleared');
-      // 清门只发生在收口已证明之后：登记簿同步注销，绝不留"已证明却仍被探测"的幽灵条目。
-      this._cleanupUnregister(gate);
-    }
-    if (this._pendingReadGates) this._pendingReadGates.delete(key);
-    if (this._pendingReadGate && String(this._pendingReadGate.shopId) === key) this._pendingReadGate = null;
-  }
-
-  // ── 收口登记簿（r13 缺口 3）────────────────────────────────────────
-  // 登记簿条目 = "本店尚未证明收口的一次真实资源占用"。它与当前门可以不同步：
-  // 新一轮读取可以拿走当前门（许可），旧 epoch 的句柄/会话仍留在登记簿里，
-  // 必须继续被关闭 + isConnected()===false 核验；其业务结果一律丢弃（本就不参与放行）。
-
-  /** 本店仍在收口中的门（登记顺序，最旧在前）。 */
-  _pendingCleanupsFor(shopId) {
-    const list = this._cleanupRegistry && this._cleanupRegistry.get(String(shopId));
-    return Array.isArray(list) ? list.slice() : [];
-  }
-
-  _cleanupRegister(gate) {
-    if (!gate) return false;
-    if (!this._cleanupRegistry) this._cleanupRegistry = new Map();
-    const key = String(gate.shopId);
-    let list = this._cleanupRegistry.get(key);
-    if (!list) { list = []; this._cleanupRegistry.set(key, list); }
-    if (!list.includes(gate)) list.push(gate);
-    return true;
-  }
-
-  /** 只有拿到真实收口证明才注销；注销与"是否仍是当前门"无关。 */
-  _cleanupUnregister(gate) {
-    const key = String(gate && gate.shopId);
-    const list = this._cleanupRegistry && this._cleanupRegistry.get(key);
-    if (!Array.isArray(list)) return false;
-    const i = list.indexOf(gate);
-    if (i < 0) return false;
-    list.splice(i, 1);
-    if (list.length === 0) this._cleanupRegistry.delete(key);
-    this._cancelReadGateProbe(gate, 'cleanup-proven');
-    return true;
-  }
-
-  /** 本店是否还有未收口资源（登记簿视角，比"有无当前门"更严格）。 */
-  _hasUnprovenCleanup(shopId) {
-    return this._pendingCleanupsFor(shopId).length > 0;
-  }
-
-  // ── D24S 跨店串行启动门（2026-10-29 用户一次一家店要求，主脑否决 D24R 跨周期豁免）──
-  // _pendingReadGates/_cleanupRegistry 是"真实资源尚未证明收口"的唯一事实源。
-  // 只要任何他店仍有未证明收口的真实资源，下一家店就不得启动（如实 skipped 顺延，
-  // 待实际关闭证明后由后续周期正常处理，绝不伪造完成、绝不提前放行）。
-  // 门的登记周期新旧不影响判定：跨周期遗留门同样阻断（等待收口是不可避免的真实等待，
-  // 不得用"防饿死"豁免换算成跨店并发）。
-
-  /** 仍有未证明收口资源的店铺 ID 集合（当前门 + 收口登记簿）。 */
-  _unprovenCleanupShopIds() {
-    const ids = new Set();
-    if (this._cleanupRegistry) for (const k of this._cleanupRegistry.keys()) ids.add(k);
-    if (this._pendingReadGates) for (const k of this._pendingReadGates.keys()) ids.add(k);
-    if (this._pendingReadGate && this._pendingReadGate.shopId) ids.add(String(this._pendingReadGate.shopId));
-    return ids;
-  }
-
-  /** 他店中首个"处理在途或真实资源收口未证明"的店铺 ID（无则 null）。
-   *  本店自身不算（同店在途/收口由既有每店互斥与读取许可门负责）。 */
-  _otherBusyOrUnprovenShop(shopId) {
-    const self = String(shopId);
-    if (this._shopProcessing) {
-      for (const k of this._shopProcessing.keys()) if (k !== self) return k;
-    }
-    for (const id of this._unprovenCleanupShopIds()) if (id !== self) return id;
-    return null;
-  }
-
-  /** 阻断启动下一家店的店铺（返回其 id），无阻断返回 null。
-   *  本店自身的门不算（同店阻断由既有读取许可/门逻辑负责）。 */
-  _cycleNewCleanupBlocker(shopId) {
-    for (const id of this._unprovenCleanupShopIds()) {
-      if (id === String(shopId)) continue;
-      return id;
-    }
-    return null;
-  }
-
-  /** 门在登记簿中的位置：-1 = 已注销（收口已证明）。 */
-  _cleanupRegistryIndexOf(gate) {
-    if (!gate) return -1;
-    const list = this._cleanupRegistry && this._cleanupRegistry.get(String(gate.shopId));
-    return Array.isArray(list) ? list.indexOf(gate) : -1;
-  }
-
-  // ── 收口门（2026-10-23 长期 unknown 门最小修复）─────────────────────────
-  // 门的身份三件套：gateId（登记序号）+ readEpoch（登记时物理读取计数）+ 内存 CAS。
-  // 只有"已证明未创建"或"已证明已关闭"才允许清门；否则保持阻断（探测耗尽转 terminal/manual）。
-
-  /** 会话取用：任何异常都按"无会话"处理，绝不据此放行。 */
-  _readGateSession(gate) {
-    if (!gate || typeof gate.sessionRef !== 'function') return null;
-    try { return gate.sessionRef() || null; } catch (_) { return null; }
-  }
-
-  /**
-   * "未创建"证明的所有者（r13 缺口 1）：优先活引用（opener 在截止后才落到失败路径时，
-   * 快照永远停在 null，会把本店永久锁死），其次登记时快照。任何异常/非字符串一律视为无证明。
-   */
-  _readGateNotCreatedOwner(gate) {
-    if (!gate) return null;
-    if (typeof gate.notCreatedRef === 'function') {
-      try {
-        const o = gate.notCreatedRef();
-        if (typeof o === 'string' && o) return o;
-      } catch (_) { /* 读取异常：按无证明处理 */ }
-    }
-    return (typeof gate.notCreatedOwner === 'string' && gate.notCreatedOwner) ? gate.notCreatedOwner : null;
-  }
-
-  /**
-   * 收口句柄取用：句柄是适配器同步登记的**活对象**（close/isConnected 闭包，不可序列化）。
-   * handleRef 让"句柄晚于门才出现"（opener 仍挂账、截止先触发）也能被后续探测看到。
-   */
-  _readGateHandle(gate) {
-    if (!gate) return null;
-    if (typeof gate.handleRef === 'function') {
-      let h = null;
-      try { h = gate.handleRef(); } catch (_) { h = null; }
-      if (h && typeof h === 'object' && typeof h.isConnected === 'function') return h;
-    }
-    const c = gate.cleanupHandle;
-    return (c && typeof c === 'object' && typeof c.isConnected === 'function') ? c : null;
-  }
-
-  /** 登记新门：分配 gateId/readEpoch、审计（只记标量与"有无句柄"）、启动有界收口探测。 */
-  _newReadGate(shopId, fields = {}) {
-    const key = String(shopId);
-    const closes = Array.isArray(fields.closes) ? fields.closes : [];
-    const rc = fields.resourceCreated === false ? false : (fields.resourceCreated === true ? true : null);
-    // 登记时的证明快照（供审计/静态判定）；后续推进仍优先活引用（迟到证明同样有效）。
-    let notCreatedOwner = typeof fields.notCreatedOwner === 'string' && fields.notCreatedOwner ? fields.notCreatedOwner : null;
-    if (!notCreatedOwner && typeof fields.notCreatedRef === 'function') {
-      try {
-        const o = fields.notCreatedRef();
-        if (typeof o === 'string' && o) notCreatedOwner = o;
-      } catch (_) { /* 快照读取异常：留给活引用 */ }
-    }
-    const gate = {
-      gateId: (this._readGateSeq = (this._readGateSeq || 0) + 1),
-      readEpoch: this._readAttemptSeq || 0,
-      shopId: key,
-      workRec: fields.workRec || null,
-      sessionRef: typeof fields.sessionRef === 'function' ? fields.sessionRef : () => null,
-      handleRef: typeof fields.handleRef === 'function' ? fields.handleRef : null,
-      cleanupHandle: fields.cleanupHandle || null,
-      resourceCreated: rc,
-      notCreatedOwner,
-      notCreatedRef: typeof fields.notCreatedRef === 'function' ? fields.notCreatedRef : null,
-      closes,
-      probeIndex: 0,
-      probeTimer: null,
-      probePaused: false,
-      phase: 'pending',
-      advancePromise: null,
-      lastWhy: null,
-      registeredAt: this.nowFn(),
-    };
-    this._setPendingReadGate(key, gate);
-    this._cleanupRegister(gate);
-    try {
-      this._audit({
-        kind: 'ad-state-read', shopId: key, event: 'gate-registered',
-        gateId: gate.gateId, readEpoch: gate.readEpoch, resourceCreated: gate.resourceCreated,
-        notCreatedOwner: gate.notCreatedOwner || null,
-        hasSession: !!this._readGateSession(gate), hasHandle: !!this._readGateHandle(gate),
-        cleanups: this._pendingCleanupsFor(key).length,
-        closes: closes.map((c) => `${c && c.label ? c.label : '?'}:${c && c.closed === true ? 'closed' : (c && c.closed === false ? 'failed' : 'pending')}`),
-      });
-    } catch (_) { /* 审计失败不影响 */ }
-    this._scheduleReadGateProbe(gate);
-    return gate;
-  }
-
-  /** 清门（身份 CAS）：只有传入门仍是该店当前门才清，并取消其探测 timer。 */
-  _clearReadGateIf(shopId, gate, reason) {
-    const key = String(shopId);
-    if (!gate) return false;
-    if (this._pendingReadGateFor(key) !== gate) return false; // 迟到/旧门不得清当前门
-    gate.cancelled = true;
-    gate.clearReason = reason || 'cleared';
-    this._clearPendingReadGate(key);
-    return true;
-  }
-
-  _cancelReadGateProbe(gate, reason) {
-    if (!gate || !gate.probeTimer) return false;
-    try { this._clearTimeoutFn(gate.probeTimer); } catch (_) { /* 清理失败不影响 */ }
-    gate.probeTimer = null;
-    gate.probeCancelReason = reason || 'cancelled';
-    return true;
-  }
-
-  /** 排下一次收口探测（有界 1s→5s→30s）；已 terminal/已暂停/在途则不排；用尽即转 terminal。 */
-  _scheduleReadGateProbe(gate) {
-    if (!gate || gate.phase !== 'pending' || gate.probePaused === true) return false;
-    if (gate.probeTimer) return false;
-    if (this._cleanupRegistryIndexOf(gate) < 0) return false; // 已注销（收口已证明）：不再探测
-    if (gate.probeIndex >= READ_GATE_PROBE_DELAYS_MS.length) { this._markReadGateTerminal(gate, 'probes-exhausted'); return false; }
-    const delay = READ_GATE_PROBE_DELAYS_MS[gate.probeIndex];
-    gate.probeIndex += 1;
-    const timer = this._setTimeoutFn(() => {
-      gate.probeTimer = null;
-      Promise.resolve(this._runReadGateProbe(gate)).catch(() => { /* 探测异常：保持阻断 */ });
-    }, delay);
-    gate.probeTimer = timer;
-    if (timer && typeof timer.unref === 'function') { try { timer.unref(); } catch (_) { /* 不可 unref：忽略 */ } }
-    return true;
-  }
-
-  /** 探测本体：仅推进收口（关闭/核验），零页面动作、零 opener；只有拿到证明才注销。 */
-  async _runReadGateProbe(gate) {
-    if (!gate || gate.phase !== 'pending') return null;
-    // 收口与"是否仍是当前门"无关（r13 缺口 3）：被新门替换的旧 epoch 句柄/会话同样必须关闭，
-    // 绝不再因"已被替换"而放弃收口（旧实现正是在这里让旧浏览器永远挂着）。
-    if (this._cleanupRegistryIndexOf(gate) < 0) return null; // 已注销：本次收口已结束
-    const settleBoundMs = this._adStateMsOption('adStateSettleWaitMs', 5000);
-    const closeWaitMs = this._adStateMsOption('adStateCloseWaitMs', 10000);
-    let adv;
-    try {
-      adv = await this._advanceReadGate(gate, settleBoundMs, closeWaitMs);
-    } catch (e) {
-      adv = { done: false, why: `收口探测异常：${String((e && e.message) || e).slice(0, 120)}` };
-    }
-    if (!adv) adv = { done: false, why: '收口探测无结果' };
-    if (adv.done) {
-      // 证明到手：先注销收口义务（与当前门身份无关），再按身份 CAS 释放读取许可。
-      const unregistered = this._cleanupUnregister(gate);
-      const cleared = this._clearReadGateIf(gate.shopId, gate, adv.proof || 'closed');
-      try { this._audit({ kind: 'ad-state-read', shopId: gate.shopId, event: 'gate-released', gateId: gate.gateId, readEpoch: gate.readEpoch, via: 'probe', proof: adv.proof || 'closed', proofOwner: adv.proofOwner || null, cleared, unregistered, probes: gate.probeIndex }); } catch (_) { /* 审计失败不影响 */ }
-      return adv;
-    }
-    gate.lastWhy = adv.why;
-    try {
-      this._audit({
-        kind: 'ad-state-read', shopId: gate.shopId, event: 'gate-probe',
-        gateId: gate.gateId, readEpoch: gate.readEpoch, probe: gate.probeIndex,
-        resourceCreated: gate.resourceCreated, hasHandle: !!this._readGateHandle(gate),
-        reason: String(adv.why || '').slice(0, 200),
-      });
-    } catch (_) { /* 审计失败不影响 */ }
-    if (this._cleanupRegistryIndexOf(gate) >= 0) this._scheduleReadGateProbe(gate);
-    return adv;
-  }
-
-  /** 探测用尽：转 terminal 并保持阻断（门仍在；后续周期拿到真实证据仍可清门）。 */
-  _markReadGateTerminal(gate, reason) {
-    if (!gate || gate.phase !== 'pending') return false;
-    gate.phase = 'terminal';
-    this._cancelReadGateProbe(gate, reason || 'probes-exhausted');
-    gate.terminalAt = this.nowFn();
-    try {
-      this._audit({
-        kind: 'ad-state-read', shopId: gate.shopId, event: 'gate-terminal',
-        gateId: gate.gateId, readEpoch: gate.readEpoch, probes: gate.probeIndex,
-        reason: String(gate.lastWhy || reason || '').slice(0, 200),
-        note: `有界收口探测（${READ_GATE_PROBE_DELAYS_MS.join('/')}ms）均未证明已关闭或未创建：保持阻断，需人工处置；绝不按时间盲放行`,
-      });
-    } catch (_) { /* 审计失败不影响 */ }
-    this._armReadGateSettleWake(gate);
-    return true;
-  }
-
-  /**
-   * 终态 settle 唤醒（D9G 迟到收口）：探测用尽转 terminal 后底层 work 才 settle 时，
-   * 旧实现要等下一次周期读取才会再推进，期间本店停在 UNKNOWN（资源其实已可证明收口）。
-   * 转 terminal 时挂**一次性** settledP 唤醒（含登记时早已 settle 的情况，settledP 永不
-   * reject）：不是新的轮询服务，只复用既有 _advanceReadGate 的收口证明链（not-created /
-   * 真实关闭+连接核验）。拿到证明才注销登记簿并按身份 CAS 清门；无证明保持阻断，
-   * 零新读取、零 opener、零点击。
-   */
-  _armReadGateSettleWake(gate) {
-    if (!gate || gate.settleWakeArmed) return false;
-    if (!gate.workRec || typeof gate.workRec.settledP.then !== 'function') return false;
-    gate.settleWakeArmed = true;
-    gate.workRec.settledP.then(() => {
-      Promise.resolve(this._runReadGateSettleWake(gate)).catch(() => { /* 唤醒异常：保持阻断 */ });
-    });
-    return true;
-  }
-
-  async _runReadGateSettleWake(gate) {
-    if (!gate) return null;
-    if (this._cleanupRegistryIndexOf(gate) < 0) return null; // 已注销：别处已证明收口（含与探测并发）
-    let adv;
-    try {
-      adv = await this._advanceReadGate(gate, this._adStateMsOption('adStateSettleWaitMs', 5000), this._adStateMsOption('adStateCloseWaitMs', 10000));
-    } catch (e) {
-      adv = { done: false, why: `settle 唤醒收口异常：${String((e && e.message) || e).slice(0, 120)}` };
-    }
-    if (!adv) adv = { done: false, why: 'settle 唤醒收口无结果' };
-    if (!adv.done) {
-      try {
-        this._audit({ kind: 'ad-state-read', shopId: gate.shopId, event: 'gate-settle-wake', gateId: gate.gateId, readEpoch: gate.readEpoch, phase: gate.phase, ok: false, reason: String(adv.why || '').slice(0, 200) });
-      } catch (_) { /* 审计失败不影响 */ }
-      return adv;
-    }
-    if (this._cleanupRegistryIndexOf(gate) < 0) return adv; // await 后复查：与探测/其他唤醒并发时不重复清门
-    // 证明到手（与探测同语义）：先注销收口义务（旧门自己的资源），再按身份 CAS 释放读取许可。
-    const unregistered = this._cleanupUnregister(gate);
-    const cleared = this._clearReadGateIf(gate.shopId, gate, adv.proof || 'closed');
-    try {
-      this._audit({ kind: 'ad-state-read', shopId: gate.shopId, event: 'gate-released', gateId: gate.gateId, readEpoch: gate.readEpoch, via: 'settle-wake', proof: adv.proof || 'closed', proofOwner: adv.proofOwner || null, cleared, unregistered });
-    } catch (_) { /* 审计失败不影响 */ }
-    return adv;
-  }
-
-  /** 本店全部已知门（当前门 + 登记簿里被替换的旧 epoch 门），去重后按登记顺序。 */
-  _allKnownGates() {
-    const seen = new Set();
-    const out = [];
-    for (const list of Array.from((this._cleanupRegistry && this._cleanupRegistry.values()) || [])) {
-      for (const gate of (Array.isArray(list) ? list : [])) {
-        if (!gate || seen.has(gate)) continue;
-        seen.add(gate);
-        out.push(gate);
-      }
-    }
-    for (const gate of Array.from((this._pendingReadGates && this._pendingReadGates.values()) || [])) {
-      if (!gate || seen.has(gate)) continue;
-      seen.add(gate);
-      out.push(gate);
-    }
-    return out;
-  }
-
-  _pauseAllReadGateProbes(reason) {
-    for (const gate of this._allKnownGates()) {
-      if (!gate || gate.phase !== 'pending') continue;
-      this._cancelReadGateProbe(gate, reason);
-      gate.probePaused = true;
-    }
-  }
-
-  _resumeReadGateProbes() {
-    for (const gate of this._allKnownGates()) {
-      if (!gate || gate.phase !== 'pending' || gate.probePaused !== true) continue;
-      gate.probePaused = false;
-      this._scheduleReadGateProbe(gate);
-    }
-  }
-
-  /** 删除店：门保留（句柄仍需真实关闭，探测是有界收口而非读取），只留审计事实。 */
-  _noteReadGateForDeletedShop(shopId) {
-    const gate = this._pendingReadGateFor(shopId);
-    if (!gate) return false;
-    try {
-      this._audit({
-        kind: 'ad-state-read', shopId: String(shopId), event: 'gate-shop-deleted',
-        gateId: gate.gateId, readEpoch: gate.readEpoch, phase: gate.phase,
-        hasHandle: !!this._readGateHandle(gate),
-        cleanups: this._pendingCleanupsFor(shopId).length,
-        note: '该店已删除：不再启动任何读取；门保留直至收口有证明',
-      });
-    } catch (_) { /* 审计失败不影响 */ }
-    return true;
-  }
-
-  // ── 按店有限恢复链（2026-10-18 F4-R8）─────────────────────────────
-  // 设计边界：
-  //  - 每店最多一条活动链；链只由真实读取失败触发，计数只随物理读取递增；
-  //  - 等待用可取消 timer（不 await 5 分钟占住 pollOnce，不阻塞其他店）；
-  //  - 同店与既有 _shopProcessing 互斥；普通巡查/手动刷新遇到活动链只合并返回，不叠加新链；
-  //  - stop/删除/代数变化取消 timer 与迟到结果；满 10 次停止，不再自行第 11 次。
-  //  - 仅内存态：进程重启后不恢复计数/句柄（见报告的重启边界）。
-  _readRecoveryFor(shopId) {
-    const key = String(shopId);
-    const rec = this._readRecoveries && this._readRecoveries.get(key);
-    if (!rec || rec.cancelled) return null;
-    if (rec.monitorGen !== this._gen) {
-      this._cancelReadRecovery(key, 'generation-change');
-      return null;
-    }
-    return rec;
-  }
-
-  _readRecoveryActive(rec) {
-    return !!(rec && !rec.cancelled && (rec.phase === 'waiting' || rec.phase === 'running' || rec.phase === 'idle'));
-  }
-
-  /** 只读投影：店铺行/机读状态共用同一来源（不重算次数，不猜下一次时间）。 */
-  _readRecoveryView(shopId) {
-    const rec = this._readRecoveryFor(shopId);
-    if (!rec) return null;
-    const max = READ_RECOVERY_MAX_RETRIES;
-    const waiting = rec.phase === 'waiting' && rec.nextAt != null;
-    let nextText = null;
-    if (waiting) {
-      const w = shanghaiWall(rec.nextAt);
-      nextText = `${String(w.hour).padStart(2, '0')}:${String(w.minute).padStart(2, '0')}`;
-    }
-    let text;
-    if (rec.phase === 'exhausted') text = `已重试${max}次仍失败`;
-    else if (rec.phase === 'stopped') text = `恢复已停止（${String(rec.lastReason || '不可重试错误').slice(0, 60)}）`;
-    else if (waiting) text = `恢复中（${rec.attempts}/${max}），下次重试 ${nextText}`;
-    else text = `恢复中（${rec.attempts}/${max}）`;
-    return {
-      active: rec.phase === 'waiting' || rec.phase === 'running',
-      phase: rec.phase,
-      attempts: rec.attempts,
-      maxRetries: max,
-      nextRetryAt: waiting ? new Date(rec.nextAt).toISOString() : null,
-      lastReason: rec.lastReason || null,
-      text,
-    };
-  }
-
-  _ensureReadRecovery(shopCfg, error, attempts) {
-    const key = String(shopCfg.id);
-    const existing = this._readRecoveries.get(key);
-    if (existing && !existing.cancelled) return existing; // 同店重复触发不叠加、不重置已用次数
-    if (existing && existing.cancelled) this._readRecoveries.delete(key);
-    const rec = {
-      shopId: key,
-      attempts: Math.max(0, Math.min(Number(attempts) || 0, READ_RECOVERY_MAX_RETRIES)),
-      phase: 'idle',
-      nextAt: null,
-      lastReason: String((error && error.reason) || '读取失败'),
-      lastBlocked: (error && error.blocked) || 'ad_state_read',
-      timer: null,
-      gen: (this._readRecoverySeq = (this._readRecoverySeq || 0) + 1),
-      monitorGen: this._gen,
-      cancelled: false,
-      runningPromise: null,
-    };
-    this._readRecoveries.set(key, rec);
-    this._audit({
-      kind: 'ad-state-read', shopId: key, event: 'recovery-scheduled',
-      attempts: rec.attempts, maxRetries: READ_RECOVERY_MAX_RETRIES,
-      groupSize: READ_RECOVERY_GROUP_SIZE, groupWaitMs: READ_RECOVERY_GROUP_WAIT_MS,
-      reason: rec.lastReason,
-    });
-    // 同步阶段已做首次+1次重读（attempts=1）：同组第 2 次可立即；若尚未重读（attempts=0）则首组 2 次。
-    const delay = (rec.attempts > 0 && rec.attempts % READ_RECOVERY_GROUP_SIZE === 0)
-      ? READ_RECOVERY_GROUP_WAIT_MS : 0;
-    this._scheduleReadRecoveryCheck(rec, delay);
-    return rec;
-  }
-
-  /**
-   * 空表机读码只读桥接（2026-10-22 DIAN-4 独立审查边界）：动作批次因「商品自选第 1 页 0 行但分页
-   * total=1」以 **partial 收口**、且本批次零派发时，只把本店交给既有**只读**有限恢复链
-   * （每次物理读取都是全新会话的只读全量回读，自带严格关闭证明、同店互斥与 10 次上限）。
-   * 绝不重跑 executor、绝不点击任何开关，也绝不改写 batch 的 outcome/counts 或当前广告状态投影。
-   */
-  _maybeBridgeEmptyTableReadRecovery(shopId, batch) {
-    try {
-      if (!batch || batch.outcome !== 'partial') return null;
-      const zixuan = batch.executor && batch.executor.views && batch.executor.views.zixuan;
-      const ev = zixuan && zixuan.emptyTableEvidence;
-      if (!ev) return null;
-      const c = batch.counts;
-      const parts = c ? [c.confirmed, c.failed, c.unknown] : [];
-      // 计数字段缺失或非法＝派发数不可判定，按"可能有派发"处理，绝不并入本链。
-      if (parts.length !== 3 || !parts.every((n) => Number.isInteger(n))) return null;
-      const dispatched = parts.reduce((s, n) => s + n, 0);
-      if (dispatched !== 0) return null; // 已派发/结果未知：走既有动作回读收口，不并入本链
-      const key = String(shopId);
-      if (this._hasPendingReadGate(key)) return null;                     // 本店存在未收口读取会话：不新开
-      const shopCfg = this._findShop(key);
-      if (!shopCfg || !this._isShopActive(key)) return null;
-      // closeProven 依据：runner 在把批次交回本进程前已在 finally 中 await 关闭本次动作会话，
-      // 且本店没有未证明关闭的读取门；两者任一不成立都不会铸码。
-      const code = evidenceCode({ ...ev, closeProven: true, dispatched: 0 });
-      if (!code) return null;
-      const reason = String(zixuan.reason || batch.reason || '商品自选空表证据不足（total=1 无行）');
-      const rec = this._ensureReadRecovery(shopCfg, { status: 'blocked', blocked: 'inventory', reason, emptyTableCode: code }, 0);
-      this._audit({
-        kind: 'ad-state-read', shopId: key, event: 'empty-table-bridge', code,
-        tab: ev.tab, pageNo: ev.pageNo, attempt: ev.pageNo,
-        total: ev.pagination && ev.pagination.total, hasNext: ev.pagination && ev.pagination.hasNext,
-        identityOk: ev.identityOk === true, refreshOk: ev.refreshOk === true,
-        outcome: batch.outcome, dispatched, scheduled: !!rec,
-      });
-      return rec ? this._readRecoveryView(key) : null;
-    } catch (_) { /* 桥接失败不改变动作结果，也不掩盖批次落库 */ return null; }
-  }
-
-  _scheduleReadRecoveryCheck(rec, delayMs) {
-    if (!rec || rec.cancelled) return;
-    if (rec.timer) {
-      try { this._clearTimeoutFn(rec.timer); } catch (_) { /* 清理失败不影响新登记 */ }
-      rec.timer = null;
-    }
-    const delay = Math.max(0, Number(delayMs) || 0);
-    rec.phase = 'waiting';
-    rec.nextAt = this.nowFn() + delay;
-    const gen = rec.gen;
-    const h = this._setTimeoutFn(() => {
-      rec.timer = null;
-      rec.runningPromise = this._runReadRecoveryGroup(rec, gen).catch((e) => {
-        try { this._audit({ kind: 'ad-state-read', shopId: rec.shopId, event: 'recovery-error', reason: String((e && e.message) || e).slice(0, 160) }); } catch (_) { /* 审计失败不影响 */ }
-      });
-    }, delay);
-    rec.timer = h;
-    if (h && typeof h.unref === 'function') h.unref();
-  }
-
-  /** 本组应执行到的累计重试次数（每 2 次一组；奇数先补齐同组）。 */
-  _readRecoveryGroupTarget(attempts) {
-    const rem = attempts % READ_RECOVERY_GROUP_SIZE;
-    const add = rem === 0 ? READ_RECOVERY_GROUP_SIZE : (READ_RECOVERY_GROUP_SIZE - rem);
-    return Math.min(attempts + add, READ_RECOVERY_MAX_RETRIES);
-  }
-
-  _recordRecoveryState(rec, error) {
-    if (!rec || rec.cancelled) return;
-    const view = this._readRecoveryView(rec.shopId);
-    if (!view) return;
-    const reason = error ? String(error.reason || '读取失败') : (rec.lastReason || '读取失败');
-    const rt = this._runtime(rec.shopId);
-    rt.lastReadError = {
-      kind: 'retrying',
-      reason,
-      blocked: (error && error.blocked) || rec.lastBlocked || 'ad_state_read',
-      retrying: true,
-      retried: true,
-      retryCount: rec.attempts,
-      recovery: view,
-      at: new Date(this.nowFn()).toISOString(),
-    };
-    rt.lastError = reason;
-    if (rt.lastData) rt.lastData.blockedReason = reason;
-    this._applyObservedAdState(rec.shopId, 'unknown', `有限恢复重试（${rec.attempts}/${READ_RECOVERY_MAX_RETRIES}）`);
-  }
-
-  _applyReadRecoverySuccess(shopCfg, result, rec) {
-    const shopId = String(shopCfg.id);
-    const rt = this._runtime(shopId);
-    const state = (result && result.state) || 'unknown';
-    this._audit({
-      kind: 'ad-state-read', shopId, event: 'recovery-success',
-      attempts: rec ? rec.attempts : 0, state,
-    });
-    this._clearReadFailure(shopId); // 同时清旧错误/旧阻断原因/旧恢复链
-    this._applyObservedAdState(shopId, state, `有限恢复重试成功（第${rec ? rec.attempts : 0}次，只读回读）`);
-    if (result && result.balance !== undefined) this._applyBalanceToLastData(rt, result);
-    rt.lastDataAt = new Date(this.nowFn()).toISOString();
-    this._clearReadRecovery(shopId, 'recovery-success');
-  }
-
-  _markReadRecoveryExhausted(rec, reason) {
-    if (!rec) return;
-    rec.phase = 'exhausted';
-    rec.nextAt = null;
-    if (rec.timer) {
-      try { this._clearTimeoutFn(rec.timer); } catch (_) { /* 清理失败不影响 */ }
-      rec.timer = null;
-    }
-    rec.lastReason = String(reason || rec.lastReason || '读取失败');
-    const rt = this._runtime(rec.shopId);
-    const view = this._readRecoveryView(rec.shopId);
-    rt.lastReadError = {
-      kind: 'read_failed',
-      reason: rec.lastReason,
-      blocked: rec.lastBlocked || 'ad_state_read',
-      retrying: false,
-      retried: true,
-      retryCount: rec.attempts,
-      recovery: view,
-      at: new Date(this.nowFn()).toISOString(),
-    };
-    rt.lastError = rec.lastReason;
-    if (rt.lastData) rt.lastData.blockedReason = rec.lastReason;
-    this._audit({ kind: 'ad-state-read', shopId: rec.shopId, event: 'recovery-exhausted', attempts: rec.attempts, maxRetries: READ_RECOVERY_MAX_RETRIES, reason: rec.lastReason });
-  }
-
-  _stopReadRecovery(rec, error) {
-    if (!rec) return;
-    rec.phase = 'stopped';
-    rec.nextAt = null;
-    if (rec.timer) {
-      try { this._clearTimeoutFn(rec.timer); } catch (_) { /* 清理失败不影响 */ }
-      rec.timer = null;
-    }
-    rec.lastReason = String((error && error.reason) || rec.lastReason || '不可重试错误');
-    const rt = this._runtime(rec.shopId);
-    const view = this._readRecoveryView(rec.shopId);
-    rt.lastReadError = {
-      kind: this._readErrorKind(error, rec && rec.shopId),
-      reason: rec.lastReason,
-      blocked: (error && error.blocked) || rec.lastBlocked || 'ad_state_read',
-      retrying: false,
-      retried: true,
-      retryCount: rec.attempts,
-      recovery: view,
-      at: new Date(this.nowFn()).toISOString(),
-    };
-    rt.lastError = rec.lastReason;
-    if (rt.lastData) rt.lastData.blockedReason = rec.lastReason;
-    this._audit({ kind: 'ad-state-read', shopId: rec.shopId, event: 'recovery-stopped', attempts: rec.attempts, reason: rec.lastReason });
-  }
-
-  _cancelReadRecovery(shopId, reason) {
-    const key = String(shopId);
-    const rec = this._readRecoveries && this._readRecoveries.get(key);
-    if (!rec) return false;
-    rec.cancelled = true;
-    rec.phase = 'cancelled';
-    rec.nextAt = null;
-    rec.gen += 1;
-    if (rec.timer) {
-      try { this._clearTimeoutFn(rec.timer); } catch (_) { /* 清理失败不影响 */ }
-      rec.timer = null;
-    }
-    this._readRecoveries.delete(key);
-    this._audit({ kind: 'ad-state-read', shopId: key, event: 'recovery-cancelled', reason });
-    return true;
-  }
-
-  _clearReadRecovery(shopId, reason) {
-    const key = String(shopId);
-    const rec = this._readRecoveries && this._readRecoveries.get(key);
-    if (!rec) return false;
-    rec.cancelled = true;
-    rec.phase = 'cleared';
-    rec.nextAt = null;
-    rec.gen += 1;
-    if (rec.timer) {
-      try { this._clearTimeoutFn(rec.timer); } catch (_) { /* 清理失败不影响 */ }
-      rec.timer = null;
-    }
-    this._readRecoveries.delete(key);
-    this._audit({ kind: 'ad-state-read', shopId: key, event: 'recovery-cleared', reason });
-    return true;
-  }
-
-  _cancelAllReadRecoveries(reason) {
-    for (const id of Array.from(this._readRecoveries.keys())) this._cancelReadRecovery(id, reason);
-  }
-
-  async _runReadRecoveryGroup(rec, gen) {
-    if (!rec || rec.cancelled || rec.gen !== gen) return;
-    if (rec.monitorGen !== this._gen) { this._cancelReadRecovery(rec.shopId, 'generation-change'); return; }
-    const shopCfg = this._findShop(rec.shopId);
-    if (!shopCfg || !this._isShopActive(rec.shopId)) {
-      this._cancelReadRecovery(rec.shopId, 'shop-inactive');
-      return;
-    }
-    if (rec.attempts >= READ_RECOVERY_MAX_RETRIES) {
-      this._markReadRecoveryExhausted(rec, rec.lastReason);
-      return;
-    }
-    // 同店互斥：主轮询/手动刷新/登录接管在途 → 不叠加同店读取，稍后再试（不计次数、不新开 opener）。
-    if (!this._tryAcquireShop(rec.shopId)) {
-      this._scheduleReadRecoveryCheck(rec, 5000);
-      this._recordRecoveryState(rec, null);
-      return;
-    }
-    rec.phase = 'running';
-    rec.nextAt = null;
-    try {
-      const target = this._readRecoveryGroupTarget(rec.attempts);
-      while (rec.attempts < target && rec.attempts < READ_RECOVERY_MAX_RETRIES) {
-        if (rec.cancelled || rec.gen !== gen || rec.monitorGen !== this._gen) return;
-        if (!this._isShopActive(rec.shopId)) { this._cancelReadRecovery(rec.shopId, 'shop-inactive'); return; }
-        const seq0 = this._readAttemptSeq || 0;
-        const r = await this._readChengfangAdStateBounded(shopCfg, { recoveryAttempt: true });
-        const attempted = (this._readAttemptSeq || 0) > seq0;
-        // 迟到结果：stop/删除/代数变化后一律不动作、不覆盖新状态。
-        if (rec.cancelled || rec.gen !== gen || rec.monitorGen !== this._gen) return;
-        if (!this._isShopActive(rec.shopId)) { this._cancelReadRecovery(rec.shopId, 'shop-inactive'); return; }
-        if (!attempted) {
-          // 收口门未推进（无物理读取）：不消耗重试次数，等待下一次检查，绝不新开 opener。
-          rec.lastReason = String((r && r.error && r.error.reason) || '收口未完成，等待下一次检查');
-          if (r && r.error && r.error.blocked) rec.lastBlocked = r.error.blocked;
-          this._scheduleReadRecoveryCheck(rec, READ_RECOVERY_GROUP_WAIT_MS);
-          this._recordRecoveryState(rec, r && r.error);
-          return;
-        }
-        rec.attempts += 1;
-        if (!r || !r.error) {
-          this._applyReadRecoverySuccess(shopCfg, r, rec);
-          return;
-        }
-        rec.lastReason = String(r.error.reason || '读取失败');
-        if (r.error.blocked) rec.lastBlocked = r.error.blocked;
-        if (!this._isTransientReadError(r.error)) {
-          // Auth/身份/超时/清单不可重试等：不盲试，链停止并保留原因与已尝试次数。
-          this._stopReadRecovery(rec, r.error);
-          return;
-        }
-        if (rec.attempts >= READ_RECOVERY_MAX_RETRIES) {
-          this._markReadRecoveryExhausted(rec, rec.lastReason);
-          return;
-        }
-      }
-      // 组结束：等待从本组末次完成时算起，至少 300000ms 后才允许下一组。
-      this._scheduleReadRecoveryCheck(rec, READ_RECOVERY_GROUP_WAIT_MS);
-      this._recordRecoveryState(rec, null);
-    } finally {
-      this._releaseShop(rec.shopId);
-    }
-  }
-
   /** 回读失败：撤销旧 on 证据，写完整原因（lastError/today.blockedReason/结构化分类一致）。 */
   _applyReadFailure(shopId, err) {
     const rt = this._runtime(shopId);
     // 页面展示的错误详情同样脱敏：保留业务原因与分类，但绝不出站裸 Cookie/令牌/会话值。
     const baseReason = log.sanitize(String((err && err.reason) || '未知读取失败'));
-    const recovery = (err && err.recovery) || this._readRecoveryView(shopId);
     const hasEvidence = !!(err && err.loginEvidence && typeof err.loginEvidence === 'object');
-    const kind = (recovery && recovery.active) ? 'retrying' : this._readErrorKind(err, shopId);
+    const kind = this._readErrorKind(err, shopId);
     // AUTH-60S FINAL：连续观测窗口只统计**带正向结构性证据**的轮次；本轮无证据
     // （Cookie/超时/裸异常等）即窗口中断，清除计时（中断时段不累计）。
     if (!hasEvidence) this._clearAuthEvidenceWatch(shopId);
@@ -3350,9 +2420,8 @@ class Monitor {
       blocked: (err && err.blocked) || 'ad_state_read',
       lastStep: (err && err.lastStep) || null,
       retrying: kind === 'retrying',
-      retried: (err && err.retried === true) || !!(recovery && recovery.attempts > 0),
-      retryCount: (err && err.retryCount) || (recovery && recovery.attempts) || 0,
-      recovery: recovery || null,
+      retried: err && err.retried === true,
+      retryCount: (err && err.retryCount) || 0,
       at: new Date(this.nowFn()).toISOString(),
     };
     rt.lastError = reason;
@@ -3381,8 +2450,6 @@ class Monitor {
     if (rt.lastData) delete rt.lastData.blockedReason;
     // AUTH-60S：读取成功即离开正向证据 → 清除连续观测窗口（下次命中重新计时）。
     this._clearAuthEvidenceWatch(shopId);
-    // 正常新成功可重置恢复事件：清 timer/进度/旧错误（幂等；无链时无动作）。
-    this._clearReadRecovery(shopId, 'read-success');
   }
 
   /**
@@ -3496,111 +2563,6 @@ class Monitor {
       .then(() => { settledOk = true; }, (e) => { settledErr = e || new Error('browser.close rejected'); });
     await Promise.race([p, new Promise((r) => setTimeout(r, waitMs))]);
     return { closed: settledOk && !settledErr, error: settledErr, promise: p };
-  }
-
-  /** settle 记录器：resolve/reject 都算 settle；settledP 永不 reject（可安全 await/竞争）。 */
-  _settleRecord(promise) {
-    let settled = false;
-    const settledP = Promise.resolve().then(() => promise).then(() => { settled = true; }, () => { settled = true; });
-    return { settledP, isSettled: () => settled };
-  }
-
-  /**
-   * 带登记的有界会话关闭（2026-09-29 二次补验证修正）：关闭一发起就**同步**登记为 pending
-   * （closed:null）进 closes 列表，完成后再更新为 true/false——放行判定在任何时刻都能看到
-   * 「在途关闭」，不会因「关闭结果未返回、列表尚为空」而误判全部已关闭并放行下一轮。
-   */
-  _closeSessionTracked(session, waitMs, closes, label) {
-    const entry = { label, closed: null, error: null, promise: null };
-    closes.push(entry);
-    const p = this._closeSessionBounded(session, waitMs).then((r) => {
-      entry.closed = r.closed;
-      entry.error = r.error;
-      return r;
-    });
-    entry.promise = p;
-    return p;
-  }
-
-  /**
-   * 阻断推进（2026-09-29 补验证修正；二次补验证加强）：真实等待旧 work settle（上界
-   * settleBoundMs 防绝对僵死；未 settle 一律不放行），随后逐个核对已登记的会话关闭——
-   * 在途（closed:null）先等其出结果，仍未成功的补做一次（重试幂等，严格成功才算收口）。
-   * 动态遍历以覆盖等待期间新登记的条目。
-   */
-  async _advanceReadGate(gate, settleBoundMs, closeWaitMs) {
-    if (!gate) return { done: false, why: '缺少收口门' };
-    if (gate.advancePromise) return gate.advancePromise; // 并发共享同一次推进（不叠加关闭/核验）
-    const p = this._advanceReadGateInner(gate, settleBoundMs, closeWaitMs);
-    gate.advancePromise = p;
-    try {
-      return await p;
-    } finally {
-      if (gate.advancePromise === p) gate.advancePromise = null;
-    }
-  }
-
-  async _advanceReadGateInner(gate, settleBoundMs, closeWaitMs) {
-    if (!gate.workRec || typeof gate.workRec.settledP.then !== 'function') return { done: false, why: '缺少 work settle 记录' };
-    const settled = await Promise.race([gate.workRec.settledP.then(() => true), new Promise((r) => setTimeout(r, settleBoundMs)).then(() => false)]);
-    if (!settled) return { done: false, why: 'work 未 settle' };
-    // 可信"未创建"（r13 缺口 1）：**必须**先有界确认旧 work 已 settle，未 settle 的 work 里仍可能
-    // 正在创建资源，任何证明都不得提前换取放行；证明还必须是资源所有者产出的（notCreatedOwner），
-    // 且既无会话、无句柄、没有在途关闭。占位条目（closed:false = "无关闭证明"）不构成待收口事实。
-    const notCreatedOwner = this._readGateNotCreatedOwner(gate);
-    // 快照记为"已创建"（true）时所有者证明自相矛盾，一律不采信证明（宁可保守阻断）。
-    if (notCreatedOwner && gate.resourceCreated !== true && !this._readGateSession(gate) && !this._readGateHandle(gate)
-      && (!Array.isArray(gate.closes) || !gate.closes.some((c) => c && c.closed === null))) {
-      return { done: true, why: null, proof: 'not-created', proofOwner: notCreatedOwner };
-    }
-    // 会话从未建立（opener 在返回会话前失败）：绝不以 _closeSessionBounded(null) 的
-    // closed:true 假放行；只能凭适配器登记的收口句柄推进真实关闭与连接核验。
-    if (!(gate.sessionRef && typeof gate.sessionRef === 'function') || !gate.sessionRef()) {
-      return this._advanceOpenerCleanupGate(gate, closeWaitMs);
-    }
-    for (let i = 0; i < gate.closes.length; i++) {
-      const c = gate.closes[i];
-      if (c.closed === true) continue;
-      if (c.promise && c.closed === null) {
-        await Promise.race([c.promise, new Promise((r) => setTimeout(r, closeWaitMs))]);
-        if (c.closed === true) continue;
-      }
-      const r = await this._closeSessionBounded(gate.sessionRef(), closeWaitMs);
-      c.closed = r.closed;
-      c.error = r.error;
-      if (!r.closed) return { done: false, why: `会话关闭失败${r.error ? ': ' + String((r.error && r.error.message) || r.error).slice(0, 120) : ''}` };
-    }
-    const bad = gate.closes.filter((c) => c.closed !== true);
-    if (bad.length > 0) return { done: false, why: `仍有未完成收口：${bad.map((c) => c.label).join('、')}` };
-    return { done: true, why: null, proof: 'closed' };
-  }
-
-  /**
-   * opener 未返回会话时的收口推进（2026-10-18 F3-R7，跨周期收口门）：
-   * 失败路径已创建浏览器却无严格关闭证明时，只有适配器登记在 WeakMap 的收口句柄能推进
-   * 本次真实关闭并独立核验连接；缺任何句柄一律保持未证明（保守阻断，不启动新 opener），
-   * 绝不调用 _closeSessionBounded(null) 取 closed=true 假放行。
-   * 推进成功（close 完成且 isConnected()===false）后由调用方清门，恢复正常读取。
-   */
-  async _advanceOpenerCleanupGate(gate, closeWaitMs) {
-    const handle = this._readGateHandle(gate);
-    if (!handle || typeof handle !== 'object') {
-      return { done: false, why: 'opener 失败未提供收口句柄：本次关闭无法核验（保守阻断，不启动新回读）' };
-    }
-    if (typeof handle.isConnected !== 'function') {
-      return { done: false, why: 'opener 收口句柄缺少连接核验（isConnected），关闭不可证明（保守阻断）' };
-    }
-    const provablyClosed = () => { try { return handle.isConnected() === false; } catch (_) { return false; } };
-    if (provablyClosed()) return { done: true, why: null, proof: 'already-closed' };
-    let closeResolved = false;
-    if (typeof handle.close === 'function') {
-      const p = Promise.resolve()
-        .then(() => handle.close())
-        .then(() => { closeResolved = true; }, () => { closeResolved = false; });
-      await Promise.race([p, new Promise((r) => setTimeout(r, closeWaitMs))]);
-    }
-    if (closeResolved && provablyClosed()) return { done: true, why: null, proof: 'closed' };
-    return { done: false, why: `opener 收口句柄推进后仍无法证明已关闭（close ${closeResolved ? '成功但连接核验仍在线' : '被拒绝或超时'}）` };
   }
 
   /**
@@ -3869,17 +2831,13 @@ class Monitor {
         });
         return d;
       },
-      // 交接证据必须同时证明「旧执行器已结束」与「旧读取工作已严格收口」：
-      // _execInflight 计数为 0 不能证明 _pendingReadGate 背后的在途回读/会话已关闭，
-      // 该门未清时一律视为在途 → 证据不足 → 零新点击（不放行交接，也不清锁）。
+      // 交接证据：旧执行器已结束且无在途写入才允许交接（读取收口由每次读取自身的有界关闭负责）。
       inflightProof: () => {
         const p = orch.mixedInflightProof(shopCfg.id);
-        const readGateClear = !this._hasPendingReadGate(shopCfg.id);
         return {
-          executorFinished: p.executorFinished === true && readGateClear,
-          noInflightWrites: p.noInflightWrites === true && readGateClear,
+          executorFinished: p.executorFinished === true,
+          noInflightWrites: p.noInflightWrites === true,
           inflight: p.inflight || 0,
-          pendingReadGate: !readGateClear,
         };
       },
       persist: () => this._saveState(),
@@ -4021,105 +2979,17 @@ class Monitor {
   }
 
   /**
-   * 每店读取许可（2026-10-23 r13 缺口 2）：推进收口 → 身份 CAS → 新开 opener 必须整段串行，
-   * 否则两个并发调用会同时拿到"已放行"并各自开一个浏览器（第二次物理读取 = 资源翻倍 + 归属混乱）。
-   * 排队按 FIFO；许可按店隔离（跨店互不阻塞）；持有者异常也必须释放。
+   * 生产回读外壳（批次二收敛：单次读 + 有界关闭 + 失败重试一次）：
+   * - 每次读取独立浏览器；整次读取共用一个 deadline（默认 300s）；
+   * - 会话关闭在 _readChengfangAdState 的 try/finally 内以 closeWaitMs（默认 60s）有界完成；
+   * - 仅瞬态错误在同一 deadline 预算内重试一次；关闭失败只记日志，不登记跨周期收口门；
+   * - 截止后到达的迟到会话立即有界关闭，绝不留无人管理的浏览器。
+   * 审计 kind:ad-state-read：start / done(ok|error) / deadline / retry。
    */
-  async _withShopReadPermit(shopId, fn) {
-    const key = String(shopId);
-    if (!this._readPermits) this._readPermits = new Map();
-    const prev = this._readPermits.get(key) || Promise.resolve();
-    let settle;
-    const mine = new Promise((resolve) => { settle = resolve; });
-    this._readPermits.set(key, mine);
-    await prev.then(() => {}, () => {}); // 前任的读取结果/失败都不影响排队
-    let value;
-    let failure = null;
-    try {
-      value = await fn();
-    } catch (e) {
-      failure = e;
-    } finally {
-      settle();
-      if (this._readPermits.get(key) === mine) this._readPermits.delete(key);
-    }
-    if (failure) throw failure;
-    return value;
-  }
-
-  /**
-   * 生产回读外壳（2026-09-29 08:00 事件；同日补验证修正收口判定；2026-10-23 r13 加每店许可）：
-   * 整段在 _withShopReadPermit 内执行：先按**登记簿顺序**推进本店全部未收口资源（含被新 epoch
-   * 替换的旧句柄/会话），任何一条未证明即阻断并透出该条身份，绝不开第二次物理读取。
-   * 给乘方整次回读加总截止时间。截止后 opener 才返回的迟到会话由 onSession 立即严格关闭，
-   * 绝不留下无人管理的浏览器。
-   * 审计 kind:ad-state-read：start / done(ok|error) / deadline(cleanup=closed|blocked) / blocked，带 lastStep 与原因。
-   */
-  async _readChengfangAdStateBounded(shopCfg, opts = {}) {
-    return this._withShopReadPermit(shopCfg.id, () => this._readChengfangAdStateBoundedInner(shopCfg, opts));
-  }
-
-  async _readChengfangAdStateBoundedInner(shopCfg, opts = {}) {
+  async _readChengfangAdStateBounded(shopCfg) {
     const timeoutMs = this._adStateMsOption('adStateReadTimeoutMs', 300000);
-    const settleBoundMs = this._adStateMsOption('adStateSettleWaitMs', 5000);
-    // R9（2026-10-25）：工作 Cookie 检查点的真实保存可达数十秒，旧默认 10s 会把"只差约
-    // 1 秒即完成"的真实关闭错判为未关闭并丢弃已读数据。默认关闭等待提到 60s；显式
-    // adStateCloseWaitMs 覆盖仍优先，整体 300s 读取 deadline 与其它关闭原语不变。
     const closeWaitMs = this._adStateMsOption('adStateCloseWaitMs', 60000);
-    const recoveryMode = opts && opts.recoveryAttempt === true;
-    // 收口登记簿优先于当前门（缺口 3）：许可内逐条推进本店所有未证明收口的旧 epoch。
-    const cleanups = this._pendingCleanupsFor(shopCfg.id);
-    for (const gate of cleanups) {
-      const adv = await this._advanceReadGate(gate, settleBoundMs, closeWaitMs);
-      if (!adv.done) {
-        gate.lastWhy = adv.why;
-        const phaseNote = gate.phase === 'terminal'
-          ? `；收口探测已用尽（${READ_GATE_PROBE_DELAYS_MS.join('/')}ms），保持阻断待人工处置` : '';
-        const why = `上一回读未完成收口（${adv.why}），保持阻断（不启动新回读）${phaseNote}`;
-        try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'blocked', gateId: gate.gateId, readEpoch: gate.readEpoch, gatePhase: gate.phase, reason: why }); } catch (_) { /* 审计失败不影响 */ }
-        return { state: 'unknown', error: { status: 'blocked', reason: why, blocked: 'ad_state_read', blockedBy: 'unread_session', gateId: gate.gateId, gatePhase: gate.phase } };
-      }
-      // 证明到手：注销收口义务（与当前门身份无关），再按身份 CAS 释放读取许可。
-      const unregistered = this._cleanupUnregister(gate);
-      const cleared = this._clearReadGateIf(shopCfg.id, gate, adv.proof || 'advanced');
-      try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'gate-released', gateId: gate.gateId, readEpoch: gate.readEpoch, via: 'poll', proof: adv.proof || 'advanced', proofOwner: adv.proofOwner || null, cleared, unregistered }); } catch (_) { /* 审计失败不影响 */ }
-    }
-    // 许可内最后一道身份核验：若仍有当前门（例如并发探测刚登记的新失败），必须重读并按其
-    // 结果决定是否阻断——CAS 失败绝不"当作已放行"再开第二次物理读取。
-    const straggler = this._pendingReadGateFor(shopCfg.id);
-    if (straggler) {
-      const adv = await this._advanceReadGate(straggler, settleBoundMs, closeWaitMs);
-      const why = `上一回读未完成收口（${adv.why || '当前门仍在登记中'}），保持阻断（不启动新回读）`;
-      try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'blocked', gateId: straggler.gateId, readEpoch: straggler.readEpoch, gatePhase: straggler.phase, reason: why }); } catch (_) { /* 审计失败不影响 */ }
-      return { state: 'unknown', error: { status: 'blocked', reason: why, blocked: 'ad_state_read', blockedBy: 'unread_session', gateId: straggler.gateId, gatePhase: straggler.phase } };
-    }
-    // 活动恢复链合并：普通巡查/手动刷新/登录接管遇到本店活动链时不得再叠加另一条 10 次链。
-    // 只返回真实恢复进度（机读仍 unknown），由链按自己的 timer 继续；不同店互不影响。
-    let recoveryExhausted = false;
-    if (!recoveryMode) {
-      const rec = this._readRecoveryFor(shopCfg.id);
-      if (this._readRecoveryActive(rec)) {
-        const view = this._readRecoveryView(shopCfg.id);
-        return {
-          state: 'unknown',
-          error: {
-            status: 'blocked',
-            reason: `本店有限恢复进行中（${view.attempts}/${view.maxRetries}）：${view.lastReason || '等待下次重试'}；本轮不叠加新读取`,
-            blocked: 'ad_state_read',
-            blockedBy: 'recovery_inflight',
-            retried: true,
-            retryCount: view.attempts,
-            recovery: view,
-          },
-        };
-      }
-      // 满 10 次/不可重试而停止后：普通下一轮巡查仍按既有调度只做一次真实读取，
-      // 不再自动生成新的 10 次链（避免无限新链）；成功读取会在 _clearReadFailure 重置事件。
-      recoveryExhausted = !!(rec && (rec.phase === 'exhausted' || rec.phase === 'stopped'));
-    }
-    const maxAttempts = (recoveryMode || recoveryExhausted) ? 1 : 2;
-    // 共享总截止：首读与同周期最多一次瞬态重读共用同一个 deadlineAt，重读只使用剩余预算。
-    // 恢复链的每次物理读取独立进入本方法（各自新的 deadline），5 分钟组间等待不计入读取超时。
+    // 首读与最多一次瞬态重读共用同一个 deadline；重读只使用剩余预算。
     const deadlineAt = Date.now() + timeoutMs;
     let attempt = 0;
     let firstTransientReason = null;
@@ -4132,29 +3002,27 @@ class Monitor {
       }
       try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'start', timeoutMs: remaining, attempt: attempt + 1 }); } catch (_) { /* 审计失败不影响 */ }
       const steps = [];
-      const closes = [];
       let session = null;
       let timedOut = false;
-      // D22R 协作取消令牌：截止定时器触发时翻转，经 opener 参数透传到真实开启链
-      //（defaultChengfangOpener → openChengfangShop → openQianchuanHome），
-      // 让截止后不再启动新的店铺/候选浏览器进程，本次 work 尽快 settle，收口门可推进。
+      // 协作取消令牌：截止后不再启动新的店铺/候选浏览器进程，本次 work 尽快 settle。
       const cancelToken = { cancelled: false, reason: null };
       const meta = {
         steps,
         closeWaitMs,
         cancelToken,
-        onSession: (s) => {
-          session = s;
+        onSession: (sess) => {
+          session = sess;
+          // 迟到会话（截止后才建立/返回）：立即有界关闭；失败只记日志，不引入跨周期状态。
           if (timedOut) {
-            // 迟到会话（截止后才建立/返回）：立即严格关闭；关闭一发起就同步登记为 pending，
-            // 旧 work 先 settle 时绝不因「closes 尚为空/条目未完成」误判全部已关闭（二次补验证修正）
-            this._closeSessionTracked(s, closeWaitMs, closes, 'late-session');
+            this._closeSessionBounded(sess, closeWaitMs).then((r) => {
+              if (!r.closed) log.warn(`回读迟到会话关闭失败（${shopCfg.id}）：${String((r.error && r.error.message) || r.error || 'unknown').slice(0, 120)}`);
+            }).catch((e) => {
+              log.warn(`回读迟到会话关闭异常（${shopCfg.id}）：${String((e && e.message) || e).slice(0, 120)}`);
+            });
           }
         },
       };
-      this._readAttemptSeq = (this._readAttemptSeq || 0) + 1; // 物理读取计数（恢复链只认此值）
       const work = this._readChengfangAdState(shopCfg, meta);
-      const workRec = this._settleRecord(work);
       let timer = null;
       let deadlineFired = false;
       let result;
@@ -4165,198 +3033,115 @@ class Monitor {
         ]);
       } catch (e) {
         clearTimeout(timer);
-        // work 理论上不 reject（内层全兜底）；防御性透传前尽量终止会话
         if (session) await this._closeSessionBounded(session, closeWaitMs).catch(() => {});
         throw e;
       }
       clearTimeout(timer);
-      if (!deadlineFired) {
-        // 缺口 B（2026-10-19）：done=error 的审计必须携带脱敏后的 blocked/status/reason/timeout/lastStep，
-        // 否则动作前复核失败只剩 unknown_blocked，页面与审计都读不到具体受阻步骤（不写裸 Cookie/URL/令牌）。
-        try {
-          const lastStep = steps.length ? steps[steps.length - 1] : null;
-          const doneEvent = { kind: 'ad-state-read', shopId: shopCfg.id, event: 'done', outcome: result && result.error ? 'error' : 'ok', lastStep, attempt: attempt + 1 };
-          if (result && result.error) {
-            const m = this._maskReadError(result.error, shopCfg.id);
-            doneEvent.status = m.status;
-            // 分类放 errorKind：kind 已被审计类型 ad-state-read 占用，不能互相覆盖。
-            doneEvent.errorKind = m.kind;
-            doneEvent.blocked = m.blocked;
-            doneEvent.reason = m.reason;
-            if (m.timeout) doneEvent.timeout = true;
-            if (m.lastStep) doneEvent.lastStep = doneEvent.lastStep || m.lastStep;
-          }
-          this._audit(doneEvent);
-        } catch (_) { /* 审计失败不影响 */ }
-        // 正常结束也必须证明会话严格关闭；关闭失败/未确认一律阻断本店，且不得据此重读。
-        // 缺省 closeState 不再默认已关闭：没有证据就是未证明（不虚设 closed=true）。
-        const closeState = meta.closeState || { closed: false, error: new Error('缺少本次会话关闭证明'), source: 'missing' };
-        if (closeState.closed !== true) {
-          const hadSession = closeState.source === 'session';
-          const transient = !!(result && result.error && this._isTransientReadError(result.error));
-          // opener 在返回会话前已明确失败（Auth/身份/清单等不可重试原因）：保留原错误分类，
-          // 不因「缺关闭证明」改写成登录失效或读取失败；本次同样不会启动第二次读取。
-          if (!hadSession && result && result.error && !transient) return result;
-          const why = `本次会话未获得严格关闭证明${closeState.error ? ': ' + String((closeState.error && closeState.error.message) || closeState.error).slice(0, 120) : ''}`;
-          const orig = result && result.error && result.error.reason ? `；原始错误：${result.error.reason}` : '';
-          if (hadSession) {
-            this._newReadGate(shopCfg.id, {
-              workRec,
-              sessionRef: () => session,
-              handleRef: () => (meta && (meta.openerResource || meta.openerCleanupHandle)) || null,
-              resourceCreated: true,
-              closes: [{ label: 'session', closed: false, error: closeState.error || null, promise: null }],
-            });
-          } else if (transient) {
-            // 跨周期收口门（F3-R7）：无严格关闭证明的瞬态导航失败必须按店登记持久内存门；
-            // 下一周期先凭收口句柄推进本次真实关闭，未证实前绝不启动新 opener。
-            // 缺句柄的未知失败保守阻断（_advanceOpenerCleanupGate 无法核验即保持门）。
-            // Auth/身份等不可重试分类走上方早退分支保持原语义，不改写、不扩大重试。
-            this._newReadGate(shopCfg.id, {
-              workRec,
-              sessionRef: () => null,
-              handleRef: () => (meta && (meta.openerResource || meta.openerCleanupHandle)) || null,
-              cleanupHandle: (meta && meta.openerCleanupHandle) || null,
-              resourceCreated: meta && meta.resourceCreated === false ? false : (meta && meta.resourceCreated === true ? true : null),
-              notCreatedRef: () => (meta && meta.resourceCreated === false ? (meta.notCreatedOwner || null) : null),
-              closes: [{ label: 'opener-cleanup', closed: false, error: closeState.error || null, promise: null }],
-            });
-          }
-          try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'blocked', reason: why + orig, attempt: attempt + 1 }); } catch (_) { /* 审计失败不影响 */ }
-          return { state: 'unknown', error: { status: 'blocked', reason: `回读结束但${why}${orig}，已保持阻断（不启动新回读）`, blocked: 'ad_state_read', blockedBy: 'unread_session' } };
-        }
-        // 空表机读码铸造：只有本次会话关闭已获严格证明才会走到这里，因此码本身即含「关闭明确」；
-        // 关闭未证明的错误对象已在上方分支返回（不含 emptyTableCode），绝不进入重读或恢复链。
-        if (result && result.error && result.error.emptyTableEvidence) {
-          const ev = result.error.emptyTableEvidence;
-          const code = evidenceCode({ ...ev, closeProven: true, dispatched: 0 });
-          if (code) {
-            result.error.emptyTableCode = code;
-            try {
-              this._audit({
-                kind: 'ad-state-read', shopId: shopCfg.id, event: 'empty-table-evidence', code,
-                tab: ev.tab, pageNo: ev.pageNo, attempt: attempt + 1,
-                total: ev.pagination && ev.pagination.total, hasNext: ev.pagination && ev.pagination.hasNext,
-                identityOk: ev.identityOk === true, refreshOk: ev.refreshOk === true,
-              });
-            } catch (_) { /* 审计失败不影响 */ }
-          }
-        }
-        // 明确瞬态且可安全重读：同一周期内最多一次额外完整回读（清空上一份分页累计，重新开 session）。
-        // 恢复链的单次读取（maxAttempts=1）或已满 10 次的普通巡查不得再触发同周期重读。
-        if (maxAttempts > 1 && attempt === 0 && result && result.error && this._isTransientReadError(result.error)
-            && !this._hasPendingReadGate(shopCfg.id)) {
-          const rem2 = deadlineAt - Date.now();
-          if (rem2 > 0) {
-            firstTransientReason = String(result.error.reason || '');
-            const rt = this._runtime(shopCfg.id);
-            rt.lastReadError = {
-              kind: 'retrying',
-              reason: firstTransientReason,
-              blocked: result.error.blocked || 'ad_state_read',
-              retrying: true,
-              retried: false,
-              at: new Date(this.nowFn()).toISOString(),
-            };
-            try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'retry', attempt: 2, reason: firstTransientReason, remainingMs: rem2 }); } catch (_) { /* 审计失败不影响 */ }
-            attempt = 1;
-            continue;
-          }
-        }
-        let out = result;
-        if (attempt > 0 && result && result.error) {
-          out = {
-            ...result,
-            error: {
-              ...result.error,
-              retried: true,
-              retryCount: 1,
-              reason: `首次回读失败（${firstTransientReason || '瞬态错误'}）；已重试1次仍未恢复：${result.error.reason}`,
-            },
-          };
-        }
-        if (attempt > 0) {
-          // 重试结束必须收口"正在重试"标记：成功清除，失败改为最终分类（避免 UI 永久停在重试中）。
-          const rt = this._runtime(shopCfg.id);
-          if (out && out.error) {
-            rt.lastReadError = {
-              kind: this._readErrorKind(out.error, shopCfg.id),
-              reason: String(out.error.reason || ''),
-              blocked: out.error.blocked || 'ad_state_read',
-              retrying: false,
-              retried: true,
-              at: new Date(this.nowFn()).toISOString(),
-            };
-          } else if (rt.lastReadError && rt.lastReadError.kind === 'retrying') {
-            rt.lastReadError = null;
-          }
-        }
-        // 同步阶段（首次 + 同周期 1 次重读）仍未恢复 → 启动按店有限恢复链。
-        // 这 1 次即时重读已计入 10 次；链只执行剩余次数，绝不嵌套成 20 次。
-        // 建链判定只看**最新一次物理读取**的原始错误：out.error 是为展示拼接的组合文本，
-        // 首次白名单/传输词会残留在里面，用它判定会把已不满足白名单的店铺错误续上恢复链。
-        const latestReadError = result && result.error;
-        if (!recoveryMode && !recoveryExhausted && out && out.error
-            && this._isTransientReadError(latestReadError)
-            && !this._hasPendingReadGate(shopCfg.id)) {
-          const rec = this._ensureReadRecovery(shopCfg, out.error, attempt);
-          if (rec) {
-            const view = this._readRecoveryView(shopCfg.id);
-            out = {
-              ...out,
-              error: {
-                ...out.error,
-                retryCount: attempt,
-                recovery: view,
-                reason: `${out.error.reason}；已启动有限恢复（${rec.attempts}/${READ_RECOVERY_MAX_RETRIES}）`,
-              },
-            };
-            this._recordRecoveryState(rec, out.error);
-          }
-        }
-        if (recoveryExhausted && out && !out.error) {
-          // 满 10 次后的普通巡查真实读取成功：正常新成功重置恢复事件（清旧错误/进度）。
-          this._clearReadFailure(shopCfg.id);
-          this._applyObservedAdState(shopCfg.id, out.state || 'unknown', '满10次后普通巡查只读回读成功');
-        }
-        return out;
-      }
-      // ── 截止收口：每一步都是真实收口证明，不以定时等待结束或 browser.closed 假值放行
       const lastStep = steps.length ? steps[steps.length - 1] : null;
-      if (session) {
-        // 关闭一发起就同步登记为 pending（见 _closeSessionTracked）
-        this._closeSessionTracked(session, closeWaitMs, closes, 'session');
+      if (deadlineFired) {
+        // 截止收口：对已建立的会话做一次有界关闭；无会话则由 onSession 在迟到会话到达时有界关闭。
+        let cleanup = 'closed';
+        if (session) {
+          const cr = await this._closeSessionBounded(session, closeWaitMs);
+          if (!cr.closed) {
+            cleanup = 'blocked';
+            log.warn(`回读截止后会话关闭失败（${shopCfg.id}）：${String((cr.error && cr.error.message) || cr.error || 'unknown').slice(0, 120)}`);
+          }
+        }
+        try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'deadline', lastStep, timeoutMs, cleanup, attempt: attempt + 1 }); } catch (_) { /* 审计失败不影响 */ }
+        const why = cleanup === 'blocked' ? '会话关闭失败/未确认' : '已终止本次会话';
+        return { state: 'unknown', error: { status: 'blocked', reason: `回读截止（${timeoutMs}ms）已到：${why}；最后步骤：${lastStep || '未记录'}`, blocked: 'ad_state_read', timeout: true, lastStep, cleanup } };
       }
-      const settledNow = await Promise.race([workRec.settledP.then(() => true), new Promise((r) => setTimeout(r, settleBoundMs)).then(() => false)]);
-      if (settledNow) {
-        // work 已 settle：迟到会话登记必然已完成（onSession 同步登记先于 settle）——排空在途关闭结果
-        for (let i = 0; i < closes.length; i++) {
-          const c = closes[i];
-          if (c.promise && c.closed === null) await Promise.race([c.promise, new Promise((r) => setTimeout(r, closeWaitMs))]);
+      // 正常结束：闭环审计（done 携带脱敏后的 blocked/status/reason/timeout/lastStep）。
+      try {
+        const doneEvent = { kind: 'ad-state-read', shopId: shopCfg.id, event: 'done', outcome: result && result.error ? 'error' : 'ok', lastStep, attempt: attempt + 1 };
+        if (result && result.error) {
+          const m = this._maskReadError(result.error, shopCfg.id);
+          doneEvent.status = m.status;
+          doneEvent.errorKind = m.kind;
+          doneEvent.blocked = m.blocked;
+          doneEvent.reason = m.reason;
+          if (m.timeout) doneEvent.timeout = true;
+          if (m.lastStep) doneEvent.lastStep = doneEvent.lastStep || m.lastStep;
+        }
+        this._audit(doneEvent);
+      } catch (_) { /* 审计失败不影响 */ }
+      // 会话关闭证明：没有证据就是未证明，绝不默认已关闭。
+      const closeState = meta.closeState || { closed: false, error: null, source: 'missing' };
+      if (closeState.closed !== true) {
+        const hadSession = closeState.source === 'session';
+        const transient = !!(result && result.error && this._isTransientReadError(result.error));
+        if (!hadSession && result && result.error && !transient) return result;
+        const why = `本次会话未获得严格关闭证明${closeState.error ? ': ' + String((closeState.error && closeState.error.message) || closeState.error).slice(0, 120) : ''}`;
+        log.warn(`回读会话关闭未获证明（${shopCfg.id}）：${why}`);
+        const orig = result && result.error && result.error.reason ? `；原始错误：${result.error.reason}` : '';
+        try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'blocked', reason: why + orig, attempt: attempt + 1 }); } catch (_) { /* 审计失败不影响 */ }
+        return { state: 'unknown', error: { status: 'blocked', reason: `回读结束但${why}${orig}，本次结果不作 on/off 证据`, blocked: 'ad_state_read', blockedBy: 'unread_session' } };
+      }
+      // 空表机读码铸造：只有本次会话关闭已获严格证明才会走到这里。
+      if (result && result.error && result.error.emptyTableEvidence) {
+        const ev = result.error.emptyTableEvidence;
+        const code = evidenceCode({ ...ev, closeProven: true, dispatched: 0 });
+        if (code) {
+          result.error.emptyTableCode = code;
+          try {
+            this._audit({
+              kind: 'ad-state-read', shopId: shopCfg.id, event: 'empty-table-evidence', code,
+              tab: ev.tab, pageNo: ev.pageNo, attempt: attempt + 1,
+              total: ev.pagination && ev.pagination.total, hasNext: ev.pagination && ev.pagination.hasNext,
+              identityOk: ev.identityOk === true, refreshOk: ev.refreshOk === true,
+            });
+          } catch (_) { /* 审计失败不影响 */ }
         }
       }
-      const pendingClose = closes.some((c) => c.closed === null);
-      const allClosed = closes.every((c) => c.closed === true);
-      if (!settledNow || !allClosed) {
-        // 截止门（本次修复的主缺口）：旧实现只登记 workRec/sessionRef，opener 仍挂账时既没有
-        // 句柄也没有"未创建"证明，永远无法核验收口 → 本店长期 unknown。
-        // 现在同时携带同步登记的活句柄（可能晚于门到达，故用 handleRef）与可信 resourceCreated。
-        const deadlineGate = this._newReadGate(shopCfg.id, {
-          workRec,
-          sessionRef: () => session,
-          handleRef: () => (meta && (meta.openerResource || meta.openerCleanupHandle)) || null,
-          cleanupHandle: (meta && (meta.openerResource || meta.openerCleanupHandle)) || null,
-          resourceCreated: meta && meta.resourceCreated === false ? false : (meta && meta.resourceCreated === true ? true : null),
-          closes,
-        });
-        const why = !settledNow
-          ? 'work 未 settle'
-          : closes.filter((c) => c.closed !== true).map((c) => `${c.label}${c.closed === null ? ' 关闭进行中' : ' 关闭失败'}${c.error ? ': ' + String((c.error && c.error.message) || c.error).slice(0, 120) : ''}`).join('；');
-        try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'deadline', lastStep, timeoutMs, cleanup: 'blocked', why: why + (pendingClose ? '（存在在途关闭）' : ''), attempt: attempt + 1 }); } catch (_) { /* 审计失败不影响 */ }
-        return { state: 'unknown', error: { status: 'blocked', reason: `回读截止（${timeoutMs}ms）已到：${why}，已保持阻断（不启动新回读）；最后步骤：${lastStep || '未记录'}`, blocked: 'ad_state_read', blockedBy: 'unread_session', gateId: deadlineGate.gateId, gatePhase: deadlineGate.phase, timeout: true, lastStep, cleanup: 'blocked' } };
+      // 明确瞬态且可安全重读：同一 deadline 内最多一次额外完整回读（重新开 session）。
+      if (attempt === 0 && result && result.error && this._isTransientReadError(result.error)) {
+        const rem2 = deadlineAt - Date.now();
+        if (rem2 > 0) {
+          firstTransientReason = String(result.error.reason || '');
+          const rt = this._runtime(shopCfg.id);
+          rt.lastReadError = {
+            kind: 'retrying',
+            reason: firstTransientReason,
+            blocked: result.error.blocked || 'ad_state_read',
+            retrying: true,
+            retried: false,
+            at: new Date(this.nowFn()).toISOString(),
+          };
+          try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'retry', attempt: 2, reason: firstTransientReason, remainingMs: rem2 }); } catch (_) { /* 审计失败不影响 */ }
+          attempt = 1;
+          continue;
+        }
       }
-      try { this._audit({ kind: 'ad-state-read', shopId: shopCfg.id, event: 'deadline', lastStep, timeoutMs, cleanup: 'closed', attempt: attempt + 1 }); } catch (_) { /* 审计失败不影响 */ }
-      return { state: 'unknown', error: { status: 'blocked', reason: `回读截止（${timeoutMs}ms）已到，已终止本次会话；最后步骤：${lastStep || '未记录'}`, blocked: 'ad_state_read', timeout: true, lastStep, cleanup: 'closed' } };
+      let out = result;
+      if (attempt > 0 && result && result.error) {
+        out = {
+          ...result,
+          error: {
+            ...result.error,
+            retried: true,
+            retryCount: 1,
+            reason: `首次回读失败（${firstTransientReason || '瞬态错误'}）；已重试1次仍未恢复：${result.error.reason}`,
+          },
+        };
+      }
+      if (attempt > 0) {
+        // 重试结束必须收口“正在重试”标记：成功清除，失败改为最终分类。
+        const rt = this._runtime(shopCfg.id);
+        if (out && out.error) {
+          rt.lastReadError = {
+            kind: this._readErrorKind(out.error, shopCfg.id),
+            reason: String(out.error.reason || ''),
+            blocked: out.error.blocked || 'ad_state_read',
+            retrying: false,
+            retried: true,
+            at: new Date(this.nowFn()).toISOString(),
+          };
+        } else if (rt.lastReadError && rt.lastReadError.kind === 'retrying') {
+          rt.lastReadError = null;
+        }
+      }
+      return out;
     }
   }
 
@@ -4383,14 +3168,6 @@ class Monitor {
         // 透传进恢复链）。未登记 authRecoveryPolicy 的店铺不进 fix3，对其零影响。
         ...this._authRecoveryWiring(shopCfg),
         ...( (_meta && _meta.cancelToken) ? { cancelToken: _meta.cancelToken } : {} ),
-        // 所有权早登记（2026-10-23）：适配器必须在**创建资源之后、任何后续 await 之前**同步回调。
-        // 截止先于 opener 返回时，门里已经握着可核验的 close/isConnected 句柄。
-        // 句柄是闭包对象：绝不进返回值、日志或 JSON。
-        onResource: (handle) => {
-          if (!_meta || !handle || typeof handle !== 'object' || typeof handle.isConnected !== 'function') return;
-          _meta.openerResource = handle;
-          _meta.resourceCreated = true;
-        },
       });
       if (_meta && _meta.onSession) _meta.onSession(session);
       if (!session || !session.page || (!session.controller && !session.readOnlyEmpty)) {
@@ -4571,23 +3348,6 @@ class Monitor {
       // 「本次已严格关闭」独立核对证据才能作为同一周期重读的依据。
       const cleanup = readChengfangCleanupEvidence(e);
       if (_meta && cleanup) _meta.openerCleanup = cleanup;
-      // 跨周期收口句柄（F3-R7）：opener 失败但已创建浏览器时，句柄随原始错误一并透传，
-      // 供外壳登记持久门并在后续周期推进真实关闭；句柄本身绝不进入返回值或日志。
-      if (_meta && typeof readChengfangCleanupHandle === 'function') {
-        const cleanupHandle = readChengfangCleanupHandle(e);
-        if (cleanupHandle) _meta.openerCleanupHandle = cleanupHandle;
-      }
-      // 生产者"未创建"证明（r13 缺口 1）：只采信**资源所有者**在 lib/resource-attestation
-      // 私有登记表里产出的证明；裸属性 chengfangResourceCreated=false 不再采信。
-      // 且必须同时不存在任何收口事实来源（同步句柄/延迟句柄/已关闭证据）——那些都代表
-      // 真实创建过资源，一律以句柄与连接核验为准（宁可保守阻断）。
-      if (_meta && e && !_meta.openerResource && !_meta.openerCleanupHandle && !_meta.openerCleanup) {
-        const proof = resourceNotCreatedProof(e);
-        if (proof) {
-          _meta.resourceCreated = false;
-          _meta.notCreatedOwner = proof.ownerId;
-        }
-      }
       // F5-R9：Cookie 解析/结构/读取受阻、身份、通用 Auth 均按具体故障分类；
       // 只有正式登录检测的正证据才是 auth（可要求重新登录），其余保持原 reason。
       // AUTH-60S FINAL：携带 loginEvidence 时由结构性证据 + 连续观测窗口决定 cls（任一
@@ -4660,8 +3420,6 @@ class Monitor {
     this._recordBatch(shopId, batch);
     this._memPush(this.actions, { shopId, ...this._summarizeBatch(batch) }, undefined, 'batch');
     this._audit({ kind: 'action', shopId, ...this._summarizeBatch(batch) });
-    // 空表机读码 → 只读恢复桥接（开启批次同样 partial 收口、零派发才放行）
-    this._maybeBridgeEmptyTableReadRecovery(shopId, batch);
   }
 
   /**
@@ -5217,7 +3975,6 @@ class Monitor {
     this._memPush(this.actions, { shopId: shopCfg.id, ...this._summarizeBatch(batch) }, undefined, 'batch');
     this._audit({ kind: 'action', shopId: shopCfg.id, ...this._summarizeBatch(batch) });
     // 空表机读码 → 只读恢复桥接：partial 收口不变，不重跑 executor，不改写 outcome/counts
-    this._maybeBridgeEmptyTableReadRecovery(shopCfg.id, batch);
     return { status: 'ok', over: true, batch: this._summarizeBatch(batch) };
   }
 
@@ -5225,22 +3982,14 @@ class Monitor {
 
   /** 每日开启相位：遍历启用的店铺执行开启（真实=executeChengfangEnableBatch；演练=runDryEnableCycle）。 */
   async _runEnablePhase(gen, businessDate = null, { scope = 'scheduler' } = {}) {
-    // 互斥：暂停巡查或其他周期进行中 → 绝不并发开启（同一店铺执行互斥），调用方稍后重试
-    if (this._cycleRunning) {
-      return { skipped: true, reason: '已有周期进行中（暂停/开启互斥），本轮开启相位跳过' };
-    }
+    // 并发由单店锁 _shopProcessing（_runShopEnablePhase → _tryAcquireShop）保证：同店串行、
+    // 异店可并行，不需要全局周期布尔。
     // scope='scheduler'：独立每日开启调度器驱动（默认）。生命周期只随 _enableGen/
     // enableRunning 终止，令牌 kind='enable'——"停止值守"绝不取消每日开启。
-    // scope='pause'：值守循环的历史回退路径（未启用独立调度器时，开启窗口由值守循环
-    // 驱动）；随 this.running/_gen 终止，令牌 kind='pause'（停止值守一并中止）。
     const schedScope = scope !== 'pause';
     const token = { aborted: false, kind: schedScope ? 'enable' : 'pause' };
     this._activeTokens.add(token);
-    this._cycleRunning = true;
     const today = businessDate || shanghaiDate(this.nowFn());
-    // D24S/D24T：开启相位同样遵守跨店串行启动门（登记簿/门是唯一事实源，
-    // 跨周期遗留的未收口门同样阻断他店启动；他店处理在途同样顺延）。
-    const preExistingCleanup = this._unprovenCleanupShopIds();
     try {
       for (const shopCfg of this._activeShops()) {
         if (schedScope) {
@@ -5252,22 +4001,10 @@ class Monitor {
         // 删除后调度器再次检查活动列表
         if (!this._isShopActive(shopCfg.id)) continue;
         if (this._enablePhaseDone(shopCfg.id, today)) continue;
-        const cleanupBlocker = this._cycleNewCleanupBlocker(shopCfg.id, preExistingCleanup);
-        if (cleanupBlocker) {
-          this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-serial-cleanup', trigger: scope, blockedBy: cleanupBlocker });
-          continue; // 不标记当日完成：窗口内按既有节奏有界重试
-        }
-        // D24T 跨入口一次一家店：他店处理在途（周期外取得的每店锁）→ 本店开启相位顺延。
-        const otherBusy = this._otherBusyOrUnprovenShop(shopCfg.id);
-        if (otherBusy) {
-          this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-serial-other-busy', trigger: scope, blockedBy: otherBusy });
-          continue; // 不标记当日完成：窗口内按既有节奏有界重试
-        }
         await this._runShopEnablePhase(shopCfg, token, today);
       }
     } finally {
       this._activeTokens.delete(token);
-      this._cycleRunning = false;
     }
     return { skipped: false };
   }
@@ -5277,7 +4014,8 @@ class Monitor {
    * 每日开启预检与决策链（_runShopEnablePhase，source='manual_verify'）——同一真实回读
    * （v3 有界）、身份核验、串行门、当日去重、审计与 fail-closed 规则，不另造旁路。
    * 边界：异步执行（HTTP 不悬挂），状态经 getManualEnableVerifyStatus() 可回读；
-   * 与巡查/自动开启共用 _cycleRunning 互斥（在途即拒绝，不等待）；当日已 success 去重拒绝；
+   * 与巡查/自动开启不共用全局周期布尔，同店互斥由 _shopProcessing（_shopBusy/_tryAcquireShop）
+   * 负责（在途即拒绝，不等待）；当日已 success 去重拒绝；
    * 不改写自动排程（_enableSchedule 的 nextRunAt 不由手动路径设置）。
    */
   runManualEnableVerify(shopId) {
@@ -5288,17 +4026,9 @@ class Monitor {
     if (this._manualVerify && this._manualVerify.status === 'running') {
       return { ok: false, error: '已有手动验证进行中，请稍后（可经状态接口回读进度）', code: 'manual_busy' };
     }
-    if (this._cycleRunning) {
-      return { ok: false, error: '已有巡查/开启周期进行中（互斥），本轮拒绝手动验证', code: 'cycle_busy' };
-    }
     if (this._shopBusy(shopId)) {
-      // WD-NEW-1 并发收口：登录接管等单店处理在途时，同店手动验证拒绝（不会设置 _cycleRunning，需单查）
+      // WD-NEW-1 并发收口：登录接管等单店处理在途时，同店手动验证拒绝
       return { ok: false, error: '该店已有处理在途（登录接管等），本轮拒绝手动验证', code: 'shop_busy' };
-    }
-    // D24T 跨入口一次一家店：他店处理在途/收口未证明（周期外取得的每店锁）→ 同样拒绝，零动作。
-    const otherBusy = this._otherBusyOrUnprovenShop(shopId);
-    if (otherBusy) {
-      return { ok: false, error: `店 ${otherBusy} 处理在途/真实资源收口未证明（一次一家店，跨店串行），本轮拒绝手动验证`, code: 'shop_busy' };
     }
     const today = shanghaiDate(this.nowFn());
     if (this._enablePhaseDone(shopId, today)) {
@@ -5308,7 +4038,6 @@ class Monitor {
     this._manualVerify = { shopId, status: 'running', startedAt, finishedAt: null, result: null };
     const token = { aborted: false, kind: 'enable' };
     this._activeTokens.add(token);
-    this._cycleRunning = true;
     this._audit({ kind: 'enable-phase', shopId, event: 'manual-verify-start', trigger: 'manual_verify', businessDate: today });
     (async () => {
       try {
@@ -5323,7 +4052,6 @@ class Monitor {
         this._audit({ kind: 'enable-phase', shopId, event: 'manual-verify-failed', trigger: 'manual_verify', businessDate: today, reason: String((e && (e.reason || e.message)) || e).slice(0, 200) });
       } finally {
         this._activeTokens.delete(token);
-        this._cycleRunning = false;
       }
     })();
     return { ok: true, started: true, manualVerify: { ...this._manualVerify } };
@@ -5447,7 +4175,6 @@ class Monitor {
         blocked: 'serial_gate_bounded',
         settledAs: 'unknown_expired',
         oldEnableActionId: bounded.actionId,
-        serialGateAttempts: bounded.attempts,
         serialGateWaitedMs: bounded.waitedMs,
         currentAdState,
         firstCheckTime,
@@ -5465,7 +4192,7 @@ class Monitor {
         decision: dailyDecision.decision, currentAdState,
         blocked: 'serial_gate_bounded', exhausted: true,
         oldEnableActionId: bounded.actionId,
-        serialGateAttempts: bounded.attempts, serialGateWaitedMs: bounded.waitedMs,
+        serialGateWaitedMs: bounded.waitedMs,
         reason: bounded.reason,
         enable: { outcome: 'unknown_expired', serial: 'unknown_expired' },
       };
@@ -5991,8 +4718,6 @@ class Monitor {
         // 读取失败结构化状态（完整原因 + 分类：retrying/read_failed/auth/timeout）。
         // 只用于如实展示与重试/扫码判定，绝不被当作 on/off 或成功证据。
         lastReadError: rt.lastReadError || null,
-        // 按店有限恢复进度（真实 timer/计数投影；active=等待/执行中，exhausted=已重试10次仍失败）
-        readRecovery: this._readRecoveryView(s.id),
         today: rt.lastData || null,
         dataRefreshing: rt.dataRefreshing === true,
         lastDataAt: rt.lastDataAt || (rt.lastData && rt.lastData.fetchedAt) || null,
@@ -6108,7 +4833,6 @@ class Monitor {
           pauseEligible: (t && t.businessDate === today) ? t.pauseEligible === true : false,
           roiTooLow: !!(t && t.businessDate === today && t.roiTooLow === true),
           lastError: rt.lastError || (t && t.blockedReason) || null,
-          readRecovery: this._readRecoveryView(s.id),
           // 状态供界面兼容；正常配置店铺不显示待核验标记。
           identityPending: this._shopIdentityState(s).pending,
           identityNote: this._shopIdentityState(s).reason,

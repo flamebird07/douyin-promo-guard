@@ -11,8 +11,8 @@
  *  5) close 失败/迟到 work → 不启动第二次读取，且只阻断本店（跨店隔离）；
  *  6) 总期限与次数可控；
  *  7) refreshShopData：新 Auth 撤销旧 on、旧原因被新因覆盖、成功清除、注入 error 不丢；
- *  8) 跨周期收口门（F3-R7）：无句柄未知失败连续两调用只 opener 一次；真实适配器 close
- *     拒绝 → 凭 WeakMap 收口句柄推进，关闭成功后自动清门并从新 session 读取成功（跨店隔离）。
+ *  8) 批次二（PROMO-IMPL-D1）：跨周期收口门已删除——opener 失败无关闭证明时本次不作
+ *     on/off 证据，但不再登记持久门；下一次读取照常自建新会话（跨店隔离不变）。
  *
  * 不访问浏览器/CDP/网络/真实 Cookie；所有生产模块仅注入假对象。
  */
@@ -177,7 +177,7 @@ async function runRealNavFailure(shopCfg, opts = {}) {
   return { error, nav };
 }
 
-function buildMonitor({ dataDir, openerFn, timeoutMs = 400, closeWaitMs = 200, settleWaitMs = 200, readAdState = null }) {
+function buildMonitor({ dataDir, openerFn, timeoutMs = 400, closeWaitMs = 200, readAdState = null }) {
   const cfgResult = makeCfgResult({
     shops: [SHOP_A, SHOP_B],
     monitor: {
@@ -185,7 +185,6 @@ function buildMonitor({ dataDir, openerFn, timeoutMs = 400, closeWaitMs = 200, s
         scope: [TAB_MAIN, TAB_SUB],
         adStateReadTimeoutMs: timeoutMs,
         adStateCloseWaitMs: closeWaitMs,
-        adStateSettleWaitMs: settleWaitMs,
       },
     },
   });
@@ -212,7 +211,7 @@ test('T1 32vs31 首轮不一致 → 同一周期一次有界只读重读 → 32/
   assert.equal(fake.browsers[0].closed, true, '首轮会话必须严格关闭后才允许重读');
   const evs = auditEvents(dataDir).filter((j) => j.kind === 'ad-state-read');
   assert.ok(evs.some((j) => j.event === 'retry'), '必须留下 retry 审计');
-  assert.equal(mon._pendingReadGateFor(SHOP_A.id), null, '恢复后不得留下阻断门');
+  assert.equal(mon._pendingReadGateFor, undefined, '旧读门方法必须删除');
 });
 
 test('T2 稳定 32vs31 → 两次后保留有原因 unknown，零点击、不无限重试', async () => {
@@ -230,7 +229,7 @@ test('T2 稳定 32vs31 → 两次后保留有原因 unknown，零点击、不无
   assert.match(r.error.reason, /已重试1次仍未恢复/);
   assert.equal(fake.calls.opener, 2, '最多两次（首读 + 一次重读）');
   assert.equal(fake.calls.adClicks, 0);
-  assert.equal(mon._pendingReadGateFor(SHOP_A.id), null);
+  assert.equal(mon._pendingReadGateFor, undefined, '旧读门方法必须删除');
 });
 
 test('T3 导航未稳定且真实适配器证明已严格关闭 → 仅一次新 session 重读成功；不是登录失效', async () => {
@@ -336,10 +335,10 @@ test('T5 关闭失败/超时未收口 → 不启动第二次；且只阻断本�
   const openerAfter = fakeA.calls.opener;
   const r2 = await mon._readCurrentAdState(SHOP_A);
   assert.equal(r2.error.blockedBy, 'unread_session');
-  assert.equal(fakeA.calls.opener, openerAfter, '未收口前不得开新 session');
+  assert.equal(fakeA.calls.opener, openerAfter + 1, '无持久读门：下一次读取自建新会话（自身 close 仍拒绝 → 不作证据）');
   const rB = await mon._readCurrentAdState(SHOP_B);
   assert.equal(rB.state, 'on', JSON.stringify(rB.error || rB));
-  assert.equal(fakeB.calls.opener, 1, 'B 店不得被 A 店的收口门阻塞');
+  assert.equal(fakeB.calls.opener, 1, '跨店隔离：A 店失败不影响 B 店');
 });
 
 test('T6 共享总期限与次数可控：首读耗时后重读只用剩余预算，总数不超过 2', async () => {
@@ -474,7 +473,7 @@ test('T9 现有保护不回退：身份失败/重复 ID 不重试，分页严格
   }
 });
 
-test('T10 跨周期：无句柄未知 opener 失败 → 连续两次调用也只启动一次 opener（持久收口门，跨店隔离）', async () => {
+test('T10 无关闭证明的 opener 失败：每次调用独立重试一次；无持久收口门；跨店隔离', async () => {
   const dataDir = makeTempDir('usr-t10-');
   let openerCalls = 0;
   const fakeB = makeFakeFactory([{ shopId: SHOP_B.id, views: fullViews('b') }]);
@@ -489,21 +488,19 @@ test('T10 跨周期：无句柄未知 opener 失败 → 连续两次调用也只
   });
   const r1 = await mon._readCurrentAdState(SHOP_A);
   assert.equal(r1.state, 'unknown');
-  assert.equal(openerCalls, 1, '首次失败内不得二次读取');
+  assert.equal(openerCalls, 1, '首次失败且无关闭证明 → 不盲目重试');
   assert.equal(r1.error.blockedBy, 'unread_session');
-  assert.ok(mon._pendingReadGateFor(SHOP_A.id), '无关闭证明的瞬态失败必须登记按店持久收口门');
+  assert.equal(mon._pendingReadGateFor, undefined, '旧持久收口门必须删除');
   const r2 = await mon._readCurrentAdState(SHOP_A);
   assert.equal(r2.state, 'unknown');
   assert.equal(r2.error.blockedBy, 'unread_session');
-  assert.match(r2.error.reason, /收口句柄/);
-  assert.equal(openerCalls, 1, '下一周期不得静默遗忘未证明的关闭再开 opener');
-  assert.ok(mon._pendingReadGateFor(SHOP_A.id), '缺句柄时门必须保持（保守阻断）');
+  assert.equal(openerCalls, 2, '下一次调用自建新会话，不残留跨周期门');
   const rB = await mon._readCurrentAdState(SHOP_B);
   assert.equal(rB.state, 'on', JSON.stringify(rB.error || rB));
-  assert.equal(fakeB.calls.opener, 1, 'A 店收口门不得阻塞 B 店');
+  assert.equal(fakeB.calls.opener, 1, '跨店隔离：A 店失败不影响 B 店');
 });
 
-test('T11 跨周期：真实适配器导航失败 close 拒绝 → 凭收口句柄推进关闭，成功后自动清门并从新 session 读取成功', async () => {
+test('T11 真实适配器导航失败且 close 拒绝：本次不作 on/off 证据；无持久门，下一次读取照常新建会话', async () => {
   const dataDir = makeTempDir('usr-t11-');
   const nav = makeNavFailureHome({ closeMode: 'reject' });
   const ok = makeFakeFactory([{ shopId: SHOP_A.id, views: fullViews('b') }]);
@@ -515,7 +512,7 @@ test('T11 跨周期：真实适配器导航失败 close 拒绝 → 凭收口句�
       if (args.shopCfg.id === SHOP_B.id) return fakeB.opener(args);
       openerCalls += 1;
       if (openerCalls === 1) {
-        // 第一次：走真实 openChengfangShop 失败路径（close 拒绝 → 无证明 + 有句柄）
+        // 第一次：走真实 openChengfangShop 失败路径（close 拒绝 → 无证明）
         await openChengfangShop({
           loginCfg: {},
           shopCfg: args.shopCfg,
@@ -532,29 +529,16 @@ test('T11 跨周期：真实适配器导航失败 close 拒绝 → 凭收口句�
   assert.equal(r1.error.blockedBy, 'unread_session');
   assert.match(r1.error.reason, /导航"乘方"未到达管理页/, '原始错误原文必须保留');
   assert.equal(openerCalls, 1);
-  const gate = mon._pendingReadGateFor(SHOP_A.id);
-  assert.ok(gate, 'close 拒绝的失败必须登记持久收口门');
-  assert.ok(gate.cleanupHandle, '真实适配器必须移交收口句柄（WeakMap，不可序列化）');
-  assert.equal(gate.sessionRef(), null, '无会话门绝不携带会话引用');
+  assert.equal(mon._pendingReadGateFor, undefined, '旧持久收口门必须删除');
+  assert.equal(nav.isConnected(), true, '失败后的关闭未被证明');
 
-  // 第二次调用：close 仍拒绝 → 先推进真实关闭，仍未证明 → 不新开 opener
+  // 无持久门：下一次读取立即新建会话并成功
   const r2 = await mon._readCurrentAdState(SHOP_A);
-  assert.equal(r2.state, 'unknown');
-  assert.equal(r2.error.blockedBy, 'unread_session');
-  assert.match(r2.error.reason, /收口句柄/);
-  assert.equal(openerCalls, 1, 'close 仍拒绝时不得启动新 session');
-  assert.equal(nav.isConnected(), true, '推进尝试不得伪造关闭事实');
-
-  // 同一假 browser 的 close 恢复可成功 → 后续调用自动推进关闭 → 清门 → 新 session 正常读取
-  nav.setCloseMode('ok');
-  const r3 = await mon._readCurrentAdState(SHOP_A);
-  assert.equal(r3.state, 'on', JSON.stringify(r3.error || r3));
-  assert.equal(openerCalls, 2, '只有真实关闭被证明后才允许下一次读取');
-  assert.equal(nav.isConnected(), false, '本次失败浏览器必须由 Monitor 凭句柄真实关闭');
-  assert.equal(mon._pendingReadGateFor(SHOP_A.id), null, '关闭成功后不得残留收口门');
+  assert.equal(r2.state, 'on', JSON.stringify(r2.error || r2));
+  assert.equal(openerCalls, 2, '下一次读取自建新会话，不等旧关闭推进');
   assert.equal(ok.calls.adClicks, 0, '全程零广告点击');
   const rB = await mon._readCurrentAdState(SHOP_B);
   assert.equal(rB.state, 'on', JSON.stringify(rB.error || rB));
-  assert.equal(fakeB.calls.opener, 1, '跨店隔离：A 店收口门全程未阻塞 B 店');
+  assert.equal(fakeB.calls.opener, 1, '跨店隔离：A 店失败不影响 B 店');
   assert.equal(fakeB.calls.adClicks, 0);
 });

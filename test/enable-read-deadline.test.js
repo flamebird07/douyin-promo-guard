@@ -161,7 +161,7 @@ test('T1 正常回读不退化：on / off / mixed / 多页清单 / 身份门禁�
   }
 });
 
-test('N1 opener 永不返回：截止后有界返回 unknown；旧 work 未 settle 时新回读不再调用 opener；迟到会话被收口', async () => {
+test('N1 opener 永不返回：截止后有界返回 unknown；无持久读门（下一次回读自建新会话）；迟到会话被收口', async () => {
   const dataDir = makeTempDir('stage3b-data-');
   const fake = makeFake({ shopId: 'shop-a', views: OK_VIEWS });
   let releaseOpener = null;
@@ -181,28 +181,24 @@ test('N1 opener 永不返回：截止后有界返回 unknown；旧 work 未 sett
   const r1 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
   assert.equal(r1.state, 'unknown');
   assert.equal(r1.error.timeout, true);
-  assert.equal(r1.error.cleanup, 'blocked', `cleanup=${r1.error.cleanup}`);
-  assert.ok(/work 未 settle/.test(r1.error.reason), `reason=${r1.error.reason}`);
+  assert.equal(r1.error.cleanup, 'closed', `无会话即无待关闭资源 cleanup=${r1.error.cleanup}`);
   assert.equal(openerCalls, 1, '截止时仅一次 opener 在途');
-  // 旧 work 未 settle：新回读不得再调用 opener
+  // 不再有持久读门：下一次回读立即新建会话并正常返回
   const r2 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
-  assert.equal(r2.error.blockedBy, 'unread_session');
-  assert.equal(openerCalls, 1, '旧 work 未 settle 时 opener 调用数不得增加');
-  // 释放 opener：迟到会话必须被立即收口（不留无人管理的浏览器）
-  releaseOpener(await fake.opener());
-  await new Promise((r) => setTimeout(r, 120));
-  assert.equal(fake.browsers[0].closed, true, '迟到会话必须被收口');
-  assert.equal(fake.calls.opener, 1, '迟到会话经首次（已计数的）opener 调用建立');
-  // work 已 settle 且会话已关闭 → 第三次回读放行并正常返回
-  const r3 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
-  assert.equal(r3.state, 'on');
-  assert.equal(r3.error, undefined);
-  assert.equal(openerCalls, 2, '放行后才允许第二次 opener');
+  assert.equal(r2.state, 'on', JSON.stringify(r2.error || r2));
+  assert.equal(r2.error, undefined);
+  assert.equal(openerCalls, 2, '下一次回读自建新会话，不被旧 work 阻断');
+  // 释放首次 opener 的迟到会话：必须被有界收口（不留无人管理的浏览器）
+  const late = await fake.opener();
+  const lateBrowser = fake.browsers[fake.browsers.length - 1];
+  releaseOpener(late);
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(lateBrowser.closed, true, '迟到会话必须被收口');
   const evs = auditList(dataDir).filter((j) => j.kind === 'ad-state-read').map((j) => j.event);
-  assert.ok(evs.includes('start') && evs.includes('deadline') && evs.includes('blocked'), JSON.stringify(evs));
+  assert.ok(evs.includes('start') && evs.includes('deadline'), JSON.stringify(evs));
 });
 
-test('N2 opener 在截止后才返回会话：迟到会话被收口，work settle 后才允许新读取', async () => {
+test('N2 opener 在截止后才返回会话：迟到会话被收口；下一次回读照常新建会话', async () => {
   const dataDir = makeTempDir('stage3b-data-');
   const fake = makeFake({ shopId: 'shop-a', views: OK_VIEWS });
   const monitor = buildMonitor({
@@ -217,16 +213,17 @@ test('N2 opener 在截止后才返回会话：迟到会话被收口，work settl
   });
   const r1 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
   assert.equal(r1.error.timeout, true, `r1=${JSON.stringify(r1.error)}`);
+  await new Promise((r) => setTimeout(r, 250)); // 等迟到会话到达并被有界关闭
   assert.equal(fake.browsers[0].closed, true, '迟到会话必须被收口');
   assert.equal(fake.browsers.length, 1);
-  // 迟到会话被关闭 → inner 抛 Target closed → work settle → 第二次回读放行（新会话）
+  // 无跨周期门：第二次回读立即新建会话并成功
   const r2 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
   assert.equal(r2.state, 'on');
   assert.equal(r2.error, undefined);
   assert.equal(fake.calls.opener, 2);
 });
 
-test('N3 browser.close() 拒绝：不得标为已关闭，不得开启新读取', async () => {
+test('N3 browser.close() 拒绝：不得标为已关闭；下一次回读照常新建会话（无持久门）', async () => {
   const dataDir = makeTempDir('stage3b-data-');
   const fake = makeFake({ shopId: 'shop-a', views: OK_VIEWS, hangOn: 'readView', closeMode: 'reject' });
   const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
@@ -236,36 +233,32 @@ test('N3 browser.close() 拒绝：不得标为已关闭，不得开启新读取'
   assert.ok(/关闭失败/.test(r1.error.reason), `reason=${r1.error.reason}`);
   assert.equal(fake.browsers[0].closed, false, 'close 拒绝不得标为已关闭');
   const openerAfterR1 = fake.calls.opener;
-  // 再次回读：阻断推进重试 close 仍拒绝 → 继续阻断，opener 不增加
+  // 无持久读门：下一次回读立即新建会话；该会话 close 仍被拒 → 结果不作 on/off 证据
   const r2 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
   assert.equal(r2.error.blockedBy, 'unread_session');
-  assert.ok(/关闭失败/.test(r2.error.reason));
-  assert.equal(fake.calls.opener, openerAfterR1, 'close 未成功前不得启动新会话');
+  assert.ok(/未获得严格关闭证明/.test(r2.error.reason), `reason=${r2.error.reason}`);
+  assert.equal(fake.calls.opener, openerAfterR1 + 1, '不再有持久读门：下一次读取自建新会话');
   const evs = auditList(dataDir).filter((j) => j.kind === 'ad-state-read').map((j) => j.event);
-  assert.ok(evs.includes('blocked'), JSON.stringify(evs));
+  assert.ok(evs.includes('deadline') && evs.includes('blocked'), JSON.stringify(evs));
 });
 
-test('N4 close 完成但旧 work 仍不 settle：保持阻断；work settle 后才放行', async () => {
+test('N4 close 完成但旧 work 仍不 settle：本次有界返回；下一次回读照常新建会话（无跨周期门）', async () => {
   const dataDir = makeTempDir('stage3b-data-');
   const fake = makeFake({ shopId: 'shop-a', views: OK_VIEWS, hangOn: 'readView-detached', closeMode: 'ok' });
   const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
   const r1 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
   assert.equal(r1.error.timeout, true);
-  assert.equal(r1.error.cleanup, 'blocked');
-  assert.ok(/work 未 settle/.test(r1.error.reason), `reason=${r1.error.reason}`);
+  assert.equal(r1.error.cleanup, 'closed');
   assert.equal(fake.browsers[0].closed, true, '会话本身已关闭');
   const openerAfterR1 = fake.calls.opener;
-  // close 已完成但 work 仍未 settle → 新回读必须保持阻断（不得凭浏览器已关闭放行）
+  // 旧 work 永不 settle 也不残留任何门：下一次回读立即新建会话并成功
   const r2 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
-  assert.equal(r2.error.blockedBy, 'unread_session');
-  assert.equal(fake.calls.opener, openerAfterR1, 'work 未 settle 不得启动新读取');
-  // 释放旧 work → 第三次回读放行
+  assert.equal(r2.state, 'on', JSON.stringify(r2.error || r2));
+  assert.equal(r2.error, undefined);
+  assert.equal(fake.calls.opener, openerAfterR1 + 1, '旧 work 不阻断新会话');
+  // 释放旧 work 的挂起 promise（无状态影响，仅避免悬挂）
   assert.ok(typeof fake.detachedReject === 'function', 'detached 挂起应可释放');
   fake.detachedReject(new Error('Target page/context has been closed'));
-  const r3 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
-  assert.equal(r3.state, 'on');
-  assert.equal(r3.error, undefined);
-  assert.equal(fake.calls.opener, openerAfterR1 + 1, 'work settle 后才允许新 opener');
 });
 
 test('N5 正常关闭且旧 work 已 settle：本轮 cleanup=closed、下一次读取放行（原 T2 语义）', async () => {
@@ -289,21 +282,21 @@ test('N5 正常关闭且旧 work 已 settle：本轮 cleanup=closed、下一次�
   assert.ok(evs.includes('start') && evs.includes('deadline'), JSON.stringify(evs));
 });
 
-test('T3 close 永不完成：不得标为已关闭、不得开启新读取（原 T3，语义更新为 cleanup=blocked）', async () => {
+test('T3 close 永不完成：本次有界返回 cleanup=blocked；下一次回读照常新建会话', async () => {
   const dataDir = makeTempDir('stage3b-data-');
   const fake = makeFake({ shopId: 'shop-a', views: OK_VIEWS, hangOn: 'readView', closeMode: 'never' });
   const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
   const r1 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
   assert.equal(r1.error.timeout, true);
   assert.equal(r1.error.cleanup, 'blocked');
-  assert.ok(/work 未 settle/.test(r1.error.reason), `close 永不完成 → 挂起读取无法结束 → reason=${r1.error.reason}`);
+  assert.ok(/关闭失败|未确认/.test(r1.error.reason), `reason=${r1.error.reason}`);
   assert.equal(fake.browsers[0].closed, false);
   const openerAfterR1 = fake.calls.opener;
   const r2 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
   assert.equal(r2.error.blockedBy, 'unread_session');
-  assert.equal(fake.calls.opener, openerAfterR1, '不得启动新会话');
+  assert.equal(fake.calls.opener, openerAfterR1 + 1, '无持久门：下一次读取自建新会话');
   const evs = auditList(dataDir).filter((j) => j.kind === 'ad-state-read').map((j) => j.event);
-  assert.ok(evs.includes('blocked'), JSON.stringify(evs));
+  assert.ok(evs.includes('deadline') && evs.includes('blocked'), JSON.stringify(evs));
 });
 
 test('T4 挂起不再挡互斥：A 店截止 fail-closed，B 店被处理，巡查可用，零点击', async () => {
@@ -388,15 +381,11 @@ test('T5 审计区分两类 unknown：readError（带 error）与 readNote（开
   }
 });
 
-test('N6 竞态复现：迟到会话 + 关闭永不完成 + 旧 work 先 settle → 不得凭空/未完成列表放行（v2 缺陷回归）', async () => {
-  // v2 缺陷：onSession 迟到分支只在关闭 promise 完成后才向 closes 加条目——旧 work 先 settle 时
-  // 超时收口路径看到空列表 → allClosed=true → 放行 → 第二次回读调用 opener（主脑复现场景）。
-  // v3：关闭一发起就同步登记为 pending（closed:null），空/未完成列表一律不放行。
+test('N6 竞态复现（批次二后）：迟到会话 + 关闭永不完成 → 不残留跨周期门；迟到关闭不阻塞后续读取', async () => {
+  // 旧实现的 v2/v3 缺陷围绕“跨周期收口门”展开；门已删除，本用例改为验证新边界：
+  // 截止时无会话 → 有界返回；迟到会话走日志收口（close 永不完成也不留状态）；
+  // 后续读取照常新建会话，只按自身关闭证明决定结果（close 仍拒绝 → 本次不作 on/off 证据）。
   const dataDir = makeTempDir('stage3b-data-');
-  // 迟到会话：browser.close 永不完成（tracked 关闭永远在途），但会话自有 close() 立即完成——
-  // inner 的 finally 走 session.close 不被阻塞 → 旧 work 在 tracked 关闭完成前先 settle。
-  // v2 只在关闭完成后才登记 → 判定时列表为空 → 误判全部已关闭并放行（主脑复现的确定性等价构造）；
-  // v3 发起即登记 pending（closed:null）→ 必须保持阻断。
   const fake = makeFake({ shopId: 'shop-a', views: OK_VIEWS, closeMode: 'never', sessionCloseFast: true });
   let releaseOpener = null;
   let openerCalls = 0;
@@ -411,25 +400,19 @@ test('N6 竞态复现：迟到会话 + 关闭永不完成 + 旧 work 先 settle 
       }
       return fake.opener(args);
     },
-    closeWaitMs: 2000,
+    closeWaitMs: 100,
   });
-  // r1：截止时 session 未建立 → work 未 settle → blocked + 阻断门（此刻 closes 为空）
   const r1 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
   assert.equal(r1.error.timeout, true);
-  assert.equal(r1.error.cleanup, 'blocked');
-  assert.ok(/work 未 settle/.test(r1.error.reason), `reason=${r1.error.reason}`);
+  assert.equal(r1.error.cleanup, 'closed', '截止时无会话，无待关闭资源');
   assert.equal(openerCalls, 1);
-  // 释放 opener：迟到会话返回，其 close 永不完成；inner 因会话仍可用而正常走完 → work 先 settle
+  // 释放 opener：迟到会话返回；其 browser.close 永不完成 → 仅日志收口，不产生任何跨周期状态
   releaseOpener(await fake.opener());
   await new Promise((r) => setTimeout(r, 120));
-  // 第二次回读：门禁必须看到「在途的迟到关闭」（v3 同步登记），不得凭空列表放行
+  // 无持久门：第二次回读立即新建会话；该会话自身 close 未获证明 → 本次结果不作证据
   const r2 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
-  assert.equal(r2.error && r2.error.blockedBy, 'unread_session', `v2 缺陷表现：r2 未被阻断（state=${r2.state}）；v3 reason=${r2.error && r2.error.reason}`);
-  assert.equal(openerCalls, 1, '旧关闭未完成时 opener 调用数不得增加');
-  // 多次推进阻断门仍不得绕过/丢失在途关闭
-  const r3 = await monitor._readCurrentAdState({ id: 'shop-a', name: 'shop-a' });
-  assert.equal(r3.error && r3.error.blockedBy, 'unread_session');
-  assert.equal(openerCalls, 1, '多次推进后仍不得启动新 opener');
+  assert.equal(r2.error && r2.error.blockedBy, 'unread_session', `reason=${r2.error && r2.error.reason}`);
+  assert.equal(openerCalls, 2, '后续读取自建新会话，不等待迟到关闭');
   const evs = auditList(dataDir).filter((j) => j.kind === 'ad-state-read').map((j) => j.event);
-  assert.ok(evs.includes('blocked'), JSON.stringify(evs));
+  assert.ok(evs.includes('deadline') && evs.includes('blocked'), JSON.stringify(evs));
 });

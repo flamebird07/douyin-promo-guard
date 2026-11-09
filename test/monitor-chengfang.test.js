@@ -689,10 +689,15 @@ test('贴近点击：页面结构变化（乘方导航消失）→ beforeDispatc
 /** 启动监控循环并推进到"开启相位已执行 / 已挂起等待"的状态。 */
 async function startLoopAndSettle(monitor, clock) {
   monitor.start();
-  // _intervalLoop 是异步循环：等待首个 delayFn 门挂起（意味着窗口判断已完成）。
-  // 07:00 开启相位会先执行真实/演练批次（本地 fixture 数秒）后才挂起等待，
-  // 故超时必须覆盖相位耗时（60s），否则会误判"循环未挂起"。
-  await waitFor(() => clock.pending() >= 1, 60000, '循环挂起');
+  // 先启动费比巡查并让其首轮挂起，再登记每日开启（启动顺序：巡查优先）。
+  await waitFor(() => clock.pending() >= 1, 60000, '费比巡查首轮挂起');
+  // 每日开启统一由独立 _enableLoop 调度（不再由 _intervalLoop 承载）。
+  if (monitor.enableSchedulerShouldRun()) {
+    monitor.startEnableScheduler({ reason: 'test-enable-loop' });
+    // 独立开启循环与巡查循环并存：等到其完成首次开启尝试（lastRunAt 落账）再返回，
+    // 保持原 helper「已推进到开启相位执行完成/挂起等待」的语义（真实/演练批次数秒）。
+    await waitFor(() => !!monitor._enableSchedule.lastRunAt, 60000, '每日开启首轮执行');
+  }
 }
 
 /** 最近一次批次的 outcome（持久化批次记录顶层无 outcome，须取 runs 末条）。 */
@@ -705,7 +710,7 @@ test('自动开启调度：07:00 前（06:00）启动 → 等待开启窗口，�
   const clock = makeClock(shanghaiMs('2026-09-12', '06:00'));
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
-    monitorChengfang: { pauseEnabled: true, enableEnabled: true },
+    monitorChengfang: { pauseEnabled: true, enableEnabled: true, enableSchedulerEnabled: true },
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
   });
   await startLoopAndSettle(monitor, clock);
@@ -723,7 +728,7 @@ test('自动开启调度：07:00 整 → 执行每日开启（真实 all_enabled
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
     costCents: 10000, // 恰好不超标：S2 后 07:00 开启完成即巡查，隔离本用例只验证开启相位
-    monitorChengfang: { pauseEnabled: true, enableEnabled: true },
+    monitorChengfang: { pauseEnabled: true, enableEnabled: true, enableSchedulerEnabled: true },
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(5) } },
     controllerWrap: async (ctrl) => {
       const orig = ctrl.switchView.bind(ctrl);
@@ -756,7 +761,7 @@ test('自动开启调度：当天只执行一次（同一天重启监控不重�
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
     costCents: 10000, // 恰好不超标：S2 后 07:00 开启完成即巡查，隔离本用例只验证同日去重
-    monitorChengfang: { pauseEnabled: true, enableEnabled: true },
+    monitorChengfang: { pauseEnabled: true, enableEnabled: true, enableSchedulerEnabled: true },
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
   });
   await startLoopAndSettle(monitor, clock);
@@ -799,7 +804,7 @@ test('自动开启调度：跨日重置（2026-09-21 新语义）→ 未暂停�
   // 模拟次日阈值暂停已确认（页面回读=off）→ 第 3 天必须真正执行开启进程。
   // 决策只认本轮回读（adBelief 仅审计）：把 live 行翻到关闭侧。
   // 停值守循环并启动独立每日开启调度器接管窗口（此前窗口由值守循环内分支驱动；
-  // 快进时两循环并发会撞 _cycleRunning 互斥把开启挤到下一天，那是时钟快进伪影）。
+  // 快进时两循环并发会争同一店的 _shopProcessing 锁把开启挤到下一天，那是时钟快进伪影）。
   monitor.stop();
   const sched = await monitor.startEnableScheduler({ reason: 'test' });
   assert.strictEqual(sched.ok, true, sched.reason || '独立调度器启动失败');
@@ -858,7 +863,7 @@ test('自动开启调度：enableEnabled=false → 07:00 相位 blocked，零页
   const clock = makeClock(shanghaiMs('2026-09-12', '07:00'));
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
-    monitorChengfang: { pauseEnabled: true, enableEnabled: false },
+    monitorChengfang: { pauseEnabled: true, enableEnabled: false, enableSchedulerEnabled: true },
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
   });
   await startLoopAndSettle(monitor, clock);
@@ -874,7 +879,7 @@ test('自动开启调度：realMode=false → 开启相位为演练（枚举目�
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
     execution: { realMode: false, dryRun: true },
-    monitorChengfang: { pauseEnabled: true, enableEnabled: true },
+    monitorChengfang: { pauseEnabled: true, enableEnabled: true, enableSchedulerEnabled: true },
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(5) } },
   });
   await startLoopAndSettle(monitor, clock);
@@ -1016,17 +1021,23 @@ test('上线：当日已 success 后窗口内重启 → 不重复开启（真实
   monitor2.stopEnableScheduler({ byUser: false, reason: 'test-cleanup' });
 });
 
-test('上线：两相位互斥——暂停周期进行中，开启相位请求被拒（不并发执行）', async (t) => {
+test('上线（批次二）：巡查周期进行中不再阻断开启相位——同店互斥由 _shopProcessing 负责', async (t) => {
   const clock = makeClock(shanghaiMs('2026-09-12', '07:00'));
   const { monitor } = await setupChengfangMonitor(t, {
     clock,
     execution: { realMode: false, dryRun: true },
     fixture: { plans: { '全店托管': [], '商品自选': ZIXUAN_CLOSED(1) } },
   });
-  monitor._cycleRunning = true; // 模拟暂停/其他周期占用互斥锁
-  const r = await monitor._runEnablePhase(undefined, '2026-09-12');
-  assert.strictEqual(r.skipped, true, '互斥期间开启相位必须跳过');
-  monitor._cycleRunning = false;
+  monitor.enableRunning = true;
+  monitor._cycleRunning = true; // 巡查在途：不再是开启相位的互斥门
+  try {
+    const r = await monitor._runEnablePhase(0, '2026-09-12');
+    assert.strictEqual(r.skipped, false, '巡查在途不得再跳过开启相位');
+    assert.ok(monitor.getEnablePhaseRecord('shop-001', '2026-09-12'), '开启相位应实际落账（演练记录）');
+  } finally {
+    monitor._cycleRunning = false;
+    monitor.enableRunning = false;
+  }
 });
 
 test('上线修复（2026-09-16）：调度漂移——定时器额外延迟不累积；休眠时钟跳跃立即返回', async (t) => {

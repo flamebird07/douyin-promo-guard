@@ -92,7 +92,7 @@ test('M1 旧槽等待超界 + 回读 mixed → 落 exhausted 终态、未确认�
   assert.equal(rec.blocked, 'serial_gate_bounded');
   assert.equal(rec.settledAs, 'unknown_expired');
   assert.equal(rec.oldEnableActionId, SLOT_ACTION_ID);
-  assert.ok(rec.serialGateAttempts >= 1);
+  assert.ok(rec.serialGateWaitedMs >= 30 * 60 * 1000, '收口依据为槽位等待时长');
   assert.match(rec.reason, /有界收口/);
   assert.match(rec.reason, /未确认/);
   assert.equal(monitor._enablePhaseDone(SHOP, DAY), true, 'exhausted 属当日终态，禁止再自动补点');
@@ -124,33 +124,27 @@ test('M2 未达上限（新槽 + 首次尝试）→ 行为不变：unknown + ser
   const rec = monitor.getEnablePhaseRecord(SHOP, DAY);
   assert.equal(rec.status, 'unknown');
   assert.equal(rec.blocked, 'serial_gate');
-  assert.equal(rec.serialGateAttempts, 1, '首次尝试只累计次数');
   assert.equal(monitor._enablePhaseDone(SHOP, DAY), false, 'unknown 仍可在窗口内重试');
   assert.equal(audits(dataDir).some((e) => e.step === 'serial-gate-bounded'), false, '不得提前收口');
   monitor.stop();
 });
 
-test('M3 次数上限（3 次）→ 第 3 次尝试收口；前两次保持 unknown', async () => {
+test('M3 次数不再累计：等待未到上限时反复调用也不收口', async () => {
   const dataDir = makeTempDir('fix2-');
-  seedSlot(dataDir, { startedAt: Date.now() }); // 时间未超界，只靠次数
+  seedSlot(dataDir, { startedAt: Date.now() }); // 时间未超界
   const monitor = buildMonitor(dataDir);
   monitor._serialGateMaxWaitMs = 24 * 60 * 60 * 1000; // 隔离时间维度
 
   const r1 = await runPhase(monitor);
   assert.notEqual(r1.status, 'exhausted');
-  assert.equal(monitor.getEnablePhaseRecord(SHOP, DAY).serialGateAttempts, 1);
-  assert.equal(monitor._switchOrchestrator.hasUnknownBlock(SHOP), true);
 
   const r2 = await runPhase(monitor);
   assert.notEqual(r2.status, 'exhausted');
-  assert.equal(monitor.getEnablePhaseRecord(SHOP, DAY).serialGateAttempts, 2);
-  assert.equal(monitor._switchOrchestrator.hasUnknownBlock(SHOP), true);
 
   const r3 = await runPhase(monitor);
-  assert.equal(r3.status, 'exhausted', JSON.stringify(r3));
-  assert.equal(monitor.getEnablePhaseRecord(SHOP, DAY).serialGateAttempts, 3);
-  assert.equal(monitor._switchOrchestrator.hasUnknownBlock(SHOP), false);
-  assert.equal(monitor._enablePhaseDone(SHOP, DAY), true);
+  assert.notEqual(r3.status, 'exhausted', JSON.stringify(r3));
+  assert.equal(monitor.getEnablePhaseRecord(SHOP, DAY).serialGateAttempts, undefined, '尝试计数登记已删除');
+  assert.equal(monitor._enablePhaseDone(SHOP, DAY), false, '等待未超界仍可在窗口内重试');
   monitor.stop();
 });
 

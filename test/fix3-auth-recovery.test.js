@@ -456,7 +456,6 @@ test('E1 auth 结案证据 → 释放该店 unknown serial_gate；他店不受�
   assert.strictEqual(begin.ok, true, JSON.stringify(begin));
   // 他店不被牵连
   assert.strictEqual(orch.hasUnknownBlock('shop-b'), false);
-  assert.strictEqual(monitor._otherBusyOrUnprovenShop('shop-b'), null);
   // 结案前必须已落盘证据包（脱敏）
   const evDir = path.join(dataDir, 'auth-evidence');
   assert.ok(fs.existsSync(evDir), '证据包目录必须存在');
@@ -638,7 +637,7 @@ function buildControlMonitor(opts = {}) {
   return { monitor, cookieDir, dataDir, calls, shops };
 }
 
-test('G3 对照店 checkLogin：可用 → ok；未提供对照店/他店在途 → fail-closed 未结案', async () => {
+test('G3 对照店 checkLogin：可用 → ok；未提供对照店 → fail-closed 未结案', async () => {
   const { monitor, cookieDir, shops } = buildControlMonitor();
   writeTempCookie(cookieDir, SHOP);
   writeTempCookie(cookieDir, '瑾漂亮潮流服饰');
@@ -649,12 +648,11 @@ test('G3 对照店 checkLogin：可用 → ok；未提供对照店/他店在途 
   assert.strictEqual(ok.shop, '瑾漂亮潮流服饰');
   assert.match(ok.reason, /排除全局误判/);
 
-  // 他店处理在途 → 串行窗口不成立 → 不结案
+  // 跨店互不阻塞：他店处理在途不再阻断本店对照检查（同店互斥由 _shopProcessing 负责）
   monitor._shopProcessing.add('瑾漂亮潮流服饰');
   const busy = await monitor._authControlCheck(self, { shopSafeName: SHOP });
-  assert.strictEqual(busy.ok, false, JSON.stringify(busy));
-  assert.strictEqual(busy.shop, null);
-  assert.match(busy.reason, /窗口不成立/);
+  assert.strictEqual(busy.ok, true, JSON.stringify(busy));
+  assert.strictEqual(busy.shop, '瑾漂亮潮流服饰');
   monitor._shopProcessing.delete('瑾漂亮潮流服饰');
 
   // 对照店 checkLogin 未通过 → 未结案
@@ -782,30 +780,56 @@ test('G6 乘方读取路径接线：_readChengfangAdState 把 restoreControlChec
   }
 });
 
-test('G7 defaultChengfangOpener 透传 fix3 选项到 openChengfangShop（不丢接线）', async () => {
+test('G7 defaultChengfangOpener 透传 fix3/只读诊断/资源收口选项到 openChengfangShop（不丢接线）', async () => {
   const cf = require('../src/adapters/chengfang-reader');
   const oOpen = cf.openChengfangShop;
   const oCtrl = cf.createChengfangController;
   const oWatch = cf.watchChengfangControlsForManualReview;
   const captured = [];
+  const watchSessions = [];
   const sentinelCheck = () => {};
   const sentinelClosed = () => {};
+  const sentinelAudit = () => {};
+  const sentinelCancel = { cancelled: false };
+  const sentinelResource = () => {};
   cf.openChengfangShop = async (p) => { captured.push(p); return { browser: null, target: {}, account: {}, context: {}, cookieSession: null }; };
   cf.createChengfangController = () => ({});
-  cf.watchChengfangControlsForManualReview = (c) => c;
+  cf.watchChengfangControlsForManualReview = (c, s) => { watchSessions.push(s); return c; };
   const { defaultChengfangOpener } = require('../src/engine/chengfang-runner');
   try {
     await defaultChengfangOpener({
       loginCfg: {}, shopCfg: { id: 'shop-a' },
       restoreControlCheck: sentinelCheck, onAuthClosedOut: sentinelClosed,
+      audit: sentinelAudit, readOnlyStatus: true,
+      cancelToken: sentinelCancel, onResource: sentinelResource,
     });
     assert.strictEqual(captured.length, 1);
     assert.strictEqual(captured[0].restoreControlCheck, sentinelCheck, 'restoreControlCheck 必须透传到 openChengfangShop');
     assert.strictEqual(captured[0].onAuthClosedOut, sentinelClosed, 'onAuthClosedOut 必须透传到 openChengfangShop');
-    // 批次等未注入场景：透传 undefined，不伪造对照店/结案能力。
+    // T04：审计/只读/取消/资源回调必须逐字透传（同一引用，不包装、不改写）。
+    assert.strictEqual(captured[0].audit, sentinelAudit, 'audit 必须透传到 openChengfangShop（浮层诊断）');
+    assert.strictEqual(captured[0].readOnlyStatus, true, 'readOnlyStatus 必须透传到 openChengfangShop');
+    assert.strictEqual(captured[0].cancelToken, sentinelCancel, 'cancelToken 必须透传到 openChengfangShop（协作取消）');
+    assert.strictEqual(captured[0].onResource, sentinelResource, 'onResource 必须透传到 openChengfangShop（早所有权登记）');
+    // 手动恢复包装器浮层重读使用 session.audit，必须同一引用。
+    assert.strictEqual(watchSessions[0].audit, sentinelAudit, 'audit 必须透传到 watchChengfangControlsForManualReview');
+    // 批次等未注入场景：透传 undefined，不伪造对照店/结案/诊断能力。
     await defaultChengfangOpener({ loginCfg: {}, shopCfg: { id: 'shop-a' } });
     assert.strictEqual(captured[1].restoreControlCheck, undefined);
     assert.strictEqual(captured[1].onAuthClosedOut, undefined);
+    assert.strictEqual(captured[1].audit, undefined);
+    assert.strictEqual(captured[1].readOnlyStatus, undefined);
+    assert.strictEqual(captured[1].cancelToken, undefined);
+    assert.strictEqual(captured[1].onResource, undefined);
+    assert.strictEqual(watchSessions[1].audit, undefined);
+    // 错误路径不被吞：opener 原样拒绝，错误对象不替换、不包装。
+    const boom = new Error('open-failed-sentinel');
+    cf.openChengfangShop = async () => { throw boom; };
+    await assert.rejects(
+      () => defaultChengfangOpener({ loginCfg: {}, shopCfg: { id: 'shop-a' }, audit: sentinelAudit }),
+      (e) => e === boom,
+      'openChengfangShop 的拒绝必须原样传播',
+    );
   } finally {
     cf.openChengfangShop = oOpen;
     cf.createChengfangController = oCtrl;

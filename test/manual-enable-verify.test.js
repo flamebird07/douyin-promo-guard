@@ -139,7 +139,7 @@ test('W3 窗口未到点不提前：6:59 启动（enableHour=7）→ 等 7:00 �
   });
   monitor.startEnableScheduler();
   clock.releaseOne(); // → 07:00
-  await waitFor(() => fake.calls.opener >= 1, 3000, '到点应执行');
+  await waitFor(() => fake.calls.opener >= 1 && auditList(dataDir).some((j) => j.event === 'daily-decide' && j.shopId === 'shop-a'), 3000, '到点应执行');
   const decide = auditList(dataDir).find((j) => j.event === 'daily-decide' && j.shopId === 'shop-a');
   assert.ok(decide && decide.decision === 'already_on');
   monitor.stopEnableScheduler({ byUser: false });
@@ -186,17 +186,27 @@ test('M2 当日去重：已 success 后再次手动验证 → 拒绝且不再开
   assert.equal(fake.calls.opener, openerBefore, '去重拒绝后不得再开会话');
 });
 
-test('M3 在途互斥：巡查/开启周期进行中 → 拒绝（不等待）', async () => {
+test('M3 巡查在途不再拦手动验证；同店处理在途仍由 _shopProcessing 拒绝', async () => {
   const dataDir = makeTempDir('stage10-');
   const clock = makeClock(shanghaiMs('2026-09-29', '10:00'));
   const fake = makeFake({ shopId: 'shop-a', views: ON_VIEWS });
   const monitor = buildMonitor({ dataDir, clock, enableHour: 7, openerFn: fake.opener });
-  monitor._cycleRunning = true; // 模拟巡查在途
+  monitor._cycleRunning = true; // 巡查在途：不再是跨路径互斥门
   const r = monitor.runManualEnableVerify('shop-a');
-  assert.equal(r.ok, false);
-  assert.equal(r.code, 'cycle_busy');
-  assert.equal(fake.calls.opener, 0);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  await waitFor(() => monitor.getManualEnableVerifyStatus().status === 'done', 5000, '巡查在途时手动验证仍应执行');
+  assert.equal(monitor.getManualEnableVerifyStatus().result.decision, 'already_on');
   monitor._cycleRunning = false;
+
+  // 同店处理在途 → 仍拒绝（最小同店互斥保留）
+  const dataDir2 = makeTempDir('stage10b-');
+  const fake2 = makeFake({ shopId: 'shop-a', views: ON_VIEWS });
+  const monitor2 = buildMonitor({ dataDir: dataDir2, clock, enableHour: 7, openerFn: fake2.opener });
+  monitor2._shopProcessing.add('shop-a');
+  const r2 = monitor2.runManualEnableVerify('shop-a');
+  assert.equal(r2.ok, false);
+  assert.equal(r2.code, 'shop_busy');
+  assert.equal(fake2.calls.opener, 0, '同店在途拒绝后不得开会话');
 });
 
 test('M4 并发手动拒绝：手动验证运行中再触发 → manual_busy', async () => {

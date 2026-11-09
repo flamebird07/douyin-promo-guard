@@ -260,3 +260,117 @@ test('N9 正例补充：enable unknown 槽位 + 全量 on 回读 → 释放', as
   assert.equal(fake.calls.click, 0);
   monitor.stop();
 });
+
+// ---- 2026-11-05 T16：capability gate 修复（settleUnknownEnableTargetNotAchieved 缺失）----
+
+test('T16-1 capability gate：orchestrator 无 settleUnknownEnableTargetNotAchieved 时旧 pause unknown + 全量 off → resolveUnknownWithReadback 正常释放且零点击', async () => {
+  const dataDir = makeTempDir('stage16-');
+  seedSlot(dataDir, 'shop-a', 'pause', SLOT_ACTION_ID);
+  const fake = makeFake({ shopId: 'shop-a', views: OFF_VIEWS });
+  const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
+  const orch = monitor._switchOrchestrator;
+  delete orch.settleUnknownEnableTargetNotAchieved; // 模拟能力缺失（当前 orchestrator 即未实现）
+  assert.equal(orch.hasUnknownBlock('shop-a'), true);
+  let resolvedViaReadback = false;
+  const orig = orch.resolveUnknownWithReadback.bind(orch);
+  orch.resolveUnknownWithReadback = (shopId, actionId, opts) => {
+    resolvedViaReadback = shopId === 'shop-a' && actionId === SLOT_ACTION_ID;
+    return orig(shopId, actionId, opts);
+  };
+  const r = await monitor._tryResolveUnknownSlotWithFreshRead({ id: 'shop-a', name: 'shop-a' });
+  assert.ok(r && r.resolved === true, `应经 resolveUnknownWithReadback 释放，实际 ${JSON.stringify(r)}`);
+  assert.equal(resolvedViaReadback, true, '必须走 resolveUnknownWithReadback 精确 shopId+actionId 释放');
+  assert.equal(orch.hasUnknownBlock('shop-a'), false, '释放后不再 unknown 阻塞');
+  assert.equal(orch.isBusy('shop-a'), false);
+  assert.equal(fake.calls.click, 0, '零点击');
+  monitor.stop();
+});
+
+test('T16-2 capability gate：能力缺失时 identity false / rows 缺失 / mixed / 行 unknown 均保持阻断', async () => {
+  const cases = [
+    { label: 'identity false', views: OFF_VIEWS, identityOk: false },
+    { label: 'mixed', views: MIXED_VIEWS },
+    { label: '行 unknown', views: { [TAB_MAIN]: [{ rows: [{ id: 'p1', switchChecked: false }, { id: 'p2', switchChecked: null }] }], [TAB_SUB]: [{ rows: [] }] } },
+  ];
+  for (const c of cases) {
+    const dataDir = makeTempDir('stage16-');
+    seedSlot(dataDir, 'shop-a', 'pause', SLOT_ACTION_ID);
+    const fake = makeFake({ shopId: 'shop-a', views: c.views });
+    let openerFn = fake.opener;
+    if (c.identityOk === false) {
+      openerFn = async () => {
+        const s = await fake.opener();
+        s.controller.verifyIdentity = async () => ({ ok: false, reason: '模拟身份失败' });
+        return s;
+      };
+    }
+    const monitor = buildMonitor({ dataDir, openerFn });
+    delete monitor._switchOrchestrator.settleUnknownEnableTargetNotAchieved;
+    const r = await monitor._tryResolveUnknownSlotWithFreshRead({ id: 'shop-a', name: 'shop-a' });
+    assert.ok(r && r.resolved === false, `${c.label} 应保持阻断，实际 ${JSON.stringify(r)}`);
+    assert.equal(monitor._switchOrchestrator.hasUnknownBlock('shop-a'), true, `${c.label} 槽位须保持 unknown`);
+    assert.equal(fake.calls.click, 0, `${c.label} 零点击`);
+    monitor.stop();
+  }
+  // rows 缺失（注入摘要）
+  {
+    const dataDir = makeTempDir('stage16-');
+    seedSlot(dataDir, 'shop-a', 'pause', SLOT_ACTION_ID);
+    const monitor = buildMonitor({ dataDir, openerFn: async () => { throw new Error('不应开浏览器'); }, readAdState: async () => ({ state: 'off' }) });
+    delete monitor._switchOrchestrator.settleUnknownEnableTargetNotAchieved;
+    const r = await monitor._tryResolveUnknownSlotWithFreshRead({ id: 'shop-a', name: 'shop-a' });
+    assert.ok(r && r.resolved === false && /rows 缺失/.test(r.reason), JSON.stringify(r));
+    assert.equal(monitor._switchOrchestrator.hasUnknownBlock('shop-a'), true);
+    monitor.stop();
+  }
+});
+
+test('T16-3 fail-closed：旧 enable unknown + 全量 off 且专用能力缺失 → 明确阻断、不抛异常、不释放、零点击', async () => {
+  const dataDir = makeTempDir('stage16-');
+  seedSlot(dataDir, 'shop-a', 'enable', 'act_enable_old');
+  const fake = makeFake({ shopId: 'shop-a', views: OFF_VIEWS });
+  const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
+  delete monitor._switchOrchestrator.settleUnknownEnableTargetNotAchieved;
+  let r = null;
+  let threw = null;
+  try { r = await monitor._tryResolveUnknownSlotWithFreshRead({ id: 'shop-a', name: 'shop-a' }); } catch (e) { threw = e; }
+  assert.equal(threw, null, '不得抛异常');
+  assert.ok(r && r.resolved === false, `应 fail-closed，实际 ${JSON.stringify(r)}`);
+  assert.ok(/能力缺失|fail-closed/.test(String(r.reason)), `reason 须明确能力缺失，实际 ${r.reason}`);
+  assert.equal(monitor._switchOrchestrator.hasUnknownBlock('shop-a'), true, '不得释放');
+  assert.equal(fake.calls.click, 0, '零点击，不得点 enable');
+  monitor.stop();
+});
+
+test('T16-4 精确匹配：actionId 不匹配的释放尝试被拒，槽位保持阻断', async () => {
+  const dataDir = makeTempDir('stage16-');
+  seedSlot(dataDir, 'shop-a', 'pause', SLOT_ACTION_ID);
+  const fake = makeFake({ shopId: 'shop-a', views: OFF_VIEWS });
+  const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
+  delete monitor._switchOrchestrator.settleUnknownEnableTargetNotAchieved;
+  const orch = monitor._switchOrchestrator;
+  // 直接以错误 actionId 调用释放入口：必须被 shopId+actionId 精确匹配拒绝
+  const bad = orch.resolveUnknownWithReadback('shop-a', 'act_other_999', { confirmed: true, note: 'x', persist: () => monitor._saveState() });
+  assert.ok(!bad || bad.ok !== true, `错误 actionId 不得释放，实际 ${JSON.stringify(bad)}`);
+  assert.equal(orch.hasUnknownBlock('shop-a'), true, '槽位保持阻断');
+  // 正确 actionId 仍可正常释放（门禁链路完整）
+  const good = await monitor._tryResolveUnknownSlotWithFreshRead({ id: 'shop-a', name: 'shop-a' });
+  assert.ok(good && good.resolved === true, JSON.stringify(good));
+  assert.equal(orch.hasUnknownBlock('shop-a'), false);
+  monitor.stop();
+});
+
+test('T16-5 持久化失败（能力缺失场景下）：pause 释放回滚、槽位保持 unknown', async () => {
+  const dataDir = makeTempDir('stage16-');
+  seedSlot(dataDir, 'shop-a', 'pause', SLOT_ACTION_ID);
+  const fake = makeFake({ shopId: 'shop-a', views: OFF_VIEWS });
+  const monitor = buildMonitor({ dataDir, openerFn: fake.opener });
+  delete monitor._switchOrchestrator.settleUnknownEnableTargetNotAchieved;
+  monitor._saveState = () => ({ ok: false, reason: '模拟持久化失败' });
+  const r = await monitor._tryResolveUnknownSlotWithFreshRead({ id: 'shop-a', name: 'shop-a' });
+  assert.ok(r && r.resolved === false, JSON.stringify(r));
+  const slot = monitor._switchOrchestrator.peek('shop-a');
+  assert.ok(slot && slot.unknown === true && slot.settled !== true, `须回滚 unknown，实际 ${JSON.stringify(slot)}`);
+  assert.equal(monitor._switchOrchestrator.hasUnknownBlock('shop-a'), true);
+  monitor.stop();
+});

@@ -29,15 +29,23 @@ const { compactUrls } = require('../lib/log');
 const { perOrderDisplayText } = require('./rules');
 
 /** 生产默认会话开启器：真实乘方管理页（openChengfangShop + 真实控制器）。 */
-async function defaultChengfangOpener({ loginCfg, shopCfg, restoreControlCheck, onAuthClosedOut }) {
+async function defaultChengfangOpener({
+  loginCfg, shopCfg, restoreControlCheck, onAuthClosedOut,
+  audit, readOnlyStatus, cancelToken, onResource,
+}) {
   const { openChengfangShop, createChengfangController, watchChengfangControlsForManualReview } = require('../adapters/chengfang-reader');
   // fix3：对照店 checkLogin（排除全局误判）与 auth 结案回调由 Monitor 按店铺注入，
   // 经 openChengfangShop → openQianchuanHome 透传进恢复链；未注入时保持未结案 fail-closed。
+  // 只读诊断/资源收口接线（T04）：audit（浮层诊断日志）、readOnlyStatus（只读空范围判定）、
+  // cancelToken（回读截止协作取消）、onResource（浏览器早所有权登记）与 auth 回调同链透传，
+  // 未提供时原样为 undefined，由下游各自默认处理（不伪造能力）。
   const { browser, target, account, context, cookieSession } = await openChengfangShop({
     loginCfg, shopCfg, restoreControlCheck, onAuthClosedOut,
+    audit, readOnlyStatus, cancelToken, onResource,
   });
+  // 手动恢复包装器在浮层重读时使用 session.audit（chengfang-overlay 诊断），一并透传。
   const controller = watchChengfangControlsForManualReview(createChengfangController({}), {
-    context, target, shopCfg, loginCfg,
+    context, target, shopCfg, loginCfg, audit,
   });
   // context / cookieSession 一并透出：批次结束（浏览器关闭前）用于**本次实际加载的**
   // 店铺 Cookie 文件回写（见 _closeSession → writebackSessionCookies）。
@@ -308,18 +316,12 @@ class ChengfangRunner {
     const counts = { confirmed: 0, failed: 0, unknown: 0, skipped: 0, cancelled: 0 };
     const base = { kind: 'chengfang-batch', shopId: shopCfg.id, batchDate };
 
-    // ── 0) 前置门槛（fail-closed）：集中配置门槛 → 时段 → 停止 ──────────
+    // ── 0) 前置门槛（fail-closed）：集中配置门槛 → 停止 ─────────────────
+    // （客户 2026-11-08 S2：费比严格超标后暂停为最高业务优先级，删除 dailyStartHour
+    //  时段门；配置门槛与停止信号门禁不变）
     const realAllowed = resolveChengfangRealAllowed(this.config);
     if (!realAllowed.ok) {
       return { outcome: 'blocked', reason: realAllowed.reason, counts, batchDate, error: null };
-    }
-    if (!isAfterDailyStart(this.now(), this.config.schedule.dailyStartHour)) {
-      const hh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
-      return {
-        outcome: 'blocked_window',
-        reason: `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai），本轮不执行真实暂停`,
-        counts, batchDate,
-      };
     }
     if (cycleToken && cycleToken.aborted) {
       return { outcome: 'blocked_stopped', reason: '监控已停止，本轮不执行真实暂停', counts, batchDate };

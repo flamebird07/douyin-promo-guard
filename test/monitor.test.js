@@ -181,14 +181,13 @@ test('真实模式 + mock 来源：直接拒绝执行', async (t) => {
   assert.strictEqual(controller.state.closeCalls.length, 0);
 });
 
-test('真实模式 07:59：读取并记录但不关闭（手动检查不绕过时间限制）', async (t) => {
+test('真实模式 07:59：超标关闭照常执行（S2 2026-11-08：暂停为最高业务优先级，不再被 dailyStartHour 窗口拦截）', async (t) => {
   const clock = makeClock(shanghaiMs('2026-09-12', '07:59'));
   const { monitor, controller } = setup(t, { execution: { realMode: true }, clock });
   const r = await monitor.pollOnce('manual-ui');
-  assert.strictEqual(r.results[0].status, 'window_blocked');
-  assert.match(r.results[0].reason, /08:00|手动检查不绕过/);
-  assert.strictEqual(controller.state.closeCalls.length, 0);
-  assert.ok(monitor.getStatus().monitor.windowBlockReason);
+  assert.strictEqual(r.results[0].status, 'ok');
+  assert.strictEqual(r.results[0].batch.outcome, 'all_closed_confirmed');
+  assert.strictEqual(controller.state.closeCalls.length, 3, '07:59 严格超标 → 真实关闭照常执行');
 });
 
 test('真实模式 08:00 整：执行全店关闭并回读确认，批次按实际业务日期持久化', async (t) => {
@@ -214,7 +213,7 @@ test('真实模式：清单页身份不匹配 → 零关闭（批次被阻止）
 });
 
 // ── 调度循环（门控时钟）──────────────────────────────────────────
-test('调度：07:59 启动 → 等待到 08:00 先查一次，随后每 30 分钟', async (t) => {
+test('调度：07:59 启动 → 立即巡查，随后每 30 分钟（暂停无时段门）', async (t) => {
   const clock = makeClock(shanghaiMs('2026-09-12', '07:59'));
   const { monitor } = setup(t, { clock });
   const pollAt = [];
@@ -229,21 +228,19 @@ test('调度：07:59 启动 → 等待到 08:00 先查一次，随后每 30 分�
     return r;
   };
   monitor.start();
-  await waitFor(() => clock.pending() === 1, 2000, '等待08:00的延时挂起');
-  assert.strictEqual(monitor.schedule.phase, 'waiting_window');
-  clock.releaseOne(); // 07:59 → 08:00
-  await waitFor(() => polls === 1 && clock.pending() === 1, 2000, '第一次巡查完成');
-  assert.strictEqual(pollAt[0], shanghaiMs('2026-09-12', '08:00'), '08:00 前等待，整点先查');
-  clock.releaseOne(); // 08:00 → 08:30
+  await waitFor(() => polls === 1 && clock.pending() === 1, 2000, '启动后立即完成第一次巡查');
+  assert.strictEqual(monitor.schedule.phase, 'running');
+  assert.strictEqual(pollAt[0], shanghaiMs('2026-09-12', '07:59'), '不得等待 08:00');
+  clock.releaseOne(); // 07:59 → 08:29
   await waitFor(() => polls === 2, 2000, '第二次巡查完成');
-  assert.strictEqual(pollAt[1], shanghaiMs('2026-09-12', '08:30'), '30 分钟后再次巡查');
+  assert.strictEqual(pollAt[1], shanghaiMs('2026-09-12', '08:29'), '30 分钟后再次巡查');
   monitor.stop();
   clock.releaseAll();
   await monitor._loopPromise;
   assert.strictEqual(polls, 2);
 });
 
-test('调度：23:50 巡查后跨午夜 → 等待次日 08:00 再巡查', async (t) => {
+test('调度：23:50 巡查后跨午夜 → 00:20 继续巡查，不等次日 08:00', async (t) => {
   const clock = makeClock(shanghaiMs('2026-09-12', '23:50'));
   const { monitor } = setup(t, { clock });
   const pollDates = [];
@@ -259,10 +256,9 @@ test('调度：23:50 巡查后跨午夜 → 等待次日 08:00 再巡查', async
   };
   monitor.start();
   await waitFor(() => polls === 1 && clock.pending() === 1, 2000, '23:50 巡查完成');
-  // 巡查后循环应进入"跨日等待次日 08:00"状态
-  assert.strictEqual(monitor.schedule.waitingFor08, true, '跨日 → 等待次日 08:00');
-  assert.strictEqual(new Date(monitor.schedule.nextRunAt).getTime(), shanghaiMs('2026-09-13', '08:00'));
-  clock.releaseOne(); // 23:50 → 次日 08:00
+  assert.strictEqual(monitor.schedule.waitingFor08, false, '跨日也不进入时间窗口等待');
+  assert.strictEqual(new Date(monitor.schedule.nextRunAt).getTime(), shanghaiMs('2026-09-13', '00:20'));
+  clock.releaseOne(); // 23:50 → 次日 00:20
   await waitFor(() => polls === 2, 2000, '次日巡查完成');
   assert.deepStrictEqual(pollDates, ['2026-09-12', '2026-09-13']);
   monitor.stop();

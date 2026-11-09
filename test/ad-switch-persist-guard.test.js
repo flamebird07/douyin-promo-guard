@@ -154,21 +154,20 @@ test('确认后保存失败 → 不错误释放（保持 unknown 阻塞）', asy
   assert.strictEqual(orch.hasUnknownBlock('s1'), true, '不得先释放锁');
 });
 
-test('重启读取未完成记录 → unknown；存储恢复后可安全恢复', async () => {
+test('重启读取未完成记录 → unknown；新 tryBegin 可自动替换', async () => {
   const g1 = createSwitchSerialGate();
   const a = g1.tryBegin('shop-x', 'pause');
   g1.markUnknown('shop-x', a.actionId, '动作中');
   const st = g1.exportState();
   const g2 = createSwitchSerialGate({ state: st });
   assert.strictEqual(g2.hasUnknownBlock('shop-x'), true);
-  // 明确未发出（not_sent）场景：释放后新动作可进行
+  // unknown 槽自动被新 tryBegin 替换（费比超标立即暂停优先级最高）
   const b = g2.tryBegin('shop-x', 'enable');
-  assert.strictEqual(b.ok, false, 'unknown 不放行');
+  assert.strictEqual(b.ok, true, 'unknown 允许替换');
+  // 旧 actionId 的 resolveUnknownAfterReadback 因 actionId 不匹配而失败
   const rec = g2.resolveUnknownAfterReadback('shop-x', a.actionId, { confirmed: true });
-  assert.strictEqual(rec.ok, true);
-  const c = g2.tryBegin('shop-x', 'enable');
-  assert.strictEqual(c.ok, true, '恢复后可安全进行');
-  g2.markNotSent('shop-x', c.actionId);
+  assert.strictEqual(rec.ok, false, '旧 actionId 不得影响新槽');
+  g2.markNotSent('shop-x', b.actionId);
   assert.strictEqual(g2.isBusy('shop-x'), false);
 });
 

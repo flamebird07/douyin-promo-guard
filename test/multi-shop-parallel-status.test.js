@@ -50,7 +50,7 @@ function setupTwoShops(t, opts = {}) {
   return { monitor, dataDir, cookieDir, clock };
 }
 
-test('同轮两店确实重叠开始，且并行上限为 2', async (t) => {
+test('同轮跨店严格串行（D24）：上一家收口后才启动下一家，顺序与配置一致', async (t) => {
   const { monitor } = setupTwoShops(t);
   let inFlight = 0;
   let peak = 0;
@@ -65,17 +65,21 @@ test('同轮两店确实重叠开始，且并行上限为 2', async (t) => {
     return { status: 'ok', shopId: shop.id };
   };
   const p = monitor.pollOnce('test');
+  // 第一家启动后、放行前，后继店不得开始（严格串行，不重叠）
+  await waitFor(() => startOrder.length >= 1, 2000);
+  assert.strictEqual(startOrder[0], 'shop-a', '按配置顺序从第一家开始');
+  assert.strictEqual(peak, 1, '未放行时仅一家在途（跨店不重叠）');
+  while (barriers.length) barriers.shift()();
   await waitFor(() => startOrder.length >= 2, 2000);
-  assert.ok(startOrder.includes('shop-a') && startOrder.includes('shop-b'), '两店应重叠开始');
-  assert.strictEqual(peak, 2, '两店同时在途');
-  // 放行前 2 家后，第 3 家应被限流为最多再开 1
+  assert.strictEqual(startOrder[1], 'shop-b', '上一家收口后才启动下一家');
   while (barriers.length) barriers.shift()();
   await waitFor(() => startOrder.length >= 3, 2000);
+  assert.strictEqual(startOrder[2], 'shop-c');
   while (barriers.length) barriers.shift()();
   const r = await p;
   assert.ok(r.ok);
   assert.strictEqual(r.results.length, 3);
-  assert.ok(peak <= 2, `并行上限 2，实际 peak=${peak}`);
+  assert.ok(peak <= 1, `跨店严格串行，实际 peak=${peak}`);
   // 结果按配置顺序
   assert.deepEqual(r.results.map((x) => x.shopId), ['shop-a', 'shop-b', 'shop-c']);
 });

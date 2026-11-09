@@ -1585,6 +1585,58 @@ test('2026-09-21 回归②：商品自选回读恢复持续失败 → 已确认�
   assert.strictEqual(batch.counts.unknown, 23, `商品自选 23 条结果未知，实际 ${JSON.stringify(batch.counts)}`);
 });
 
+test('S2 2026-11-08：executeChengfangBatch 在 00:01 / 07:00 不再受 dailyStartHour 门（停止信号仍拦）', async () => {
+  const { ChengfangRunner } = require('../src/engine/chengfang-runner');
+  const config = {
+    execution: { realMode: true, dryRun: false },
+    monitor: { chengfang: { pauseEnabled: true } },
+    schedule: { dailyStartHour: 8, timezone: 'Asia/Shanghai' },
+  };
+  for (const hm of ['00:01', '07:00']) {
+    let readCalls = 0;
+    const coordinator = {
+      readAndEvaluate: async () => {
+        readCalls += 1;
+        const e = new Error('SENTINEL_REVALIDATE');
+        e.reason = 'SENTINEL_REVALIDATE';
+        throw e;
+      },
+    };
+    const runner = new ChengfangRunner({
+      coordinator, config, now: () => shanghaiMs('2026-09-12', hm), audit: () => {},
+    });
+    const r = await runner.executeChengfangBatch({
+      shopCfg: SHOP_CFG,
+      cycleToken: { aborted: false },
+      trigger: { reason: 'S2-window-gate' },
+      pageOpener: async () => { throw new Error('不应打开页面'); },
+      loginCfg: {},
+    });
+    assert.strictEqual(readCalls, 1, `${hm} 必须越过时间门进入操作前重新核验`);
+    assert.strictEqual(r.outcome, 'blocked');
+    assert.match(r.reason, /SENTINEL_REVALIDATE/);
+    assert.doesNotMatch(r.reason, /未到允许执行时段/, `${hm} 不得再返回 dailyStartHour 窗口拦截`);
+  }
+
+  // 停止信号门禁不变：00:01 也必须在读取前拦截。
+  let stoppedReads = 0;
+  const stoppedRunner = new ChengfangRunner({
+    coordinator: { readAndEvaluate: async () => { stoppedReads += 1; throw new Error('不应读取'); } },
+    config,
+    now: () => shanghaiMs('2026-09-12', '00:01'),
+    audit: () => {},
+  });
+  const stopped = await stoppedRunner.executeChengfangBatch({
+    shopCfg: SHOP_CFG,
+    cycleToken: { aborted: true },
+    trigger: { reason: 'S2-stop' },
+    pageOpener: async () => { throw new Error('不应打开页面'); },
+    loginCfg: {},
+  });
+  assert.strictEqual(stopped.outcome, 'blocked_stopped');
+  assert.strictEqual(stoppedReads, 0, '停止信号仍在读取前拦截');
+});
+
 test('2026-09-21 回归③：全部已暂停（两区域）→ 只读核验零点击，不重复暂停（成功之后不反复关闭）', async () => {
   const { result, state } = await run({
     fixture: { plans: { '全店托管': [{ ...TUOGUAN_PLAN, checked: false }], '商品自选': ZIXUAN_CLOSED(23) } },

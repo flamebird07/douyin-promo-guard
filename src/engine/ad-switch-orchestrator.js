@@ -231,6 +231,7 @@ class AdSwitchOrchestrator {
     }
 
     // ── 2) 串行门登记 actionId ───────────────────────────────────
+    // 活跃 in-flight 由串行门拒绝；unknown/已 settled 的旧槽自动被新 tryBegin 替换。
     const begin = this.gate.tryBegin(shopId, action);
     if (!begin.ok) {
       this.audit({ kind: 'ad-switch', step: 'serial-gate', shopId, ok: false, reason: begin.reason });

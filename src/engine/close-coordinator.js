@@ -21,7 +21,7 @@ const guard = require('./guard');
 const { evaluateWholeShopCostPerOrder, perOrderDisplayText } = require('./rules');
 const { closeOneAd } = require('./close-flow');
 const { DataGuardError } = require('../lib/errors');
-const { shanghaiDate, isAfterDailyStart } = require('../lib/time');
+const { shanghaiDate } = require('../lib/time');
 
 class WholeShopCloseCoordinator {
   /**
@@ -165,13 +165,9 @@ class WholeShopCloseCoordinator {
     const details = [];
     const base = { kind: 'whole-shop-batch', shopId: shopCfg.id, batchDate };
 
-    // ── 0) 前置门槛：真实模式 + 允许时段 + 未停止 ───────────────────
+    // ── 0) 前置门槛：真实模式 + 未停止 ─────────────────────────────
     if (this.config.execution.realMode !== true) {
       return { outcome: 'blocked', reason: '真实执行模式未开启（演练模式不执行关闭）', counts };
-    }
-    if (!isAfterDailyStart(this.now(), this.config.schedule.dailyStartHour)) {
-      const hh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
-      return { outcome: 'blocked_window', reason: `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai），本轮不执行真实关闭`, counts };
     }
     if (cycleToken && cycleToken.aborted) {
       return { outcome: 'blocked_stopped', reason: '监控已停止，本轮不执行关闭', counts };
@@ -264,18 +260,13 @@ class WholeShopCloseCoordinator {
     this.audit({ ...base, step: 'targeting', targets: targets.map((t) => t.adId), alreadyClosed });
 
     // ── 4) 逐个关闭。每个"真正发出关闭请求"的时机（含重试前）都重新检查：
-    //       停止信号、允许时段、批次业务日期（修复跨午夜时机漏洞）；
+    //       停止信号、批次业务日期（修复跨午夜时机漏洞）；
     //       已经发出的请求由 close-flow 继续回读确认。──────────────────
-    const startHour = this.config.schedule.dailyStartHour;
     const abortReason = () => {
       if (cycleToken && cycleToken.aborted) return '收到停止信号：不再发出新的关闭请求';
       const currentDate = shanghaiDate(this.now());
       if (currentDate !== batchDate) {
         return `跨日（批次日期 ${batchDate} → 当前 ${currentDate}）：本批次不再发出新的关闭请求（触发数据为上一日期口径）`;
-      }
-      if (!isAfterDailyStart(this.now(), startHour)) {
-        const hh = String(startHour).padStart(2, '0');
-        return `已进入新的一天且未到允许时段（每日 ${hh}:00 后，Asia/Shanghai）：不再发出新的关闭请求`;
       }
       return null;
     };

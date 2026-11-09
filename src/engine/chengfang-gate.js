@@ -8,7 +8,7 @@
  * - monitor.chengfang.pauseEnabled === true
  * - execution.dryRun !== true（非演练）
  * - 当前账户匹配（由执行器身份核验负责）
- * - 上海时间 08:00 后（isAfterDailyStart）
+ * - 无时段/首查门槛（2026-11-08 S2：费比严格超标后暂停为最高业务优先级）
  * - 未收到停止信号
  * - 触发业务日期与当前上海日历日一致（未跨日）
  *
@@ -95,8 +95,9 @@ function resolveChengfangEnableAllowed(config) {
  * @param {()=>number} p.nowFn
  * @param {()=>boolean} [p.stopRequested]
  * @param {string} [p.businessDate] 触发批次业务日期（上海日历日），用于跨日检查
- * @param {'pause'|'enable'} [p.action] 动作类型：pause 走 08:00 后暂停窗口与 pauseEnabled；
- *                                      enable 走 enableHour 起窗口与 enableEnabled（默认 'pause'）
+ * @param {'pause'|'enable'} [p.action] 动作类型：pause 无时段门槛（2026-11-08 S2），仅保留
+ *                                      stop/跨日/realMode/pauseEnabled；enable 走首查窗口与 enableEnabled
+ *                                      （默认 'pause'）
  * @returns {()=>{ok:boolean,reason?:string}}
  */
 /**
@@ -141,13 +142,9 @@ function buildChengfangRequestGate({ config, nowFn, stopRequested, businessDate,
       }
       // manual_verify：无时段门槛（人工显式验证可任意时刻），其余门禁照常
     } else {
-      // pause：首查窗口后放行（首查完成后费比暂停，不再等 dailyStartHour；客户 2026-10-09 R1）
-      const w = shanghaiWall(nowFn());
-      const tod = (w.hour || 0) * 60 + (w.minute || 0);
-      if (tod < firstCheckMinute) {
-        const hhmm = firstCheckTimeText(cf);
-        return { ok: false, reason: `未到每日首查时刻（每日 ${hhmm} 后，Asia/Shanghai）：不再发出新的暂停请求` };
-      }
+      // pause：无时段门槛（客户 2026-11-08 S2：费比严格超标后暂停为最高业务优先级，
+      // 不再被首查未完成或 firstCheckMinute/dailyStartHour 时间窗口拦截）；
+      // 停止信号、跨日、realMode、pauseEnabled 门禁照常（fail-closed 不变）。
     }
     if (businessDate !== undefined && businessDate !== null && shanghaiDate(nowFn()) !== businessDate) {
       return { ok: false, reason: `跨日（触发业务日期 ${businessDate} → 当前 ${shanghaiDate(nowFn())}）：不再发出新的${label}请求` };

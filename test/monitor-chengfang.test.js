@@ -222,17 +222,76 @@ test('主链路：execution.dryRun=true 即使 realMode+pauseEnabled 全开 → 
 
 // ── 时段 / 跨日 / 停止 → 不发新暂停请求 ────────────────────────────
 
-test('主链路：上海时间 07:59 → window_blocked，零页面会话', async (t) => {
+test('主链路：上海时间 07:59 → 严格超标照常暂停（S2 2026-11-08：暂停不再被 dailyStartHour 窗口拦截）', async (t) => {
   const clock = makeClock(shanghaiMs('2026-09-12', '07:59'));
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
     fixture: { plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(3) } },
   });
   const r = await monitor.pollOnce('interval');
-  assert.strictEqual(r.results[0].status, 'window_blocked');
-  assert.match(r.results[0].reason, /08:00/);
-  assert.ok(monitor.schedule.lastWindowBlockReason, '窗口原因对外可见');
-  assert.strictEqual(track.sessions, 0);
+  assert.strictEqual(r.results[0].status, 'ok');
+  assert.strictEqual(r.results[0].batch.allPausedConfirmed, true, '07:59 暂停批次照常确认');
+  assert.strictEqual(track.sessions, 1, '暂停执行打开乘方页');
+});
+
+test('S2 主链路：00:01 首查未完成 + 严格超标 + 广告在投 → 照常执行暂停（最高业务优先级）', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '00:01'));
+  const { monitor, track } = await setupChengfangMonitor(t, {
+    clock,
+    monitorChengfang: { pauseEnabled: true, enableEnabled: true, enableSchedulerEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(3) } },
+  });
+  // 首查调度器已启用但当日首查未完成（不调用 monitor.start()，enablePhase 记录为空）
+  const r = await monitor.pollOnce('interval');
+  assert.strictEqual(r.results[0].status, 'ok', JSON.stringify(r.results[0]));
+  assert.strictEqual(r.results[0].batch.allPausedConfirmed, true, '00:01 首查未完成仍照常暂停');
+  assert.strictEqual(track.sessions, 1, '暂停执行打开乘方页');
+});
+
+test('S2 主链路：00:01 首查未完成 + 0 单 → 不暂停（零单保护不被 S2 放宽）', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '00:01'));
+  const { monitor, track } = await setupChengfangMonitor(t, {
+    clock,
+    orders: 0,
+    monitorChengfang: { pauseEnabled: true, enableEnabled: true, enableSchedulerEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(3) } },
+  });
+  const r = await monitor.pollOnce('interval');
+  assert.notStrictEqual(r.results[0].status, 'window_blocked', '零单取消按业务规则，不是窗口拦截');
+  assert.strictEqual(track.sessions, 0, '0 单零页面会话');
+  assert.strictEqual(monitor.actions.length, 0, '0 单零暂停动作');
+});
+
+test('S2 负例：00:01 数据读取失败 → 不进入暂停、零页面会话', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '00:01'));
+  const { monitor, track } = await setupChengfangMonitor(t, {
+    clock,
+    monitorChengfang: { pauseEnabled: true, enableEnabled: true, enableSchedulerEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(3) } },
+    readerWrap: (r) => {
+      const orig = r.readOrderSummary.bind(r);
+      r.readOrderSummary = async () => ({ ...(await orig()), valueCount: null, parseError: 'orders unavailable' });
+    },
+  });
+  const r = await monitor.pollOnce('interval');
+  assert.strictEqual(r.results[0].status, 'stopped', JSON.stringify(r.results[0]));
+  assert.match(r.results[0].reason || '', /数据解析失败|DATA_GUARD/);
+  assert.strictEqual(track.sessions, 0, '数据失败零页面会话');
+  assert.strictEqual(monitor.actions.length, 0, '数据失败零暂停动作');
+});
+
+test('S2 负例：00:01 广告状态 unknown → fail-closed 零点击', async (t) => {
+  const clock = makeClock(shanghaiMs('2026-09-12', '00:01'));
+  const { monitor, track, live } = await setupChengfangMonitor(t, {
+    clock,
+    monitorChengfang: { pauseEnabled: true, enableEnabled: true, enableSchedulerEnabled: true },
+    fixture: { plans: { '全店托管': [TUOGUAN_PLAN], '商品自选': ZIXUAN_PLANS(3) } },
+  });
+  live.setRows([{ id: 'unknown-row', switchChecked: undefined }]);
+  const r = await monitor.pollOnce('interval');
+  assert.strictEqual(r.results[0].currentAdState, 'unknown', JSON.stringify(r.results[0]));
+  assert.strictEqual(track.sessions, 0, '状态 unknown 零页面会话');
+  assert.strictEqual(monitor.actions.length, 0, '状态 unknown 零点击');
 });
 
 test('主链路：操作中跨日（第2页处理时跨午夜）→ 不再发新暂停请求', async (t) => {
@@ -663,6 +722,7 @@ test('自动开启调度：07:00 整 → 执行每日开启（真实 all_enabled
   const switchViews = [];
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
+    costCents: 10000, // 恰好不超标：S2 后 07:00 开启完成即巡查，隔离本用例只验证开启相位
     monitorChengfang: { pauseEnabled: true, enableEnabled: true },
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(5) } },
     controllerWrap: async (ctrl) => {
@@ -677,8 +737,9 @@ test('自动开启调度：07:00 整 → 执行每日开启（真实 all_enabled
   await startLoopAndSettle(monitor, clock);
   await waitFor(() => !!monitor.batches['shop-001'] && !!monitor.batches['shop-001']['2026-09-12'], 8000, '开启批次落库');
   const batch = monitor.batches['shop-001']['2026-09-12'];
-  assert.strictEqual(lastRunOutcome(monitor, 'shop-001', '2026-09-12'), 'all_enabled_confirmed', batch.reason);
-  assert.strictEqual(batch.allEnabledConfirmed, true);
+  // S2（2026-11-08）：07:00 首查完成后费比巡查照常跟进；开启确认取首批 run 断言。
+  assert.strictEqual(batch.runs[0].outcome, 'all_enabled_confirmed', batch.reason);
+  assert.strictEqual(batch.runs[0].allEnabledConfirmed, true);
   assert.strictEqual(track.sessions, 1, '开启相位打开一次乘方页');
   // 操作阶段 + 全量回读阶段各切换两个子标签，共 4 次；关键不变量是绝不触碰标准/全域/品牌
   assert.strictEqual(switchViews.length, 4, `开启相位切换标签次数（操作2 + 回读2）：${switchViews.join(',')}`);
@@ -694,6 +755,7 @@ test('自动开启调度：当天只执行一次（同一天重启监控不重�
   const clock = makeClock(shanghaiMs('2026-09-12', '07:00'));
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
+    costCents: 10000, // 恰好不超标：S2 后 07:00 开启完成即巡查，隔离本用例只验证同日去重
     monitorChengfang: { pauseEnabled: true, enableEnabled: true },
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
   });
@@ -701,10 +763,10 @@ test('自动开启调度：当天只执行一次（同一天重启监控不重�
   await waitFor(() => !!monitor.batches['shop-001'] && !!monitor.batches['shop-001']['2026-09-12'], 8000, '第一次开启批次落库');
   assert.strictEqual(track.sessions, 1);
   monitor.stop();
-  // 同一天重启：_lastEnableDate 仍为 2026-09-12 → 不重复开启，直接等待 08:00
+  // 同一天重启：_lastEnableDate 仍为 2026-09-12 → 不重复开启。
   await startLoopAndSettle(monitor, clock);
   assert.strictEqual(track.sessions, 1, '同一天重启不重复开启');
-  assert.strictEqual(lastRunOutcome(monitor, 'shop-001', '2026-09-12'), 'all_enabled_confirmed');
+  assert.strictEqual(monitor.batches['shop-001']['2026-09-12'].runs[0].allEnabledConfirmed, true);
   monitor.stop();
 });
 
@@ -755,26 +817,23 @@ test('自动开启调度：跨日重置（2026-09-21 新语义）→ 未暂停�
   monitor.stop();
 });
 
-test('自动开启调度：监控未启动 → 手动 pollOnce（07:00）也不触发开启（window_blocked，零会话）', async (t) => {
+test('自动开启调度：监控未启动 → 手动 pollOnce（07:00）不触发开启相位（S2：暂停只读盘点不再被窗口拦截）', async (t) => {
   const clock = makeClock(shanghaiMs('2026-09-12', '07:00'));
   const { monitor, track } = await setupChengfangMonitor(t, {
     clock,
     monitorChengfang: { pauseEnabled: true, enableEnabled: true },
     fixture: { plans: { '全店托管': [TUOGUAN_CLOSED], '商品自选': ZIXUAN_CLOSED(3) } },
   });
-  // 不调用 monitor.start()：调度循环不存在，开启相位（仅由 _intervalLoop 驱动）不可能被触发
+  // 不调用 monitor.start()：调度循环不存在，开启相位（仅由 _intervalLoop 驱动）不可能被触发。
+  // S2（2026-11-08）：超标+已全关的暂停只读盘点照常执行（不再等 08:00），但绝不触发开启。
   const r = await monitor.pollOnce('interval');
-  assert.strictEqual(r.results[0].status, 'window_blocked', '07:00 未到暂停窗口，暂停路径被窗口阻止');
-  assert.strictEqual(track.sessions, 0, '零页面会话');
-  assert.strictEqual(monitor.actions.length, 0, '零开启/暂停动作');
-  assert.strictEqual(monitor.batches['shop-001'], undefined, '无开启批次');
-  // 手动 pollOnce 只走暂停路径并因未到 08:00 被窗口阻止：允许存在 window_blocked 命中记录，
-  // 但绝不允许任何执行动作（开启/暂停均未发出）
-  assert.ok(monitor.triggers.length >= 1, '暂停路径窗口阻止命中记录');
-  assert.ok(monitor.triggers.every((t) => t.blocked === 'window' && t.mode === 'real'), '仅窗口阻止记录，无任何执行');
-  // 第三轮回归：真实 trigger 必须带显式动作标签（值守侧 describeTrigger 只认 targetAction，不猜）
-  assert.ok(monitor.triggers.every((t) => t.targetAction === 'pause'),
-    `真实暂停 trigger 必须带 targetAction='pause'，实际：${JSON.stringify(monitor.triggers.map((t) => t.targetAction))}`);
+  assert.notStrictEqual(r.results[0].status, 'window_blocked', '暂停路径不再被时间窗口拦截');
+  assert.strictEqual(monitor.actions.length, 1, '超标已全关 → 只读盘点记录一条批次');
+  assert.strictEqual(monitor.actions[0].actionType, 'pause');
+  assert.strictEqual(monitor.actions[0].outcome, 'nothing_to_pause');
+  assert.strictEqual((track.clickLog || []).length, 0, '只读盘点零点击');
+  const rec = monitor.batches['shop-001'] && monitor.batches['shop-001']['2026-09-12'];
+  assert.ok(!rec || rec.runs.every((x) => x.allEnabledConfirmed !== true), '手动 pollOnce 不产生开启批次');
 });
 
 test('第三轮：真实开启路径被窗口拦下 → trigger 带 targetAction=enable（动作标签不得缺失）', async (t) => {

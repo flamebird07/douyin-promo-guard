@@ -28,6 +28,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // 推广控制主项目根目录解析：优先环境变量；再按部署位置探测（本文件位于
 // bill-manager/ 且与 douyin-promo-guard 为兄弟目录）；最后按公开仓库内相对位置
@@ -136,7 +137,8 @@ function deriveAdState(status, shop) {
   }
   if (shop && shop.lastAdState) {
     // mixed 只作过渡观测，不是完成态：界面文案必须带待收敛/重新判定/重试中，不得显示为一次成功
-    const map = { on: { on: true, note: '开启' }, off: { on: false, note: '暂停' }, mixed: { on: null, note: '混合（待收敛，非完成态）' }, unknown: { on: null, note: '未知' } };
+    // on 的页面当前状态文案统一为“投放中”（“开启”是动作词；与历史推导分支一致，2026-11-05）
+    const map = { on: { on: true, note: '投放中' }, off: { on: false, note: '暂停' }, mixed: { on: null, note: '混合（待收敛，非完成态）' }, unknown: { on: null, note: '未知' } };
     const m = map[shop.lastAdState] || map.unknown;
     // 展示时间必须与当前状态同源且仅有状态证据：只读观测优先，其次动作确认。
     // 无 adStateObservedAt / adStateConfirmedAt 时 at=null；不得用费用/订单采集时间（lastDataAt）冒充。
@@ -259,6 +261,8 @@ function createWatchDrill(opts = {}) {
     _lastEnableSeen: {},
     // 只读运行时版本指纹（require.resolve 路径 + 文件 sha256；无密钥）
     _runtimeFingerprint: null,
+    // 卡点证据扫描结果缓存（仅服务端内部：key→本店截图文件映射；绝不进入快照/日志）
+    _blockerEntries: [],
   };
 
   // ── 日志（内存有界 + JSONL 持久化）────────────────────────────────────────
@@ -1193,6 +1197,12 @@ function createWatchDrill(opts = {}) {
       return snapshot();
     }
     const m = drill._monitor;
+    // 费比暂停是最高业务优先级：服务启动必须先启动暂停巡查，再登记每日开启。
+    try { refreshGates(); } catch (_) { /* 门槛快照失败不阻塞自动启动 */ }
+    if (opts.autostartOnBoot !== false) {
+      pushLog('info', '服务启动先启动推广值守（费比暂停最高优先级）；页面打开/关闭/刷新只读，不改变后台值守状态');
+      start();
+    }
     if (m.enableSchedulerShouldRun()) {
       const r = m.startEnableScheduler({ reason: '服务启动自动恢复' });
       if (r && r.ok === false) {
@@ -1212,11 +1222,6 @@ function createWatchDrill(opts = {}) {
     // 本次运行中人工停止后页面重开不恢复；下一次服务启动再次自动启动）。
     // - 隔离逃逸：opts.autostartOnBoot === false 时不自动启动（仅供不希望 _intervalLoop
     //   干扰单店派发计数的隔离测试使用；生产服务启动不传该 opt，默认自动启动）。
-    try { refreshGates(); } catch (_) { /* 门槛快照失败不阻塞自动启动 */ }
-    if (opts.autostartOnBoot !== false) {
-      pushLog('info', '服务启动自动启动推广值守（客户 2026-10-09 要求）；页面打开/关闭/刷新只读，不改变后台值守状态');
-      start();
-    }
     if (!drill._syncTimer) {
       drill._syncTimer = setInterval(() => { try { syncFromMonitor(); } catch (_) { /* 后台同步失败不影响运行 */ } }, 60 * 1000);
       if (typeof drill._syncTimer.unref === 'function') drill._syncTimer.unref();
@@ -1301,6 +1306,93 @@ function createWatchDrill(opts = {}) {
     st.status = 'idle';
     st.nextRunAt = null;
     return snapshot();
+  }
+
+  // ── 自动发布选品卡点证据：只读扫描 + 店铺数据投影（PROMO-AUTO-BLOCKER-VIEW-20261104）──
+  // 唯一证据来源：plan-publisher 在选品页卡点时写入的失败现场截图——
+  //   隔离店：<publisher>/shop-state/<slug>__<account>/blocker-evidence/latest.{json,png}
+  //   legacy 默认店：<publisher>/blocker-evidence/latest.{json,png}
+  // 纯 fs 只读（不写文件、不启动调度/浏览器、不读 Cookie）。严格白名单：
+  // kind=screenshot、source=plan-publisher-selection-page、reason ∈ 两类不足30卡点、
+  // 图片名固定 latest.png 且两文件实际存在；meta.reasonText 一律不信任，
+  // 展示文案由服务端白名单映射——广告读取（千川/乘方）窗口形状永远不被认可。
+  // 图片 URL 只携带服务端扫描产生的不透明 key；请求参数绝不参与本地路径拼接。
+  const BLOCKER_PUBLISHER_DIR = (typeof opts.blockerPublisherDir === 'string' && opts.blockerPublisherDir)
+    || path.join(PROMO_GUARD_DIR, 'plan-publisher');
+  const BLOCKER_REASON_TEXT = Object.freeze({
+    'still-not-30-valid': '商品不足30个',
+    'catalog-exhausted-or-safe-pagination-boundary': '商品不足30个（目录/翻页边界）',
+  });
+  function tsOf(iso) { const t = Date.parse(typeof iso === 'string' ? iso : ''); return Number.isNaN(t) ? 0 : t; }
+  function scanBlockerEvidence() {
+    const out = [];
+    const evDirs = [];
+    try {
+      const ssRoot = path.join(BLOCKER_PUBLISHER_DIR, 'shop-state');
+      for (const name of fs.readdirSync(ssRoot)) {
+        const full = path.join(ssRoot, name);
+        try { if (fs.statSync(full).isDirectory()) evDirs.push(path.join(full, 'blocker-evidence')); } catch (_) { /* 不可读的店目录跳过 */ }
+      }
+    } catch (_) { /* shop-state 不存在 = 无隔离店证据 */ }
+    evDirs.push(path.join(BLOCKER_PUBLISHER_DIR, 'blocker-evidence')); // legacy 默认店（非隔离目录）
+    for (const evDir of evDirs) {
+      let meta = null;
+      try { meta = JSON.parse(fs.readFileSync(path.join(evDir, 'latest.json'), 'utf8')); } catch (_) { continue; }
+      if (!meta || typeof meta !== 'object' || Array.isArray(meta)) continue;
+      if (meta.kind !== 'screenshot') continue;
+      if (meta.source !== 'plan-publisher-selection-page') continue;
+      if (typeof meta.reason !== 'string' || !BLOCKER_REASON_TEXT[meta.reason]) continue;
+      if (meta.image !== 'latest.png') continue;
+      if (typeof meta.shop !== 'string' || !meta.shop.trim()) continue;
+      const pngFile = path.join(evDir, 'latest.png'); // 文件名恒为服务端常量，绝不来自请求
+      try { if (!fs.statSync(pngFile).isFile()) continue; } catch (_) { continue; }
+      out.push({
+        key: crypto.createHash('sha256').update(evDir).digest('hex').slice(0, 16),
+        pngFile,
+        shop: meta.shop.trim().slice(0, 60),
+        reason: meta.reason,
+        reasonText: BLOCKER_REASON_TEXT[meta.reason],
+        capturedAt: (typeof meta.capturedAt === 'string' && !Number.isNaN(Date.parse(meta.capturedAt))) ? meta.capturedAt : null,
+        businessDate: typeof meta.businessDate === 'string' ? meta.businessDate : null,
+      });
+    }
+    return out;
+  }
+  function toBlockerView(e) {
+    return {
+      kind: 'screenshot',
+      reason: e.reason,
+      reasonText: e.reasonText,
+      capturedAt: e.capturedAt,
+      businessDate: e.businessDate,
+      url: '/api/watch-drill/blocker-image?key=' + encodeURIComponent(e.key),
+    };
+  }
+  /** 扫描结果投影为页面店铺数据：planPublishing.shops[] 逐店挂各自卡点；blocker 为当前店镜像。
+   *  最小合并：只附加/刷新 blocker 与 shops 两个键，planPublishing 里既有的当日发布字段
+   *  （status/plans/attempts 等，若由其它装配链路写入）一律原样保留，绝不整对象覆盖。 */
+  function planPublishingView() {
+    let entries = [];
+    try { entries = scanBlockerEvidence(); } catch (_) { entries = []; }
+    drill._blockerEntries = entries;
+    const byShop = new Map();
+    for (const e of entries) {
+      const prev = byShop.get(e.shop);
+      // 同名店多账户目录时取 capturedAt 最新一条（单店目录本身 latest 同名覆盖，有界）
+      if (!prev || tsOf(e.capturedAt) > tsOf(prev.blocker.capturedAt)) {
+        byShop.set(e.shop, { name: e.shop, blocker: toBlockerView(e) });
+      }
+    }
+    const names = String(drill.shopName || '').split('、');
+    const current = entries.filter((e) => names.includes(e.shop))
+      .sort((a, b) => tsOf(b.capturedAt) - tsOf(a.capturedAt))[0] || null;
+    const existing = drill.state.planPublishing && typeof drill.state.planPublishing === 'object' && !Array.isArray(drill.state.planPublishing)
+      ? drill.state.planPublishing : {};
+    return {
+      ...existing,
+      blocker: current ? toBlockerView(current) : null,
+      shops: [...byShop.values()],
+    };
   }
 
   function snapshot() {
@@ -1399,6 +1491,8 @@ function createWatchDrill(opts = {}) {
         : null,
       // 只读运行时版本指纹（非敏感；require.resolve 路径 + 文件 sha256）
       runtimeFingerprint: drill._runtimeFingerprint || collectRuntimeFingerprint(),
+      // 自动发布选品卡点证据投影（逐店；仅白名单内的选品页截图证据，无证据为 null/空）
+      planPublishing: planPublishingView(),
     });
   }
 
@@ -1556,6 +1650,23 @@ function createWatchDrill(opts = {}) {
           consumedEvtSeq: drill._lastEvtSeq,
           confirmDialogs: CONFIRM_DIALOG_MEASURED, // 未实测的确认弹窗仍为阻断
         });
+      }
+      // 受控只读卡点截图路由：请求参数只接受服务端当场扫描出的不透明 key；
+      // key→文件路径的映射由 scanBlockerEvidence 在服务端建立（文件名恒为 latest.png），
+      // 未知 key、注入式路径、非 GET 一律 404，绝不打开任意本地文件。
+      if (p === '/api/watch-drill/blocker-image') {
+        if (req.method !== 'GET') return send(404, { error: 'Not Found' });
+        const key = String(url.searchParams.get('key') || '');
+        let fresh = [];
+        try { fresh = scanBlockerEvidence(); } catch (_) { fresh = []; }
+        drill._blockerEntries = fresh;
+        const e = /^[0-9a-f]{16}$/.test(key) ? fresh.find((x) => x.key === key) : null;
+        if (!e) return send(404, { error: '无匹配的卡点证据（未知 key 或证据已失效）' });
+        let buf = null;
+        try { buf = fs.readFileSync(e.pngFile); } catch (_) { return send(404, { error: '截图读取失败' }); }
+        if (!buf || !buf.length || buf.length > 8 * 1024 * 1024) return send(503, { error: '截图文件为空或过大' });
+        res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': buf.length, 'Cache-Control': 'no-store' });
+        return res.end(buf);
       }
       return send(404, { error: 'Not Found' });
     } catch (e) {

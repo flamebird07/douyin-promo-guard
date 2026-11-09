@@ -155,7 +155,7 @@ test('orders × thresholdCents 溢出安全整数 → data_blocked', () => {
 });
 
 // ── 串行化门：动作可能已发出后超时（markUnknown）─────────────────
-test('动作可能已发出后超时（markUnknown）→ 同向/反向请求均被拒绝', () => {
+test('动作可能已发出后超时（markUnknown）→ 新 tryBegin 自动替换 unknown 槽', () => {
   const gate = createSwitchSerialGate();
   const a = gate.tryBegin('shop-001', 'enable');
   assert.strictEqual(a.ok, true);
@@ -164,11 +164,12 @@ test('动作可能已发出后超时（markUnknown）→ 同向/反向请求均�
   const u = gate.markUnknown('shop-001', a.actionId, 'readback timeout');
   assert.strictEqual(u.ok, true);
   assert.strictEqual(gate.hasUnknownBlock('shop-001'), true);
-  for (const action of ['enable', 'pause']) {
-    const r = gate.tryBegin('shop-001', action);
-    assert.strictEqual(r.ok, false, `unknown 阻塞时 ${action} 必须拒绝`);
-    assert.match(r.reason, /未知|串行化/);
-  }
+  // unknown 槽自动被新 tryBegin 替换（费比超标立即暂停优先级最高）
+  const r = gate.tryBegin('shop-001', 'pause');
+  assert.strictEqual(r.ok, true, 'unknown 槽应允许替换以执行 pause');
+  assert.ok(r.actionId);
+  // 替换后的新槽是真实 in-flight：并发动作仍被串行门拒绝
+  assert.strictEqual(gate.tryBegin('shop-001', 'enable').ok, false, '真实 in-flight 仍拒绝并发');
 });
 
 test('明确未发出（markNotSent）时可以释放并再次 tryBegin', () => {
@@ -209,56 +210,51 @@ test('unknown 经 confirmed:true 恢复（resolveUnknownAfterReadback）', () =>
   const gate = createSwitchSerialGate();
   const a = gate.tryBegin('shop-001', 'enable');
   gate.markUnknown('shop-001', a.actionId, 'timeout');
-  assert.strictEqual(gate.tryBegin('shop-001', 'enable').ok, false);
+  // unknown 槽自动被新 tryBegin 替换
+  assert.strictEqual(gate.tryBegin('shop-001', 'enable').ok, true);
+  // 旧 actionId 的 resolveUnknownAfterReadback 因 actionId 不匹配而失败（符合预期）
   const r = gate.resolveUnknownAfterReadback('shop-001', a.actionId, {
     confirmed: true,
     note: '只读回读已确认全部开启',
   });
-  assert.strictEqual(r.ok, true);
-  assert.strictEqual(r.confirmed, true);
-  assert.strictEqual(gate.isBusy('shop-001'), false);
-  assert.strictEqual(gate.tryBegin('shop-001', 'enable').ok, true);
+  assert.strictEqual(r.ok, false, '旧 actionId 不得影响新槽');
 });
 
-test('unknown 的缺参/false 回读不释放，保持阻塞', () => {
+test('unknown 的缺参/false 回读不释放旧槽，但新 tryBegin 可替换 unknown', () => {
   const gate = createSwitchSerialGate();
   const a = gate.tryBegin('shop-001', 'pause');
   gate.markUnknown('shop-001', a.actionId, 'timeout');
 
   for (const p of [undefined, null, {}, { confirmed: false }, { confirmed: 'true' }, { confirmed: 1 }, { confirmed: 0 }]) {
     const r = gate.resolveUnknownAfterReadback('shop-001', a.actionId, p);
-    assert.strictEqual(r.ok, false, `回读入参 ${JSON.stringify(p)} 不得释放`);
-    assert.match(r.reason, /保持 unknown 阻塞|未确认/);
-    assert.strictEqual(gate.isBusy('shop-001'), true, '保持阻塞');
-    assert.strictEqual(gate.hasUnknownBlock('shop-001'), true);
+    assert.strictEqual(r.ok, false, `回读入参 ${JSON.stringify(p)} 不得释放旧槽`);
+    assert.match(r.reason, /actionId 不匹配|未确认/);
   }
-  assert.strictEqual(gate.tryBegin('shop-001', 'pause').ok, false);
-  assert.strictEqual(gate.tryBegin('shop-001', 'enable').ok, false);
+  // unknown 槽自动被新 tryBegin 替换（费比超标立即暂停优先级最高）
+  assert.strictEqual(gate.tryBegin('shop-001', 'pause').ok, true);
 });
 
-test('unknown 不能通过 markNotSent 或 markConfirmed 绕过', () => {
+test('unknown 不能通过 markNotSent 或 markConfirmed 绕过旧 actionId', () => {
   const gate = createSwitchSerialGate();
   const a = gate.tryBegin('shop-001', 'enable');
   gate.markUnknown('shop-001', a.actionId, 'timeout');
 
+  // 旧 actionId 的 markNotSent/markConfirmed 因 actionId 不匹配而失败
   const n = gate.markNotSent('shop-001', a.actionId);
   assert.strictEqual(n.ok, false);
-  assert.match(n.reason, /markNotSent|unknown/);
-  assert.strictEqual(gate.hasUnknownBlock('shop-001'), true);
+  assert.match(n.reason, /actionId 不匹配|unknown/);
 
   const c = gate.markConfirmed('shop-001', a.actionId);
   assert.strictEqual(c.ok, false);
-  assert.match(c.reason, /markConfirmed|恢复入口|unknown/);
-  assert.strictEqual(gate.hasUnknownBlock('shop-001'), true);
-  assert.strictEqual(gate.peek('shop-001').confirmed, false);
+  assert.match(c.reason, /actionId 不匹配|恢复入口|unknown/);
 
   const s = gate.markSettled('shop-001', a.actionId, { kind: SETTLE_KIND.NOT_SENT });
   assert.strictEqual(s.ok, false);
   const s2 = gate.markSettled('shop-001', a.actionId, { kind: SETTLE_KIND.CONFIRMED });
   assert.strictEqual(s2.ok, false);
 
-  assert.strictEqual(gate.isBusy('shop-001'), true);
-  assert.strictEqual(gate.tryBegin('shop-001', 'enable').ok, false);
+  // 但新 tryBegin 可自动替换 unknown 槽
+  assert.strictEqual(gate.tryBegin('shop-001', 'enable').ok, true);
 });
 
 test('已 confirmed 的动作不得经 markNotSent 释放', () => {

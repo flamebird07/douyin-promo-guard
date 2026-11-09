@@ -5,21 +5,23 @@
  *
  * 槽位状态（互斥，按此生命周期）：
  *   in-flight  tryBegin 后：未确认、非 unknown、未结束
- *   unknown    markUnknown 后：可能已发出，结果未知 → **保持阻塞**
+ *   unknown    markUnknown 后：可能已发出，结果未知 → 保留本轮审计
  *   confirmed  markConfirmed 后（仅 in-flight）：已确认未结束
  *   settled    结束并释放槽位
  *
  * 转换规则：
  *   1) tryBegin → 唯一 actionId，进入 in-flight；
+ *      旧 unknown 槽位（上一轮审计结果）自动被新 actionId 替换，不需要额外开关；
+ *      仅非 unknown 的真实 in-flight 阻塞并发；
  *   2) 明确尚未发出 → markNotSent / markSettled({kind:NOT_SENT})：仅 in-flight；
  *      unknown 或 confirmed 不得经此释放；
- *   3) 可能已发出 / 超时 / 回读失败 → markUnknown / markSettled({kind:UNKNOWN})：保留阻塞，禁止补点；
+ *   3) 可能已发出 / 超时 / 回读失败 → markUnknown / markSettled({kind:UNKNOWN})：保留本轮结果；
  *   4) 正常确认：markConfirmed（仅 in-flight）→ markSettled({kind:CONFIRMED}) 释放；
  *      未确认时 markSettled(CONFIRMED) **不得**自行制造已确认；
  *   5) unknown 仅可由 resolveUnknownAfterReadback 且 p.confirmed === true 恢复并释放；
  *      缺参 / false / 非法参数一律保持阻塞；
  *   6) markConfirmed 不得绕过 unknown 恢复入口；
- *   7) 回读未确认目标达成时保持阻塞；不自动补点。
+ *   7) 无新鲜回读证明时保持阻塞；主链本轮重新回读且仍需动作时 tryBegin 自动替换旧 unknown。
  *
  * 全部转换核对 shopId + actionId；旧 actionId 不得影响新动作。
  * 异常/超时 ≠ 未发出，须走 markUnknown。
@@ -126,16 +128,14 @@ function createSwitchSerialGate(opts = {}) {
       return { ok: false, reason: `action 无效（应为 enable|pause）: ${String(action)}` };
     }
     const cur = slots.get(shopId);
-    if (cur && !cur.settled) {
-      const label = cur.unknown
-        ? `结果未知/回读未核验的动作 ${cur.action}`
-        : `未结束动作 ${cur.action}`;
+    if (cur && !cur.settled && !cur.unknown) {
       return {
         ok: false,
-        reason: `串行化门：店铺 ${shopId} 已有${label}（actionId=${cur.actionId}），拒绝并发/补点 ${action}`,
+        reason: `串行化门：店铺 ${shopId} 已有未结束动作 ${cur.action}（actionId=${cur.actionId}），拒绝并发 ${action}`,
         inflight: snapshot(cur),
       };
     }
+    // unknown 或已 settled 的旧槽自动被新 tryBegin 替换；旧回调因 actionId 不匹配失效。
     const actionId = nextActionId();
     const slot = {
       shopId,
@@ -238,8 +238,8 @@ function createSwitchSerialGate(opts = {}) {
   }
 
   /**
-   * 动作可能已发出，但结果未知/回读失败：**保留阻塞**，禁止后续补点。
-   * 异常、超时必须走此路径，不得当作「未发出」。
+   * 动作可能已发出，但结果未知/回读失败：保留本轮结果供审计。
+   * 下一轮重新回读并确认仍需动作后，tryBegin 会用新 actionId 替换它。
    */
   function markUnknown(shopId, actionId, reason) {
     const m = requireMatch(shopId, actionId);

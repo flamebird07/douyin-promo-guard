@@ -14,7 +14,7 @@
  * - 高于阈值 + 回读 on → pause 流程一次；回读 off → 零点击
  * - 等于阈值 / unknown / 身份失败 / 数据异常 → 零点击
  * - 07:00 enable 与周期 enable/pause 并发：第二个被门阻止
- * - 动作回读失败后下一周期不补点
+ * - 动作回读失败后，下一周期经新鲜回读仍需动作则允许重试
  * - 旧 actionId 不影响新动作
  * - dryRun/realMode 门禁仍有效（execute 被调用前决策/门已拦截或 execute 契约返回 neverSent）
  */
@@ -301,7 +301,7 @@ test('集成：07:00 enable 与周期 enable/pause 并发时第二个被门阻�
   assert.strictEqual(enableExec, 1);
 });
 
-test('集成：动作回读失败后下一周期不补点（unknown 阻塞）', async () => {
+test('集成：动作回读失败后，下一周期重新回读仍需暂停则允许重试', async () => {
   const { orch } = makeOrch();
   let executeCount = 0;
   const r1 = await orch.runSwitchAction({
@@ -319,17 +319,23 @@ test('集成：动作回读失败后下一周期不补点（unknown 阻塞）', 
   assert.strictEqual(orch.hasUnknownBlock(SHOP.id), true);
   assert.strictEqual(executeCount, 1);
 
-  // 下一周期：仍 should_pause，但门必须拒绝（不补点）
+  const oldId = r1.actionId;
+  // 下一周期重新读到 on 且仍 should_pause：旧 unknown 不得永久占锁
   const r2 = await orch.runSwitchAction({
     shopId: SHOP.id,
     action: 'pause',
     targetState: 'off',
     readState: async () => 'on',
     decide: periodicDecideOver(orch),
-    execute: async () => { executeCount += 1; return {}; },
+    execute: async () => {
+      executeCount += 1;
+      return { outcome: 'all_paused_confirmed', allPausedConfirmed: true };
+    },
   });
-  assert.strictEqual(r2.blocked, 'serial_gate');
-  assert.strictEqual(executeCount, 1, '下一周期不得补点');
+  assert.notStrictEqual(r2.actionId, oldId);
+  assert.strictEqual(r2.serial, 'confirmed');
+  assert.strictEqual(executeCount, 2, '每个新周期最多执行一次');
+  assert.strictEqual(orch.gate.markConfirmed(SHOP.id, oldId).ok, false, '旧 actionId 不得影响新动作');
 });
 
 test('集成：unknown 仅 confirmed:true 回读可恢复；旧 actionId 不影响新动作', async () => {
@@ -420,17 +426,23 @@ test('集成：execute 契约 neverSent（dryRun/realMode 门禁）→ markNotSe
   assert.strictEqual(r2.serial, 'not_sent');
 });
 
-test('集成：重启恢复——未结束动作导入为 unknown 阻塞，不把未知写成成功', () => {
+test('集成：重启恢复——旧 unknown 自动被新 tryBegin 替换', () => {
   const gate1 = createSwitchSerialGate();
   const a = gate1.tryBegin('shop-001', 'pause');
   assert.strictEqual(a.ok, true);
+  // in-flight（unknown:false）动作永不替换，禁止并发点击
+  assert.strictEqual(gate1.tryBegin('shop-001', 'pause').ok, false, 'in-flight 动作永不替换');
   gate1.markUnknown('shop-001', a.actionId, '回读失败');
   const state = gate1.exportState();
 
   const gate2 = createSwitchSerialGate({ state });
-  assert.strictEqual(gate2.hasUnknownBlock('shop-001'), true, '重启后必须恢复为 unknown 阻塞');
-  assert.strictEqual(gate2.tryBegin('shop-001', 'pause').ok, false, '禁止补点');
-  assert.strictEqual(gate2.peek('shop-001').confirmed, false, '不得把未知写成成功');
+  assert.strictEqual(gate2.hasUnknownBlock('shop-001'), true, '重启后先保留 unknown 审计状态');
+  // unknown 槽自动被新 tryBegin 替换（费比超标立即暂停优先级最高）
+  const retry = gate2.tryBegin('shop-001', 'pause');
+  assert.strictEqual(retry.ok, true, 'unknown 允许替换');
+  assert.notStrictEqual(retry.actionId, a.actionId, '替换必须使用新 actionId');
+  assert.strictEqual(gate2.peek('shop-001').confirmed, false, '不得把旧未知写成成功');
+  assert.strictEqual(gate2.markUnknown('shop-001', a.actionId, '迟到回调').ok, false, '旧 actionId 失效');
 
   // settled 槽不导入
   const gate3 = createSwitchSerialGate({
@@ -582,7 +594,7 @@ test('主链路集成：回读 unknown → 零点击', async (t) => {
   assert.strictEqual(calls.pause, 0);
 });
 
-test('主链路集成：动作回读失败（partial）→ 下一周期不补点', async (t) => {
+test('主链路集成：动作回读失败（partial）→ 下一周期新鲜回读后重试', async (t) => {
   const { mon, calls } = await setupMonitor(t, { costCents: 10001, adState: 'on' });
   mon._pollChengfangOver = async () => {
     calls.pause += 1;
@@ -599,13 +611,16 @@ test('主链路集成：动作回读失败（partial）→ 下一周期不补点
     };
   };
   const r1 = await mon.pollOnce('interval');
+  const oldId = r1.results[0].actionId;
   assert.strictEqual(r1.results[0].serial, 'unknown');
   assert.strictEqual(calls.pause, 1);
 
   const r2 = await mon.pollOnce('interval');
-  assert.strictEqual(r2.results[0].blocked, 'serial_gate');
-  assert.strictEqual(calls.pause, 1, '下一周期不得补点');
+  assert.notStrictEqual(r2.results[0].actionId, oldId);
+  assert.strictEqual(r2.results[0].serial, 'unknown');
+  assert.strictEqual(calls.pause, 2, '下一周期重新回读后允许一次新动作');
   assert.ok(mon._switchOrchestrator.hasUnknownBlock(SHOP.id));
+  assert.strictEqual(mon._switchGate.markNotSent(SHOP.id, oldId).ok, false, '旧 actionId 不得释放新槽');
 });
 
 test('主链路集成：dryRun/realMode 门禁——execute 返回 neverSent 时串行门释放且不计成功', async (t) => {
@@ -719,7 +734,7 @@ test('决策层单测契约：metric 与 decision 分离（与 orchestrator.eval
 
 // ── mixed / 门禁优先级 / 批次单次记录（G1–G3 补充）────────────────
 
-test('mixed 目标筛选语义：above+mixed 进 pause；below+mixed 进 enable；equal+mixed 零动作', async () => {
+test('mixed 目标筛选语义：above+mixed 进 pause；below+mixed 进 enable；equal+mixed 统一暂停收敛（客户 2026-10-10）', async () => {
   const { orch } = makeOrch();
   let pauseExec = 0;
   let enableExec = 0;
@@ -747,8 +762,8 @@ test('mixed 目标筛选语义：above+mixed 进 pause；below+mixed 进 enable�
     decide: (st) => orch.evaluatePeriodic({ costCents: 10000, orders: 100, thresholdCents: TH, currentAdState: st, identityOk: true }),
     execute: async () => { pauseExec += 1; return {}; },
   });
-  assert.strictEqual(r3.decision, DECISION.EQUAL_NO_ACTION);
-  assert.strictEqual(pauseExec, 1, 'equal+mixed 零动作');
+  assert.strictEqual(r3.decision, DECISION.SHOULD_PAUSE);
+  assert.strictEqual(pauseExec, 2, 'equal+mixed 走统一暂停收敛（只停 on 项，非零动作）');
 });
 
 test('门禁优先级：无控制范围 → blocked（不因 already_off 包成 ok）', async (t) => {
@@ -765,7 +780,7 @@ test('门禁优先级：无控制范围 → blocked（不因 already_off 包成 
   assert.strictEqual(calls.enable, 0);
 });
 
-test('门禁优先级：超标 + 07:59 → window_blocked（不因 already_off/mixed 包成 ok）', async (t) => {
+test('门禁优先级：超标 + 07:59 → 暂停盘点照常执行（S2 2026-11-08：暂停不再被时间窗口拦截）', async (t) => {
   const clockNow = shanghaiMs('2026-09-12', '07:59');
   const cookieDir = makeTempDir('sw-ck-');
   const dataDir = makeTempDir('sw-data-');
@@ -790,14 +805,13 @@ test('门禁优先级：超标 + 07:59 → window_blocked（不因 already_off/m
   const mon = new Monitor(cfgResult, { reader, controller }, {
     dataDir,
     nowFn,
-    readAdState: async () => 'off', // already_off 也不得吞掉 window_blocked
+    readAdState: async () => 'off', // already_off 也要进入超标只读盘点（S2：不被时间窗口拦截）
   });
   mon._pollChengfangOver = async () => { exec += 1; return { status: 'ok', batch: {} }; };
   mon._executeEnableBatchFor = async () => { exec += 1; return { outcome: 'all_enabled_confirmed', allEnabledConfirmed: true }; };
   const r = await mon.pollOnce('interval');
-  assert.strictEqual(r.results[0].status, 'window_blocked');
-  assert.match(r.results[0].reason, /08:00/);
-  assert.strictEqual(exec, 0, '窗口外不打开执行会话');
+  assert.strictEqual(r.results[0].status, 'ok');
+  assert.strictEqual(exec, 1, '07:59 超标（含 already_off）照常进入暂停路径，仅 enable 不触发');
 });
 
 test('门禁优先级：清单身份失败 → blocked（不包成 ok/unknown 零点击）', async (t) => {
@@ -941,7 +955,7 @@ test('enable 不得因暂停成功结果码被确认', async () => {
   assert.strictEqual(orch.hasUnknownBlock(SHOP.id), true, '槽位保持阻塞');
 });
 
-test('partial / 未知结果 → 保持 unknown 阻塞，不释放', async () => {
+test('partial / 未知结果保留本轮记录，但不跨轮次永久阻塞', async () => {
   const { orch } = makeOrch();
   const r1 = await orch.runSwitchAction({
     shopId: SHOP.id,
@@ -962,7 +976,8 @@ test('partial / 未知结果 → 保持 unknown 阻塞，不释放', async () =>
     decide: periodicDecideOver(orch),
     execute: async () => ({ outcome: 'some_closed_string', reason: '任意含 closed 的字符串不得当成功' }),
   });
-  assert.strictEqual(r2.blocked, 'serial_gate', 'partial 后不补点');
+  assert.notStrictEqual(r2.actionId, r1.actionId);
+  assert.strictEqual(r2.serial, 'unknown', '新一轮执行结果仍按自身事实记录 unknown');
 });
 
 test('旧 actionId 不能在 all_closed_confirmed 路径上影响新动作', async () => {

@@ -44,7 +44,7 @@ const { discoverShopsFromCookies } = require('./shop-discovery');
 const guard = require('./guard');
 const { NotConnectedError, AuthError } = require('../lib/errors');
 const { buildHoldLogFields } = require('../login/auth-failure-text');
-const { shanghaiDate, shanghaiClockText, shanghaiWall, shanghaiMs, isAfterDailyStart, msUntilDailyStart, msUntilHour, msUntilFirstCheck, nextIntervalDelayMs } = require('../lib/time');
+const { shanghaiDate, shanghaiClockText, shanghaiWall, shanghaiMs, nextIntervalDelayMs } = require('../lib/time');
 const { centsToYuan } = require('../lib/money');
 const log = require('../lib/log');
 
@@ -963,7 +963,7 @@ class Monitor {
     const gen = this._gen;
     this._audit({ kind: 'monitor', event: 'start', mode: this.modeLabel, activeShopCount });
     this._loopPromise = this._intervalLoop(gen);
-    log.info(`监控已启动（${this.modeLabel}，活动店铺 ${activeShopCount} 家，每日 ${this.config.schedule.dailyStartHour}:00 后，每 ${this.config.schedule.intervalMinutes} 分钟）`);
+    log.info(`监控已启动（${this.modeLabel}，活动店铺 ${activeShopCount} 家，启动即巡查，之后每 ${this.config.schedule.intervalMinutes} 分钟；暂停无每日时段门槛）`);
     return { ok: true, activeShopCount };
   }
 
@@ -1219,9 +1219,8 @@ class Monitor {
    *   执行后直接进入费比巡查（不再等待 dailyStartHour；客户要求首查后立即费比控制）。
    *   仅当独立调度器未运行（enableRunning=false）且未被用户独立停用时由本循环兜底；
    *   调度器运行时本循环在窗口内直接进入巡查，避免双循环重复开启。
-   * - 首查窗口前（00:00–00:04:59）：等待到首查窗口（不再以 dailyStartHour 为上界）。
-   * - 首查窗口后：费比巡查（原有逻辑），跨日等待目标为首查窗口（firstCheckMinute）。
-   * - 无首查配置：保留旧 dailyStartHour 门禁（00:00–dailyStartHour 等待）。
+   * - 费比巡查无首查/时段门槛：启动即查，之后严格按 intervalMinutes；跨日也不等待固定时刻。
+   * - 每日开启只是独立相位，成功、失败或未完成都不得阻塞费比暂停巡查。
    * 停止/重启通过代数防止多循环；所有等待用 delayFn（可注入时钟门）。
    */
   async _intervalLoop(gen) {
@@ -1232,7 +1231,7 @@ class Monitor {
     //  0 = 尚未建立 → 首次有机会（窗口开启）立即巡查一次；
     //  任何分支转入费比巡查前都必须先检查 due；未到点绝不 pollOnce（不拉已完成店费用/订单/广告、不派发动作）；
     //  首查尝试/重试"只决定较早唤醒去重试 pending"，绝不改动/提前该到期，也绝不让已完成店提前 poll；
-    //  仅"实际完成一次费比 poll"后按 nextIntervalDelayMs + 配置 intervalMinutes 更新到期；
+    //  仅"实际完成一次费比 poll"后按 intervalMinutes 更新到期；
     //  外部阈值重排（_scheduleEpoch 变化）把到期 rebase 到最新 schedule.nextRunAt 的"精确目标"（不用 min，
     //  以免保留已过时的旧到期 → R5-2）。
     // 这样可根除"只在混合分支守 due、通用尾巴却无条件 poll"（R5-1/R5-3）以及"min 保留旧到期"（R5-2）。
@@ -1265,36 +1264,15 @@ class Monitor {
           }
           const activeShops = this._activeShops();
           const pendingNow = activeShops.filter((s) => !this._enablePhaseDone(s.id, today));
-          if (pendingNow.length > 0 && pendingNow.length === activeShops.length) {
-            // 全部未完成：任何店首查均未确认 → 安全门禁，绝不进入费比巡查，有界等待重试，绝不忙循环。
-            this.schedule.phase = 'enable_window';
-            this.schedule.waitingFor08 = false;
-            this.schedule.lastWindowBlockReason = `全部 ${activeShops.length} 家活动店铺首查未完成/未确认，有界等待 ${Math.round(ENABLE_RETRY_MS / 60000)} 分钟后重试（费比巡查暂缓，遵守首查安全门禁）`;
-            await this.delayFn(ENABLE_RETRY_MS, gen);
-            continue;
+          if (pendingNow.length > 0) {
+            this.schedule.lastWindowBlockReason = `${pendingNow.length} 家每日开启未完成；不阻塞费比暂停巡查，稍后独立重试`;
           }
-          // 至此：混合（部分 done、部分 pending）或本相位刚把剩余店全部确认完成（pendingNow=0）。
-          // 不再在此 poll，也不再自排等待——统一落入下方共享"费比巡查窗口 + due 判定"。
+          // 不论每日开启是否完成，都落入下方费比巡查；暂停优先级最高。
           this.schedule.waitingFor08 = false;
         }
       }
 
-      // ── 费比巡查窗口门禁（首查窗口配置时窗口即开；无配置保留旧 dailyStartHour 门禁）──
-      const patrolWindowOpen = enableWindow ? this._dailyFirstCheckOpen(w) : isAfterDailyStart(now, sch.dailyStartHour);
-      if (!patrolWindowOpen) {
-        const waitMs = enableWindow
-          ? msUntilFirstCheck(now, this._firstCheckMinuteOfDay())
-          : msUntilHour(now, sch.dailyStartHour);
-        const target = now + waitMs;
-        this.schedule.phase = 'waiting_window';
-        this.schedule.waitingFor08 = !enableWindow;
-        this.schedule.nextRunAt = new Date(target).toISOString();
-        this.schedule.lastWindowBlockReason = enableWindow
-          ? `等待每日首查时刻 ${this._firstCheckTimeText()} 后进入费比巡查`
-          : `等待每日 ${sch.dailyStartHour}:00（Asia/Shanghai）后执行暂停巡查`;
-        await this.delayFn(waitMs, gen);
-        continue;
-      }
+      // 费比暂停巡查无每日窗口门槛：启动即查，之后只按 intervalMinutes 节流。
       this.schedule.phase = 'running';
       this.schedule.waitingFor08 = false;
 
@@ -1320,11 +1298,8 @@ class Monitor {
         if (gen !== this._gen || !this.running) return;
         const lastRun = this.nowFn();
         this.schedule.lastRunAt = new Date(lastRun).toISOString();
-        // 完成一次真实费比巡查后按配置间隔更新共享到期（跨日目标 00:05）；首查尝试/重试不会走到这里。
-        const crossDayMinute = enableWindow ? this._firstCheckMinuteOfDay() : null;
-        const nd = nextIntervalDelayMs(lastRun, lastRun, sch.intervalMinutes, sch.dailyStartHour, null, crossDayMinute);
-        nextPatrolDueMs = nd.nextRunAt;
-        if (nd.crossDay && !enableWindow) this.schedule.waitingFor08 = true;
+        // 完成一次真实费比巡查后严格按配置间隔更新；跨日不等待首查或 dailyStartHour。
+        nextPatrolDueMs = lastRun + (sch.intervalMinutes * 60 * 1000);
       } else if (pendingRemain > 0) {
         this.schedule.lastWindowBlockReason = `${pendingRemain} 家未完成店 ${Math.round(ENABLE_RETRY_MS / 60000)} 分钟有界重试等待中；已完成店费比巡查未到点（下次 ${new Date(nextPatrolDueMs).toISOString()}），不提前拉取`;
       }
@@ -3646,9 +3621,11 @@ class Monitor {
    */
   async _tryResolveUnknownSlotWithFreshRead(shopCfg, stateRead0 = null) {
     const orch = this._switchOrchestrator;
+    // 2026-11-05 修复 capability gate：settleUnknownEnableTargetNotAchieved 是 enable 专用
+    // 「目标未达成结案」能力，缺失时不得拦掉 pause/enable 槽位的正常目标态核验释放
+    // （resolveUnknownWithReadback 链路）；仅 enable 未达成分支在其能力缺失时 fail-closed。
     if (!orch || typeof orch.hasUnknownBlock !== 'function' || typeof orch.peek !== 'function'
-      || typeof orch.resolveUnknownWithReadback !== 'function'
-      || typeof orch.settleUnknownEnableTargetNotAchieved !== 'function') return null;
+      || typeof orch.resolveUnknownWithReadback !== 'function') return null;
     if (!orch.hasUnknownBlock(shopCfg.id)) return null;
     const slot = orch.peek(shopCfg.id);
     if (!slot || !slot.actionId || slot.unknown !== true || slot.settled === true) return null;
@@ -3683,6 +3660,13 @@ class Monitor {
       // 其余（部分清单/identity false/mixed/unknown/超时）一律保持阻断、零点击。
       // 只陈述"当前全量状态证明目标未达成"，绝不谎称旧动作未点击、绝不声明历史点击因果。
       if (slot.action === 'enable' && expectState === 'on' && !r.error && identityOk && allOff && r.state === 'off') {
+        // 能力缺失 fail-closed：orchestrator 未提供 enable 专用「目标未达成结案」入口时，
+        // 不得抛异常、不得放宽释放、不得点 enable；明确返回 reason 保持阻断（2026-11-05）。
+        if (typeof orch.settleUnknownEnableTargetNotAchieved !== 'function') {
+          const why = 'enable 目标未达成结案能力缺失（settleUnknownEnableTargetNotAchieved 未实现）：fail-closed 保持阻断';
+          this._audit({ kind: 'ad-switch', step: 'resolve-unknown-attempt', shopId: shopCfg.id, actionId: slot.actionId, ok: false, reason: why });
+          return { resolved: false, reason: why, actionId: slot.actionId };
+        }
         const evidence = { listComplete: true, identityOk: true, allRowsOff: true, rowCount: r.rows.length, freshState: 'off' };
         const evidenceSummary = `${r.rows.length} 行全量 switchChecked=false（当前全量 off），identity.ok=true，读取时间 ${new Date(this.nowFn()).toISOString()}`;
         const note = `旧 enable 目标（on）未达成：本轮新鲜完整回读全量 ${evidenceSummary}；以「已核验失败/未达成」终态安全结案（非 confirmed、不声明历史点击因果），同轮正常决策可创建新 enable`;
@@ -4713,18 +4697,9 @@ class Monitor {
       const pre = settlePre('本轮已停止/取消：未发出');
       return { status: 'blocked', reason: '本轮已停止/取消，零广告动作', zeroClick: true, outcome: 'blocked_stopped', blocked: 'stopped', ...(pre || {}) };
     }
-    // unknown 槽位核验释放（2026-09-29 第 6 阶段）：仅当该店存在 unknown 阻塞槽位时，用一次
-    // 新鲜、完整、身份核验通过且有界的本轮回读严格确认旧动作目标状态已达成才释放；
-    // 任一条件不满足则不做任何事（后续仍由串行门阻断，零点击）。
-    await this._tryResolveUnknownSlotWithFreshRead(shopCfg);
-    // mixed 不是完成态（2026-10-10 新目标）：旧动作仍是 unknown 且本轮完整回读为 mixed 时，
-    // 有证据地交接并按**新判定**重操作一次（同轮至多一次额外修复；嵌套调用不再交接）。
-    if (opts.fromMixedReconcile !== true && this._switchOrchestrator.hasUnknownBlock(shopCfg.id)) {
-      const entryReconcile = await this._mixedReconcileRepair(shopCfg, cycleToken, trigger, {
-        stage: 'entry', action,
-      });
-      if (entryReconcile) return entryReconcile;
-    }
+    // unknown 只作为上一轮审计结果，不是跨轮锁：本入口不再先做额外的整页回读核验
+    // （那会让费比超标暂停多等一次页面读取）；串行门 tryBegin 会用新 actionId 直接
+    // 替换旧 unknown 槽，仅真实 in-flight 才拒绝并发。
     const thresholdCents = this._thresholdCents(shopCfg);
     const decide = (currentAdState) => this._switchOrchestrator.evaluatePeriodic({
       costCents: data.cost.valueCents,
@@ -4978,42 +4953,12 @@ class Monitor {
         return { status: 'blocked', reason: scopeBlockedReason };
       }
 
-      // 4) 执行时间窗口（超标=暂停意图）：
-      // 2026-10-09 R1：首查调度器启用时，首查未完成则费比暂停被首查安全门禁拦截
-      // （客户：未知/失败/未确认动作必须先核验，不能通过费比路径绕过首查安全门禁）；
-      // 首查已完成（success）则直接放行费比暂停（不再等 dailyStartHour）。
-      // 调度器未启用时（如纯费比测试）保留旧 dailyStartHour 门禁。
-      // D53（2026-10-30）：门禁以**实际生效**的调度器判定为准（enableSchedulerShouldRun）——
-      // 独立停用每日开启只停开启任务，绝不连带停费比暂停巡查；停用后走原 dailyStartHour 门禁。
+      // 4) 时间窗口（客户 2026-11-08 S2：费比严格超标后暂停为最高业务优先级，
+      // 删除 pauseEligible 的首查未完成与 dailyStartHour 早退——暂停不再被时间/首查窗口拦截；
+      // 首查安全门禁仅拦下方的 threshold recovery enable，不拦 SHOULD_PAUSE 与超标 already_off）。
+      // D53（2026-10-30）：门禁以**实际生效**的调度器判定为准（enableSchedulerShouldRun）。
       const enableWindowCfg = this.enableSchedulerShouldRun();
       const todayDate = shanghaiDate(this.nowFn());
-      if (data.evaluation.pauseEligible === true) {
-        if (enableWindowCfg && !this._enablePhaseDone(shopCfg.id, todayDate)) {
-          const reason = `当日首次开启检查未完成（首查安全门禁），费比暂停暂不执行：已读取并记录，未执行真实关闭`;
-          this.schedule.lastWindowBlockReason = reason;
-          this._commitShopLastDataSkippedBalance(rt, candidate, '首查安全门禁拦截暂停，未读取千川余额');
-          this._memPush(this.triggers, {
-            shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason,
-            targetCount: 0,
-          }, undefined, 'trigger');
-          this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason });
-          this._emitJudgement(shopCfg, { data, over: true, status: 'window_blocked', reason });
-          return { status: 'window_blocked', reason };
-        }
-        if (!enableWindowCfg && !isAfterDailyStart(this.nowFn(), this.config.schedule.dailyStartHour)) {
-          const hh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
-          const reason = `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：已读取并记录，未执行真实关闭（手动检查不绕过时间限制）`;
-          this.schedule.lastWindowBlockReason = reason;
-          this._commitShopLastDataSkippedBalance(rt, candidate, '未到允许执行时段，未读取千川余额');
-          this._memPush(this.triggers, {
-            shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason,
-            targetCount: 0,
-          }, undefined, 'trigger');
-          this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason });
-          this._emitJudgement(shopCfg, { data, over: true, status: 'window_blocked', reason });
-          return { status: 'window_blocked', reason };
-        }
-      }
 
       // 5) 本轮回读 currentAdState（清单身份/完整性失败 → blocked，不得包成 ok）
       const stateRead = await this._readCurrentAdState(shopCfg);
@@ -5093,13 +5038,11 @@ class Monitor {
       });
 
       // 6) 决策分流：should_* 进入动作；超标 + already_off 走暂停只读盘点（nothing_to_close）
-      // 2026-10-09 R1：首查窗口配置时，首查未完成则费比控制（暂停/恢复）被首查安全门禁拦截。
-      // 客户：未知/失败/未确认动作必须先核验，不能通过费比路径绕过首查安全门禁；
-      // 费比导致的暂停不能被首查再次强制打开（threshold_recovery 在首查完成前不执行）。
+      // 首查安全门禁（2026-11-08 S2 收窄）：只拦 threshold recovery enable——
+      // 费比导致的暂停不能被首查再次强制打开；SHOULD_PAUSE 与超标 already_off 盘点
+      // 拥有最高业务优先级，不再被首查未完成拦截。
       if (enableWindowCfg && !this._enablePhaseDone(shopCfg.id, todayDate)
-          && (decision.decision === DECISION.SHOULD_PAUSE
-              || decision.decision === DECISION.SHOULD_ENABLE
-              || (decision.decision === DECISION.ALREADY_OFF && data.evaluation.over === true))) {
+          && decision.decision === DECISION.SHOULD_ENABLE) {
         const reason = `当日首次开启检查未完成（首查安全门禁），费比控制暂不执行：已读取并记录`;
         this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'window_blocked', reason, decision: decision.decision, zeroClick: true });
         return {
@@ -5807,15 +5750,8 @@ class Monitor {
       return { status: 'ok', over: true, dryRun: true, targetCount: activeTargets.length, coverageGaps, sideUnknown };
     }
 
-    // 真实模式：手动/定时一视同仁，受时间窗口限制
-    if (!isAfterDailyStart(this.nowFn(), this.config.schedule.dailyStartHour)) {
-      const hh = String(this.config.schedule.dailyStartHour).padStart(2, '0');
-      const reason = `未到允许执行时段（每日 ${hh}:00 后，Asia/Shanghai）：已读取并记录，未执行真实关闭（手动检查不绕过时间限制）`;
-      this.schedule.lastWindowBlockReason = reason;
-      this._memPush(this.triggers, { shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason, targetCount: activeTargets.length }, undefined, 'trigger');
-      this._audit({ kind: 'trigger', shopId: shopCfg.id, mode: 'real', targetAction: 'pause', blocked: 'window', reason });
-      return { status: 'window_blocked', reason };
-    }
+    // 真实暂停不设时间窗口：费比严格超标即进入关闭链路。
+    // 该历史全店路径与乘方主路径保持同一优先级，避免切换配置后重新出现时段锁。
     this.schedule.lastWindowBlockReason = null;
 
     const todayStatus = new Map(); // 批次内结果累积（跨批次状态以最新清单读取为准）

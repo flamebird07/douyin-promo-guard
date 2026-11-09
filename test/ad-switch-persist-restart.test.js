@@ -78,7 +78,9 @@ test('终态写入失败：保持阻塞（不释放、不重复点击）', () =>
   assert.strictEqual(s.persistFailed, true);
   assert.strictEqual(gate.hasUnknownBlock('shop-c'), true, '持久化失败必须保持阻塞');
   assert.strictEqual(gate.isBusy('shop-c'), true);
-  assert.strictEqual(gate.tryBegin('shop-c', 'pause').ok, false, '不得重复点击');
+  // 持久化失败转 unknown 后不是跨轮锁：下一轮 fresh read 仍 on 且仍超标时，
+  // 新 tryBegin 以新 actionId 替换旧 unknown 槽（费比超标立即暂停优先级最高）
+  assert.strictEqual(gate.tryBegin('shop-c', 'pause').ok, true, 'unknown 槽允许被下一轮新 actionId 替换');
 });
 
 test('not_sent 终态写入失败：转 unknown 保持阻塞', () => {
@@ -94,7 +96,7 @@ test('not_sent 终态写入失败：转 unknown 保持阻塞', () => {
   assert.strictEqual(gate.isBusy('shop-d'), true, '失败不得释放槽');
 });
 
-test('partial/unknown 重启后仍阻塞', () => {
+test('partial/unknown 重启后新 tryBegin 可替换', () => {
   const stateFile = tmpState();
   const gate1 = createSwitchSerialGate();
   const a = gate1.tryBegin('shop-e', 'pause');
@@ -103,7 +105,8 @@ test('partial/unknown 重启后仍阻塞', () => {
   fs.writeFileSync(stateFile, JSON.stringify(snap));
   const gate2 = createSwitchSerialGate({ state: JSON.parse(fs.readFileSync(stateFile, 'utf8')) });
   assert.strictEqual(gate2.hasUnknownBlock('shop-e'), true);
-  assert.strictEqual(gate2.tryBegin('shop-e', 'pause').ok, false);
+  // unknown 槽自动被新 tryBegin 替换（费比超标立即暂停优先级最高）
+  assert.strictEqual(gate2.tryBegin('shop-e', 'pause').ok, true);
 });
 
 test('编排器 never_sent+双写失败：persistence_blocked / zeroClick:true / serial:unknown / dispatched:0', async () => {
@@ -131,8 +134,9 @@ test('编排器 never_sent+双写失败：persistence_blocked / zeroClick:true /
   assert.strictEqual(r.outcome, 'persistence_blocked');
   assert.strictEqual(r.zeroClick, true, '未发出必须 zeroClick');
   assert.strictEqual(r.serial, 'unknown', '终态未落盘不得宣称 not_sent 释放');
-  assert.strictEqual(gate.hasUnknownBlock('shop-z'), true, '阻止再次动作');
-  assert.strictEqual(gate.tryBegin('shop-z', 'enable').ok, false);
+  // unknown 只作上一轮审计结果，不是跨轮锁：下一轮新 tryBegin 可替换（重新回读后再决策）
+  assert.strictEqual(gate.hasUnknownBlock('shop-z'), true, '本轮结果仍如实 unknown');
+  assert.strictEqual(gate.tryBegin('shop-z', 'enable').ok, true, 'unknown 槽允许被下一轮新 actionId 替换');
 });
 
 test('resolveUnknownWithReadback 持久化失败：内存不释放，落盘仍 unknown', () => {

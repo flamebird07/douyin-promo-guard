@@ -323,12 +323,28 @@ test('G7 非法来源拒绝', () => {
   assert.ok(/未知开启来源/.test(r.reason));
 });
 
-test('G8 暂停门槛不回归：07:00 拒（isAfterDailyStart 语义）', () => {
-  const g = buildChengfangRequestGate({
+test('G8 暂停无时段门槛（S2 2026-11-08）：00:01/07:00 放行；stop/跨日/realMode/pauseEnabled 仍拦', () => {
+  const gate = (hm, opts = {}) => buildChengfangRequestGate({
     config: GATE_CFG,
-    nowFn: () => shanghaiMs('2026-09-29', '07:00'),
+    nowFn: () => shanghaiMs('2026-09-29', hm),
     businessDate: '2026-09-29',
     action: 'pause',
+    ...opts,
   });
-  assert.equal(g().ok, false);
+  assert.equal(gate('00:01')().ok, true, '首查未完成/未到 08:00 也必须放行暂停');
+  assert.equal(gate('07:00')().ok, true, '07:00 暂停照常放行');
+
+  assert.equal(gate('00:01', { stopRequested: () => true })().ok, false, '停止信号仍拦');
+  assert.equal(gate('00:01', { businessDate: '2026-09-28' })().ok, false, '跨日仍拦');
+  const cfgNoReal = { ...GATE_CFG, execution: { realMode: false, dryRun: false } };
+  assert.equal(buildChengfangRequestGate({
+    config: cfgNoReal, nowFn: () => shanghaiMs('2026-09-29', '00:01'), businessDate: '2026-09-29', action: 'pause',
+  })().ok, false, 'realMode 仍拦');
+  const cfgNoPause = {
+    ...GATE_CFG,
+    monitor: { chengfang: { ...GATE_CFG.monitor.chengfang, pauseEnabled: false } },
+  };
+  assert.equal(buildChengfangRequestGate({
+    config: cfgNoPause, nowFn: () => shanghaiMs('2026-09-29', '00:01'), businessDate: '2026-09-29', action: 'pause',
+  })().ok, false, 'pauseEnabled 仍拦');
 });

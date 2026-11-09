@@ -143,6 +143,16 @@ class Monitor {
     this._coordinators = new Map(); // shopId -> WholeShopCloseCoordinator（跨周期保留在途请求登记）
     this._chengfangRunners = new Map(); // shopId -> ChengfangRunner（乘方主链路）
     this._chengfangOpener = opts.chengfangOpener || null; // 测试注入：本地 DOM fixture 会话开启器
+    // 同店跨上下文浏览器会话互斥（PROMO-IMPL-E1）：发布/恢复入口持有的当日 shop/day lease。
+    // 生产由 watch-drill 装配时注入 leaseDir + leaseExists(shopCfg, businessDate, leaseDir)；
+    // 缺省 null = 不检查，行为与旧版完全一致（monitor 不直接依赖父仓文件/路径规则）。
+    this._publishLeaseDir = typeof opts.leaseDir === 'string' && opts.leaseDir.trim() !== '' ? opts.leaseDir : null;
+    this._publishLeaseExists = typeof opts.leaseExists === 'function' ? opts.leaseExists : null;
+    // 全局浏览器操作排队锁（PROMO-IMPL-F1）：所有会打开该店浏览器的读取/开关动作在跨进程
+    // 全局锁内执行，锁忙本轮跳过该店。生产由 watch-drill 注入 {acquire,release}（复用
+    // promo-plan-scheduler 的文件锁原语）；缺省 null = 不排队，行为与旧版完全一致。
+    this._globalBrowserLock = (opts.globalBrowserLock && typeof opts.globalBrowserLock.acquire === 'function')
+      ? opts.globalBrowserLock : null;
     // 决策层 + 串行门外层（2026-09-22）：每日 07:00 开启 / 低于阈值开启 / 高于阈值暂停统一入口
     this._readAdState = opts.readAdState || null; // 测试注入：本轮回读 currentAdState
     this._switchOrchestrator = opts.switchOrchestrator || null; // 测试注入
@@ -1890,6 +1900,14 @@ class Monitor {
       // 只读回读广告状态（on/off/mixed/unknown）；失败 → unknown + blocked 说明
       const stateRead = await this._readCurrentAdState(shopCfg);
       this._applyBalanceToLastData(candidate, stateRead);
+      // 全局浏览器操作锁忙（PROMO-IMPL-F1）：本次只读刷新让位，不写 adState、不落读取失败。
+      if (stateRead.globalBusy === true) {
+        this._auditGlobalBrowserOpBusy(shopId);
+        return {
+          ok: true, readOnly: true, shopId, adState: rt.lastAdState,
+          blocked: 'global-browser-op-busy', reason: stateRead.error.reason, zeroClick: true,
+        };
+      }
       if (stateRead.error) {
         // 新错误覆盖旧因；Auth 失败同时撤销旧 on 证据；未知保持零广告开关。
         this._applyReadFailure(shopCfg.id, stateRead.error);
@@ -1992,6 +2010,62 @@ class Monitor {
 
   _releaseShop(shopId) {
     this._shopProcessing.delete(String(shopId));
+  }
+
+  /**
+   * 发布/恢复租约在途判定（PROMO-IMPL-E1）：同一店铺当日已有发布/恢复入口持锁时，
+   * 值守读取/动作必须让位（同店串行、跨店不受影响）。lease 路径与 expiry 规则由
+   * watch-drill 注入的 leaseExists 负责；未注入 → false（旧行为零变化）。
+   */
+  _publishLeaseInFlight(shopCfg, businessDate) {
+    if (typeof this._publishLeaseExists !== 'function') return false;
+    try {
+      return this._publishLeaseExists(shopCfg, businessDate || shanghaiDate(this.nowFn()), this._publishLeaseDir) === true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * 全局浏览器操作排队锁（PROMO-IMPL-F1）：跨进程文件锁的取放由 watch-drill 注入
+   * （复用 promo-plan-scheduler 的 acquireProcessLock/releaseProcessLock）。未注入 → 不排队。
+   * 取锁失败（含异常）一律视为忙：让位本店，不在持锁时等待，也不把异常当空闲放行。
+   */
+  _acquireGlobalBrowserOp() {
+    if (!this._globalBrowserLock) return { held: true, token: null, noLock: true };
+    try {
+      const r = this._globalBrowserLock.acquire();
+      if (r && r.held === true) return { held: true, token: r.token };
+      return { held: false };
+    } catch (_) {
+      return { held: false };
+    }
+  }
+
+  _releaseGlobalBrowserOp(acq) {
+    if (!acq || acq.held !== true || acq.noLock === true) return;
+    try { this._globalBrowserLock.release(acq.token); } catch (_) { /* 释放失败不覆盖原结果 */ }
+  }
+
+  /**
+   * 在全局浏览器操作锁内执行 fn：正常/异常都在 finally 释放，返回 {busy:false,value}
+   * 或 {busy:true}（未执行 fn）。不新增状态机，只在既有读取/动作外壳外面包一层。
+   */
+  async _withGlobalBrowserOp(fn) {
+    const acq = this._acquireGlobalBrowserOp();
+    if (!acq.held) return { busy: true };
+    try {
+      return { busy: false, value: await fn() };
+    } finally {
+      this._releaseGlobalBrowserOp(acq);
+    }
+  }
+
+  /** 锁忙跳过审计（kind=poll / status=skipped / reason 固定），与 E1 租约跳过同形状。 */
+  _auditGlobalBrowserOpBusy(shopId) {
+    try {
+      this._audit({ kind: 'poll', shopId, status: 'skipped', reason: 'global-browser-op-busy' });
+    } catch (_) { /* 审计失败不影响让位 */ }
   }
 
   /**
@@ -2987,6 +3061,22 @@ class Monitor {
    * 审计 kind:ad-state-read：start / done(ok|error) / deadline / retry。
    */
   async _readChengfangAdStateBounded(shopCfg) {
+    // 全局浏览器操作排队锁（PROMO-IMPL-F1）：外壳取锁 → 读取（含瞬态重读/会话关闭）→
+    // finally 释放；锁忙不进入真实读取，返回带 globalBusy 的 unknown 标记，绝不编造平台状态。
+    const r = await this._withGlobalBrowserOp(() => this._readChengfangAdStateBoundedInner(shopCfg));
+    if (r.busy) {
+      return {
+        state: 'unknown', globalBusy: true,
+        error: {
+          status: 'blocked', reason: '全局浏览器操作锁忙（其它店发布/恢复/巡查在途），本轮跳过',
+          blocked: 'global_browser_op_busy', globalBusy: true,
+        },
+      };
+    }
+    return r.value;
+  }
+
+  async _readChengfangAdStateBoundedInner(shopCfg) {
     const timeoutMs = this._adStateMsOption('adStateReadTimeoutMs', 300000);
     const closeWaitMs = this._adStateMsOption('adStateCloseWaitMs', 60000);
     // 首读与最多一次瞬态重读共用同一个 deadline；重读只使用剩余预算。
@@ -3621,7 +3711,22 @@ class Monitor {
    * 低于阈值 / 每日开启共用的执行入口（复用 ChengfangRunner，不复制 Playwright）。
    * 返回形状与 runner 批次兼容，供编排器收口。
    */
-  async _executeEnableBatchFor(shopCfg, cycleToken, { reason, triggerLabel, enableSource = 'daily_schedule' } = {}) {
+  async _executeEnableBatchFor(shopCfg, cycleToken, opts = {}) {
+    // 全局浏览器操作排队锁（PROMO-IMPL-F1）：开关动作执行处取锁 → 执行 → finally 释放。
+    // 锁忙 = 本轮零动作跳过（不调用真实执行体、不点任何开关），审计同形状 skipped。
+    const r = await this._withGlobalBrowserOp(() => this._executeEnableBatchForInner(shopCfg, cycleToken, opts));
+    if (r.busy) {
+      this._auditGlobalBrowserOpBusy(shopCfg.id);
+      return {
+        status: 'skipped', outcome: 'skipped', neverSent: true, globalBusy: true, zeroClick: true,
+        reason: '全局浏览器操作锁忙（其它店发布/恢复/巡查在途），本轮跳过开关动作',
+        counts: { confirmed: 0, failed: 0, unknown: 0, skipped: 0, cancelled: 0 },
+      };
+    }
+    return r.value;
+  }
+
+  async _executeEnableBatchForInner(shopCfg, cycleToken, { reason, triggerLabel, enableSource = 'daily_schedule' } = {}) {
     const runner = this._getChengfangRunner(shopCfg);
     const opener = this._chengfangOpener || defaultChengfangOpener;
     const loginCfg = this.config.login;
@@ -3652,6 +3757,13 @@ class Monitor {
 
   // ── 单店铺轮询 ───────────────────────────────────────────────────
   async _pollShop(shopCfg, cycleToken, trigger) {
+    // 同店跨上下文互斥（PROMO-IMPL-E1）：该店当日发布/恢复租约在途 → 本轮读取/动作全部跳过，
+    // 避免值守浏览器与发布/恢复浏览器同店并发（Cookie/会话为店铺级共享资源）。
+    // 覆盖常规巡查与登录后立即巡查两条入口；跨店不受影响；不编造平台状态（unknownReason 原样）。
+    if (this._publishLeaseInFlight(shopCfg)) {
+      this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'skipped', reason: 'publish-lease-in-flight' });
+      return { status: 'skipped', reason: '该店发布/恢复租约在途，本轮跳过避免同店浏览器并发' };
+    }
     const rt = this._runtime(shopCfg.id);
     try {
       // 1) 登录态静态核验（Cookie 文件存在/结构/有效期）
@@ -3721,6 +3833,13 @@ class Monitor {
       // 5) 本轮回读 currentAdState（清单身份/完整性失败 → blocked，不得包成 ok）
       const stateRead = await this._readCurrentAdState(shopCfg);
       this._applyBalanceToLastData(candidate, stateRead);
+      // 全局浏览器操作锁忙（PROMO-IMPL-F1）：本轮跳过该店，绝不改写广告状态、不落读取失败。
+      if (stateRead.globalBusy === true) {
+        rt.dataRefreshing = false;
+        if (rt.lastData && typeof rt.lastData === 'object') rt.lastData.refreshing = false;
+        this._auditGlobalBrowserOpBusy(shopCfg.id);
+        return { status: 'skipped', reason: '全局浏览器操作锁忙（其它店发布/恢复/巡查在途），本轮跳过', globalBusy: true };
+      }
       if (stateRead.error) {
         const err = stateRead.error;
         // 失败/unknown：新错误覆盖旧因，撤销旧 on 证据；只读观测不得伪称动作确认。
@@ -3887,6 +4006,21 @@ class Monitor {
    * 窗口未开放/门槛不通过 → 零请求，且不打开乘方页面。
    */
   async _pollChengfangOver(shopCfg, data, cycleToken, trigger, opts = {}) {
+    // 全局浏览器操作排队锁（PROMO-IMPL-F1）：暂停动作执行处取锁 → 执行 → finally 释放。
+    // 锁忙 = 本轮零动作跳过（不打开页面、不点任何开关）。
+    const r = await this._withGlobalBrowserOp(() => this._pollChengfangOverInner(shopCfg, data, cycleToken, trigger, opts));
+    if (r.busy) {
+      this._auditGlobalBrowserOpBusy(shopCfg.id);
+      return {
+        status: 'skipped', outcome: 'skipped', neverSent: true, globalBusy: true, zeroClick: true,
+        reason: '全局浏览器操作锁忙（其它店发布/恢复/巡查在途），本轮跳过暂停动作',
+        counts: { confirmed: 0, failed: 0, unknown: 0, skipped: 0, cancelled: 0 },
+      };
+    }
+    return r.value;
+  }
+
+  async _pollChengfangOverInner(shopCfg, data, cycleToken, trigger, opts = {}) {
     const rt = this._runtime(shopCfg.id);
     const runner = this._getChengfangRunner(shopCfg);
     const opener = this._chengfangOpener || defaultChengfangOpener;
@@ -3981,22 +4115,17 @@ class Monitor {
   // ── 每日自动开启相位（07:00 窗口，每天一次；独立于费用/订单阈值）────
 
   /** 每日开启相位：遍历启用的店铺执行开启（真实=executeChengfangEnableBatch；演练=runDryEnableCycle）。 */
-  async _runEnablePhase(gen, businessDate = null, { scope = 'scheduler' } = {}) {
+  async _runEnablePhase(gen, businessDate = null) {
     // 并发由单店锁 _shopProcessing（_runShopEnablePhase → _tryAcquireShop）保证：同店串行、
     // 异店可并行，不需要全局周期布尔。
-    // scope='scheduler'：独立每日开启调度器驱动（默认）。生命周期只随 _enableGen/
-    // enableRunning 终止，令牌 kind='enable'——"停止值守"绝不取消每日开启。
-    const schedScope = scope !== 'pause';
-    const token = { aborted: false, kind: schedScope ? 'enable' : 'pause' };
+    // 独立每日开启调度器驱动。生命周期只随 _enableGen/enableRunning 终止，
+    // 令牌 kind='enable'——"停止值守"绝不取消每日开启。
+    const token = { aborted: false, kind: 'enable' };
     this._activeTokens.add(token);
     const today = businessDate || shanghaiDate(this.nowFn());
     try {
       for (const shopCfg of this._activeShops()) {
-        if (schedScope) {
-          if (gen !== this._enableGen || !this.enableRunning) break;
-        } else if (gen !== this._gen || !this.running) {
-          break;
-        }
+        if (gen !== this._enableGen || !this.enableRunning) break;
         if (token.aborted) break;
         // 删除后调度器再次检查活动列表
         if (!this._isShopActive(shopCfg.id)) continue;
@@ -4078,6 +4207,12 @@ class Monitor {
    * 原预检与决策链整体移入 _runShopEnablePhaseInner，语义零改动。
    */
   async _runShopEnablePhase(shopCfg, cycleToken, businessDate = null, source = 'daily_schedule') {
+    // 同店跨上下文互斥（PROMO-IMPL-E1）：发布/恢复租约在途时本次开启相位零动作，
+    // 每日任务保持既有重试语义（skipped 不标记当日完成），手动验证如实报未执行。
+    if (this._publishLeaseInFlight(shopCfg, businessDate)) {
+      this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-publish-lease', trigger: source });
+      return { status: 'skipped', zeroClick: true, reason: '该店发布/恢复租约在途，本次开启相位跳过（零动作）' };
+    }
     if (this._shopBusy(shopCfg.id)) {
       this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-shop-busy', trigger: source });
       return { status: 'skipped', zeroClick: true, reason: '该店已有处理在途（登录接管/巡查），本次开启相位跳过（零动作）' };
@@ -4103,6 +4238,12 @@ class Monitor {
     // 决策层：当前状态只来自本轮回读（adBelief 仅审计，不得代替回读、不得直接触发点击）
     const stateRead0 = await this._readCurrentAdState(shopCfg);
     const currentAdState = stateRead0.state;
+    // 全局浏览器操作锁忙（PROMO-IMPL-F1）：本次开启相位零动作跳过（skipped 不标记当日完成，
+    // 窗口内重试），不写 adState、不落读取失败。
+    if (stateRead0.globalBusy === true) {
+      this._auditGlobalBrowserOpBusy(shopCfg.id);
+      return { status: 'skipped', zeroClick: true, globalBusy: true, reason: '全局浏览器操作锁忙（其它店发布/恢复/巡查在途），本次开启相位跳过（零动作）' };
+    }
     // 缺口 B（2026-10-19）：开启相位的回读失败必须进入 API 页面详情（lastReadError/lastError）；
     // 本轮读取成功则清除上一轮遗留的旧错误，不把临时错误写成登录失效（_applyReadFailure 按具体分类）。
     if (stateRead0.error) this._applyReadFailure(shopCfg.id, stateRead0.error);
@@ -4242,7 +4383,11 @@ class Monitor {
       persistBeforeRelease: () => this._saveState(),
       readState: async () => {
         const r = await this._readCurrentAdState(shopCfg);
-        if (r && r.error) {
+        if (r && r.globalBusy === true) {
+          // 全局浏览器操作锁忙（PROMO-IMPL-F1）：动作前回读让位，不落读取失败、不执行开启。
+          enableReadError = this._maskReadError(r.error, shopCfg.id);
+          this._auditGlobalBrowserOpBusy(shopCfg.id);
+        } else if (r && r.error) {
           enableReadError = this._maskReadError(r.error, shopCfg.id);
           this._applyReadFailure(shopCfg.id, r.error);
         } else {
@@ -4429,6 +4574,20 @@ class Monitor {
    * 确保自动监控绝不进入其他产品覆盖流程。
    */
   async _pollLegacyWholeShopOver(shopCfg, data, cycleToken) {
+    // 全局浏览器操作排队锁（PROMO-IMPL-F1）：历史全店暂停动作同样在全局锁内执行。
+    const r = await this._withGlobalBrowserOp(() => this._pollLegacyWholeShopOverInner(shopCfg, data, cycleToken));
+    if (r.busy) {
+      this._auditGlobalBrowserOpBusy(shopCfg.id);
+      return {
+        status: 'skipped', outcome: 'skipped', neverSent: true, globalBusy: true, zeroClick: true,
+        reason: '全局浏览器操作锁忙（其它店发布/恢复/巡查在途），本轮跳过暂停动作',
+        counts: { confirmed: 0, failed: 0, unknown: 0, skipped: 0, cancelled: 0 },
+      };
+    }
+    return r.value;
+  }
+
+  async _pollLegacyWholeShopOverInner(shopCfg, data, cycleToken) {
     const rt = this._runtime(shopCfg.id);
     const coord = this._getCoordinator(shopCfg);
     let inventory;

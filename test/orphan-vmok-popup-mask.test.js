@@ -199,6 +199,26 @@ function addLoadingMask(root) {
   root.appendChild(mask);
   return mask;
 }
+/**
+ * S2 并存形态：非白名单弹窗本体（仅 tools-vmok-plugin-modal__wrap，无 ocean/overall 类），
+ * 唯一可见关闭控件为既有白名单 .tools-vmok-plugin-modal__close-icon。
+ */
+function addUnknownPopup(root, { withClose = true, text = '新的投放计划已创建' } = {}) {
+  const wrap = new FakeNode('div', { class: 'tools-vmok-plugin-modal__wrap' });
+  root.appendChild(wrap);
+  const body = new FakeNode('div', { class: 'popup-body' }, text);
+  wrap.appendChild(body);
+  let x = null;
+  if (withClose) {
+    x = new FakeNode('div', { class: 'tools-vmok-plugin-modal__close-icon' });
+    body.appendChild(x);
+  }
+  return { wrap, body, x };
+}
+/** 普通无浮层语义的占位节点：用于制造「遮罩与弹窗本体非紧邻」的布局。 */
+function addSpacer(root) {
+  return root.appendChild(new FakeNode('div', { class: 'page-spacer' }, ''));
+}
 function makeScriptedPage(dom, opts = {}) {
   const audits = [];
   const page = {
@@ -366,4 +386,159 @@ test('O11 无浮窗 none：行为不变', async () => {
   assert.equal(r.dismissed, false);
   assert.equal(page._n, 1);
   assert.equal(audits.length, 0);
+});
+
+// ── S2（2026-11-16）：弹窗本体 + 空壳遮罩并存 ──────────────────────────────
+
+test('N1 并存主链（非紧邻）：未知类型弹窗 + 空壳 mask → 泛化归属 → dismiss-intro，端到端 dismissed', async () => {
+  const dom = makeDom();
+  const pop = addUnknownPopup(dom.root);
+  const spacer = addSpacer(dom.root);
+  const mask = addOrphanMask(dom.root);
+  assert.equal(pop.wrap.nextElementSibling, spacer, 'fixture：遮罩与弹窗本体必须非紧邻');
+  assert.equal(mask.nextElementSibling, null);
+  // 插件响应关闭弹窗：同时移除弹窗本体与遮罩
+  pop.x.onClick = () => { removeNode(pop.wrap); removeNode(mask); };
+
+  const probe = runInPage(handleChengfangOverlayInPage, { click: false }, { document: dom.document, url: QC_URL });
+  assert.equal(probe.trusted, true);
+  assert.equal(probe.state, 'dismissable');
+  assert.equal(probe.kind, 'intro');
+  assert.equal(probe.action, 'dismiss-intro');
+  assert.ok(probe.affiliatedMask);
+  assert.equal(probe.affiliatedMask.cls, 'tools-vmok-plugin-popup__mask');
+  assert.equal(probe.affiliatedMask.generalized, true);
+  assert.equal(probe.blockers.length, 0);
+  assert.equal(mask.clicked, 0, '归属路径绝不点遮罩本身');
+  assert.equal(pop.x.clicked, 0);
+
+  const clicked = runInPage(handleChengfangOverlayInPage, { click: true }, { document: dom.document, url: QC_URL });
+  assert.equal(clicked.clicked, true);
+  assert.equal(clicked.action, 'dismiss-intro');
+  assert.equal(pop.x.clicked, 1);
+  assert.equal(mask.clicked, 0);
+  const after = runInPage(handleChengfangOverlayInPage, { click: false }, { document: dom.document, url: QC_URL });
+  assert.equal(after.state, 'none');
+
+  // 端到端：泛化归属 → 点击弹窗自身关闭控件 → 二次观察 none → dismissed
+  const dom2 = makeDom();
+  const pop2 = addUnknownPopup(dom2.root);
+  addSpacer(dom2.root);
+  const mask2 = addOrphanMask(dom2.root);
+  pop2.x.onClick = () => { removeNode(pop2.wrap); removeNode(mask2); };
+  const ep = makeScriptedPage(dom2);
+  const r = await dismissKnownChengfangOverlays({ page: ep.page, audit: ep.audit, shopId: '简尚衣橱优品店', gapMs: 5 });
+  assert.equal(r.dismissed, true);
+  assert.equal(r.state, 'none');
+  assert.equal(r.action, 'dismiss-intro');
+  assert.equal(pop2.x.clicked, 1);
+  assert.equal(mask2.clicked, 0);
+});
+
+test('N2 两段式收敛：只移除弹窗、遮罩残留 → not-disappeared；下一轮 S1 孤儿路径接管', async () => {
+  const dom = makeDom();
+  const pop = addUnknownPopup(dom.root);
+  addSpacer(dom.root);
+  const mask = addOrphanMask(dom.root);
+  pop.x.onClick = () => removeNode(pop.wrap); // 遮罩残留
+  const { page, audits, audit } = makeScriptedPage(dom);
+  const r = await dismissKnownChengfangOverlays({ page, audit, shopId: '简尚衣橱优品店', gapMs: 5 });
+  assert.equal(r.dismissed, false);
+  assert.equal(r.state, 'not-disappeared');
+  assert.equal(r.action, 'dismiss-intro');
+  assert.equal(pop.x.clicked, 1);
+  assert.equal(mask.clicked, 0);
+  assert.ok(audits.some((a) => a.action === 'dismiss-intro' && a.result === 'failed'));
+
+  // 下一 patrol 轮：弹窗已消失，仅剩空壳遮罩 → S1 孤儿路径
+  const next = runInPage(handleChengfangOverlayInPage, { click: false }, { document: dom.document, url: QC_URL });
+  assert.equal(next.state, 'dismissable');
+  assert.equal(next.kind, 'orphan-vmok-mask');
+  assert.equal(next.action, 'dismiss-orphan-mask');
+  assert.equal(next.blockers.length, 0);
+});
+
+test('N3 弹窗无白名单关闭控件 + 空壳 mask → 归属后如实 no-control，零点击', () => {
+  const dom = makeDom();
+  addUnknownPopup(dom.root, { withClose: false });
+  addSpacer(dom.root);
+  const mask = addOrphanMask(dom.root);
+  const r = runInPage(handleChengfangOverlayInPage, { click: true }, { document: dom.document, url: QC_URL });
+  assert.equal(r.state, 'no-control');
+  assert.equal(r.kind, 'intro');
+  assert.equal(r.clicked, false);
+  assert.ok(r.affiliatedMask);
+  assert.equal(r.affiliatedMask.cls, 'tools-vmok-plugin-popup__mask');
+  assert.equal(r.affiliatedMask.generalized, true);
+  assert.equal(mask.clicked, 0);
+});
+
+test('N4 空壳 mask + 弹窗内含危险文本 → danger 优先 blocked，不发生归属', () => {
+  const dom = makeDom();
+  addUnknownPopup(dom.root, { text: '确认删除这 30 条计划？删除后不可恢复' });
+  addSpacer(dom.root);
+  const mask = addOrphanMask(dom.root);
+  const r = runInPage(handleChengfangOverlayInPage, { click: true }, { document: dom.document, url: QC_URL });
+  assert.equal(r.state, 'blocked');
+  assert.ok(r.blockers.includes('danger-text'));
+  assert.equal(r.affiliatedMask, undefined);
+  assert.equal(mask.clicked, 0);
+  assert.ok(r.coexistDiag, '仍 blocked 于未知浮层时必须输出 coexistDiag');
+  assert.equal(r.coexistDiag.dangerText, true);
+  assert.equal(r.coexistDiag.introRoots, 1);
+});
+
+test('N5 空壳 mask + 弹窗 + 第二个业务 dialog → foreign≥2 不归属；coexistDiag 齐全且 audit 可见', async () => {
+  const dom = makeDom();
+  addUnknownPopup(dom.root);
+  const mask = addOrphanMask(dom.root);
+  const biz = new FakeNode('div', { role: 'dialog', class: 'biz-confirm-dialog' }, '新的投放计划已创建');
+  dom.root.appendChild(biz);
+
+  const probe = runInPage(handleChengfangOverlayInPage, { click: false }, { document: dom.document, url: QC_URL });
+  assert.equal(probe.state, 'blocked');
+  assert.ok(probe.blockers.includes('unknown-overlay:2'));
+  assert.equal(probe.affiliatedMask, undefined);
+  assert.ok(probe.coexistDiag);
+  assert.equal(probe.coexistDiag.introRoots, 1);
+  assert.equal(probe.coexistDiag.introCls.length, 1);
+  assert.match(probe.coexistDiag.introCls[0], /tools-vmok-plugin-modal__wrap/);
+  assert.equal(probe.coexistDiag.guideRoots, 0);
+  assert.equal(probe.coexistDiag.panelCandidates, 0);
+  assert.equal(probe.coexistDiag.dangerText, false);
+  assert.equal(probe.coexistDiag.foreignCls.length, 2);
+  assert.ok(probe.coexistDiag.foreignCls.some((c) => /tools-vmok-plugin-popup__mask/.test(c)));
+  assert.equal(mask.clicked, 0);
+
+  const { page, audits, audit } = makeScriptedPage(dom);
+  const r = await dismissKnownChengfangOverlays({ page, audit, shopId: '简尚衣橱优品店', gapMs: 5 });
+  assert.equal(r.state, 'blocked');
+  const blocked = audits.find((a) => a.kind === 'chengfang-overlay' && a.action === 'probe' && a.result === 'blocked');
+  assert.ok(blocked, '必须产生 blocked 审计事件');
+  assert.ok(blocked.coexistDiag, 'audit blocked 事件 extra 必须带 coexistDiag');
+  assert.equal(blocked.coexistDiag.introRoots, 1);
+  assert.equal(blocked.coexistDiag.introCls.length, 1);
+  assert.equal(blocked.coexistDiag.foreignCls.length, 2);
+  assert.equal(r.coexistDiag.introRoots, 1);
+  assert.equal(mask.clicked, 0);
+});
+
+test('N6 guide（唯一跳过按钮）+ 空壳 mask：按既有行为断言——unknown-overlay 阻断，不归属', () => {
+  // 既有代码对「guideRoot + foreign」本就是 blocked；S2 泛化归属条件 1 明确要求 introRoots===1，
+  // 故此处不发生归属。本用例锁定既有行为，不改任何既有分支来迁就设计预期。
+  const dom = makeDom();
+  const guide = new FakeNode('div', { class: 'onboarding-guide' });
+  dom.root.appendChild(guide);
+  const skipBtn = new FakeNode('button', {}, '跳过');
+  guide.appendChild(skipBtn);
+  const mask = addOrphanMask(dom.root);
+
+  const probe = runInPage(handleChengfangOverlayInPage, { click: false }, { document: dom.document, url: QC_URL });
+  assert.equal(probe.state, 'blocked');
+  assert.ok(probe.blockers.includes('unknown-overlay:1'));
+  assert.equal(probe.kind, null);
+  assert.equal(probe.affiliatedMask, undefined);
+  assert.equal(probe.coexistDiag.guideRoots, 1);
+  assert.equal(skipBtn.clicked, 0);
+  assert.equal(mask.clicked, 0);
 });

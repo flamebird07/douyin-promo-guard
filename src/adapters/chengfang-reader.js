@@ -387,23 +387,34 @@ async function dismissKnownChengfangOverlays({ page, audit, shopId, maxRounds = 
       emit('probe', 'blocked', '当前不是可信千川页面（严格 origin/path），零点击');
       return { dismissed: false, state: 'untrusted', reason: '当前不是可信千川页面，零点击' };
     }
+    // coexistDiag-20261116（S2）: blocked 时把探针的并存诊断并入 audit extra（以及返回值），
+    // 供生产审计裁决「弹窗本体类型未在白名单 + 空壳遮罩」的并存形态。
+    const blockedExtra = (probe) => {
+      const diag = (probe.unknownDiag || []).slice(0, 5);
+      const coexist = probe.coexistDiag || null;
+      if (!diag.length && !coexist) return null;
+      return {
+        ...(diag.length ? { unknownDiag: diag } : {}),
+        ...(coexist ? { coexistDiag: coexist } : {}),
+      };
+    };
     if (probe.state === 'blocked') {
       const reason = (probe.blockers || []).join(',') || '未知/多义浮窗';
-      const diag = (probe.unknownDiag || []).slice(0, 5);
-      emit('probe', 'blocked', reason, diag.length ? { unknownDiag: diag } : null);
-      return { dismissed: false, state: 'blocked', reason, ...(diag.length ? { unknownDiag: diag } : {}) };
+      const extra = blockedExtra(probe);
+      emit('probe', 'blocked', reason, extra);
+      return { dismissed: false, state: 'blocked', reason, ...(extra || {}) };
     }
     // aurora-qc-loading-mask-transient-20261101: 有界重读耗尽后仍瞬态 → blocked（不放行、不点击、不永久白名单）
     if (probe.state === 'transient') {
       const reason = 'unknown-overlay:1';
-      const diag = (probe.unknownDiag || []).slice(0, 5);
+      const extra = blockedExtra(probe);
       emit(
         'probe',
         'blocked',
         `瞬态加载遮罩未在有界重读内消失（aurora-qc-loading-mask；重读 ${transientRereads}/${maxTransientRereads}）`,
-        diag.length ? { unknownDiag: diag } : null,
+        extra,
       );
-      return { dismissed: false, state: 'blocked', reason, ...(diag.length ? { unknownDiag: diag } : {}) };
+      return { dismissed: false, state: 'blocked', reason, ...(extra || {}) };
     }
     if (probe.state === 'no-control') {
       // 有界重读预算耗尽仍缺唯一控件：如实阻断（永久缺控件不猜测、不扩大选择器）。
@@ -1923,6 +1934,25 @@ function handleChengfangOverlayInPage(options) {
   const closablePanels = panelCandidates.filter((p) => p.close);
   if (closablePanels.length > 1 || (closablePanels.length && known.length)) out.blockers.push('ambiguous-panel-close');
   if (panelCandidates.length) out.sidePanels = panelCandidates.map((p) => ({ obstructed: p.obstructed, checkedTargets: p.checked, close: !!p.close }));
+  // general-affiliated-mask-20261116（S2）: 弹窗本体（introRoots 恰 1 个）与空壳 vmok 遮罩并存，
+  // 但弹窗类型不在既有白名单（isKnownAffiliatedPopup=false）时，遮罩不会被归属 → foreign 残留 →
+  // 下方 unknown-overlay 短路 return，intro dismissable 分支永远执行不到（生产死锁，5+ 小时）。
+  // 与既有白名单路径的唯一区别：**不要求紧邻**——空壳遮罩零内容零交互面，紧邻性对安全性无增益；
+  // 而生产中旧孤儿遮罩可能与新弹窗本体相距很远，紧邻要求会导致永不收敛。
+  // 其余门禁与 S1 谓词同口径（dangerText/blockers/guide/可关侧栏/多浮层任一存在即不归属）；
+  // 遮罩类名 token 精确匹配、必须是空壳、且内部不含任何其它弹层候选。归属后由既有 intro 分支
+  // 点击弹窗自身白名单关闭控件；遮罩若残留，下一轮由 S1 孤儿路径接管（两段式收敛）。
+  if (!out.affiliatedMask && introRoots.length === 1 && !isKnownAffiliatedPopup(introRoots[0])
+      && !dangerText && out.blockers.length === 0
+      && guideRoots.length === 0 && closablePanels.length === 0
+      && foreign.length === 1
+      && classTokens(foreign[0]).indexOf('tools-vmok-plugin-popup__mask') !== -1
+      && isEmptyMaskShell(foreign[0])
+      && !dialogCands.some((o) => o !== foreign[0] && foreign[0].contains && foreign[0].contains(o))) {
+    const generalizedMask = foreign[0];
+    foreign = foreign.filter((el) => el !== generalizedMask);
+    out.affiliatedMask = { cls: 'tools-vmok-plugin-popup__mask', generalized: true };
+  }
   // aurora-qc-loading-mask-transient-20261101: 精确识别唯一空壳 aurora-qc-loading-mask 为可等待瞬态（非永久 none 白名单）。
   // 条件：精确 class token + 空文本 + 无元素子节点/可见后代/关闭控件 + 无其它 foreign·danger·已知弹窗·侧栏。
   // 泛 [class*="mask"] 扫描保留；畸形/并存仍走 unknown-overlay 阻断；全程零点击。
@@ -1974,6 +2004,17 @@ function handleChengfangOverlayInPage(options) {
     && isEmptyMaskShell(foreign[0]);
   if (foreign.length > 0 && !transientAuroraLoading && !isOrphanVmokMask) {
     out.blockers.push(`unknown-overlay:${foreign.length}`);
+    // coexistDiag-20261116（S2）: blocked 探针共存诊断。unknownDiag 只含 foreign，无法裁决
+    // 「弹窗本体（introRoots/guideRoots/侧栏候选/危险文本）+ 空壳遮罩」这一并存形态，故并列输出
+    // 结构化计数与类名（截断 80 字符；绝不含文本原文）。
+    out.coexistDiag = {
+      introRoots: introRoots.length,
+      introCls: introRoots.slice(0, 3).map((el) => String((el.getAttribute && el.getAttribute('class')) || '').slice(0, 80)),
+      guideRoots: guideRoots.length,
+      panelCandidates: panelCandidates.length,
+      dangerText: dangerText,
+      foreignCls: foreign.slice(0, 3).map((el) => String((el.getAttribute && el.getAttribute('class')) || '').slice(0, 80)),
+    };
     const structure = (el) => ({
       tag: String(el.tagName || '').toLowerCase().slice(0, 24),
       cls: String((el.getAttribute && el.getAttribute('class')) || '').slice(0, 60),

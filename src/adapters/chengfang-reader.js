@@ -1960,7 +1960,19 @@ function handleChengfangOverlayInPage(options) {
       && isExactEmptyAuroraQcLoadingMask(foreign[0])) {
     transientAuroraLoading = true;
   }
-  if (foreign.length > 0 && !transientAuroraLoading) {
+  // orphan-vmok-mask-20261113: 第三方插件弹窗本体已移除、只剩空壳孤儿遮罩
+  // （tools-vmok-plugin-popup__mask，零子节点零文本零关闭控件）会滞留数小时至数天，
+  // 单轮瞬态等待无效。唯一空壳孤儿遮罩 → 点击遮罩本身触发插件 backdrop 关闭监听；
+  // 非空壳/多浮层/并存已知弹窗或危险文本一律维持 unknown 阻断。
+  const isOrphanVmokMask = !dangerText
+    && out.blockers.length === 0
+    && introRoots.length === 0
+    && guideRoots.length === 0
+    && closablePanels.length === 0
+    && foreign.length === 1
+    && classTokens(foreign[0]).indexOf('tools-vmok-plugin-popup__mask') !== -1
+    && isEmptyMaskShell(foreign[0]);
+  if (foreign.length > 0 && !transientAuroraLoading && !isOrphanVmokMask) {
     out.blockers.push(`unknown-overlay:${foreign.length}`);
     const structure = (el) => ({
       tag: String(el.tagName || '').toLowerCase().slice(0, 24),
@@ -2074,6 +2086,20 @@ function handleChengfangOverlayInPage(options) {
         transient: true,
       }];
     } catch (_) { /* 诊断可选 */ }
+    return out;
+  }
+  // orphan-vmok-mask-20261113: 孤儿空壳遮罩 → dismissable，点击遮罩本身（空壳零内容，
+  // 不存在误点业务控件的可能）；点击后由 dismiss 调度器两次观察确认消失，未消失仍 blocked。
+  if (isOrphanVmokMask) {
+    out.kind = 'orphan-vmok-mask';
+    out.key = 'tools-vmok-plugin-popup__mask';
+    out.action = 'dismiss-orphan-mask';
+    out.state = 'dismissable';
+    out.closeCandidates = 1;
+    const control = foreign[0];
+    if (!wantClick) return out;
+    try { control.click(); } catch (_) { out.blockers.push('click-threw'); out.state = 'blocked'; return out; }
+    out.clicked = true;
     return out;
   }
   if (introRoots.length === 0 && guideRoots.length === 0 && closablePanels.length === 0) { out.state = 'none'; return out; }

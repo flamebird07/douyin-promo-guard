@@ -13,7 +13,7 @@
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
-const { chromium } = require('playwright');
+const { launchTestBrowser } = require('./helpers/browser'); // MAC-2：测试浏览器统一解析（env 覆盖/平台默认）
 const { buildChengfangFixtureHtml } = require('./chengfang-fixture');
 const {
   collectChengfangRowsInPage,
@@ -35,18 +35,16 @@ const {
   createChengfangController,
 } = require('../src/adapters/chengfang-reader');
 
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
-
 let browser;
 let page;
 
 before(async () => {
-  browser = await chromium.launch({ headless: true, executablePath: EDGE, args: ['--window-size=1200,800'] });
+  browser = await launchTestBrowser({ args: ['--window-size=1200,800'] });
   page = await browser.newPage();
 });
 
 after(async () => {
-  await browser.close().catch(() => {});
+  if (browser) await browser.close().catch(() => {});
 });
 
 test('新账户乘方页：关闭介绍浮层 → 商品 → 计划视图后才出现控制子标签', async () => {

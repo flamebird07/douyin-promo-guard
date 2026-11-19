@@ -24,6 +24,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { AuthError } = require('../lib/errors');
+const { launchExecutableOption } = require('./browser-launch'); // MAC-1：edgePath 可选解析
 const { safeCookieBaseName, ensureWorkCopy, validateCookieArray } = require('./cookie-workcopy');
 // AD-COOKIE-FOUR-TIER-20261019-F1：恢复链身份验证复用既有严格语义探针/判定（无循环依赖：
 // session-cookie-checkpoint 只依赖 cookie-writeback）。
@@ -957,7 +958,7 @@ async function checkLoginByBrowser(loginCfg, cookieFilePath) {
   const { chromium } = require('playwright');
   const browser = await chromium.launch({
     headless: true,
-    executablePath: loginCfg.edgePath,
+    ...launchExecutableOption(loginCfg),
     args: ['--window-size=1920,1080'],
   });
   try {

@@ -18,6 +18,7 @@
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const PROJECT_ROOT = path.join(__dirname, '..');
@@ -289,12 +290,29 @@ function loadRaw() {
 }
 
 /**
+ * 展开 login 段目录配置里的 "~/" 前缀为当前用户家目录（MAC-2 2026-11-16）。
+ * 仅识别 "~/"（含 lone "~"），不把 "~other" 当当前用户；空值与其余路径（含绝对路径）原样返回。
+ */
+function expandLoginHomeDir(v) {
+  if (typeof v !== 'string') return v;
+  const s = v.trim();
+  if (s === '~') return os.homedir();
+  if (s.startsWith('~/')) return path.join(os.homedir(), s.slice(2));
+  return v;
+}
+
+/**
  * 按指定路径加载配置（merge 默认值 + 收集待配置项），与 loadConfig 同一逻辑。
  * 供测试锁定特定文件（如示例文件），不受 config/config.json 是否存在影响。
  */
 function loadConfigFrom(cfgPath) {
   const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
   const merged = deepMerge(DEFAULTS, cfg);
+  // MAC-2：cookieSourceDir / cookieWorkDir 支持 "~/"（README 与 macOS 样例已声明，生产统一展开）
+  if (merged.login) {
+    merged.login.cookieSourceDir = expandLoginHomeDir(merged.login.cookieSourceDir);
+    merged.login.cookieWorkDir = expandLoginHomeDir(merged.login.cookieWorkDir);
+  }
   if (merged.execution.realMode !== true) {
     merged.execution.dryRun = true;
     merged.execution.realMode = false;

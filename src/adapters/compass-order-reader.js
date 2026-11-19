@@ -28,6 +28,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { launchExecutableOption } = require('../login/browser-launch'); // MAC-1：edgePath 可选解析
 const { AuthError, DataGuardError } = require('../lib/errors');
 const { parseIntegerCount } = require('../lib/money');
 const { shanghaiDate, shanghaiMs } = require('../lib/time');
@@ -279,7 +280,7 @@ function createCompassOrderReader(p) {
     injectedFactory: typeof p.browserFactory === 'function' ? p.browserFactory : null,
     fallbackLaunch: () => require('playwright').chromium.launch({
       headless,
-      executablePath: loginCfg.edgePath,
+      ...launchExecutableOption(loginCfg), // MAC-1：edgePath 可选解析
       args: ['--window-size=1920,1080'],
     }),
   });
@@ -290,7 +291,7 @@ function createCompassOrderReader(p) {
       injectedFactory: typeof p.browserFactory === 'function' ? p.browserFactory : null,
       fallbackLaunch: () => require('playwright').chromium.launch({
         headless,
-        executablePath: loginCfg.edgePath,
+        ...launchExecutableOption(loginCfg), // MAC-1：edgePath 可选解析
         args: ['--window-size=1920,1080'],
       }),
     });

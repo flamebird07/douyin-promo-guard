@@ -1,0 +1,75 @@
+{
+  "_说明": "Apple Silicon macOS 本地运行示例（MAC-2 2026-11-16）。由 config/config.example.json 精确派生：复制为 config/config.example.macos.json 后仅改 login 段，其余字段/数值与 Windows 版逐字相同。login 段差异：cookieSourceDir 可为空（不配置外部 Cookie 来源即跳过该层）或以 ~/ 开头（加载时按当前用户家目录展开）；edgePath 取 playwright = 使用 Playwright 自带浏览器（首次需 npx playwright install chromium），也可填本机浏览器绝对路径（支持 ~/ 前缀）。若沿用旧 Windows 默认 Edge 路径，macOS 会自动回退 Playwright 自带浏览器；其余输错的显式路径由 Playwright 如实报错。业务门槛与 fail-closed 语义不变。",
+
+  "shops": [
+    {
+      "id": "瑾漂亮潮流服饰",
+      "id_说明": "罗盘/千川页面均未暴露店铺稳定ID；id 取店铺名，身份按页面店铺名精确映射核验（归因记录在读取结果的 shopIdAttribution）",
+      "name": "瑾漂亮潮流服饰",
+      "compassShopName": "瑾漂亮潮流服饰",
+      "cookieFile": "瑾漂亮潮流服饰",
+      "accountId": "1710242295996424",
+      "accountId_说明": "页面实测：千川头部 ID 元素（账户『伊人美』）；千川费用/清单源用它做账户映射核验",
+      "enabled": true
+    }
+  ],
+  "promoPage": {
+    "costEntry": "抖店首页顶部『巨量千川』→ 首页『账户整体消耗(元)』（统计周期=当天）",
+    "orderEntry": "抖店首页『成交订单数』文字 → 电商罗盘『经营概况』（售卖类型=全店 且 日期=实时）",
+    "accountType": "巨量千川"
+  },
+  "rules": [
+    {
+      "type": "wholeShopCostPerOrder",
+      "name": "当天每单成本超额关全店",
+      "metric": "cost_per_order",
+      "metric_说明": "当天累计推广费用 ÷ 当天累计全店订单数；整数分判定：费用分 > 订单数×阈值分，恰好相等不关闭",
+      "thresholdCents": 100,
+      "comparator": ">",
+      "period": "today",
+      "timezone": "Asia/Shanghai",
+      "enabled": true
+    }
+  ],
+  "schedule": { "dailyStartHour": 8, "intervalMinutes": 30, "timezone": "Asia/Shanghai" },
+  "execution": {
+    "dryRun": true,
+    "dryRun_说明": "演练开关（fail-closed 第二道）：true 时即使 realMode 与开关全开，执行器仍零点击，页面门槛会如实显示『不会执行』",
+    "realMode": false,
+    "realMode_说明": "真实执行开关，默认关闭；开启前需人工确认且千川开关点击路径须先经真实验证",
+    "maxRetries": 2,
+    "retryBackoffMs": 3000,
+    "closeTimeoutMs": 20000,
+    "readbackTimeoutMs": 120000,
+    "readbackAttempts": 3,
+    "readbackIntervalMs": 3000,
+    "zeroOrderRecheck": 1,
+    "maxAdPages": 50
+  },
+  "monitor": {
+    "snapshotMaxAgeMinutes": 30,
+    "mockDataSource": false,
+    "orderDataSource": "compass",
+    "costDataSource": "qianchuan",
+    "adListDataSource": "qianchuan",
+    "qianchuan": {
+      "adTypes": ["uni_promotion", "standard", "brand"],
+      "adTypes_说明": "已接入只读读取的投放类型。brand 已实测为空清单（共0条，确认无对象）"
+    },
+    "chengfang": {
+      "scope": ["全店托管", "商品自选"],
+      "scope_说明": "乘方控制范围（推广值守主链路）。页面实测两个 Tab：全店托管 / 商品自选；两者逐页读取并核验身份",
+      "pauseEnabled": false,
+      "pauseEnabled_说明": "真实暂停开关（fail-closed 第一道）：false 时真实暂停被拦截，页面门槛如实显示『不会执行』",
+      "enableEnabled": false,
+      "enableEnabled_说明": "真实开启开关（每日 07:00 相位）：false 时真实开启被拦截",
+      "enableHour": 7,
+      "enableHour_说明": "每日开启相位起始小时（Asia/Shanghai）；开启窗口为 enableHour 起至 dailyStartHour 前"
+    }
+  },
+  "login": {
+    "cookieSourceDir": "~/Documents/douyin-promo-guard-cookies",
+    "edgePath": "playwright",
+    "douyinHomeUrl": "https://fxg.jinritemai.com/ffa/mshop/homepage/index"
+  }
+}

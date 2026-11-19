@@ -16,11 +16,10 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
-const { chromium } = require('playwright');
+const { launchTestBrowser } = require('./helpers/browser'); // MAC-2：测试浏览器统一解析（env 覆盖/平台默认）
 const vm = require('vm');
 const { buildShopRows } = require(path.join(__dirname, '..', '..', 'bill-manager', 'watch-drill.js'));
 
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const INDEX_HTML = path.join(__dirname, '..', '..', 'bill-manager', 'index.html');
 const SERVER_JS = path.join(__dirname, '..', 'src', 'ui', 'server.js');
 
@@ -95,11 +94,11 @@ const baseState = () => ({
 });
 
 before(async () => {
-  browser = await chromium.launch({ headless: true, executablePath: EDGE, args: ['--window-size=1280,900'] });
+  browser = await launchTestBrowser({ args: ['--window-size=1280,900'] });
 });
 
 after(async () => {
-  await browser.close().catch(() => {});
+  if (browser) await browser.close().catch(() => {});
 });
 
 test('index.html 多店行（激活推广值守页签）：余额+可见上海时间/未知；店B 刷新真实发生且 DOM 更新；编辑框输入与焦点保留', async () => {

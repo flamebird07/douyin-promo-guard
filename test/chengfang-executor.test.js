@@ -22,7 +22,7 @@
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
-const { chromium } = require('playwright');
+const { launchTestBrowser } = require('./helpers/browser'); // MAC-2：测试浏览器统一解析（env 覆盖/平台默认）
 const { buildChengfangFixtureHtml } = require('./chengfang-fixture');
 const { createChengfangController } = require('../src/adapters/chengfang-reader');
 const { executeChengfangPause, executeChengfangEnable } = require('../src/engine/chengfang-executor');
@@ -30,7 +30,6 @@ const { buildChengfangRequestGate } = require('../src/engine/chengfang-gate');
 const { makeClock } = require('./helpers');
 const { shanghaiMs } = require('../src/lib/time');
 
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const ACCOUNT_ID = '1710242295996424';
 const SHOP_CFG = { id: '瑾漂亮潮流服饰', name: '瑾漂亮潮流服饰', accountId: ACCOUNT_ID };
 
@@ -42,11 +41,11 @@ let browser;
 let page;
 
 before(async () => {
-  browser = await chromium.launch({ headless: true, executablePath: EDGE, args: ['--window-size=1280,900'] });
+  browser = await launchTestBrowser({ args: ['--window-size=1280,900'] });
 });
 
 after(async () => {
-  await browser.close().catch(() => {});
+  if (browser) await browser.close().catch(() => {});
 });
 
 async function loadPage(opts = {}) {

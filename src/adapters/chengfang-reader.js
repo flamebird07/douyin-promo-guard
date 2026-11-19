@@ -23,6 +23,7 @@
  */
 
 const path = require('path');
+const { launchExecutableOption } = require('../login/browser-launch'); // MAC-1：edgePath 可选解析
 const { AuthError, DataGuardError } = require('../lib/errors');
 const { maskUrlQueries } = require('../lib/log');
 const { openQianchuanHome, closeBrowser } = require('./qianchuan-reader');
@@ -184,7 +185,7 @@ async function retainChengfangPageForManualReview({ context, target, shopCfg, lo
       const { chromium } = require('playwright');
       browser = await chromium.launch({
         headless: false,
-        executablePath: loginCfg.edgePath,
+        ...launchExecutableOption(loginCfg), // MAC-1：edgePath 可选解析
         args: ['--window-size=1920,1080'],
       });
     }

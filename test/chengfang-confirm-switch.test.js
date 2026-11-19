@@ -12,10 +12,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { chromium } = require('playwright');
+const { launchTestBrowser } = require('./helpers/browser'); // MAC-2：测试浏览器统一解析（env 覆盖/平台默认）
 
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
-const launch = () => chromium.launch({ headless: true, executablePath: EDGE, args: ['--window-size=1200,800'] });
+const launch = () => launchTestBrowser({ args: ['--window-size=1200,800'] });
 
 const {
   createChengfangController,

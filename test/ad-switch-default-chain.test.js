@@ -9,14 +9,13 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
-const { chromium } = require('playwright');
+const { launchTestBrowser } = require('./helpers/browser'); // MAC-2：测试浏览器统一解析（env 覆盖/平台默认）
 const { Monitor } = require('../src/engine/monitor');
 const { makeTempDir, writeTempCookie, makeCfgResult, makeLinkedReader, makeStatefulController, makeClock, waitFor } = require('./helpers');
 const { shanghaiMs } = require('../src/lib/time');
 const { buildChengfangFixtureHtml } = require('./chengfang-fixture');
 const { createChengfangController } = require('../src/adapters/chengfang-reader');
 
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const ACCOUNT_ID = '1710242295996424';
 const SHOP = { id: 'shop-001', name: '测试店铺一', cookieFile: '测试店铺一', accountId: ACCOUNT_ID, enabled: true };
 const TUOGUAN = { id: '184388555253250562', name: '全店托管', checked: true };
@@ -25,9 +24,9 @@ const ZIX = (n, checked = true) =>
 
 let browser;
 before(async () => {
-  browser = await chromium.launch({ headless: true, executablePath: EDGE, args: ['--window-size=1280,900'] });
+  browser = await launchTestBrowser({ args: ['--window-size=1280,900'] });
 });
-after(async () => { await browser.close().catch(() => {}); });
+after(async () => { if (browser) await browser.close().catch(() => {}); });
 
 async function setupDefault(t, { costCents = 5000, orders = 100, fixture, clock, realMode = true, monitorChengfang = {} } = {}) {
   const cookieDir = makeTempDir('dc-ck-');

@@ -16,10 +16,8 @@
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
-const { chromium } = require('playwright');
+const { launchTestBrowser } = require('./helpers/browser'); // MAC-2：测试浏览器统一解析（env 覆盖/平台默认）
 const { extractOrderValueInPage } = require('../src/adapters/compass-order-reader');
-
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 
 /** 基于实测 DOM 证据（2026-09-13）构造经营概况指标卡 fixture。 */
 function buildPage({ orderCard, tabsHtml }) {
@@ -55,12 +53,12 @@ let browser;
 let page;
 
 before(async () => {
-  browser = await chromium.launch({ headless: true, executablePath: EDGE, args: ['--window-size=1200,800'] });
+  browser = await launchTestBrowser({ args: ['--window-size=1200,800'] });
   page = await browser.newPage();
 });
 
 after(async () => {
-  await browser.close().catch(() => {});
+  if (browser) await browser.close().catch(() => {});
 });
 
 const PROBE_ARGS = { uuid: 'pay_cnt', label: '成交订单数', overview: '经营概况' };

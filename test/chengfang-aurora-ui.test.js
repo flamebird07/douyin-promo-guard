@@ -13,7 +13,7 @@
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
-const { chromium } = require('playwright');
+const { launchTestBrowser } = require('./helpers/browser'); // MAC-2：测试浏览器统一解析（env 覆盖/平台默认）
 const { buildChengfangFixtureHtml } = require('./chengfang-fixture');
 const {
   createChengfangController,
@@ -23,7 +23,6 @@ const {
 const { executeChengfangPause, executeChengfangEnable } = require('../src/engine/chengfang-executor');
 const { shanghaiMs } = require('../src/lib/time');
 
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const ACCOUNT_ID = '1710242295996424';
 const SHOP_CFG = { id: '瑾漂亮潮流服饰', name: '瑾漂亮潮流服饰', accountId: ACCOUNT_ID };
 // 新 UI 每次回读都带一次页面刷新（reload+切视图+重设条数），单轮读取成本高于旧 UI，
@@ -41,10 +40,10 @@ const ZIXUAN = (n) =>
 let browser;
 
 before(async () => {
-  browser = await chromium.launch({ headless: true, executablePath: EDGE, args: ['--window-size=1280,900'] });
+  browser = await launchTestBrowser({ args: ['--window-size=1280,900'] });
 });
 after(async () => {
-  await browser.close().catch(() => {});
+  if (browser) await browser.close().catch(() => {});
 });
 
 async function loadPage(opts = {}) {

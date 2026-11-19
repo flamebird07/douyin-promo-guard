@@ -36,6 +36,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { launchExecutableOption } = require('../login/browser-launch'); // MAC-1：edgePath 可选解析
 const { AuthError, DataGuardError } = require('../lib/errors');
 const { parseMoneyCents } = require('../lib/money');
 const { shanghaiDate } = require('../lib/time');
@@ -1036,7 +1037,7 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
       const { chromium } = require('playwright');
       return chromium.launch({
         headless: opts.headless !== false,
-        executablePath: loginCfg.edgePath,
+        ...launchExecutableOption(loginCfg), // MAC-1：edgePath 可选解析
         args: ['--window-size=1920,1080'],
       });
     },
@@ -1083,7 +1084,7 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
         const { chromium } = require('playwright');
         return chromium.launch({
           headless: opts.headless !== false,
-          executablePath: loginCfg.edgePath,
+          ...launchExecutableOption(loginCfg), // MAC-1：edgePath 可选解析
           args: ['--window-size=1920,1080'],
         });
       },

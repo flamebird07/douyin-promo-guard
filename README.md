@@ -43,7 +43,7 @@
 ## 快速开始
 
 ```bash
-npm install && npm run check && npm test   # 237 项隔离测试（12 个测试文件 + 2 个辅助 fixture/helpers）
+npm install && npm run check && npm test
 npm start                                  # 中文控制台 http://127.0.0.1:18789
 node src/index.js chengfang-read           # 乘方只读核实：身份 + 两区域清单（零点击）
 node src/index.js chengfang                # 乘方只读演练：核验身份 + 枚举将暂停目标（dryRun 恒 true，零点击）
@@ -51,6 +51,26 @@ node src/index.js poll                     # 费用/订单演练一轮
 node src/index.js orders                   # 只读：罗盘订单
 node src/index.js ads                      # 只读：千川清单（历史覆盖表透明展示，非本轮动作依据）
 ```
+
+## 店铺扫码登录（2026-11-17，网页内嵌二维码 · 多店铺）
+
+- 打开控制台 `http://127.0.0.1:18789` 即用（服务仅监听本机 127.0.0.1，**无控制台账号门禁**——界面登录账号按用户 2026-11-17 要求移除）。
+- 工具栏「**扫码登录店铺**」：服务端无头浏览器打开抖店登录页并切到「扫码登录」视图，**二维码直接显示在网页弹窗里**（自动刷新）→ 用手机**抖店App** 扫码（10 分钟超时）→ Cookie 写入项目 `cookies/<店铺名>.json` → 立即触发 Cookie 自动发现（`requestShopDiscovery({force:true})`），**新店铺自动加入列表与 config.json**（既有店铺条目/阈值不受影响）。
+- **多店铺 = 逐店重复扫码**：同一时刻只有一个扫码会话（重复点击提示"已有会话进行中"）；同名店铺重复扫会覆盖刷新其 Cookie。表格每行「Cookie」列显示 登录文件状态（有效/已过期/缺失，电商助手只读来源会标注）。
+- 「**扫描已有 Cookie**」按钮：手动重扫 Cookie 目录（项目 `cookies/` + `login.cookieSourceDir`），把手工放入的 Cookie 文件补录为店铺；不复活已删除店铺（既有发现语义）。
+- 命令行 `npm run login`（弹出浏览器扫码）行为不变；网页内嵌二维码不可用时（登录页改版等）会如实报错并建议改用该命令。
+- 前提：`login.cookieSourceDir` 需配置非空（未配置时自动发现整个关闭——扫码成功会如实提示"新店铺不会自动加入"）；macOS 用 Playwright 自带 Chromium 需先 `npx playwright install chromium`。
+
+## macOS（Apple Silicon）本地运行
+
+1. 使用 Node.js 22 或更高版本运行 `npm ci`。
+2. 首次配置时，运行 `cp -n config/config.example.macos.json config/config.json`，然后按需修改店铺和 `login` 设置。
+3. 使用 Playwright 自带 Chromium 时，将 `login.edgePath` 设为 `playwright` 或空字符串，并运行 `npx playwright install chromium`。也可填写本机 Edge 或 Chrome 的可执行文件路径，例如 `/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge`。如果旧配置仍填 Windows 默认 Edge 路径，macOS 会使用 Playwright 自带 Chromium。
+4. 运行 `npm run check` 检查配置，再运行 `npm start` 打开本地控制台 `http://127.0.0.1:18789`。示例配置默认使用演练模式。
+
+`login.cookieSourceDir` 可填写本机的只读 Cookie 来源目录，也可留空并用 `npm run login` 在项目的 `cookies/` 下生成扫码登录文件。浏览器路径和两个 Cookie 目录配置项（`cookieSourceDir`、`cookieWorkDir`）都支持 `~/` 前缀。
+
+运行 `npm test` 时，macOS 的浏览器测试默认使用 Playwright 自带 Chromium。可以通过 `PROMO_GUARD_TEST_BROWSER_PATH` 指定本机浏览器的可执行文件路径。
 
 入口区分（读取 / 演练 / 真实执行）：
 - **读取**：`orders` / `ads` / `chengfang-read` —— 只读，不打开任何可点击路径。

@@ -3,7 +3,12 @@
 /**
  * 多店铺紧凑控制台（node:http，无额外依赖）。
  *
- * 主信息（每店一行）：店铺名称 · 广告状态 · 上次更新 · 广告费 · 订单数 · 阈值 · 操作。
+ * 店铺扫码登录（2026-11-17）：工具栏「扫码登录店铺」→ /api/shop/qr-login 启动无头会话，
+ * 抖店登录二维码直接显示在网页弹窗（/api/shop/qr-login/status 持续透出最新二维码），
+ * 手机扫码成功后 Cookie 落盘并自动发现建店。服务仅监听 127.0.0.1，无控制台账号门禁
+ * （用户 2026-11-17 明确不需要界面登录账号）。
+ *
+ * 主信息（每店一行）：店铺名称 · 广告状态 · Cookie · 上次更新 · 广告费 · 订单数 · 阈值 · 操作。
  * 操作：立即更新（只读）· 修改（默认隐藏输入框）· 删除（确认后软删）。
  * 批量：开始监控 / 停止监控 作用于全部未删除店铺。
  * 安全：不展示 Cookie/令牌/密钥；立即更新零广告动作；删除后调度与手动接口再次校验活动列表。
@@ -11,6 +16,76 @@
 
 const http = require('http');
 const { scrubDeep } = require('../lib/log');
+
+// ── 店铺扫码登录（2026-11-17，网页内嵌二维码）────────────────────────
+// 服务仅监听 127.0.0.1，本机使用，无控制台账号门禁（用户 2026-11-17 明确不需要）。
+// 复用 src/login/qr-login.js 的 WebQrLoginSession：无头浏览器取抖店登录二维码 →
+// 网页弹窗直接展示（用户手机扫码，无需弹出浏览器）→ 登录成功后 Cookie 写入项目
+// cookies/<店铺名>.json → 立即调 monitor.requestShopDiscovery({force:true})
+// （"登录成功后接管新店"的官方入口），新店铺自动进入 config.shops 与页面列表。
+// 同一时刻只允许一个扫码会话；多店铺 = 逐店重复扫码（同名店铺重复扫会覆盖刷新其 Cookie）。
+// 绝不自动改阈值/开关；发现关闭（cookieSourceDir 未配置）时如实透出提示。
+const { WebQrLoginSession } = require('../login/qr-login');
+let qrLoginJob = null; // { phase:'running'|'success'|'failed', session, startedAt, finishedAt, shopName, addedShops, discoveryHint, reason }
+const qrLoginRunId = { value: 0 };
+
+function qrLoginJobView() {
+  if (!qrLoginJob) return { active: false, phase: 'idle', qrDataUrl: null };
+  return {
+    active: qrLoginJob.phase === 'running',
+    phase: qrLoginJob.phase,
+    startedAt: qrLoginJob.startedAt,
+    finishedAt: qrLoginJob.finishedAt || null,
+    shopName: qrLoginJob.shopName || null,
+    addedShops: qrLoginJob.addedShops || null,
+    discoveryHint: qrLoginJob.discoveryHint || null,
+    reason: qrLoginJob.reason || null,
+    // 最新二维码（data:image/png;base64,...；scrubDeep 不影响 base64 数据）
+    qrDataUrl: (qrLoginJob.session && qrLoginJob.session.qrDataUrl) || null,
+  };
+}
+
+function startWebQrLogin(monitor, factory) {
+  if (qrLoginJob && qrLoginJob.phase === 'running') {
+    return { ok: false, reason: '已有扫码登录会话进行中（扫码或 10 分钟超时后结束），请稍候', job: qrLoginJobView() };
+  }
+  const session = factory((monitor.config && monitor.config.login) || {});
+  const job = { phase: 'running', session, startedAt: new Date().toISOString(), finishedAt: null, shopName: null, addedShops: null, discoveryHint: null, reason: null };
+  qrLoginJob = job;
+  const runId = ++qrLoginRunId.value;
+  (async () => {
+    try {
+      const r = await session.start(); // 阻塞至扫码成功并保存 Cookie
+      if (runId !== qrLoginRunId.value) return;
+      job.shopName = (r && r.shopName) || null;
+      job.phase = 'success';
+      job.finishedAt = new Date().toISOString();
+      try {
+        const disc = monitor.requestShopDiscovery({ force: true });
+        job.addedShops = (disc && Array.isArray(disc.added)) ? disc.added : null;
+        if (disc && Array.isArray(disc.scannedDirs) && disc.scannedDirs.length === 0) {
+          job.discoveryHint = '未扫描任何 Cookie 目录（login.cookieSourceDir 未配置且项目 cookies/ 不存在）——Cookie 文件已保存，但新店铺不会自动加入列表，请检查配置';
+        }
+        // 登录成功即自动拉取一次只读数据（2026-11-19）：与「立即更新」同一链路
+        // （零广告动作），新店入列后约 1–2 分钟数据自动出现，无需手动点更新。
+        const names = (job.addedShops && job.addedShops.length) ? job.addedShops : (job.shopName ? [job.shopName] : []);
+        for (const name of names) {
+          try { monitor.refreshShopData(String(name)).catch(() => {}); } catch (_) { /* 忽略单个店失败 */ }
+        }
+      } catch (e) {
+        job.discoveryHint = `自动发现新店失败（Cookie 已保存，可稍后点"扫描已有 Cookie"重试）: ${e.message}`;
+      }
+    } catch (e) {
+      if (runId !== qrLoginRunId.value) return;
+      job.phase = 'failed';
+      job.finishedAt = new Date().toISOString();
+      job.reason = e.message || String(e);
+    } finally {
+      await session.close().catch(() => {});
+    }
+  })();
+  return { ok: true, started: true, job: qrLoginJobView() };
+}
 
 const HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -62,6 +137,8 @@ const HTML = `<!DOCTYPE html>
 <div class="toolbar">
   <button id="btn-start" class="primary">开始监控</button>
   <button id="btn-stop" class="danger">停止监控</button>
+  <button id="btn-qrlogin" title="弹出本机浏览器，用抖音 App 扫码登录抖店；每扫一次登录一家店，Cookie 自动保存并把店铺加入列表">扫码登录店铺</button>
+  <button id="btn-rediscover" class="ghost" title="重新扫描 Cookie 目录（项目 cookies/ 与 login.cookieSourceDir），把已有 Cookie 文件补录为店铺">扫描已有 Cookie</button>
   <span class="muted">批量作用于下方全部未删除店铺的超额巡查；<b>不影响</b>独立的每日 07:00 自动开启任务 · 立即更新只读，不触发广告开关 · 推广广告控制仅抖店</span>
 </div>
 <div id="msg" class="muted"></div>
@@ -72,6 +149,7 @@ const HTML = `<!DOCTYPE html>
     <tr>
       <th>店铺名称</th>
       <th>广告状态</th>
+      <th title="本项目 cookies/ 或 login.cookieSourceDir 里的 Cookie 登录文件">Cookie</th>
       <th>上次数据更新</th>
       <th>广告费</th>
       <th>订单数</th>
@@ -81,7 +159,7 @@ const HTML = `<!DOCTYPE html>
       <th style="width:220px;">操作</th>
     </tr>
   </thead>
-  <tbody id="shopBody"><tr><td colspan="8" class="muted">加载中…</td></tr></tbody>
+  <tbody id="shopBody"><tr><td colspan="10" class="muted">加载中…</td></tr></tbody>
 </table>
 
 <details>
@@ -89,6 +167,18 @@ const HTML = `<!DOCTYPE html>
   <div id="sched" class="muted" style="margin:8px 0;"></div>
   <div id="errors" class="muted"></div>
 </details>
+
+<div id="qr-mask" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:100;">
+  <div style="position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); background:#fff; border-radius:8px; padding:20px 24px; width:420px; max-width:92vw; box-shadow:0 4px 20px rgba(0,0,0,.2);">
+    <h3 style="margin:0 0 8px; font-size:15px;">扫码登录抖店</h3>
+    <div style="text-align:center; margin:6px 0;">
+      <img id="qr-img" style="width:220px; height:220px; display:none; border:1px solid #e2e2e2; border-radius:6px;" alt="抖店登录二维码">
+      <div id="qr-loading" class="muted" style="width:220px; height:220px; line-height:220px; margin:0 auto; border:1px dashed #ccc; border-radius:6px; font-size:13px;">正在获取二维码…</div>
+    </div>
+    <div id="qr-body" class="muted" style="min-height:40px; font-size:13px; line-height:1.6; text-align:center;">打开手机「抖店App」扫上方二维码；二维码过期会自动刷新。</div>
+    <div style="text-align:right; margin-top:10px;"><button id="qr-close" class="ghost">关闭</button></div>
+  </div>
+</div>
 
 <script>
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -154,11 +244,19 @@ async function saveEdit(id) {
   if (!box) return;
   var thrEl = box.querySelector('.ethr');
   var thrYuan = thrEl ? parseFloat(thrEl.value) : NaN;
+  var roiEl = box.querySelector('.eroi');
+  var roiVal = roiEl ? parseFloat(roiEl.value) : NaN;
+  var planEl = box.querySelector('.eplans');
+  var planVal = planEl ? parseInt(planEl.value, 10) : NaN;
   var body = { shopId: id };
   if (!isNaN(thrYuan) && thrYuan > 0) body.thresholdCents = Math.round(thrYuan * 100);
+  if (!isNaN(roiVal) && roiVal > 0) body.targetRoi = roiVal;
+  if (!isNaN(planVal) && planVal >= 1 && planVal <= 10) body.plansPerShopPerDay = planVal;
   var r = await api('/api/shop/update', 'POST', body);
   if (r.ok) {
-    showMsg('已保存：' + (r.displayName || id) + '，阈值 ' + ((r.thresholdCents || 0) / 100).toFixed(2) + ' 元/单（已落盘）', 'ok');
+    var parts = ['已保存：' + (r.displayName || id), '阈值 ' + ((r.thresholdCents || 0) / 100).toFixed(2) + ' 元/单',
+      '目标 ROI ' + r.targetRoi, '每日计划 ' + r.plansPerShopPerDay + ' 条'];
+    showMsg(parts.join('，') + '（已落盘）', 'ok');
     closeEdit(id);
     refresh();
   } else {
@@ -199,13 +297,17 @@ function renderShops(rows) {
     var id = box.getAttribute('data-shop-id');
     if (!id) return;
     var thrEl = box.querySelector('.ethr');
+    var roiEl = box.querySelector('.eroi');
+    var planEl = box.querySelector('.eplans');
     editState[id] = {
       open: true,
       thresholdYuan: thrEl ? thrEl.value : '',
+      targetRoi: roiEl ? roiEl.value : '',
+      plansPerShopPerDay: planEl ? planEl.value : '',
     };
   });
   if (!rows || rows.length === 0) {
-    body.innerHTML = '<tr><td colspan="9" class="muted">暂无活动店铺</td></tr>';
+    body.innerHTML = '<tr><td colspan="10" class="muted">暂无活动店铺</td></tr>';
     return;
   }
   // 用 DOM 构建 + data-id / data-name，不用字符串拼 onclick（防引号注入）
@@ -216,12 +318,37 @@ function renderShops(rows) {
     var td1 = document.createElement('td');
     var b = document.createElement('b');
     b.textContent = s.displayName || s.name || s.id;
-    var div = document.createElement('div');
-    div.className = 'muted';
-    div.textContent = s.id;
-    td1.appendChild(b); td1.appendChild(div);
+    td1.appendChild(b);
+    // 店铺 ID 仅在与名称不同时才显示（2026-11-19：自动发现店 id=店名，重复展示没有信息量）
+    if (s.id && s.id !== (s.displayName || s.name || s.id)) {
+      var div = document.createElement('div');
+      div.className = 'muted';
+      div.textContent = s.id;
+      td1.appendChild(div);
+    }
     var td2 = document.createElement('td');
     td2.innerHTML = adBadge(s.adState);
+    // Cookie 登录文件状态（只读元信息：是否找到/是否过期；绝不展示 Cookie 内容）
+    var tdCookie = document.createElement('td');
+    var ci = s.cookieInfo || null;
+    if (ci && ci.found) {
+      var cBadge = document.createElement('span');
+      cBadge.className = 'badge ' + (ci.expired ? 'unknown' : 'on');
+      cBadge.textContent = ci.expired ? '已过期' : '有效';
+      tdCookie.appendChild(cBadge);
+      if (ci.readOnly === true) {
+        var cRo = document.createElement('div');
+        cRo.className = 'muted';
+        cRo.style.fontSize = '11px';
+        cRo.textContent = '只读来源';
+        tdCookie.appendChild(cRo);
+      }
+    } else {
+      var cMiss = document.createElement('span');
+      cMiss.className = 'badge off';
+      cMiss.textContent = '缺失';
+      tdCookie.appendChild(cMiss);
+    }
     var td3 = document.createElement('td');
     td3.textContent = fmtTime(s.lastDataAt);
     var td4 = document.createElement('td');
@@ -305,14 +432,38 @@ function renderShops(rows) {
     btnCancel.setAttribute('data-id', s.id);
     var d2 = document.createElement('div');
     d2.style.marginTop = '6px';
-    d2.appendChild(l2); d2.appendChild(in2); d2.appendChild(btnSave); d2.appendChild(btnCancel);
+    d2.appendChild(l2); d2.appendChild(in2);
+    // 目标 ROI（正数，支持小数；缺省合同默认 15）
+    var lRoi = document.createElement('label');
+    lRoi.textContent = '目标 ROI';
+    var inRoi = document.createElement('input');
+    inRoi.className = 'eroi';
+    inRoi.type = 'number';
+    inRoi.step = '0.1';
+    inRoi.min = '0.1';
+    inRoi.placeholder = String(s.targetRoi != null ? s.targetRoi : 15);
+    inRoi.value = (editState[s.id] && editState[s.id].targetRoi) != null ? editState[s.id].targetRoi : '';
+    // 每店每日计划条数（整数 1..10；缺省回落全局默认 3）
+    var lPlans = document.createElement('label');
+    lPlans.textContent = '每日计划条数(1-10)';
+    var inPlans = document.createElement('input');
+    inPlans.className = 'eplans';
+    inPlans.type = 'number';
+    inPlans.step = '1';
+    inPlans.min = '1';
+    inPlans.max = '10';
+    inPlans.placeholder = String(s.plansPerShopPerDay != null ? s.plansPerShopPerDay : 3);
+    inPlans.value = (editState[s.id] && editState[s.id].plansPerShopPerDay) != null ? editState[s.id].plansPerShopPerDay : '';
+    d2.appendChild(lRoi); d2.appendChild(inRoi);
+    d2.appendChild(lPlans); d2.appendChild(inPlans);
+    d2.appendChild(btnSave); d2.appendChild(btnCancel);
     editBox.appendChild(d2);
     if (editState[s.id] && editState[s.id].open) editBox.classList.add('open');
 
     td8.appendChild(btnRefresh);
     td8.appendChild(opsWrap);
     td8.appendChild(editBox);
-    [td1, td2, td3, td4, td5, td6, tdBal, td7, td8].forEach(function(td) { tr.appendChild(td); });
+    [td1, td2, tdCookie, td3, td4, td5, td6, tdBal, td7, td8].forEach(function(td) { tr.appendChild(td); });
     body.appendChild(tr);
   });
 }
@@ -371,11 +522,90 @@ document.getElementById('btn-stop').onclick = async function() {
   refresh();
 };
 
+// ── 店铺扫码登录（二维码直显网页；多店铺 = 逐店重复扫码）────────────
+function setQrBody(html) { document.getElementById('qr-body').innerHTML = html; }
+function showQrImage(dataUrl) {
+  var img = document.getElementById('qr-img');
+  var loading = document.getElementById('qr-loading');
+  if (dataUrl) {
+    img.src = dataUrl;
+    img.style.display = 'inline-block';
+    loading.style.display = 'none';
+  } else {
+    img.style.display = 'none';
+    loading.style.display = 'block';
+  }
+}
+var qrPollTimer = null;
+function stopQrPoll() {
+  if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null; }
+}
+function startQrPoll() {
+  stopQrPoll();
+  qrPollTimer = setInterval(async function() {
+    if (document.getElementById('qr-mask').style.display !== 'block') return;
+    try {
+      var r = await api('/api/shop/qr-login/status');
+      var j = r && r.job;
+      if (!j || j.phase === 'idle') return;
+      if (j.phase === 'running') {
+        showQrImage(j.qrDataUrl);
+        setQrBody('打开手机「<b>抖店App</b>」扫上方二维码登录（10 分钟超时；二维码过期自动刷新）。'
+          + '多店铺请逐店重复扫码；同名店铺重复扫会刷新其 Cookie。');
+      } else if (j.phase === 'success') {
+        showQrImage(null);
+        var extra = (j.addedShops && j.addedShops.length)
+          ? '已自动加入店铺列表：<b>' + esc(j.addedShops.join('、')) + '</b>'
+          : '该店铺已在列表中（同名店铺已刷新 Cookie）';
+        setQrBody('<span class="ok">✔ 登录成功：' + esc(j.shopName || '未知店铺') + '</span><br>' + extra
+          + '<br>正在自动拉取店铺数据（广告费/订单，约 1–2 分钟），完成后列表自动更新。'
+          + '<br>可以继续点「扫码登录店铺」登录下一家店。'
+          + (j.discoveryHint ? '<br><span class="bad">' + esc(j.discoveryHint) + '</span>' : ''));
+        stopQrPoll();
+        refresh();
+      } else if (j.phase === 'failed') {
+        showQrImage(null);
+        setQrBody('<span class="bad">✘ 登录失败：</span>' + esc(j.reason || '未知')
+          + (j.discoveryHint ? '<br>' + esc(j.discoveryHint) : ''));
+        stopQrPoll();
+      }
+    } catch (e) { /* 单次轮询失败忽略，下轮重试 */ }
+  }, 2000);
+}
+document.getElementById('qr-close').onclick = function() {
+  document.getElementById('qr-mask').style.display = 'none';
+  stopQrPoll();
+};
+document.getElementById('btn-qrlogin').onclick = async function() {
+  var r = await api('/api/shop/qr-login', 'POST');
+  document.getElementById('qr-mask').style.display = 'block';
+  if (r && r.ok) {
+    showQrImage(null);
+    setQrBody('正在打开抖店登录页获取二维码…');
+    startQrPoll();
+  } else {
+    showQrImage(null);
+    setQrBody('<span class="bad">' + esc((r && r.reason) || '启动失败') + '</span>');
+    if (r && r.job && r.job.active) startQrPoll(); // 已有会话进行中 → 展示其实时状态
+  }
+};
+document.getElementById('btn-rediscover').onclick = async function() {
+  var r = await api('/api/shops/rediscover', 'POST');
+  if (r && r.ok) {
+    var n = (r.added && r.added.length) ? ('新增 ' + r.added.length + ' 家：' + r.added.join('、')) : '无新增店铺';
+    showMsg('扫描完成（' + n + '）' + (r.persisted === false ? '；配置落盘失败，进程内稍后自动重试' : ''), (r.added && r.added.length) ? 'ok' : '');
+  } else {
+    showMsg('扫描失败：' + ((r && r.reason) || '未知'), 'bad');
+  }
+  refresh();
+};
+
 refresh();
 setInterval(refresh, 5000);
 </script>
 </body>
 </html>`;
+
 
 function readBody(req) {
   return new Promise((resolve) => {
@@ -387,7 +617,11 @@ function readBody(req) {
   });
 }
 
-function createUiServer(monitor, port) {
+function createUiServer(monitor, port, opts) {
+  // 扫码登录会话工厂可注入（测试用假会话，不起真实浏览器）
+  const qrSessionFactory = (opts && typeof opts.qrSessionFactory === 'function')
+    ? opts.qrSessionFactory
+    : (loginCfg) => new WebQrLoginSession(loginCfg);
   const server = http.createServer(async (req, res) => {
     const send = (code, body, type) => {
       res.writeHead(code, { 'Content-Type': type || 'application/json; charset=utf-8' });
@@ -398,6 +632,18 @@ function createUiServer(monitor, port) {
     const sendJson = (code, obj) => send(code, JSON.stringify(scrubDeep(obj)));
     const url = (req.url || '').split('?')[0];
 
+    if (url === '/api/shop/qr-login' && req.method === 'POST') {
+      return sendJson(200, startWebQrLogin(monitor, qrSessionFactory));
+    }
+    if (url === '/api/shop/qr-login/status' && req.method === 'GET') {
+      return sendJson(200, { ok: true, job: qrLoginJobView() });
+    }
+    if (url === '/api/shops/rediscover' && req.method === 'POST') {
+      if (typeof monitor.requestShopDiscovery !== 'function') {
+        return sendJson(200, { ok: false, reason: '当前 monitor 不支持 Cookie 店铺发现' });
+      }
+      return sendJson(200, monitor.requestShopDiscovery({ force: true }));
+    }
     if (url === '/' && req.method === 'GET') {
       return send(200, HTML, 'text/html; charset=utf-8');
     }
@@ -434,6 +680,8 @@ function createUiServer(monitor, port) {
         displayName: body.displayName,
         name: body.name,
         thresholdCents: body.thresholdCents,
+        targetRoi: body.targetRoi,
+        plansPerShopPerDay: body.plansPerShopPerDay,
       });
       return sendJson(200, r);
     }

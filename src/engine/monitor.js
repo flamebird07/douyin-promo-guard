@@ -26,7 +26,7 @@
 const fs = require('fs');
 const path = require('path');
 const { loadShopCookieMeta, resolveCookieFile, checkLoginByBrowser } = require('../login/session');
-const { validateTargetRoi, DEFAULT_TARGET_ROI } = require('../config');
+const { validateTargetRoi, DEFAULT_TARGET_ROI, validatePlansPerShop, DEFAULT_PLANS_PER_SHOP, resolveEffectivePlansPerShop } = require('../config');
 const { createPromoReaderNotConnected, createMockPromoReader } = require('../adapters/promo-reader');
 const { createAdControllerNotConnected, createMockAdController } = require('../adapters/ad-controller');
 const { WholeShopCloseCoordinator } = require('./close-coordinator');
@@ -1644,6 +1644,7 @@ class Monitor {
         added: r.added,
         persisted,
         pending: r.pending === true,
+        scannedDirs: r.scannedDirs,
         reason: persisted ? null : (r.reason || null),
       };
     } catch (e) {
@@ -2141,15 +2142,17 @@ class Monitor {
   }
 
   /**
-   * 修改店铺**展示名称**、阈值与目标 ROI（targetRoi）。
+   * 修改店铺**展示名称**、阈值、目标 ROI（targetRoi）与每店每日计划条数（plansPerShopPerDay）。
    * - 展示名写入 `displayName`，**绝不修改**身份字段 `name`/`id`/`compassShopName`/`accountId`/`cookieFile`；
    * - targetRoi 采用 config.validateTargetRoi 严格合同：缺字段→默认 15；明确值只接受正有限 number
    *   （支持 13.5），拒绝空/null/布尔/NaN/Infinity/0/负数/'15abc'；**只改 ROI**，不触发巡检启停、
    *   不改阈值/身份/Cookie；
+   * - plansPerShopPerDay 采用 config.validatePlansPerShop 严格合同（客户 2026-10-13："每天几条加在
+   *   目标 ROI 后面，可按店调整"）：整数 1..10；缺字段回落全局默认 3；
    * - 先持久化（原子写），成功后才报告 ok:true；写入失败精确回滚内存并返回失败。
    * 不暴露/不修改 Cookie、令牌、密钥。
    */
-  updateShop(shopId, { displayName, name, thresholdCents, targetRoi } = {}) {
+  updateShop(shopId, { displayName, name, thresholdCents, targetRoi, plansPerShopPerDay } = {}) {
     const shop = this._findShop(shopId);
     if (!shop) return { ok: false, reason: '店铺不存在' };
     if (shop.deleted === true) return { ok: false, reason: '店铺已删除，无法修改' };
@@ -2179,8 +2182,16 @@ class Monitor {
       }
       patch.targetRoi = roiCheck.value;
     }
+    // 每店每天计划数量（客户 2026-10-13 合同："每天几条加在目标 ROI 后面，可按店调整"；整数 1..10）
+    if (plansPerShopPerDay !== undefined && plansPerShopPerDay !== null) {
+      const ppCheck = validatePlansPerShop(Number(plansPerShopPerDay));
+      if (!ppCheck.ok) {
+        return { ok: false, reason: `每日计划条数无效：${ppCheck.reason}`, plansPerShopInvalid: true };
+      }
+      patch.plansPerShopPerDay = ppCheck.value;
+    }
     if (Object.keys(patch).length === 0) {
-      return { ok: false, reason: '未提供可修改字段（展示名称/阈值/目标 ROI）' };
+      return { ok: false, reason: '未提供可修改字段（展示名称/阈值/目标 ROI/每日计划条数）' };
     }
     // 整店浅快照：写入失败精确回滚（含字段是否存在）
     const snapshotBefore = { ...shop };
@@ -2188,6 +2199,7 @@ class Monitor {
       displayName: shop.displayName !== undefined ? shop.displayName : (shop.name || shop.id),
       thresholdCents: shop.thresholdCents ?? this._thresholdCents(shop),
       targetRoi: shop.targetRoi !== undefined ? shop.targetRoi : DEFAULT_TARGET_ROI,
+      plansPerShopPerDay: resolveEffectivePlansPerShop(shop, DEFAULT_PLANS_PER_SHOP),
     };
     // 只写允许修改的字段；身份字段由 Object.keys(shop) 原样保留
     Object.assign(shop, patch);
@@ -2210,6 +2222,7 @@ class Monitor {
         displayName: shop.displayName || shop.name,
         thresholdCents: shop.thresholdCents ?? this._thresholdCents(shop),
         targetRoi: shop.targetRoi !== undefined ? shop.targetRoi : DEFAULT_TARGET_ROI,
+        plansPerShopPerDay: resolveEffectivePlansPerShop(shop, DEFAULT_PLANS_PER_SHOP),
       },
       identityUnchanged: true,
       persisted: true,
@@ -2221,6 +2234,7 @@ class Monitor {
       displayName: shop.displayName || shop.name,
       thresholdCents: shop.thresholdCents ?? this._thresholdCents(shop),
       targetRoi: shop.targetRoi !== undefined ? shop.targetRoi : DEFAULT_TARGET_ROI,
+      plansPerShopPerDay: resolveEffectivePlansPerShop(shop, DEFAULT_PLANS_PER_SHOP),
       from,
       identityUnchanged: true,
       persisted: true,
@@ -4985,6 +4999,10 @@ class Monitor {
           // 本轮刷新在途（candidate 未提交）：界面可显示"刷新中"，而非把陈旧读数当新读数
           refreshing: rt.dataRefreshing === true || (t && t.refreshing === true),
           thresholdCents: this._thresholdCents(s),
+          // 目标 ROI + 每店每日计划条数（2026-11-19 主控制页编辑框）：有效值 = 已保存值，缺省回落合同默认
+          targetRoi: s.targetRoi !== undefined ? s.targetRoi : DEFAULT_TARGET_ROI,
+          plansPerShopPerDay: resolveEffectivePlansPerShop(s, DEFAULT_PLANS_PER_SHOP),
+          plansPerShopPerDaySaved: Object.prototype.hasOwnProperty.call(s, 'plansPerShopPerDay') ? s.plansPerShopPerDay : null,
           over: t ? t.over === true : null,
           // 同店同日 ROI 提示投影（t.businessDate 必须等于今日；消耗门槛已取消）
           spendFloorCents: SPEND_FLOOR_CENTS,
@@ -4998,6 +5016,16 @@ class Monitor {
           // D56：有效启用状态等价于"未删除"，避免把历史 enabled=false 的正常店误示为未启用。
           enabled: s.deleted !== true,
           platform: s.platform || 'douyin',
+          // Cookie 登录文件状态（2026-11-19 主控制页 Cookie 列）：只读元信息
+          // （是否找到/条数/过期/只读来源），绝不包含 Cookie 值本身。
+          cookieInfo: (() => {
+            try {
+              const meta = loadShopCookieMeta(this.config.login, s);
+              return { found: true, readOnly: meta.readOnly, cookieCount: meta.count, maxExpires: meta.maxExpires, expired: meta.fxgExpired };
+            } catch (e) {
+              return { found: false, error: e.reason || e.message };
+            }
+          })(),
         };
       }),
       rules: this.config.rules || [],

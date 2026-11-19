@@ -10,17 +10,6 @@
       "accountId": "1710242295996424",
       "accountId_说明": "页面实测：千川头部 ID 元素（账户『伊人美』）；千川费用/清单源用它做账户映射核验",
       "enabled": true
-    },
-    {
-      "id": "敏敏高定私服",
-      "name": "敏敏高定私服",
-      "cookieFile": "敏敏高定私服",
-      "platform": "douyin",
-      "enabled": true,
-      "autoDiscovered": true,
-      "thresholdCents": 200,
-      "targetRoi": 12.5,
-      "plansPerShopPerDay": 5
     }
   ],
   "promoPage": {
@@ -41,11 +30,7 @@
       "enabled": true
     }
   ],
-  "schedule": {
-    "dailyStartHour": 8,
-    "intervalMinutes": 30,
-    "timezone": "Asia/Shanghai"
-  },
+  "schedule": { "dailyStartHour": 8, "intervalMinutes": 30, "timezone": "Asia/Shanghai" },
   "execution": {
     "dryRun": true,
     "dryRun_说明": "演练开关（fail-closed 第二道）：true 时即使 realMode 与开关全开，执行器仍零点击，页面门槛会如实显示『不会执行』",
@@ -67,18 +52,11 @@
     "costDataSource": "qianchuan",
     "adListDataSource": "qianchuan",
     "qianchuan": {
-      "adTypes": [
-        "uni_promotion",
-        "standard",
-        "brand"
-      ],
+      "adTypes": ["uni_promotion", "standard", "brand"],
       "adTypes_说明": "已接入只读读取的投放类型。brand 已实测为空清单（共0条，确认无对象）"
     },
     "chengfang": {
-      "scope": [
-        "全店托管",
-        "商品自选"
-      ],
+      "scope": ["全店托管", "商品自选"],
       "scope_说明": "乘方控制范围（推广值守主链路）。页面实测两个 Tab：全店托管 / 商品自选；两者逐页读取并核验身份",
       "pauseEnabled": false,
       "pauseEnabled_说明": "真实暂停开关（fail-closed 第一道）：false 时真实暂停被拦截，页面门槛如实显示『不会执行』",

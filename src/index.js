@@ -77,6 +77,18 @@ function cmdCheck() {
 async function cmdServe() {
   const cfg = loadConfig();
   const monitor = new Monitor(cfg);
+  // 每日开启调度器（2026-11-20 接线，对齐 Windows 生产语义）：enableSchedulerEnabled=true
+  // 时服务启动即登记每日开启任务，不依赖『开始监控』（HANDOFF Windows 生产行为）。
+  // 实际执行仍受 realMode+enableEnabled+时间窗门禁约束；失败只记日志，不阻塞控制台。
+  try {
+    const cf = (cfg.config.monitor && cfg.config.monitor.chengfang) || {};
+    if (cfg.ready && cf.enableSchedulerEnabled === true) {
+      const r = monitor.startEnableScheduler();
+      if (!r.ok && r.reason) log.warn(`每日开启调度器未登记: ${r.reason}`);
+    }
+  } catch (e) {
+    log.warn(`每日开启调度器登记异常（不阻塞控制台）: ${e.message}`);
+  }
   const { server } = createUiServer(monitor, PORT);
   server.listen(PORT, '127.0.0.1', () => {
     log.info(`控制台已启动: http://127.0.0.1:${PORT}`);

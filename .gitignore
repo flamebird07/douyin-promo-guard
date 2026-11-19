@@ -1,7 +1,8 @@
 node_modules/
 logs/
 data/
-cookies/*.json
+cookies/
+src/cookies/
 config/config.json
 *.log
 evidence/

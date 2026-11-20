@@ -1300,6 +1300,31 @@ async function recoverLocalPreparationClose(shopLike, businessDate, opts) {
     }
     // 手动发布事实也是消费面：缺数组（错型）一律不可知，绝不当成"没有手动发布"。
     if (!Array.isArray(raw.manualUiPublicationFacts)) return bind({ ok: false, status: 'refused', reason: 'local-recovery-manual-facts-unreadable' });
+    // 2026-11-21 新机首跑适配（Mac）：attempts 文件在**首次真实派发**前不存在——发布器自身
+    // loader 的官方语义即"仅缺文件 = 首次尝试"（direct-draft-controller loadAttemptsStore
+    // ENOENT → {consumed:{},finalConsumed:{}}）。本仓严格恢复 reader 却拒缺文件，导致全新
+    // 机器一旦在准备期异常（如目录响应异常）就永久卡死、无人能解。窄门物化：仅当
+    // ①state.businessDate 与恢复目标日一致 ②active.status==='preparing' ③runId 为**当日**
+    // scheduled origin ④attempts 文件确实缺失——四条同时成立，才按 loader 官方空表形态
+    // 物化三表（consumed/finalConsumed/reopenConsumed = {}），随后走既有严格证明链
+    // （R127 语义对齐：缺键=空表；证明/哈希 CAS 照常覆盖新文件）。任何一条不成立照旧拒绝。
+    if (!fs.existsSync(paths.attemptsFile)
+        && String(raw.businessDate || '') === date
+        && a.status === 'preparing'
+        && String(a.runId || '') !== '') {
+      const activeOrigin = SCHEDULED_RUN_ORIGIN_RE.exec(String(a.runId || ''));
+      if (activeOrigin && activeOrigin[1] === date) {
+        try {
+          const emptyStore = { consumed: {}, finalConsumed: {}, reopenConsumed: {} };
+          const tmpAttempts = `${paths.attemptsFile}.tmp-${process.pid}`;
+          fs.writeFileSync(tmpAttempts, JSON.stringify(emptyStore, null, 2) + '\n');
+          fs.renameSync(tmpAttempts, paths.attemptsFile);
+          try { console.warn('[plan-publisher] local-recovery-attempts-materialized', shop, date, 'planNumber=' + Number(a.planNumber), '（新机首跑：缺文件按 loader 首次尝试官方语义物化空表）'); } catch (_) {}
+        } catch (e) {
+          return bind({ ok: false, status: 'refused', reason: 'local-recovery-attempts-materialize-failed:' + scheduledErrorText(e) });
+        }
+      }
+    }
     // B：三张表必须原始存在且为对象；缺表/错型 = 不可知，绝不把 guard loader 的默认补表当零。
     const attemptsStrict = readStrictLocalAttemptsStore(paths.attemptsFile);
     if (!attemptsStrict.ok) return bind({ ok: false, status: 'refused', reason: attemptsStrict.reason });

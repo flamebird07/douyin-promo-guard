@@ -15,6 +15,8 @@
  */
 
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { scrubDeep } = require('../lib/log');
 
 // ── 店铺扫码登录（2026-11-17，网页内嵌二维码）────────────────────────
@@ -159,10 +161,11 @@ const HTML = `<!DOCTYPE html>
       <th title="操作→修改里保存的目标 ROI（缺省 15）">目标 ROI</th>
       <th title="操作→修改里保存的每店每日计划条数（整数 1..10，缺省回落全局默认 3）">每日计划</th>
       <th title="该店此刻的真实在途状态：值守巡查处理中 / 读取数据中 / 每日开启广告处理中 / 登录接管处理中；无在途即空闲">当前动作</th>
+      <th title="计划发布（账本真实投影）：已成功/目标份数 + 最近一份状态与卡点原因。未配置发布则显示未启用">计划发布</th>
       <th style="width:220px;">操作</th>
     </tr>
   </thead>
-  <tbody id="shopBody"><tr><td colspan="13" class="muted">加载中…</td></tr></tbody>
+  <tbody id="shopBody"><tr><td colspan="14" class="muted">加载中…</td></tr></tbody>
 </table>
 
 <details>
@@ -310,7 +313,7 @@ function renderShops(rows) {
     };
   });
   if (!rows || rows.length === 0) {
-    body.innerHTML = '<tr><td colspan="13" class="muted">暂无活动店铺</td></tr>';
+    body.innerHTML = '<tr><td colspan="14" class="muted">暂无活动店铺</td></tr>';
     return;
   }
   // 用 DOM 构建 + data-id / data-name，不用字符串拼 onclick（防引号注入）
@@ -396,6 +399,38 @@ function renderShops(rows) {
     if (actBusy) {
       tdAct.style.color = '#1a7f37';
       tdAct.style.fontWeight = 'bold';
+    }
+    // 计划发布列（2026-11-21）：账本投影 已成功/目标 + 最近一份状态与卡点原因
+    var tdPub = document.createElement('td');
+    var pp = s.planPublish || null;
+    if (!pp || pp.enabled !== true) {
+      tdPub.textContent = '未启用';
+      tdPub.className = 'muted';
+    } else {
+      var pubMain = document.createElement('div');
+      var okN = Number(pp.success) || 0;
+      var tgt = pp.target != null ? pp.target : '—';
+      pubMain.textContent = okN + '/' + tgt + ' 份';
+      if (pp.target != null && okN >= pp.target) pubMain.className = 'ok';
+      tdPub.appendChild(pubMain);
+      if (pp.lastStatus) {
+        var stWord = { success: '成功', unknown: '未知（不重放）', failed: '失败', 'failed-permanent': '失败（封存）', unsubmitted: '待重试', in_progress: '进行中', preparation_stopped: '已收口' }[pp.lastStatus] || pp.lastStatus;
+        var pubLine = document.createElement('div');
+        pubLine.style.fontSize = '11px';
+        if (pp.lastStatus === 'success') pubLine.className = 'ok';
+        else if (pp.lastStatus === 'unknown' || pp.lastStatus === 'failed' || pp.lastStatus === 'failed-permanent') pubLine.className = 'bad';
+        else pubLine.className = 'muted';
+        pubLine.textContent = '最近一份：' + stWord;
+        tdPub.appendChild(pubLine);
+        if (pp.reason) {
+          var pubReason = document.createElement('div');
+          pubReason.className = 'muted';
+          pubReason.style.fontSize = '11px';
+          pubReason.title = String(pp.reason);
+          pubReason.textContent = String(pp.reason).slice(0, 60);
+          tdPub.appendChild(pubReason);
+        }
+      }
     }
     var td8 = document.createElement('td');
 
@@ -486,7 +521,7 @@ function renderShops(rows) {
     td8.appendChild(btnRefresh);
     td8.appendChild(opsWrap);
     td8.appendChild(editBox);
-    [td1, td2, tdCookie, td3, td4, td5, td6, tdBal, td7, tdRoi, tdPlans, tdAct, td8].forEach(function(td) { tr.appendChild(td); });
+    [td1, td2, tdCookie, td3, td4, td5, td6, tdBal, td7, tdRoi, tdPlans, tdAct, tdPub, td8].forEach(function(td) { tr.appendChild(td); });
     body.appendChild(tr);
   });
 }
@@ -630,6 +665,52 @@ setInterval(refresh, 5000);
 </html>`;
 
 
+// ── 计划发布状态投影（2026-11-21 主控制页「计划发布」列）──────────────
+// 数据源 = plan-publisher 真实账本 + 发布策略配置（每店当日已成功份数/目标/最近一份
+// 状态与卡点原因）。只读展示，绝不推断、绝不把 unknown 说成成功。
+const PUBLISHER_DIR = path.join(__dirname, '..', '..', 'plan-publisher');
+
+function shanghaiTodayStr(nowMs) {
+  return new Date((nowMs == null ? Date.now() : nowMs) + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+function readPlanPublishStatus(nowMs) {
+  const empty = { configured: false, autoConfirm: false, byShop: {} };
+  let cfg;
+  try {
+    cfg = JSON.parse(fs.readFileSync(path.join(PUBLISHER_DIR, 'daily-plan-config.json'), 'utf-8'));
+  } catch (_) {
+    return empty; // 未配置发布（fail-closed 不触发）→ 列显示「未启用」
+  }
+  const today = shanghaiTodayStr(nowMs);
+  let dayShops = {};
+  try {
+    const led = JSON.parse(fs.readFileSync(path.join(PUBLISHER_DIR, 'daily-plan-data', 'ledger.json'), 'utf-8'));
+    dayShops = (led.days && led.days[today] && led.days[today].shops) || {};
+  } catch (_) { /* 无账本 → 各店按未运行显示 */ }
+  const byShop = {};
+  for (const s of (Array.isArray(cfg.shops) ? cfg.shops : [])) {
+    if (!s || s.deleted === true) continue;
+    const name = String(s.name || s.id);
+    const d = dayShops[name] || null;
+    const entries = d && d.entries ? Object.values(d.entries) : [];
+    const last = entries.length ? entries[entries.length - 1] : null;
+    const target = Number.isInteger(s.plansPerShopPerDay) ? s.plansPerShopPerDay
+      : (Number.isInteger(cfg.plansPerShopPerDay) ? cfg.plansPerShopPerDay : 3);
+    byShop[name] = {
+      enabled: cfg.enabled === true,
+      autoConfirm: cfg.autoConfirm === true,
+      target,
+      success: d && Number.isInteger(d.plans) ? d.plans : 0,
+      overall: d ? d.status : '未运行',
+      lastStatus: last ? last.status : null,
+      reason: (last && last.reason) || (d && d.error) || null,
+      lastAt: (last && last.at) || (d && d.lastAt) || null,
+    };
+  }
+  return { configured: true, autoConfirm: cfg.autoConfirm === true, byShop };
+}
+
 function readBody(req) {
   return new Promise((resolve) => {
     let buf = '';
@@ -671,7 +752,17 @@ function createUiServer(monitor, port, opts) {
       return send(200, HTML, 'text/html; charset=utf-8');
     }
     if (url === '/api/status' && req.method === 'GET') {
-      return sendJson(200, monitor.getStatus());
+      const st = monitor.getStatus();
+      // 计划发布状态（2026-11-21）：账本真实投影按店合并进 shopRows（planPublish 字段）
+      try {
+        const pub = readPlanPublishStatus();
+        st.planPublishByShop = pub;
+        for (const row of (st.shopRows || [])) {
+          const key = String(row.displayName || row.name || row.id);
+          row.planPublish = pub.byShop[key] || { configured: pub.configured, enabled: pub.enabled === true, autoConfirm: pub.autoConfirm, target: null, success: 0, overall: '未运行', lastStatus: null, reason: null, lastAt: null };
+        }
+      } catch (_) { /* 投影失败不阻塞状态 */ }
+      return sendJson(200, st);
     }
     if (url === '/api/monitor/start' && req.method === 'POST') {
       const r = monitor.start();

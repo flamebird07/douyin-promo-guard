@@ -398,15 +398,16 @@ class ChengfangRunner {
   }
 
   /**
-   * 真实开启批次（每日 07:00 相位接入 monitor 主链路）。
-   * 与暂停批次的关键差异：开启不依赖费用/订单阈值（不读费用与订单），
-   * 门槛 = realMode + enableEnabled + 上海 enableHour 起窗口 + 未停止 + 未跨日。
+   * 真实开启批次（每日开启相位接入 monitor 主链路）。
+   * 与暂停批次的关键差异：开启不依赖费用/订单阈值（不读费用与订单）。
+   * 门槛 = realMode + enableEnabled + 未停止 + 未跨日 +（threshold_recovery 来源的值守窗口）。
+   * 每日开启时段：2026-11-09 定稿（docs/daily-enable-semantics-20261109.md）——每日 00:05 后
+   * 首查、暂停才开启、无小时上界；enableHour 不再参与（2026-11-21 撤除残留门禁）。
    * 返回与 Monitor._recordBatch/_summarizeBatch 兼容的批次结果。
    */
   /**
    * @param {'daily_schedule'|'threshold_recovery'|'manual_verify'} [p.enableSource]
-   *   缺省 daily_schedule（旧定时开启，enableHour 起至当日结束——2026-09-29 第 10 阶段去除
-   *   dailyStartHour 上界，支持 enableHour 晚于 dailyStartHour 的配置）；
+   *   缺省 daily_schedule（每日 00:05 后首查相位，暂停才开启，无小时上界——2026-11-09 定稿）；
    *   threshold_recovery 走值守窗口 dailyStartHour 起；
    *   manual_verify 人工按需验证（无时段门槛，其余门槛照常，fail-closed 不变）。
    */
@@ -414,8 +415,6 @@ class ChengfangRunner {
     const batchDate = shanghaiDate(this.now());
     const counts = { confirmed: 0, failed: 0, unknown: 0, skipped: 0, cancelled: 0 };
     const base = { kind: 'chengfang-enable-batch', shopId: shopCfg.id, batchDate };
-    const cf = (this.config.monitor && this.config.monitor.chengfang) || {};
-    const enableHour = cf.enableHour !== undefined && cf.enableHour !== null ? cf.enableHour : 7;
     const dailyStartHour = this.config.schedule.dailyStartHour;
     const src = enableSource === undefined || enableSource === null ? 'daily_schedule' : enableSource;
 
@@ -429,14 +428,12 @@ class ChengfangRunner {
     }
     const w = shanghaiWall(this.now());
     if (src === 'daily_schedule') {
-      if (!(w.hour >= enableHour)) {
-        const hh = String(enableHour).padStart(2, '0');
-        return {
-          outcome: 'blocked_window',
-          reason: `未到允许开启时段（每日 ${hh}:00 起至当日结束，Asia/Shanghai），本轮不执行真实开启`,
-          counts, batchDate,
-        };
-      }
+      // 2026-11-21：撤除 daily_schedule 的 enableHour 残留门禁。每日开启语义已由
+      // 2026-11-09 定稿（docs/daily-enable-semantics-20261109.md，用户确认）：
+      // 每日 00:05 后首查、暂停才开启、无小时上界（晚开机补检查）——调度器早已按此
+      // 实现（enableHour 不再参与调度），本执行器残留的 07:00 门会在 00:05-07:00
+      // 窗口把"暂停的店"拦成 blocked_window，与定稿直接冲突。真实执行仍受
+      // realMode+enableEnabled+非 dryRun 三重门约束（上方 resolveChengfangEnableAllowed）。
     } else if (src === 'threshold_recovery' && !isAfterDailyStart(this.now(), dailyStartHour)) {
       const hh = String(dailyStartHour).padStart(2, '0');
       return {

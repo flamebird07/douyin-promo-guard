@@ -1108,7 +1108,10 @@ class Monitor {
         if (afterWall.date !== w.date) continue; // 执行中跨日：回环重判（窗口外逻辑登记明日）
         const still = this._activeShops().some((s) => !this._enablePhaseDone(s.id, today));
         if (still) {
-          // 有未完成店：有界重试（RETRY_MS 后再试；跨日由回环窗口判定自然停止）
+          // 有未完成店：有界重试（RETRY_MS 后再试；跨日由回环窗口判定自然停止）。
+          // 2026-11-21 注：daily_schedule 的 enableHour 残留门禁已自执行器撤除
+          // （2026-11-09 定稿：00:05 后首查、暂停才开启、无小时上界），此处 5 分钟
+          // 有界重试即定稿语义"当日未完成时有界重试"，不再出现窗口拦截空转。
           const retryAt = afterMs + ENABLE_RETRY_MS;
           this._enableSchedule.nextRunAt = new Date(retryAt).toISOString();
           await this._enableDelay(ENABLE_RETRY_MS, gen);
@@ -1334,6 +1337,26 @@ class Monitor {
 
       // 严格串行：上一家 _pollShop（含其内部读取/动作/回读与 finally 收口）完成后才启动下一家
       for (let i = 0; i < shops.length; i += 1) await runOne(shops[i], i);
+
+      // busy 跳过店的收口补跑（2026-11-21）：巡查与每日开启相位共用单店锁，轮到该店时
+      // 若锁正被开启相位持有 → 本轮 skipped，数据会滞后整整一个巡查间隔。收口后锁多已
+      // 释放，对 skipped(busy) 店**有界补跑一次**（仍 busy 则放弃，绝不等待/绝不并发）。
+      // 仅看本周期 token（手动 pollOnce 与值守循环都适用）；真实开关动作另有派发前复核门。
+      for (let i = 0; i < shops.length; i += 1) {
+        const r = results[i];
+        if (!r || r.status !== 'skipped' || !/在途|并发|busy/i.test(String(r.reason || ''))) continue;
+        if (token.aborted) break;
+        if (this._shopBusy(shops[i].id)) continue;
+        if (!this._tryAcquireShop(shops[i].id, '值守巡查补跑（上轮撞每日开启占锁）')) continue;
+        try {
+          this._audit({ kind: 'poll', shopId: shops[i].id, status: 'retry-after-busy', reason: '巡查收口后锁已释放，对 busy 跳过店补跑一次' });
+          results[i] = { shopId: shops[i].id, ...(await this._pollShop(shops[i], token, trigger)) };
+        } catch (e) {
+          results[i] = { shopId: shops[i].id, status: 'stopped', reason: e.reason || e.message || '补跑异常' };
+        } finally {
+          this._releaseShop(shops[i].id);
+        }
+      }
 
       // 防御：极端情况下若有空槽，按配置顺序补齐 skipped（不伪造成功）
       for (let i = 0; i < results.length; i += 1) {

@@ -22,3 +22,10 @@ test/probe-*.js
 
 # 工作区本地记忆/缓存（不入公开仓库）
 .workbuddy-ai/
+
+# 计划发布运行态（2026-11-20）：策略配置含本机绝对路径且是发布总开关；账本/锁/状态绝不入库
+plan-publisher/daily-plan-config.json
+plan-publisher/daily-plan-data/
+plan-publisher/plan-publisher-state.json
+plan-publisher/shop-day-leases/
+plan-publisher/catalog-json-anomaly.log

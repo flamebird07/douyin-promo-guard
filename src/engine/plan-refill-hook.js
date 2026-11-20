@@ -12,8 +12,11 @@
  * 语义（与 Windows 生产一致，fail-closed）：
  * - 仅在**完整完成**的巡查周期后由 Monitor 调用（引擎侧已保证：拒绝/跳过/中止/只读不触发）；
  * - daily-plan-config.json 缺失或 enabled!==true → 不触发（独立发布开关，与值守 realMode 分离）；
- * - 触发 = detached spawn `node daily-plan-runner.cjs --run`（独立进程 + 自带 durable ledger 锁；
- *   发布默认停在「待人工确认」，绝无无人值守自动发布开关）；
+ * - 触发 = detached spawn `node daily-plan-runner.cjs --run --scheduler-path <本仓镜像>`
+ *   （独立进程 + 自带 durable ledger 锁 + scheduler 镜像；autoConfirm 策略 = 排程自动发布，
+ *   客户 2026-10-11 合同，Windows 生产已验证的同一入口，派发前/点击前新鲜复核 policy）；
+ * - 数量同步桥（收编自 Windows bill-manager 桥）：派发前把值守 config.json 的每店
+ *   plansPerShopPerDay/targetRoi/cookieFile 原子同步进 daily-plan-config.shops；
  * - 同一时刻最多一个补发子进程在途（进程内存标记；runner 账本锁兜底跨进程）；
  * - spawn 失败/子进程崩溃绝不影响值守（吞错记日志）。
  */
@@ -27,10 +30,17 @@ function createPlanRefillHook(opts = {}) {
   if (typeof projectRoot !== 'string' || !projectRoot) throw new Error('createPlanRefillHook: projectRoot 必填');
   const runnerPath = opts.runnerPath || path.join(projectRoot, 'plan-publisher', 'daily-plan-runner.cjs');
   const configPath = opts.configPath || path.join(projectRoot, 'plan-publisher', 'daily-plan-config.json');
+  const guardConfigPath = opts.guardConfigPath || path.join(projectRoot, 'config', 'config.json');
+  const schedulerPath = opts.schedulerPath || path.join(projectRoot, 'integrations', 'bill-manager', 'promo-plan-scheduler.js');
   const spawnFn = opts.spawnFn || require('child_process').spawn;
   const nodeBin = opts.nodeBin || process.execPath;
   const existsFn = opts.existsFn || ((p) => { try { return fs.existsSync(p); } catch (_) { return false; } });
   const readJsonFn = opts.readJsonFn || ((p) => JSON.parse(fs.readFileSync(p, 'utf-8')));
+  const writeJsonFn = opts.writeJsonFn || ((p, obj) => {
+    const tmp = `${p}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n');
+    fs.renameSync(tmp, p);
+  });
 
   let inFlight = false; // 本进程内补发子进程在途标记（跨进程由 runner 账本锁兜底）
 
@@ -45,12 +55,64 @@ function createPlanRefillHook(opts = {}) {
     }
   }
 
+  /**
+   * 数量同步桥（Mac 版，收编自 Windows bill-manager 桥）：每次派发前把值守 config.json
+   * 的每店清单与 plansPerShopPerDay/targetRoi 原子同步进 daily-plan-config.json 的 shops，
+   * 保证「页面改小/改大条数、改 ROI、删店」即时约束派发（runner 派发前还会新鲜复核）。
+   * 值守配置不可读 → 返回 false（本次不派发，fail-closed）。
+   */
+  function syncQuantitiesFromGuardConfig() {
+    let guard;
+    try {
+      guard = readJsonFn(guardConfigPath);
+    } catch (_) {
+      return false;
+    }
+    const shops = Array.isArray(guard && guard.shops) ? guard.shops : [];
+    let daily;
+    try {
+      daily = readJsonFn(configPath);
+    } catch (_) {
+      return false;
+    }
+    const prevById = new Map((Array.isArray(daily.shops) ? daily.shops : []).map((s) => [String(s.id != null ? s.id : s.name), s]));
+    daily.shops = shops
+      .filter((s) => s && s.deleted !== true && s.enabled !== false)
+      .map((s) => {
+        const prev = prevById.get(String(s.id)) || {};
+        const out = {
+          id: s.id,
+          name: s.name || s.id,
+          cookieFile: s.cookieFile || s.id,
+          platform: s.platform || 'douyin',
+          ...(s.accountId != null && String(s.accountId) !== '' ? { accountId: String(s.accountId) } : {}),
+        };
+        if (s.plansPerShopPerDay != null) out.plansPerShopPerDay = s.plansPerShopPerDay;
+        else if (prev.plansPerShopPerDay != null) out.plansPerShopPerDay = prev.plansPerShopPerDay;
+        if (s.targetRoi != null) out.targetRoi = s.targetRoi;
+        else if (prev.targetRoi != null) out.targetRoi = prev.targetRoi;
+        return out;
+      });
+    try {
+      writeJsonFn(configPath, daily);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /** Monitor onPollComplete 回调：完整巡查周期后触发一次补发 tick。 */
   return function onPollComplete() {
     if (!refillEnabled()) return; // 未配置/未启用：静默不触发（与 Windows 同语义）
     if (inFlight) return;         // 上一子进程仍在途：本轮跳过（runner 账本锁另有跨进程兜底）
     try {
-      const child = spawnFn(nodeBin, [runnerPath, '--run'], {
+      if (!syncQuantitiesFromGuardConfig()) {
+        try { log.warn('计划补发：值守配置不可读或同步失败，本次不派发（fail-closed）'); } catch (_) {}
+        return;
+      }
+      const args = [runnerPath, '--run'];
+      if (existsFn(schedulerPath)) args.push('--scheduler-path', schedulerPath);
+      const child = spawnFn(nodeBin, args, {
         cwd: path.dirname(runnerPath),
         detached: true,
         stdio: 'ignore',
@@ -61,7 +123,7 @@ function createPlanRefillHook(opts = {}) {
       inFlight = true;
       child.on('exit', () => { inFlight = false; });
       child.on('error', () => { inFlight = false; });
-      try { log.info('巡查完成：已触发计划补发 tick（独立进程，账本锁兜底；发布仍需人工确认）'); } catch (_) {}
+      try { log.info('巡查完成：已触发计划补发 tick（独立进程，账本锁兜底；autoConfirm 策略下自动发布）'); } catch (_) {}
     } catch (e) {
       try { log.warn(`计划补发触发失败（不影响值守）: ${e.message}`); } catch (_) {}
     }

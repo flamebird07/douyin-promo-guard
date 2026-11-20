@@ -67,7 +67,7 @@ node src/index.js ads                      # 只读：千川清单（历史覆�
 
 此前 Windows 生产把「巡查后触发补发」的注入方放在 bill-manager 的 start-server（Monitor onPollComplete 钩子由它注入）——这是划分不清的唯一来源。现已收编：**本仓 serve 自带该联动**（`src/engine/plan-refill-hook.js`）：完整巡查周期后 spawn 独立进程 `node plan-publisher/daily-plan-runner.cjs --run`（detached + 账本锁；`daily-plan-config.json` 缺失或 `enabled!==true` 时不触发，fail-closed；spawn 失败绝不影响值守）。bill-manager 从此在本链路中退化为纯显示。
 
-Mac 启用发布补发（本机未配置即不触发）：创建 `plan-publisher/daily-plan-config.json`（`enabled:true` + `adapterRoot`/`stateRoot` 绝对路径 + `login` Cookie 路径 + 每店条数；字段校验见 `validateDailyConfig`，`node plan-publisher/daily-plan-runner.cjs --check` 可自检）。每店条数与目标 ROI 以值守 config 为准在派发前重读。
+Mac 启用发布补发（本机未配置即不触发）：创建 `plan-publisher/daily-plan-config.json`（`enabled:true` + `adapterRoot`/`stateRoot` 绝对路径 + `login` Cookie 路径 + 每店条数；字段校验见 `validateDailyConfig`，`node plan-publisher/daily-plan-runner.cjs --check --scheduler-path integrations/bill-manager/promo-plan-scheduler.js` 可自检）。每店条数与目标 ROI 以值守 config 为准在派发前重读（同步桥每次派发前自动刷新，无需手工双维护）。本机已于 2026-11-20 按用户要求启用 `autoConfirm:true`（排程自动发布，客户 2026-10-11 合同入口；关停 = 配置改 `enabled:false`）。目录响应解析等准备期异常按合同 fail-closed 记 unknown 不重放，次一业务日自动开新一轮尝试；`catalog-json-anomaly.log` 留存响应采样定位根因。
 
 ## macOS（Apple Silicon）本地运行
 

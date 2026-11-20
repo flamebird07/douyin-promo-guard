@@ -3825,7 +3825,22 @@ function createCatalogTransport(getPage, accountId) {
     if (reqCheck.tab !== meta.tab || reqCheck.cursor !== meta.cursor) { anomalies.push({ reason: 'catalog-request-shape-drift', tab: meta.tab }); return; }
     let status; try { status = response.status(); } catch (_) { status = null; }
     if (status !== 200) { anomalies.push({ reason: 'catalog-http-status-not-200', tab: meta.tab }); return; }
-    let json; try { json = await response.json(); } catch (_) { if (isCurrentBinding(request, meta)) anomalies.push({ reason: 'catalog-response-json-unparseable', tab: meta.tab }); return; }
+    let json; try { json = await response.json(); } catch (_) {
+      if (isCurrentBinding(request, meta)) {
+        anomalies.push({ reason: 'catalog-response-json-unparseable', tab: meta.tab });
+        // 诊断采样（2026-11-20 Mac 适配）：只记状态/类型/前 300 字符，绝不记 Cookie/令牌
+        try {
+          let headers = {}; try { headers = response.headers(); } catch (_) {}
+          let bodyText = ''; try { bodyText = (await response.text()).slice(0, 300); } catch (_) { bodyText = '(body 不可读)'; }
+          const ct = headers['content-type'] || headers['Content-Type'] || '(无)';
+          const loc = headers['location'] || headers['Location'] || '';
+          fs.writeFileSync(path.join(ROOT, 'catalog-json-anomaly.log'),
+            `${new Date().toISOString()} tab=${meta.tab} status=${status} content-type=${ct}${loc ? ' location=' + loc : ''}\n${bodyText}\n\n`,
+            { flag: 'a' });
+        } catch (_) { /* 诊断采样失败不影响既有 anomaly 语义 */ }
+      }
+      return;
+    }
     // Epoch/detach may have advanced while the body awaited; a stale binding must
     // write nothing to the current epoch.
     if (!isCurrentBinding(request, meta)) return;

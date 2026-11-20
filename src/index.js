@@ -29,10 +29,11 @@
  */
 
 const path = require('path');
-const { loadConfig } = require('./config');
+const { loadConfig, PROJECT_ROOT } = require('./config');
 const { Monitor } = require('./engine/monitor');
 const { createUiServer } = require('./ui/server');
 const { loadShopCookieMeta } = require('./login/session');
+const { createPlanRefillHook } = require('./engine/plan-refill-hook');
 const log = require('./lib/log');
 
 const PORT = Number(process.env.PROMO_GUARD_PORT || 18789);
@@ -76,7 +77,11 @@ function cmdCheck() {
 
 async function cmdServe() {
   const cfg = loadConfig();
-  const monitor = new Monitor(cfg);
+  // 巡查后计划补发联动（2026-11-20 自 bill-manager 收编进本仓）：完整巡查周期后触发
+  // plan-publisher/daily-plan-runner.cjs --run（独立进程+账本锁；发布默认停在人工确认；
+  // daily-plan-config.json 未启用则不触发——fail-closed，与 Windows 生产同语义）。
+  const onPlanRefill = createPlanRefillHook({ projectRoot: PROJECT_ROOT });
+  const monitor = new Monitor(cfg, null, { onPollComplete: onPlanRefill });
   // 每日开启调度器（2026-11-20 接线，对齐 Windows 生产语义）：enableSchedulerEnabled=true
   // 时服务启动即登记每日开启任务，不依赖『开始监控』（HANDOFF Windows 生产行为）。
   // 实际执行仍受 realMode+enableEnabled+时间窗门禁约束；失败只记日志，不阻塞控制台。

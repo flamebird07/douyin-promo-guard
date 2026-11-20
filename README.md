@@ -61,6 +61,14 @@ node src/index.js ads                      # 只读：千川清单（历史覆�
 - 命令行 `npm run login`（弹出浏览器扫码）行为不变；网页内嵌二维码不可用时（登录页改版等）会如实报错并建议改用该命令。
 - 前提：`login.cookieSourceDir` 需配置非空（未配置时自动发现整个关闭——扫码成功会如实提示"新店铺不会自动加入"）；macOS 用 Playwright 自带 Chromium 需先 `npx playwright install chromium`。
 
+## 两仓功能分工（2026-11-20 澄清并收编）
+
+「每天 N 条新建计划」**属于本项目**（用户 2026-11-20 确认）——执行器一直在本仓 `plan-publisher/`（确定性工作流 + 页面控制器 + 巡查联动 runner + 账本锁 + 28 个文件；发布默认停在『待人工确认』，每份计划须人在本地确认页点确认，无无人值守自动发布开关）。bill-manager 只是借页面做**前端显示与数量同步桥**。
+
+此前 Windows 生产把「巡查后触发补发」的注入方放在 bill-manager 的 start-server（Monitor onPollComplete 钩子由它注入）——这是划分不清的唯一来源。现已收编：**本仓 serve 自带该联动**（`src/engine/plan-refill-hook.js`）：完整巡查周期后 spawn 独立进程 `node plan-publisher/daily-plan-runner.cjs --run`（detached + 账本锁；`daily-plan-config.json` 缺失或 `enabled!==true` 时不触发，fail-closed；spawn 失败绝不影响值守）。bill-manager 从此在本链路中退化为纯显示。
+
+Mac 启用发布补发（本机未配置即不触发）：创建 `plan-publisher/daily-plan-config.json`（`enabled:true` + `adapterRoot`/`stateRoot` 绝对路径 + `login` Cookie 路径 + 每店条数；字段校验见 `validateDailyConfig`，`node plan-publisher/daily-plan-runner.cjs --check` 可自检）。每店条数与目标 ROI 以值守 config 为准在派发前重读。
+
 ## macOS（Apple Silicon）本地运行
 
 1. 使用 Node.js 22 或更高版本运行 `npm ci`。

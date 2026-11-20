@@ -2027,6 +2027,12 @@ class Monitor {
     return this._shopActivity.get(String(shopId)) || null;
   }
 
+  /** 租约持有期间细化当前动作文本（如 巡查租约内：读取数据 → 关闭广告 → 回读确认）。未持租约不生效。 */
+  _setShopActivity(shopId, text) {
+    const k = String(shopId);
+    if (this._shopProcessing.has(k)) this._shopActivity.set(k, String(text));
+  }
+
   /**
    * 发布/恢复租约在途判定（PROMO-IMPL-E1）：同一店铺当日已有发布/恢复入口持锁时，
    * 值守读取/动作必须让位（同店串行、跨店不受影响）。lease 路径与 expiry 规则由
@@ -3605,12 +3611,14 @@ class Monitor {
         }
         if (action === 'pause') {
           if (this._chengfangScopeConfigured()) {
+            this._setShopActivity(shopCfg.id, this.realMode ? '关闭广告中（乘方暂停）' : '暂停枚举中（演练，零点击）');
             const r = await this._pollChengfangOver(shopCfg, data, cycleToken, trigger, {
               mixedConvergePause: opts.mixedConvergePause === true,
             });
             return this._normalizeExecuteResult(r, 'pause');
           }
           if (this._legacyWholeShopAllowed()) {
+            this._setShopActivity(shopCfg.id, '关闭广告中（全店关闭）');
             const r = await this._pollLegacyWholeShopOver(shopCfg, data, cycleToken);
             return this._normalizeExecuteResult(r, 'pause');
           }
@@ -3621,6 +3629,7 @@ class Monitor {
           };
         }
         // 低于阈值开启：threshold_recovery（值守窗口；不受每日相位去重）
+        this._setShopActivity(shopCfg.id, '开启广告中（乘方开启）');
         return this._executeEnableBatchFor(shopCfg, cycleToken, {
           reason: data.evaluation && data.evaluation.reason,
           triggerLabel: 'below_threshold_enable',
@@ -3759,6 +3768,7 @@ class Monitor {
     const opener = this._chengfangOpener || defaultChengfangOpener;
     const loginCfg = this.config.login;
     try {
+      this._setShopActivity(shopCfg.id, this.realMode ? '开启广告中（乘方开启）' : '开启枚举中（演练，零点击）');
       if (!this.realMode) {
         const res = await runner.runDryEnableCycle({ shopCfg, pageOpener: opener, loginCfg, enableSource });
         return { ...res, neverSent: true, dryRun: true, triggerLabel, enableSource, reason: reason || res.reason };
@@ -3803,6 +3813,7 @@ class Monitor {
       const coord = this._getCoordinator(shopCfg);
       let data;
       try {
+        this._setShopActivity(shopCfg.id, '读取数据中（费用/订单）');
         data = await coord.readAndEvaluate(shopCfg);
       } catch (e) {
         if (e instanceof NotConnectedError) {
@@ -3859,6 +3870,7 @@ class Monitor {
       const todayDate = shanghaiDate(this.nowFn());
 
       // 5) 本轮回读 currentAdState（清单身份/完整性失败 → blocked，不得包成 ok）
+      this._setShopActivity(shopCfg.id, '读取广告状态（乘方清单回读）');
       const stateRead = await this._readCurrentAdState(shopCfg);
       this._applyBalanceToLastData(candidate, stateRead);
       // 全局浏览器操作锁忙（PROMO-IMPL-F1）：本轮跳过该店，绝不改写广告状态、不落读取失败。
@@ -4245,7 +4257,7 @@ class Monitor {
       this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-shop-busy', trigger: source });
       return { status: 'skipped', zeroClick: true, reason: '该店已有处理在途（登录接管/巡查），本次开启相位跳过（零动作）' };
     }
-    if (!this._tryAcquireShop(shopCfg.id, '每日开启广告处理中')) {
+    if (!this._tryAcquireShop(shopCfg.id, '每日开启首查（回读广告状态）')) {
       return { status: 'skipped', zeroClick: true, reason: '同店处理互斥获取失败（并发防御），本次开启相位跳过（零动作）' };
     }
     try {

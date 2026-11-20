@@ -29,3 +29,6 @@ plan-publisher/daily-plan-data/
 plan-publisher/plan-publisher-state.json
 plan-publisher/shop-day-leases/
 plan-publisher/catalog-json-anomaly.log
+plan-publisher/shop-state/
+plan-publisher/published-products.json
+plan-publisher/catalog-json-anomaly.log

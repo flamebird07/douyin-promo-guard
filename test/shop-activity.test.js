@@ -63,3 +63,22 @@ test('互斥语义不回归：在途时再次 acquire 失败且不覆盖既有�
   monitor._releaseShop('shop-001');
   assert.strictEqual(monitor._shopBusy('shop-001'), false);
 });
+
+test('租约内细化：巡查各阶段文本（读取数据/读取广告状态）覆盖初始文本；释放后回空闲', (t) => {
+  const { monitor } = setup(t);
+  assert.strictEqual(monitor._tryAcquireShop('shop-001', '值守巡查处理中'), true);
+  monitor._setShopActivity('shop-001', '读取数据中（费用/订单）');
+  assert.strictEqual(rowActivity(monitor), '读取数据中（费用/订单）');
+  monitor._setShopActivity('shop-001', '读取广告状态（乘方清单回读）');
+  assert.strictEqual(rowActivity(monitor), '读取广告状态（乘方清单回读）');
+  monitor._setShopActivity('shop-001', '关闭广告中（乘方暂停）');
+  assert.strictEqual(rowActivity(monitor), '关闭广告中（乘方暂停）');
+  monitor._releaseShop('shop-001');
+  assert.strictEqual(rowActivity(monitor), '空闲');
+});
+
+test('细化打点不越权：未持租约时 _setShopActivity 不生效', (t) => {
+  const { monitor } = setup(t);
+  monitor._setShopActivity('shop-001', '读取数据中（费用/订单）');
+  assert.strictEqual(rowActivity(monitor), '空闲', '无租约不得出现活动文本');
+});

@@ -156,10 +156,12 @@ const HTML = `<!DOCTYPE html>
       <th title="广告费 ÷ 订单数">费比</th>
       <th title="账户级数据，仅展示、不参与自动开关判定">千川可用余额</th>
       <th>当前阈值</th>
+      <th title="操作→修改里保存的目标 ROI（缺省 15）">目标 ROI</th>
+      <th title="操作→修改里保存的每店每日计划条数（整数 1..10，缺省回落全局默认 3）">每日计划</th>
       <th style="width:220px;">操作</th>
     </tr>
   </thead>
-  <tbody id="shopBody"><tr><td colspan="10" class="muted">加载中…</td></tr></tbody>
+  <tbody id="shopBody"><tr><td colspan="12" class="muted">加载中…</td></tr></tbody>
 </table>
 
 <details>
@@ -307,7 +309,7 @@ function renderShops(rows) {
     };
   });
   if (!rows || rows.length === 0) {
-    body.innerHTML = '<tr><td colspan="10" class="muted">暂无活动店铺</td></tr>';
+    body.innerHTML = '<tr><td colspan="12" class="muted">暂无活动店铺</td></tr>';
     return;
   }
   // 用 DOM 构建 + data-id / data-name，不用字符串拼 onclick（防引号注入）
@@ -374,6 +376,18 @@ function renderShops(rows) {
     }
     var td7 = document.createElement('td');
     td7.textContent = thr;
+    // 目标 ROI / 每日计划条数列（2026-11-20）：操作→修改保存的两值直接在行内展示
+    var tdRoi = document.createElement('td');
+    tdRoi.textContent = (s.targetRoi != null ? String(s.targetRoi) : '—');
+    var tdPlans = document.createElement('td');
+    tdPlans.textContent = (s.plansPerShopPerDay != null ? (s.plansPerShopPerDay + ' 条') : '—');
+    if (s.plansPerShopPerDaySaved == null && s.plansPerShopPerDay != null) {
+      var pSmall = document.createElement('div');
+      pSmall.className = 'muted';
+      pSmall.style.fontSize = '11px';
+      pSmall.textContent = '默认';
+      tdPlans.appendChild(pSmall);
+    }
     var td8 = document.createElement('td');
 
     var btnRefresh = document.createElement('button');
@@ -463,7 +477,7 @@ function renderShops(rows) {
     td8.appendChild(btnRefresh);
     td8.appendChild(opsWrap);
     td8.appendChild(editBox);
-    [td1, td2, tdCookie, td3, td4, td5, td6, tdBal, td7, td8].forEach(function(td) { tr.appendChild(td); });
+    [td1, td2, tdCookie, td3, td4, td5, td6, tdBal, td7, tdRoi, tdPlans, td8].forEach(function(td) { tr.appendChild(td); });
     body.appendChild(tr);
   });
 }

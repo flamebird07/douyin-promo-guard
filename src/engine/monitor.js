@@ -164,6 +164,7 @@ class Monitor {
     this._cycleRunning = false;
     this._activeTokens = new Set();
     this._shopProcessing = new Set(); // WD-NEW-1 并发收口：同店处理互斥（巡查/接管/每日开启/手动验证共用）
+    this._shopActivity = new Map(); // 单店当前动作文本（与 _shopProcessing 同生命周期；2026-11-20 控制台「当前动作」列）
 
     // ── 独立每日开启调度器（2026-09-15 上线）────────────────────────
     // 生命周期与"启动值守"（超额暂停巡查）完全分离：
@@ -1312,7 +1313,7 @@ class Monitor {
           this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'skipped', reason: 'shop-processing-busy' });
           return;
         }
-        if (!this._tryAcquireShop(shopCfg.id)) {
+        if (!this._tryAcquireShop(shopCfg.id, '值守巡查处理中')) {
           results[idx] = { shopId: shopCfg.id, status: 'skipped', reason: '同店处理互斥获取失败（并发防御），本轮跳过' };
           return;
         }
@@ -1864,7 +1865,7 @@ class Monitor {
     }
     // D24 逐店串行（跨入口收口）：目标店正被巡查周期/每日开启/登录接管在途处理时，
     // 本只读刷新不叠加并发同店处理，如实返回可稍后重试（复用既有每店处理互斥，不另造锁）。
-    if (!this._tryAcquireShop(shopId)) {
+    if (!this._tryAcquireShop(shopId, '读取数据中（只读）')) {
       return {
         ok: true, readOnly: true, shopId, adState: 'unknown',
         blocked: 'shop_busy',
@@ -2002,15 +2003,28 @@ class Monitor {
     return this._shopProcessing.has(String(shopId));
   }
 
-  _tryAcquireShop(shopId) {
+  /**
+   * 单店当前动作（2026-11-20 主控制页「当前动作」列）：租约登记时附带人类可读文本，
+   * 释放即清除——如实反映该店此刻在做什么（巡查/读取/开启/登录接管），
+   * 不做任何推断或美化；无租约且无只读刷新在途 → 空闲。
+   */
+  _tryAcquireShop(shopId, activityText) {
     const k = String(shopId);
     if (this._shopProcessing.has(k)) return false;
     this._shopProcessing.add(k);
+    if (activityText) this._shopActivity.set(k, String(activityText));
     return true;
   }
 
   _releaseShop(shopId) {
-    this._shopProcessing.delete(String(shopId));
+    const k = String(shopId);
+    this._shopProcessing.delete(k);
+    this._shopActivity.delete(k);
+  }
+
+  /** 在途动作文本（无租约返回 null；只读刷新的 dataRefreshing 由投影层合并）。 */
+  _shopActivityText(shopId) {
+    return this._shopActivity.get(String(shopId)) || null;
   }
 
   /**
@@ -2117,7 +2131,7 @@ class Monitor {
       }
     }
     // D24T 等待期间复核：取得资格前重新尝试同店锁，绝不让两个入口同时各持一家店。
-    if (!this._tryAcquireShop(shopId)) {
+    if (!this._tryAcquireShop(shopId, '登录接管处理中')) {
       return { ok: false, status: 'skipped', reason: '该店已有处理在途（并发去重）' };
     }
     const token = { aborted: false, kind: 'pause' };
@@ -4231,7 +4245,7 @@ class Monitor {
       this._audit({ kind: 'enable-phase', shopId: shopCfg.id, event: 'skipped-shop-busy', trigger: source });
       return { status: 'skipped', zeroClick: true, reason: '该店已有处理在途（登录接管/巡查），本次开启相位跳过（零动作）' };
     }
-    if (!this._tryAcquireShop(shopCfg.id)) {
+    if (!this._tryAcquireShop(shopCfg.id, '每日开启广告处理中')) {
       return { status: 'skipped', zeroClick: true, reason: '同店处理互斥获取失败（并发防御），本次开启相位跳过（零动作）' };
     }
     try {
@@ -5012,6 +5026,9 @@ class Monitor {
           lastError: rt.lastError || (t && t.blockedReason) || null,
           // 状态供界面兼容；正常配置店铺不显示待核验标记。
           identityPending: this._shopIdentityState(s).pending,
+          // 当前动作（2026-11-20 主控制页）：租约在途文本 > 只读刷新在途 > 空闲。如实投影，不推断。
+          activity: this._shopActivityText(s.id)
+            || (rt.dataRefreshing === true ? '读取数据中（只读）' : '空闲'),
           identityNote: this._shopIdentityState(s).reason,
           // D56：有效启用状态等价于"未删除"，避免把历史 enabled=false 的正常店误示为未启用。
           enabled: s.deleted !== true,

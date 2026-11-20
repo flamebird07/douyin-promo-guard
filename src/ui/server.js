@@ -158,10 +158,11 @@ const HTML = `<!DOCTYPE html>
       <th>当前阈值</th>
       <th title="操作→修改里保存的目标 ROI（缺省 15）">目标 ROI</th>
       <th title="操作→修改里保存的每店每日计划条数（整数 1..10，缺省回落全局默认 3）">每日计划</th>
+      <th title="该店此刻的真实在途状态：值守巡查处理中 / 读取数据中 / 每日开启广告处理中 / 登录接管处理中；无在途即空闲">当前动作</th>
       <th style="width:220px;">操作</th>
     </tr>
   </thead>
-  <tbody id="shopBody"><tr><td colspan="12" class="muted">加载中…</td></tr></tbody>
+  <tbody id="shopBody"><tr><td colspan="13" class="muted">加载中…</td></tr></tbody>
 </table>
 
 <details>
@@ -309,7 +310,7 @@ function renderShops(rows) {
     };
   });
   if (!rows || rows.length === 0) {
-    body.innerHTML = '<tr><td colspan="12" class="muted">暂无活动店铺</td></tr>';
+    body.innerHTML = '<tr><td colspan="13" class="muted">暂无活动店铺</td></tr>';
     return;
   }
   // 用 DOM 构建 + data-id / data-name，不用字符串拼 onclick（防引号注入）
@@ -387,6 +388,14 @@ function renderShops(rows) {
       pSmall.style.fontSize = '11px';
       pSmall.textContent = '默认';
       tdPlans.appendChild(pSmall);
+    }
+    // 当前动作列（2026-11-20）：引擎租约在途文本（巡查/读取/开启/登录接管），无在途即「空闲」
+    var tdAct = document.createElement('td');
+    var actBusy = s.activity && s.activity !== '空闲';
+    tdAct.textContent = s.activity || '空闲';
+    if (actBusy) {
+      tdAct.style.color = '#1a7f37';
+      tdAct.style.fontWeight = 'bold';
     }
     var td8 = document.createElement('td');
 
@@ -477,7 +486,7 @@ function renderShops(rows) {
     td8.appendChild(btnRefresh);
     td8.appendChild(opsWrap);
     td8.appendChild(editBox);
-    [td1, td2, tdCookie, td3, td4, td5, td6, tdBal, td7, tdRoi, tdPlans, td8].forEach(function(td) { tr.appendChild(td); });
+    [td1, td2, tdCookie, td3, td4, td5, td6, tdBal, td7, tdRoi, tdPlans, tdAct, td8].forEach(function(td) { tr.appendChild(td); });
     body.appendChild(tr);
   });
 }

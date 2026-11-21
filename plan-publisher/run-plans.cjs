@@ -36,12 +36,26 @@ function overlaySweepInPage(opts) {
     const isClose = !isSkip && t.length === 0 && closeHint(el);
     if (!isSkip && !isClose) continue;
     // 危险守卫：控件自身文本或最近浮层祖先文本带危险业务词 → 绝不点
+    // 工作面排除：控件位于 drawer/panel（流程工作面，如商品目录抽屉）内 → 不是浮窗，绝不点
+    let inWorkSurface = false;
     let root = el;
-    for (let i = 0; i < 8 && root && root !== document.body; i++) {
+    for (let i = 0; i < 10 && root && root !== document.body; i++) {
       const cls = String((root.className && root.className.baseVal !== undefined) ? root.className.baseVal : (root.className || ''));
-      if (/modal|popup|dialog|guide|tour|drawer|mask|backdrop|wrap/i.test(cls)) break;
+      if (/oc-drawer|drawer|panel/i.test(cls)) { inWorkSurface = true; break; }
       root = root.parentElement || root;
     }
+    if (inWorkSurface) continue;
+    // 浮层判定（放宽，2026-11-21 用户截图实证）：跳过控件的祖先链里存在 position:fixed/absolute
+    // 且面积可观的浮层容器即可（UNI_PROM 蓝色引导卡不带 modal/guide 类名也能接住）。
+    root = el;
+    let hasFloatRoot = false;
+    for (let i = 0; i < 10 && root && root !== document.body; i++) {
+      let cs = null; try { cs = getComputedStyle(root); } catch (_) {}
+      let r = null; try { r = root.getBoundingClientRect(); } catch (_) {}
+      if (cs && (cs.position === 'fixed' || cs.position === 'absolute') && r && r.width >= 200 && r.height >= 100) { hasFloatRoot = true; break; }
+      root = root.parentElement || root;
+    }
+    if (!hasFloatRoot) continue; // 不在定位浮层里的零散控件 → 不动
     if (DANGER.test(txt(root)) || DANGER.test(t)) continue;
     picked.push({ el, kind: isSkip ? 'skip' : 'close', text: t.slice(0, 12), d: depth(el), rootCls: String(root.className || '').slice(0, 60) });
   }
@@ -4392,11 +4406,27 @@ function createRealDrivers(ctx) {
     if (initial === 'disabled-or-unknown') throw new Error('numeric-leaf-next-page-control-disabled-or-unknown');
     const selectedIds = (context.selectedIds || []).map(String);
     await settleProductPage({ cat: context.cat, native: false, pageNo: currentPage, selectedIds, baseSelectedCount: context.baseSelectedCount });
-    const scope = await page.evaluate(numericPickerPagingInPage, {
+    let scope = await page.evaluate(numericPickerPagingInPage, {
       mode: 'read', expectedCurrentPage: currentPage,
       expectedSelectedCount: before.selectedCount, expectedCapacity: before.remainingCapacity,
       selectedIds, accountId,
     });
+    if (!scope || scope.ok !== true) {
+      // 2026-11-21（用户指令：浮窗出现立即点掉）：翻页范围证明被阻挡浮窗拦下时，
+      // 先清浮窗（跳过/右上角叉）+ 引导相位，重整页面后**重证一次**；仍不成立才
+      // 按原 fail-closed 停止（绝不隔浮窗点击翻页控件）。
+      if (scope && scope.reason === 'numeric-pager-blocking-overlay-present') {
+        try { await sweepOverlays(page, 3); } catch (_) {}
+        try { await guidancePhase(); } catch (_) {}
+        await settleProductPage({ cat: context.cat, native: false, pageNo: currentPage, selectedIds, baseSelectedCount: context.baseSelectedCount });
+        const scopeRetry = await page.evaluate(numericPickerPagingInPage, {
+          mode: 'read', expectedCurrentPage: currentPage,
+          expectedSelectedCount: before.selectedCount, expectedCapacity: before.remainingCapacity,
+          selectedIds, accountId,
+        });
+        if (scopeRetry && scopeRetry.ok === true) { scope = scopeRetry; }
+      }
+    }
     if (!scope || scope.ok !== true) throw new Error('numeric-leaf-scope-not-proven:' + (scope && scope.reason || 'unknown'));
     if (scope.currentPage !== currentPage) throw new Error('numeric-leaf-scope-page-drift');
     if (String(scope.accountId) !== String(accountId)) throw new Error('numeric-leaf-scope-account-drift');
@@ -4680,6 +4710,8 @@ function createRealDrivers(ctx) {
     if(!baselineBatch)throw new Error('native-catalog-batch-missing');
     const prevSeq=baselineBatch.seq;
     const prevDom=new Set((await drawer()).cards.map(c=>String(c.id||'')).filter(Boolean));
+    // 2026-11-21 用户指令：任何操作之前都要检查浮窗——滚动翻页前清一次
+    await sweepOverlays(page, 2).catch(() => {});
     const step=await page.evaluate(nativeScrollStepInPage);
     if(!step||!step.ok)throw new Error('native-scroll-step-failed');
     const markerNudged=!!(step.marker&&step.marker.nudged===true);
@@ -4690,10 +4722,25 @@ function createRealDrivers(ctx) {
         advAnomaly=res.anomaly||null;next=advAnomaly?null:res.batch;
       } catch(_) { next=null; }
       if(advAnomaly)throw new Error('native-catalog-anomaly:'+advAnomaly);
-      if(!next)throw new Error('native-catalog-no-progress');
+      if(!next){
+        // 2026-11-21 用户指令：无进展先清浮窗再试一次（浮窗可能挡住滚动容器/请求触发）
+        await sweepOverlays(page, 2).catch(() => {});
+        await transport.flush();
+        const retry=await until(async()=>{await transport.flush();return {batch:transport.lastBatchForTab(tab),anomaly:transport.anomaly()};},x=>!!x.anomaly||(x.batch&&x.batch.seq>prevSeq),nativeTimeoutMs,'native-scroll-batch-retry').catch(()=>null);
+        const retryAnomaly=retry&&retry.anomaly?retry.anomaly:null;
+        if(retryAnomaly)throw new Error('native-catalog-anomaly:'+retryAnomaly);
+        next=retry&&retry.batch?retry.batch:null;
+        if(!next)throw new Error('native-catalog-no-progress');
+      }
       let grew=false;
       try { await until(async()=>{const s=await page.evaluate(drawerSnapshotInPage);return s.ok?s.cards.map(c=>String(c.id||'')).filter(Boolean):[];},ids=>ids.some(id=>!prevDom.has(id)),nativeTimeoutMs,'native-scroll-dom-growth'); grew=true; }
       catch(_) { grew=false; }
+      if(!grew){
+        // 2026-11-21：DOM 未增长同样先清浮窗再等一次（有新批次但卡片未渲染到位）
+        await sweepOverlays(page, 2).catch(() => {});
+        try { await until(async()=>{const s=await page.evaluate(drawerSnapshotInPage);return s.ok?s.cards.map(c=>String(c.id||'')).filter(Boolean):[];},ids=>ids.some(id=>!prevDom.has(id)),nativeTimeoutMs,'native-scroll-dom-growth-retry'); grew=true; }
+        catch(_) { grew=false; }
+      }
       if(!grew)throw new Error('native-catalog-no-progress');
       return {eof:false};
     } finally {
@@ -5518,6 +5565,8 @@ function createRealDrivers(ctx) {
         let clk=null;
         try { clk=await page.evaluate(selectBindingDrawerPanelInPage,pid); } catch(_) { return {ok:false,reason:'account-anchor-panel-navigation-rejected'}; }
         if(!clk||clk.clicked!==true||String(clk.id)!==pid) return {ok:false,reason:'account-anchor-panel-navigation-not-confirmed'};
+        // 2026-11-21 用户指令：切换商品后立即清浮窗（UNI_PROM 蓝色引导卡带「跳过」在此阶段出现）
+        try { await sweepOverlays(page, 1); } catch (_) {}
         // 2026-11-21 锚点诊断：逐候选记录抽屉行数/勾选/禁用形态（本地 stdout），人工据此判断
         // 是"店铺无手动抖音号"（业务前提缺失）还是浮窗/页面形态问题。
         try {
@@ -7383,10 +7432,15 @@ async function runScheduledPlan(businessInput, opts) {
   const nowOf = () => (typeof o.nowMs === 'function' ? o.nowMs() : (Number.isFinite(o.nowMs) ? o.nowMs : Date.now()));
   const log = typeof o.onLog === 'function' ? o.onLog : () => {};
   const AUTHORIZED_BY = 'recurring-user-policy';
-  const result = (status, reason, extra) => ({
-    status, reason: reason || null, planId: null, authorizedBy: AUTHORIZED_BY, humanApproved: false,
-    recurringPolicyAuthorized: policyApproved(), ...(extra || {}),
-  });
+  // 最终结果记录（2026-11-21）：finally 里据此判断是否留存"卡点页面"截图（用户要看卡在哪）
+  let lastOutcome = null;
+  const result = (status, reason, extra) => {
+    lastOutcome = { status, reason: reason || null };
+    return {
+      status, reason: reason || null, planId: null, authorizedBy: AUTHORIZED_BY, humanApproved: false,
+      recurringPolicyAuthorized: policyApproved(), ...(extra || {}),
+    };
+  };
   // policyProvider（新鲜读取）优先于入口快照：排程侧传入的是"当前已生效配置"，
   // 入口检查也必须是那一份，不能拿调用方冻结的旧快照授权。
   const policy = typeof o.policyProvider === 'function'
@@ -7847,6 +7901,21 @@ async function runScheduledPlan(businessInput, opts) {
     return result(opened ? 'unknown' : 'failed', 'scheduled-run-exception:' + reason, { noReplay: !!opened });
   } finally {
     if (opened) {
+      // 2026-11-21 卡点页面留存（用户要求"卡在哪里给我看"）：非成功收口且浏览器还在时，
+      // 关闭前截图 + 落 URL 到 plan-publisher/stuck-page.png / stuck-page.log。
+      if (lastOutcome && lastOutcome.status !== 'success') {
+        try {
+          const pg = opened.target;
+          if (pg && typeof pg.screenshot === 'function' && !pg.isClosed()) {
+            const shotPath = path.join(ROOT, 'stuck-page.png');
+            await pg.screenshot({ path: shotPath, fullPage: false });
+            const urlNow = await pg.url().catch(() => '(url 不可读)');
+            fs.writeFileSync(path.join(ROOT, 'stuck-page.log'),
+              `${new Date().toISOString()} status=${lastOutcome.status} reason=${lastOutcome.reason || ''}\nurl=${urlNow}\n`, { flag: 'a' });
+            log('warn', `卡点页面已截图: ${shotPath} (url=${String(urlNow).slice(0, 80)})`);
+          }
+        } catch (_) { /* 截图失败不影响收口 */ }
+      }
       if (!preserveOwnedBrowser) {
         if (!cookiesSaved) {
           try {

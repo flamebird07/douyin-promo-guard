@@ -647,7 +647,7 @@ class Monitor {
     } catch (_) { /* 审计落盘失败不阻塞 */ }
     // 过程事件接入事件流（与审计文件同源，不编造、不丢字段）
     try {
-      this._memPush(this.processEvents, { evtType: 'process', ...entry }, 500, 'process');
+      this._memPush(this.processEvents, { evtType: 'process', ts: new Date(this.nowFn()).toISOString(), ...entry }, 500, 'process');
     } catch (_) { /* 事件流写入失败不影响业务 */ }
   }
 

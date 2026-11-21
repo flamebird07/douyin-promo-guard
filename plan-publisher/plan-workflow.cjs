@@ -1203,6 +1203,8 @@ async function preparePlan(deps) {
   let finalRows = mainRows;
   for (let round = 0; !readiness.ready && round < biz.productsPerPlan; round++) {
     if (readiness.unknownManualIds.length) {
+      // 2026-11-21 诊断：未知绑定证据的主表行原文（本地 stdout，便于人工判断解析缺口）
+      try { const unknownRows = mainRows.filter(r => readiness.unknownManualIds.includes(r.productId)); console.log(JSON.stringify({ op: 'diag-unknown-binding-rows', rows: unknownRows.map(r => ({ productId: r.productId, manualAccounts: r.manualAccounts, text: String(r.text || '').replace(/s+/g, ' ').slice(0, 160) })) }, null, 1)); } catch (_) {}
       return { status: 'stopped', stage: 'readiness', reason: 'manual-binding-evidence-unknown-no-removal', readiness, businessDate };
     }
     const plan = planRemovalAndBackfill({

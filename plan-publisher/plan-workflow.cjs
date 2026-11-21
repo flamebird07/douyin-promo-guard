@@ -470,7 +470,10 @@ function parseMainTableRow(rowText) {
   // A product-ID-shaped token (15-20 digits) can never pose as the account, and a lone
   // manage button / lone name / lone ID stays unknown -- never guessed as manual.
   const singleManual = !mm && /(?:^|\s)\S+\s+ID\s*[:：]\s*(?!\d{15,20}(?:\s|$))\S+\s+管理(?:手动添加)?抖音号(?:\s|$)/.test(text);
-  const autoPullOnly = !mm && !singleManual && /预估自动拉取\s*\d+\s*个/.test(text);
+  // 2026-11-21 页面版本适配（用户实测 Mac 新后台）：计数文案存在「预估自动拉取 N 个」与
+  // 「自动拉取 N 个」两种形态（前者旧版/部分页面，后者当前创建页实测），同为 auto-pull-only
+  // 已知零手动绑定状态，正则同时接受两种前缀。
+  const autoPullOnly = !mm && !singleManual && /(?:预估)?自动拉取\s*\d+\s*个/.test(text);
   const manualAccounts = mm ? Number(mm[1]) : (singleManual ? 1 : (autoPullOnly ? 0 : null));
   return {
     productId: uniq.length === 1 ? uniq[0] : null,

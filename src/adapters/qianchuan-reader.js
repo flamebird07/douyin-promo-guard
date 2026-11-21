@@ -79,6 +79,50 @@ const DEFAULT_READINESS_INTERVAL_MS = 3000;
 // 冻结/回拨（或 interval 非法导致 deadline 永不越过），必须靠限次收敛，绝不空转。
 // maxAttempts = ceil(timeout/interval)+1，并夹到 [1, MAX_READINESS_ATTEMPTS]。
 const MAX_READINESS_ATTEMPTS = 1000;
+
+// 2026-11-21 通用浮窗清扫（用户指令：出现的浮窗立即点掉——优先「跳过」，其次右上角叉）。
+// 仅点文本/标签明确匹配的控件（最深叶子优先），危险业务文本守卫；零猜测。
+function qcOverlaySweepInPage(opts) {
+  const maxClicks = (opts && Number.isInteger(opts.maxClicks)) ? opts.maxClicks : 3;
+  const visible = (el) => {
+    try { const r = el.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) return false; const cs = getComputedStyle(el); return cs.visibility !== 'hidden' && cs.display !== 'none'; } catch (_) { return false; }
+  };
+  const txt = (el) => String(el.textContent || '').replace(/s+/g, ' ').trim();
+  const SKIP_RE = /^(跳过|跳过引导|我知道了|知道了|关闭|不再提示|以后再说|暂不|暂不开启|×|✕)$/;
+  const closeHint = (el) => {
+    const cls = String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || ''));
+    const al = String((el.getAttribute && el.getAttribute('aria-label')) || '');
+    return /close|Close|关闭|叉|dialog-close|modal-close|icon[-_]?close/i.test(cls + ' ' + al);
+  };
+  const DANGER = /(删除|暂停|终止|不可恢复|确认发布|提交|报名|去开启|立即投放|授权登录|扫码登录|重新登录)/;
+  const depth = (el) => { let d = 0; let n = el; while (n && n !== document.body) { d += 1; n = n.parentElement; } return d; };
+  const all = Array.prototype.slice.call(document.querySelectorAll('button, a, [role="button"], span, div, svg, i, em')).filter(visible);
+  const picked = [];
+  for (const el of all) {
+    if (picked.length >= maxClicks * 3) break;
+    const t = txt(el);
+    const isSkip = SKIP_RE.test(t);
+    const isClose = !isSkip && t.length === 0 && closeHint(el);
+    if (!isSkip && !isClose) continue;
+    let root = el;
+    for (let i = 0; i < 8 && root && root !== document.body; i++) {
+      const cls = String((root.className && root.className.baseVal !== undefined) ? root.className.baseVal : (root.className || ''));
+      if (/modal|popup|dialog|guide|tour|drawer|mask|backdrop|wrap/i.test(cls)) break;
+      root = root.parentElement || root;
+    }
+    if (DANGER.test(txt(root)) || DANGER.test(t)) continue;
+    picked.push({ el, kind: isSkip ? 'skip' : 'close', text: t.slice(0, 12), d: depth(el) });
+  }
+  picked.sort((a, b) => (a.kind === b.kind ? b.d - a.d : (a.kind === 'skip' ? -1 : 1)));
+  let clicked = 0;
+  const actions = [];
+  for (const p of picked) {
+    if (clicked >= maxClicks) break;
+    try { p.el.click(); clicked += 1; actions.push({ kind: p.kind, text: p.text }); } catch (_) {}
+  }
+  return { clicked, actions };
+}
+
 // SWITCH-CLICK-RETRY-20261103：切至账户视图点击的**有界**重试上限（只对非遮挡类瞬时错误）。
 // 独立计数，不复用 attempt；同时受 maxAttempts/deadline 双重约束，绝不放大点击次数。
 const SWITCH_CLICK_MAX_RETRIES = 2;
@@ -976,6 +1020,15 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
           return fail('千川营销弹窗关闭后仍存在：停止后续点击，未点击业务按钮');
         }
         try {
+          // 2026-11-21：点击前先清浮窗（用户指令：出现即点掉）——浮窗挡住按钮会 10s 超时。
+          try {
+            for (let i = 0; i < 3; i++) {
+              const sw = await target.evaluate(qcOverlaySweepInPage, { maxClicks: 3 });
+              if (!sw || !sw.clicked) break;
+              console.warn('[qianchuan-reader] home overlay-sweep round ' + (i + 1) + ' clicked=' + sw.clicked);
+              await target.waitForTimeout(400);
+            }
+          } catch (_) { /* 清扫失败不阻塞原点击路径 */ }
           // 不强制点击；Playwright 的可见、启用和命中测试保护被遮挡的按钮。
           await button.click({ timeout: Math.min(timeoutMs, 10000) });
           switched = true;
@@ -984,6 +1037,22 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
           // SWITCH-CLICK-ERROR-20261103：真实错误（name+清洗后 message）必须落盘，禁止吞掉。
           const errInfo = describeSwitchClickError(error);
           const failSwitch = message => fail(`${message}${errInfo.detail}`);
+          // 2026-11-21 浮窗证据捕获：点击超时（用户实测：千川首页有带「跳过」的浮窗挡按钮）
+          // 时，dump 可信首页上的浮层候选与「跳过」控件身份到 plan-publisher/overlay-diag.log
+          // （只读探针，零点击）——人工据此判断浮窗类型并决定是否加入白名单。绝不盲点未知浮窗。
+          if (error && error.name === 'TimeoutError') {
+            try {
+              const { handleChengfangOverlayInPage: overlayProbe } = require('./chengfang-reader');
+              const diag = await target.evaluate(overlayProbe, { click: false }).catch(e => ({ probeError: String((e && e.message) || e).slice(0, 120) }));
+              const fs2 = require('fs');
+              const dir2 = path.join(__dirname, '..', '..', 'plan-publisher');
+              fs2.mkdirSync(dir2, { recursive: true });
+              fs2.writeFileSync(require('path').join(dir2, 'overlay-diag.log'),
+                new Date().toISOString() + ' [switch-account-view-timeout] url=' + String(target.url()).slice(0, 100) + '\n' + JSON.stringify(diag, null, 1) + '\n\n',
+                { flag: 'a' });
+              console.warn('[qianchuan-reader] switch-timeout overlay-diag written');
+            } catch (_) { /* 诊断失败不影响原 fail-closed 路径 */ }
+          }
           const urlChanged = target.url() !== before;
           const popupStillOpen = !!(view.popup && view.popup.present);
           // 遮挡类（原有路径，行为不变）：TimeoutError + intercepts pointer events → 有界再观察。

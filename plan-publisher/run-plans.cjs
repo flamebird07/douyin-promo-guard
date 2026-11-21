@@ -7,6 +7,54 @@ const path = require('path');
 const crypto = require('crypto');
 const wf = require('./plan-workflow.cjs');
 const guard = require('./direct-draft-controller.cjs');
+
+// ── 通用浮窗清扫（2026-11-21，用户指令：出现的浮窗立即点掉——优先「跳过」，其次右上角叉）──
+// 页面内执行的单轮清扫：扫描可见浮层控件，按 跳过家族 > 右上角关闭（aria/class close、×✕）
+// 优先级点击（最深节点优先），单轮最多 maxClicks 次。危险业务文本守卫：控件或其浮层根
+// 带删除/暂停/终止/提交等文本时绝不点（那是业务按钮不是浮窗叉）。零猜测：只点文本/标签
+// 明确匹配的控件。调用方负责多轮复扫与等待。
+function overlaySweepInPage(opts) {
+  const maxClicks = (opts && Number.isInteger(opts.maxClicks)) ? opts.maxClicks : 3;
+  const visible = (el) => {
+    try { const r = el.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) return false; const cs = getComputedStyle(el); return cs.visibility !== 'hidden' && cs.display !== 'none'; } catch (_) { return false; }
+  };
+  const txt = (el) => String(el.textContent || '').replace(/\s+/g, ' ').trim();
+  const SKIP_RE = /^(跳过|跳过引导|我知道了|知道了|关闭|不再提示|以后再说|暂不|暂不开启|×|✕)$/;
+  const closeHint = (el) => {
+    const cls = String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || ''));
+    const al = String((el.getAttribute && el.getAttribute('aria-label')) || '');
+    return /close|Close|关闭|叉|dialog-close|modal-close|icon[-_]?close/i.test(cls + ' ' + al);
+  };
+  const DANGER = /(删除|暂停|终止|不可恢复|确认发布|提交|报名|去开启|立即投放|授权登录|扫码登录|重新登录)/;
+  const depth = (el) => { let d = 0; let n = el; while (n && n !== document.body) { d += 1; n = n.parentElement; } return d; };
+  const all = Array.prototype.slice.call(document.querySelectorAll('button, a, [role="button"], span, div, svg, i, em')).filter(visible);
+  const picked = [];
+  for (const el of all) {
+    if (picked.length >= maxClicks * 3) break;
+    const t = txt(el);
+    const isSkip = SKIP_RE.test(t);
+    const isClose = !isSkip && t.length === 0 && closeHint(el);
+    if (!isSkip && !isClose) continue;
+    // 危险守卫：控件自身文本或最近浮层祖先文本带危险业务词 → 绝不点
+    let root = el;
+    for (let i = 0; i < 8 && root && root !== document.body; i++) {
+      const cls = String((root.className && root.className.baseVal !== undefined) ? root.className.baseVal : (root.className || ''));
+      if (/modal|popup|dialog|guide|tour|drawer|mask|backdrop|wrap/i.test(cls)) break;
+      root = root.parentElement || root;
+    }
+    if (DANGER.test(txt(root)) || DANGER.test(t)) continue;
+    picked.push({ el, kind: isSkip ? 'skip' : 'close', text: t.slice(0, 12), d: depth(el), rootCls: String(root.className || '').slice(0, 60) });
+  }
+  // 最深优先（点叶子控件而不是它的容器），跳过家族优先于关闭
+  picked.sort((a, b) => (a.kind === b.kind ? b.d - a.d : (a.kind === 'skip' ? -1 : 1)));
+  let clicked = 0;
+  const actions = [];
+  for (const p of picked) {
+    if (clicked >= maxClicks) break;
+    try { p.el.click(); clicked += 1; actions.push({ kind: p.kind, text: p.text, cls: p.rootCls }); } catch (_) {}
+  }
+  return { clicked, actions };
+}
 const { createConfirmationServer } = require('./confirmation-ui.cjs');
 const shopProfile = require('./shop-profile.cjs');
 
@@ -206,12 +254,17 @@ function provePreparationZeroConsumption(stateRaw, attempts, businessDate) {
   // 是消费疑点：一律禁止收口，绝不把带旗标的 preparing 当"零消费"。
   if (stateRaw.unknown || stateRaw.pending) return { ok: false, reason: 'day-state-unresolved-flag-present' };
   if (String(stateRaw.businessDate || '') !== String(businessDate)) return { ok: false, reason: 'state-business-date-mismatch' };
-  if (String(a.businessDate || '') !== String(businessDate)) return { ok: false, reason: 'active-business-date-mismatch' };
+  // 2026-11-21 手动入口适配：manual main() 写 preparing 时不带 active.businessDate
+  //（scheduled 路径才写）。scheduled 遗留仍强制逐字相等；manual 遗留（runId 为
+  // MANUAL origin）只在字段**缺失**时放行——字段存在则照旧强制相等。
+  const scheduledOrigin = SCHEDULED_RUN_ORIGIN_RE.exec(String(a.runId || ''));
+  const manualOrigin = wf.MANUAL_RUN_ORIGIN_RE.exec(String(a.runId || ''));
+  if (!scheduledOrigin && !manualOrigin && String(a.runId || '') !== '') return { ok: false, reason: 'run-origin-not-scheduled' };
+  if (scheduledOrigin && String(a.businessDate || '') !== String(businessDate)) return { ok: false, reason: 'active-business-date-mismatch' };
+  if (scheduledOrigin && scheduledOrigin[1] !== String(businessDate)) return { ok: false, reason: 'run-origin-not-scheduled' };
   const planNumber = Number(a.planNumber);
   if (!Number.isInteger(planNumber) || planNumber < 1) return { ok: false, reason: 'active-plan-number-invalid' };
   const runId = String(a.runId || '');
-  const origin = SCHEDULED_RUN_ORIGIN_RE.exec(runId);
-  if (!origin || origin[1] !== String(businessDate)) return { ok: false, reason: 'run-origin-not-scheduled' };
   if (a.frozen || a.confirmationId != null || a.manifestHash != null || a.planId != null || a.nonce != null) {
     return { ok: false, reason: 'confirmation-artifacts-present' };
   }
@@ -290,8 +343,13 @@ function proveLocalPreparationNoConsumption(stateRaw, attempts, businessDate, ex
   const date = String(businessDate || '');
   const runId = String((expected && expected.runId) || '');
   const planNumber = Number(expected && expected.planNumber);
-  const origin = SCHEDULED_RUN_ORIGIN_RE.exec(runId);
-  if (!origin || origin[1] !== date) return { ok: false, reason: 'run-origin-not-scheduled' };
+  const scheduled = SCHEDULED_RUN_ORIGIN_RE.exec(runId);
+  const manual = wf.MANUAL_RUN_ORIGIN_RE.exec(runId);
+  // 2026-11-21：scheduled origin 内嵌业务日必须一致；manual origin 内嵌**自身启动日**，
+  // 允许跨午夜（启动在 23:xx、业务日为次日）——manual 遗留的零消费由三表/发布/手动事实面
+  // 全空证明承担，origin 只做形态校验。
+  if (scheduled && scheduled[1] !== date) return { ok: false, reason: 'run-origin-not-scheduled' };
+  if (!scheduled && !manual && runId !== '') return { ok: false, reason: 'run-origin-not-scheduled' };
   if (!Number.isInteger(planNumber) || planNumber < 1) return { ok: false, reason: 'active-plan-number-invalid' };
   if (!stateRaw || typeof stateRaw !== 'object' || Array.isArray(stateRaw)) return { ok: false, reason: 'state-malformed' };
   if (stateRaw.unknown || stateRaw.pending) return { ok: false, reason: 'day-state-unresolved-flag-present' };
@@ -5030,6 +5088,14 @@ function createRealDrivers(ctx) {
   async function bindAccountsToAllInner({productIds}) {
     const ids=(productIds||[]).map(String);
     if(ids.length!==30||new Set(ids).size!==30) return {ok:false,reason:'product-ids-not-exactly-30'};
+    // 2026-11-21 绑定阶段引导浮窗清理：创建页引导（带「跳过/我知道了」）会在绑定抽屉
+    // 交互期间弹出/残留，遮住抽屉导致逐商品切换每次都等满 nativeTimeoutMs（30×15s 起）。
+    // 绑定开始前先清一次（跳过优先；未持引导则零动作），不改变任何 fail-closed 门。
+    try {
+      const g = await guidancePhase();
+      console.warn('[plan-publisher] bind-guidance handled=' + (g && g.handled === true) + ' flagsSaved=' + (g && g.flagsSaved === true));
+    } catch (_) { /* 引导清理失败不阻塞绑定入口（后续 noBlocking 复查仍会 fail-closed） */ }
+    try { const sw = await sweepOverlays(page, 3); console.warn('[plan-publisher] bind-start sweep=' + JSON.stringify(sw)); } catch (_) {}
     // Start a NEW evidence epoch for this exact account/batch: any previous panel proof is
     // dropped before a single new read, so nothing from an older batch/authorization leaks.
     bindEvidenceEpoch+=1;
@@ -5290,9 +5356,17 @@ function createRealDrivers(ctx) {
       const proves=(s,pid)=>partial?(provesTarget(s,pid)||provesZero(s,pid)):provesTarget(s,pid);
       const zeroIds=[],boundIds=[];
       const noBlocking=async()=>{ const ov=await page.evaluate(bindingOverlaySnapshotInPage).catch(()=>null); return !!ov&&ov.accountDrawerCount===1&&ov.blockingOverlayPresent===false; };
+      // 2026-11-21 阻挡浮窗先清后查：检测到阻挡遮罩时先清一次引导浮窗（跳过优先）再复查；
+      // 仍阻挡才 fail-closed 停止（绝不隔遮罩点击任何业务控件）。
+      const noBlockingOrClearGuidance=async()=>{
+        if(await noBlocking()) return true;
+        try { await sweepOverlays(page, 2); } catch (_) {}
+        try { await guidancePhase(); } catch (_) {}
+        return await noBlocking();
+      };
       // The drawer must still be uniquely present and free of any blocking overlay before the very
       // first navigation; if we cannot confirm that, this is still pending/unknown, not success.
-      if(!(await noBlocking())) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
+      if(!(await noBlockingOrClearGuidance())) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
       let prev=null;
       for(const pid of panelIds){
         // Re-check the PREVIOUS verification still holds on a fresh read before moving on, and re-run
@@ -5300,7 +5374,7 @@ function createRealDrivers(ctx) {
         if(prev!==null){
           const re=await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null);
           if(!proves(re,prev)) return {ok:false,reason:'batch-result-panel-navigation-prev-drift'};
-          if(!(await noBlocking())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
+          if(!(await noBlockingOrClearGuidance())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
         }
         let clk=null;
         try { clk=await page.evaluate(selectBindingDrawerPanelInPage,pid); } catch(_) { return {ok:false,reason:'batch-result-panel-navigation-rejected'}; }
@@ -5312,12 +5386,12 @@ function createRealDrivers(ctx) {
         // the sanitized numeric footer/row-state of THIS LAST fresh read is attached (never row
         // text, ids, URLs or cookies), so a real run's stop can be told apart from a stale cache.
         if(!proves(fresh,pid)) return {ok:false,reason:'batch-result-panel-target-not-verified',diag:footerStateDiag(fresh,'panel-navigation')};
-        if(!(await noBlocking())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
+        if(!(await noBlockingOrClearGuidance())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
         if(partial){ (provesTarget(fresh,pid)?boundIds:zeroIds).push(String(pid)); }
         prev=pid;
       }
       // All 30 proven: navigate back to the original batch anchor and fresh-prove it before the commit.
-      if(!(await noBlocking())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
+      if(!(await noBlockingOrClearGuidance())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
       let back=null;
       try { back=await page.evaluate(selectBindingDrawerPanelInPage,originalAnchor); } catch(_) { return {ok:false,reason:'batch-result-anchor-restore-rejected'}; }
       if(!back||back.clicked!==true||String(back.id)!==String(originalAnchor)) return {ok:false,reason:'batch-result-anchor-restore-not-confirmed'};
@@ -5325,7 +5399,7 @@ function createRealDrivers(ctx) {
       try { restored=await until(()=>page.evaluate(bindingDrawerSnapshotInPage), s=>proves(s,originalAnchor), nativeTimeoutMs,'batch-result-anchor-restored'); }
       catch(_) { restored=await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null); }
       if(!proves(restored,originalAnchor)) return {ok:false,reason:'batch-result-anchor-restore-not-verified'};
-      if(!(await noBlocking())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
+      if(!(await noBlockingOrClearGuidance())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
       if(partial&&provesTarget(restored,originalAnchor)&&!boundIds.some(id=>id===String(originalAnchor))) boundIds.push(String(originalAnchor));
       return partial?{ok:true,boundIds,zeroIds}:{ok:true};
     }
@@ -5334,6 +5408,28 @@ function createRealDrivers(ctx) {
     // and never click behind an overlay.
     let snap=await readDrawer();
     notePanelEvidence(snap);
+    // 2026-11-21 浮窗诊断：抽屉快照不可用（ok:false）时，把当前可见浮层候选
+    // （类名片段 + 可见「跳过/我知道了」控件）落到 overlay-diag.log——人工据此
+    // 判断是哪类浮窗、为何白名单/引导清理没接住。绝不点任何东西。
+    if(!snap||!snap.ok){
+      try {
+        const diag=await page.evaluate(() => {
+          const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden' && getComputedStyle(e).display !== 'none'; };
+          const skipBtns = Array.prototype.slice.call(document.querySelectorAll('button, a, [role="button"], span, div'))
+            .filter(el => visible(el) && ['跳过', '跳过引导', '我知道了', '知道了'].includes(String(el.textContent || '').replace(/\s+/g, '')))
+            .slice(0, 6)
+            .map(el => ({ tag: el.tagName.toLowerCase(), cls: String(el.className || '').slice(0, 90), text: String(el.textContent || '').replace(/\s+/g, ' ').slice(0, 20) }));
+          const overlays = Array.prototype.slice.call(document.querySelectorAll('[class*="guide"], [class*="Guide"], [class*="tour"], [class*="Tour"], [class*="modal"], [class*="Modal"], [class*="popup"], [class*="Popup"], [class*="mask"], [class*="Mask"], [class*="drawer"], [class*="Drawer"], [class*="dialog"], [class*="Dialog"]'))
+            .filter(el => visible(el) && el.getBoundingClientRect().width > 200 && el.getBoundingClientRect().height > 150)
+            .slice(0, 8)
+            .map(el => ({ cls: String(el.className || '').slice(0, 110), rect: (r => r.width + 'x' + r.height + '@' + Math.round(r.x) + ',' + Math.round(r.y))(el.getBoundingClientRect()) }));
+          return { url: String(location.href).slice(0, 120), skipBtns, overlays };
+        });
+        fs.writeFileSync(path.join(ROOT, 'overlay-diag.log'),
+          new Date().toISOString() + ' snapNotOk=' + JSON.stringify(String(snap && snap.reason || '')).slice(0, 120) + '\n' + JSON.stringify(diag, null, 1) + '\n\n', { flag: 'a' });
+        console.warn('[plan-publisher] overlay-diag written (snap not ok)');
+      } catch (_) { /* 诊断失败不改变流程 */ }
+    }
     // STEP 2 (supplement): with no usable auto drawer but a proven manual2 anchor, cancel the
     // auto-opened unsaved drawer, then uniquely open the anchor's management button.
     let reopenedInStep2=false;
@@ -5422,6 +5518,19 @@ function createRealDrivers(ctx) {
         let clk=null;
         try { clk=await page.evaluate(selectBindingDrawerPanelInPage,pid); } catch(_) { return {ok:false,reason:'account-anchor-panel-navigation-rejected'}; }
         if(!clk||clk.clicked!==true||String(clk.id)!==pid) return {ok:false,reason:'account-anchor-panel-navigation-not-confirmed'};
+        // 2026-11-21 锚点诊断：逐候选记录抽屉行数/勾选/禁用形态（本地 stdout），人工据此判断
+        // 是"店铺无手动抖音号"（业务前提缺失）还是浮窗/页面形态问题。
+        try {
+          const snapDiag = await page.evaluate(bindingDrawerSnapshotInPage).catch(() => null);
+          console.warn('[plan-publisher] anchor-candidate ' + String(pid) + ' ' + JSON.stringify({
+            ok: snapDiag && snapDiag.ok === true,
+            rows: snapDiag && Array.isArray(snapDiag.rows) ? snapDiag.rows.length : null,
+            checked: snapDiag && Array.isArray(snapDiag.rows) ? snapDiag.rows.filter(r => r.checked === true).length : null,
+            labelDisabled: snapDiag && Array.isArray(snapDiag.rows) ? snapDiag.rows.filter(r => r.labelDisabled === true).length : null,
+            selectedCount: snapDiag && snapDiag.selectedCount != null ? snapDiag.selectedCount : null,
+            headerLabelDisabled: snapDiag && snapDiag.headerLabelDisabled === true,
+          }));
+        } catch (_) { /* 诊断失败不影响锚点流程 */ }
         let fresh=null;
         try {
           fresh=await until(()=>page.evaluate(bindingDrawerSnapshotInPage), s=>usableFor(s,pid), nativeTimeoutMs,'account-anchor-panel-usable');
@@ -6152,6 +6261,7 @@ function createRealDrivers(ctx) {
     const creationPage=await context.newPage();
     await creationPage.goto(creationUrl,{waitUntil:'domcontentloaded',timeout:60000});
     page=creationPage;
+    await sweepOverlays(page, 3); // 创建页一打开就清浮窗（用户指令：出现即点掉）
     const obs=await until(observe,x=>x.creation&&x.creation.accountId===accountId,30000,'creation-page-identity');
     const guidance=await guidancePhase();
     if(obs.creation.commissionChecked!==true) await page.evaluate(ensureCommissionInPage);
@@ -6789,6 +6899,18 @@ async function reconcilePublishedReadbackOnly(deps) {
     status: 'success', reconciled: true, planId, clicked: false, clicks: 0, noAction: true, noReplay: true, readback,
     postPublishEnable: { status: enableOk ? 'already-enabled' : (enableObservation.status || 'unknown-current-state'), reason: enableOk ? null : (current.reason || enableObservation.gap || enableObservation.reason || null), actionTaken: false, continueNextPlan: enableOk === true },
   };
+}
+
+
+async function sweepOverlays(page, rounds) {
+  for (let i = 0; i < (rounds || 2); i++) {
+    let r = null;
+    try { r = await page.evaluate(overlaySweepInPage, { maxClicks: 3 }); } catch (_) { return { clicked: 0 }; }
+    if (!r || !r.clicked) return { clicked: 0, rounds: i };
+    console.warn('[plan-publisher] overlay-sweep round ' + (i + 1) + ' clicked=' + r.clicked + ' ' + JSON.stringify(r.actions || []));
+    await new Promise(res => setTimeout(res, 400));
+  }
+  return { clicked: -1 };
 }
 
 async function main() {

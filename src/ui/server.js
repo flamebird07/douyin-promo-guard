@@ -420,14 +420,29 @@ function renderShops(rows) {
         if (pp.lastStatus === 'success') pubLine.className = 'ok';
         else if (pp.lastStatus === 'unknown' || pp.lastStatus === 'failed' || pp.lastStatus === 'failed-permanent') pubLine.className = 'bad';
         else pubLine.className = 'muted';
-        pubLine.textContent = '最近一份：' + stWord;
+        var when = '';
+        if (pp.lastAt) {
+          var d = new Date(String(pp.lastAt));
+          if (!isNaN(d.getTime())) when = new Date(d.getTime() + 8 * 3600 * 1000).toISOString().slice(5, 16).replace('T', ' ');
+        }
+        pubLine.textContent = '最近一份：' + stWord + (when ? ' · ' + when : '');
         tdPub.appendChild(pubLine);
         if (pp.reason) {
+          var reasonMap = {
+            'read-only-recovery-required': '前一日遗留未决，需只读恢复（当日不重试）',
+            'catalog-response-json-unparseable': '商品目录接口响应异常',
+            'catalog-http-status-not-200': '商品目录接口状态异常',
+            'scheduled-shop-missing': '发布配置缺该店',
+          };
+          var friendly = reasonMap[String(pp.reason)] || null;
+          if (!friendly) {
+            for (var k in reasonMap) { if (String(pp.reason).indexOf(k) >= 0) { friendly = reasonMap[k] + '（' + k.slice(0, 24) + '…）'; break; } }
+          }
           var pubReason = document.createElement('div');
           pubReason.className = 'muted';
           pubReason.style.fontSize = '11px';
           pubReason.title = String(pp.reason);
-          pubReason.textContent = String(pp.reason).slice(0, 60);
+          pubReason.textContent = '卡点：' + (friendly || String(pp.reason).slice(0, 60));
           tdPub.appendChild(pubReason);
         }
       }

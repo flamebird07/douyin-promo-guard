@@ -534,7 +534,11 @@ function evaluateReadiness(rows, capacity, business) {
 function planRemovalAndBackfill(input) {
   const biz = bizOf(input.business);
   const capacity = Number.isInteger(input.capacity) ? input.capacity : biz.productsPerPlan;
-  const rows = (input.rows || []).map(r => (r.productId !== undefined ? r : parseMainTableRow(r.text || r)));
+  const rows = (input.rows || []).map(r => {
+    if (r && r.productId !== undefined && r.autoPullOnly !== undefined && r.manualAccounts !== undefined) return r;
+    const parsed = parseMainTableRow(String((r && r.text) || (r && r) || ""));
+    return Object.assign({}, r, parsed, { productId: (r && r.productId != null) ? r.productId : parsed.productId });
+  });
   const evidenceById = input.evidenceById && typeof input.evidenceById === 'object' ? input.evidenceById : {};
   const classifications = [];
   const removeIds = [];
@@ -1161,6 +1165,14 @@ async function preparePlan(deps) {
       const batchIds = new Set(selected.map(String));
       candidates = mergeSettledPanelEvidence(candidates, bindingRows.filter(r => r && batchIds.has(String(r.productId))));
     }
+    // 2026-11-22 整批轮转修复：新鲜主表行必须先过解析器（autoPullOnly/已知零绑定），
+    // 否则 allProven 的 every() 在未解析行上全 false → 轮转永不触发（用户 2026-11-21 指令：
+    // 30 个全部无法绑定就翻目录下一页换一批，翻完最后一页才正常终止）。
+    candidates = candidates.map(r => {
+      if (r && r.productId !== undefined && r.autoPullOnly !== undefined && r.manualAccounts !== undefined) return r;
+      const parsed = parseMainTableRow(String((r && r.text) || ""));
+      return Object.assign({}, r, parsed, { productId: (r && r.productId != null) ? r.productId : parsed.productId });
+    });
     const readback = candidates && candidates.length ? evaluateReadiness(candidates, biz.productsPerPlan, biz) : null;
     const proof = candidates && candidates.length
       ? planRemovalAndBackfill({ rows: candidates, capacity: biz.productsPerPlan, attemptedSet, publishedSet, catalogRemainingIds: d.catalogRemainingIds || [] })

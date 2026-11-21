@@ -5270,7 +5270,7 @@ function createRealDrivers(ctx) {
         const hovered=await page.evaluate(bindingRowTooltipInPage,{mode:'hover',productId:String(pid),accountId:aid}).catch(()=>null);
         if(!hovered||hovered.hovered!==true)return {proven:false,reason:'tooltip-hover-not-confirmed'};
         let read=null;
-        try{ read=await until(()=>page.evaluate(bindingRowTooltipInPage,{mode:'read',productId:String(pid),accountId:aid}),x=>!!x&&x.ok===true&&x.present===true&&x.count===1,nativeTimeoutMs,'binding-row-tooltip-visible'); }
+        try{ read=await until(()=>page.evaluate(bindingRowTooltipInPage,{mode:'read',productId:String(pid),accountId:aid}),x=>!!x&&x.ok===true&&x.present===true&&x.count===1,Math.min(nativeTimeoutMs,3000),'binding-row-tooltip-visible'); }
         catch(_){ read=null; }
         if(!read||read.present!==true||read.count!==1)return {proven:false,reason:'tooltip-not-uniquely-visible'};
         const text=String((read.texts||[]).join(' ')).trim();
@@ -5581,9 +5581,27 @@ function createRealDrivers(ctx) {
           }));
         } catch (_) { /* 诊断失败不影响锚点流程 */ }
         let fresh=null;
-        try {
-          fresh=await until(()=>page.evaluate(bindingDrawerSnapshotInPage), s=>usableFor(s,pid), nativeTimeoutMs,'account-anchor-panel-usable');
-        } catch(_) { fresh=await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null); }
+        {
+          // 2026-11-22 提速（用户反馈：单个不可绑商品判定过久）：置灰面板永远不满足 usableFor，
+          // 旧逻辑等满 nativeTimeoutMs。改为「确定性不可用 + 两次采样一致」立即判死换下一个，
+          // 真正加载中的面板仍按原超时等待（fail-closed 语义不变）。
+          const deadSig=x=>JSON.stringify({rows:(x.rows||[]).map(r=>[String(r.ids),r.labelDisabled,r.checked]),sel:x.selectedCount,tot:x.totalCount,hdr:x.headerLabelDisabled,spin:x.spinnerCount});
+          const definitelyDead=x=>!!x&&x.ok===true&&!x.spinnerCount&&provePanelSet(x)===String(pid)
+            &&consistentSelectionState(x)
+            &&(x.headerLabelDisabled===true||(Array.isArray(x.rows)&&x.rows.length>=1&&x.rows.length<=2&&x.rows.every(r=>r.labelDisabled===true)));
+          const deadline=Date.now()+nativeTimeoutMs;
+          let prevDead=null;
+          while(Date.now()<deadline&&(!fresh||!usableFor(fresh,pid))){
+            const s=await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null);
+            if(usableFor(s,pid)){ fresh=s; break; }
+            if(definitelyDead(s)){
+              if(prevDead&&deadSig(prevDead)===deadSig(s)){ fresh=s; break; } // 稳定置灰：判死
+              prevDead=s;
+            } else prevDead=null;
+            await sleep(POLL_MS);
+          }
+          if(!fresh) fresh=await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null);
+        }
         notePanelEvidence(fresh);
         if(!fresh||fresh.ok!==true) return {ok:false,reason:'account-anchor-panel-readback-unknown'};
         // S26/S27：既有 consistentSelectionState(3338-3341) 与 3554 把页脚 selectedCount 视为当前唯一
@@ -6952,14 +6970,40 @@ async function reconcilePublishedReadbackOnly(deps) {
 
 
 async function sweepOverlays(page, rounds) {
+  // 2026-11-22 深扫（用户实证：UNI_PROM 蓝色引导卡页面内 querySelectorAll 看不见——高度怀疑
+  // shadow DOM/iframe）：Playwright 定位器自动穿透 open shadow DOM，page.frames() 覆盖全部
+  // iframe；精确匹配跳过家族文本的可见按钮，找到即点（用户指令：浮窗出现立即点掉）。
+  const DEEP_LABELS = ['跳过', '跳过引导', '我知道了', '知道了'];
+  let total = 0;
   for (let i = 0; i < (rounds || 2); i++) {
+    let clickedThisRound = 0;
+    try {
+      for (const frame of page.frames()) {
+        for (const label of DEEP_LABELS) {
+          let cand = null;
+          try { cand = frame.locator('button:has-text("' + label + '"), a:has-text("' + label + '"), [role="button"]:has-text("' + label + '")'); } catch (_) { continue; }
+          let n = 0; try { n = await cand.count(); } catch (_) { continue; }
+          for (let k = 0; k < Math.min(n, 2); k++) {
+            const el = cand.nth(k);
+            let vis = false; try { vis = await el.isVisible(); } catch (_) { continue; }
+            if (!vis) continue;
+            const t = String(await el.innerText().catch(() => '')).replace(/s+/g, '');
+            if (t !== label) continue; // 精确关闭语义文本（绝不点业务 CTA）
+            try { await el.click({ timeout: 2500 }); clickedThisRound += 1; total += 1;
+              console.warn('[plan-publisher] deep-sweep clicked "' + label + '" frame=' + String(frame.url()).slice(0, 90));
+            } catch (e) { console.warn('[plan-publisher] deep-sweep found-but-click-failed "' + label + '": ' + String(e && e.message || e).slice(0, 80)); }
+          }
+        }
+      }
+    } catch (_) { /* 深扫异常不阻断 */ }
     let r = null;
-    try { r = await page.evaluate(overlaySweepInPage, { maxClicks: 3 }); } catch (_) { return { clicked: 0 }; }
-    if (!r || !r.clicked) return { clicked: 0, rounds: i };
-    console.warn('[plan-publisher] overlay-sweep round ' + (i + 1) + ' clicked=' + r.clicked + ' ' + JSON.stringify(r.actions || []));
+    try { r = await page.evaluate(overlaySweepInPage, { maxClicks: 3 }); } catch (_) {}
+    if (r && r.clicked) { clickedThisRound += r.clicked; total += r.clicked;
+      console.warn('[plan-publisher] overlay-sweep round ' + (i + 1) + ' clicked=' + r.clicked + ' ' + JSON.stringify(r.actions || [])); }
+    if (!clickedThisRound) return { clicked: 0, rounds: i };
     await new Promise(res => setTimeout(res, 400));
   }
-  return { clicked: -1 };
+  return { clicked: total };
 }
 
 async function main() {

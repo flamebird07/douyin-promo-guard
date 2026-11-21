@@ -94,6 +94,19 @@ async function cmdServe() {
   } catch (e) {
     log.warn(`每日开启调度器登记异常（不阻塞控制台）: ${e.message}`);
   }
+  // 值守自动恢复（2026-11-21）：上次运行中值守在跑（patrolWanted=true，用户未点停止）
+  // → serve 启动即自动拉起。进程重启/部署/launchd 拉起都不丢值守；用户点「停止监控」
+  // 会清除期望（重启不复活）。失败只记日志，不阻塞控制台。
+  try {
+    if (cfg.ready && monitor._patrolWanted === true) {
+      const r = monitor.start();
+      log.info(r.ok && !r.alreadyRunning
+        ? `值守已自动恢复（上次运行中；活动店铺 ${r.activeShopCount} 家，启动即巡查）`
+        : `值守自动恢复跳过: ${r.reason || (r.alreadyRunning ? '已在运行' : '未知')}`);
+    }
+  } catch (e) {
+    log.warn(`值守自动恢复异常（不阻塞控制台）: ${e.message}`);
+  }
   const { server } = createUiServer(monitor, PORT);
   server.listen(PORT, '127.0.0.1', () => {
     log.info(`控制台已启动: http://127.0.0.1:${PORT}`);
@@ -102,7 +115,9 @@ async function cmdServe() {
     }
   });
   const shutdown = () => {
-    monitor.stop();
+    // 进程关闭（SIGTERM/kickstart 部署/关机）≠ 用户停止：保留值守期望标记，
+    // 重启后 serve 自动恢复值守（2026-11-21）。
+    monitor.stop({ preserveWanted: true });
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 2000);
   };

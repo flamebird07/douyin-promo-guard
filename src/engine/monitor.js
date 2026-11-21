@@ -248,6 +248,10 @@ class Monitor {
       this._enableSchedule.stoppedByUser = loaded.enableScheduler.stoppedByUser === true;
       this._enableSchedule.stoppedAt = loaded.enableScheduler.stoppedAt || null;
     }
+    // 值守期望运行标记（2026-11-21）：用户点「开始监控」→ true；点「停止监控」→ false。
+    // serve 启动时据此自动恢复值守（进程重启/部署/launchd 拉起都不丢期望）；
+    // SIGTERM 关闭进程不清除该标记（关闭 ≠ 用户停止）。
+    this._patrolWanted = loaded.patrolWanted === true;
     // 串行门持久化：未结束动作恢复为 unknown 阻塞（不把未知写成成功，禁止补点）
     this._switchGate = this._switchGate
       || createSwitchSerialGate({ state: loaded.switchSlots || { slots: [] } });
@@ -570,6 +574,7 @@ class Monitor {
         version: STATE_VERSION,
         batches: this.batches,
         enablePhase: this.enablePhase || {},
+        patrolWanted: this._patrolWanted === true,
         mixedStuckGateAlerts: this.mixedStuckGateAlerts || {},
         adBelief: this.adBelief || {},
         enableScheduler: {
@@ -908,15 +913,17 @@ class Monitor {
     if (this.running) return { ok: true, alreadyRunning: true, activeShopCount };
     this._gen += 1;
     this.running = true;
+    this._patrolWanted = true;
     this.startedAt = new Date(this.nowFn()).toISOString();
     const gen = this._gen;
     this._audit({ kind: 'monitor', event: 'start', mode: this.modeLabel, activeShopCount });
+    this._saveState();
     this._loopPromise = this._intervalLoop(gen);
     log.info(`监控已启动（${this.modeLabel}，活动店铺 ${activeShopCount} 家，启动即巡查，之后每 ${this.config.schedule.intervalMinutes} 分钟；暂停无每日时段门槛）`);
     return { ok: true, activeShopCount };
   }
 
-  stop() {
+  stop(opts = {}) {
     this._gen += 1;          // 使旧循环退出、旧 delay 中断（仅暂停巡查循环）
     this.running = false;
     // 停止在途**暂停巡查**周期：周期内不再发起新的关闭请求（已发出的继续回读确认）。
@@ -924,6 +931,12 @@ class Monitor {
     for (const t of this._activeTokens) if (t.kind !== 'enable') t.aborted = true;
     this.schedule.phase = 'stopped';
     this.schedule.nextRunAt = null;
+    // 值守期望标记（2026-11-21）：页面/API 停止 = 用户不要值守（清除，重启不复活）；
+    // 进程关闭（SIGTERM/kickstart 部署）传 preserveWanted=true——关闭 ≠ 用户停止，重启后自动恢复。
+    if (opts.preserveWanted !== true) {
+      this._patrolWanted = false;
+      this._saveState();
+    }
     log.info('监控已停止（暂停巡查停止，已发出的关闭请求将继续回读确认；每日开启任务不受影响）');
     this._audit({ kind: 'monitor', event: 'stop', scope: 'pause-patrol', enableSchedulerStillRunning: this.enableRunning });
     return { ok: true };

@@ -35,3 +35,4 @@ plan-publisher/catalog-json-anomaly.log
 plan-publisher/plan-publication-attempts.json
 plan-publisher/overlay-diag.log
 plan-publisher/stuck-page*
+plan-publisher/overlay-diag.log

@@ -4416,6 +4416,26 @@ function createRealDrivers(ctx) {
       // 先清浮窗（跳过/右上角叉）+ 引导相位，重整页面后**重证一次**；仍不成立才
       // 按原 fail-closed 停止（绝不隔浮窗点击翻页控件）。
       if (scope && scope.reason === 'numeric-pager-blocking-overlay-present') {
+        // 2026-11-22 浮窗身份诊断：清浮窗后仍阻挡时，dump 可见浮层候选类名+跳过控件到
+        // plan-publisher/overlay-diag.log（只读零点击），供人工判断浮窗类型。
+        try {
+          const diag = await page.evaluate(() => {
+            const visible = (el) => { try { const r = el.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) return false; const cs = getComputedStyle(el); return cs.visibility !== 'hidden' && cs.display !== 'none'; } catch (_) { return false; } };
+            const txt = (el) => String(el.textContent || '').replace(/\s+/g, ' ').trim();
+            const skipBtns = Array.prototype.slice.call(document.querySelectorAll('button, a, [role="button"], span, div'))
+              .filter(el => visible(el) && ['跳过', '跳过引导', '我知道了', '知道了'].includes(String(el.textContent || '').replace(/\s+/g, '')))
+              .slice(0, 6)
+              .map(el => ({ tag: el.tagName.toLowerCase(), cls: String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || '')).slice(0, 100), text: txt(el).slice(0, 16) }));
+            const overlays = Array.prototype.slice.call(document.querySelectorAll('[class*="guide"], [class*="Guide"], [class*="tour"], [class*="Tour"], [class*="modal"], [class*="Modal"], [class*="popup"], [class*="pop"], [class*="mask"], [class*="Mask"], [class*="dialog"], [class*="Dialog"], [class*="wrap"], [class*="Wrap"], [class*="overlay"], [class*="Overlay"], [class*="banner"], [class*="activity"], [class*="float"], [class*="Float"]'))
+              .filter(el => visible(el) && el.getBoundingClientRect().width > 150 && el.getBoundingClientRect().height > 80)
+              .slice(0, 10)
+              .map(el => ({ cls: String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || '')).slice(0, 110), rect: (rr => Math.round(rr.width) + 'x' + Math.round(rr.height) + '@' + Math.round(rr.x) + ',' + Math.round(rr.y))(el.getBoundingClientRect()), text: txt(el).slice(0, 40) }));
+            return { url: String(location.href).slice(0, 130), skipBtns, overlays };
+          });
+          fs.writeFileSync(require('path').join(ROOT, 'overlay-diag.log'),
+            new Date().toISOString() + ' [numeric-pager-blocking-overlay]\n' + JSON.stringify(diag, null, 1) + '\n\n', { flag: 'a' });
+          console.warn('[plan-publisher] numeric-pager overlay-diag written');
+        } catch (_) { /* 诊断失败不影响原 fail-closed */ }
         try { await sweepOverlays(page, 3); } catch (_) {}
         try { await guidancePhase(); } catch (_) {}
         await settleProductPage({ cat: context.cat, native: false, pageNo: currentPage, selectedIds, baseSelectedCount: context.baseSelectedCount });

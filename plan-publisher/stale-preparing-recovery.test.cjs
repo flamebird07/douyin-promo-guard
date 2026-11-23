@@ -55,6 +55,42 @@ function readJson(file) { return JSON.parse(fs.readFileSync(file, 'utf8')); }
 function emptyAttempts() { return { consumed: {}, finalConsumed: {}, reopenConsumed: {} }; }
 // 独立发布事实面（生产同形状：publishedIds + plans）；本测试的“零”是显式空数组。
 function emptyPublished() { return { publishedIds: [], plans: [] }; }
+
+nodeTest.test('a read-only recovery stop is released only by a later verified first-plan closure', () => {
+  const { applySchedulerReleaseToRecord } = require('../integrations/bill-manager/promo-plan-scheduler.js');
+  const reason = 'read-only-recovery-required';
+  const sourceHash = 'a'.repeat(64);
+  const freshRecord = () => ({
+    status: 'unknown', plans: 0, error: 'unknown:' + reason,
+    entries: { 1: { planNumber: 1, status: 'unknown', reason, at: new Date(NOW_MS - 1000).toISOString() } },
+  });
+  const proof = {
+    method: 'scheduler-release-prepublication', status: 'scheduler-release-prepublication',
+    businessDate: TODAY, shop: SHOP, accountId: ACCOUNT, planNumber: 1,
+    recStatus: 'unknown', entryStatus: 'unknown', entryProvenanceMethod: 'local-preparation-closed',
+    entryReasonHash: rp.sha256Hex(reason),
+    preparationClosureProof: {
+      method: 'local-preparation-closed', businessDate: TODAY, shop: SHOP,
+      accountId: ACCOUNT, planNumber: 1, runId: RUN_ID, sourceHash,
+      reason: 'scheduled-run-exception:native-catalog-no-progress', closedAt: new Date(NOW_MS).toISOString(),
+      zeroConsumptionProof: {
+        initialConsumptions: 0, finalConsumptions: 0, reopenConsumptions: 0, manualUnresolved: 0,
+        plansContainsNumber: false, confirmationConsumptionsRecorded: false,
+      },
+    },
+  };
+  const record = freshRecord();
+  assert.equal(applySchedulerReleaseToRecord(record, proof, NOW_MS, 1).changed, true);
+  assert.equal(record.status, 'unsubmitted');
+  assert.equal(record.entries[1].status, 'preparation-stopped');
+  assert.equal(record.plans, 0);
+  const early = structuredClone(proof);
+  early.preparationClosureProof.closedAt = new Date(NOW_MS - 2000).toISOString();
+  assert.equal(applySchedulerReleaseToRecord(freshRecord(), early, NOW_MS, 1).changed, false);
+  const withConfirmation = freshRecord();
+  withConfirmation.entries[1].confirmationId = 'unresolved-confirmation';
+  assert.equal(applySchedulerReleaseToRecord(withConfirmation, proof, NOW_MS, 1).changed, false);
+});
 // A/E：真实 legacy 店的历史消费回执（18/17/1）必须原样保留，绝不因收口被清空。
 function historicAttempts() {
   const a = emptyAttempts();

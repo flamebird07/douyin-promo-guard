@@ -582,7 +582,8 @@ function createDailyRunner(o = {}) {
       let proof = null;
       try {
         proof = deps.proveSchedulerRelease(ledgerFile,
-          { stateFile: pathsRes.paths.stateFile, attemptsFile: pathsRes.paths.attemptsFile },
+          { stateFile: pathsRes.paths.stateFile, attemptsFile: pathsRes.paths.attemptsFile,
+            publishedFile: pathsRes.paths.publishedFile },
           { businessDate: String(businessDate), shop: shopId, planNumber: planNo,
             accountId: resolvedAccount, sourceExtraFiles });
       } catch (e) { return fail('recovery-release-proof-threw:' + ((e && e.message) || e)); }
@@ -837,7 +838,11 @@ function createDailyRunner(o = {}) {
       const expectedProducts = Number.isInteger(shop.productsPerPlan) && shop.productsPerPlan > 0
         ? shop.productsPerPlan : Number((wfMod.BUSINESS && wfMod.BUSINESS.productsPerPlan) || 30);
       const productIds = Array.isArray(frozen.productIds) ? frozen.productIds.map(String) : [];
-      if (productIds.length !== expectedProducts || new Set(productIds).size !== expectedProducts) {
+      const frozenCap = Number.isInteger(frozen.productsPerPlan) ? frozen.productsPerPlan : expectedProducts;
+      const partialOk = frozen.catalogExhaustedPartial === true
+        && productIds.length >= 1 && productIds.length <= expectedProducts
+        && productIds.length === frozenCap && new Set(productIds).size === productIds.length;
+      if (!partialOk && (productIds.length !== expectedProducts || new Set(productIds).size !== expectedProducts)) {
         return fail('recovery-readback-frozen-products-invalid');
       }
       // 手动原生 UI 独立事实面必须为空：任何一条都是另一发布面 → 拒绝。
@@ -987,7 +992,9 @@ function createDailyRunner(o = {}) {
 
     // ── 形状 3：canonical F1（R7 既有路径）。
     if (typeof deps.recoverLocalPreparation !== 'function') return fail('recovery-capability-unavailable');
-    const local = await deps.recoverLocalPreparation(shopLike, businessDate, { ...stateOverride });
+    const existingClosureOnly = Object.values(rec0.entries || {}).some(e =>
+      e?.status === 'unknown' && e.reason === 'read-only-recovery-required');
+    const local = await deps.recoverLocalPreparation(shopLike, businessDate, { ...stateOverride, existingClosureOnly });
     if (!local || local.ok !== true || local.status !== 'preparationClosed' || !local.preparationClosure) {
       return fail('recovery-local-not-closed:' + ((local && (local.status + ':' + local.reason)) || 'unknown'));
     }
@@ -1004,6 +1011,10 @@ function createDailyRunner(o = {}) {
     }
     const entryStatus = String(e.status);
     const startedAt = typeof e.startedAt === 'string' ? e.startedAt : null;
+    // 旧账本只记录发布器的恢复门拒绝。须使用已经耐久收口的事实，不能在此新建事实后释放。
+    if (e.reason === 'read-only-recovery-required' && local.alreadyClosed !== true) {
+      return fail('recovery-no-existing-preparation-closure');
+    }
     // R9：账号必须绑定到本店已配置/已解析的可信 ID；六字段零消费证明之外不接受空账号。
     const boundAccount = cfgAccount !== null ? cfgAccount
       : (local.accountId != null && String(local.accountId) !== '' ? String(local.accountId)
@@ -1038,7 +1049,7 @@ function createDailyRunner(o = {}) {
         accountId: boundAccount,
         planNumber: Number(fact.planNumber), runId: String(fact.runId || local.runId || ''),
         sourceHash: String(local.sourceHash || ''), reason: String(fact.reason || local.reason || ''),
-        zeroConsumptionProof: fact.zeroConsumptionProof, entryStartedAt: startedAt,
+        zeroConsumptionProof: fact.zeroConsumptionProof, entryStartedAt: startedAt, closedAt: fact.closedAt,
       },
     };
     return scheduler.releaseProvenRemainder(proof);

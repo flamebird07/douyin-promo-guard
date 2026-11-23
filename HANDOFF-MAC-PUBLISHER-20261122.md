@@ -26,10 +26,10 @@
 - 诊断工具（已就位）：`plan-publisher/overlay-diag.log`——numeric-pager-blocking-overlay 时自动 dump 可见浮层类名+跳过控件；`plan-publisher/stuck-page.png`——非成功收口自动截图（本轮停止是 workflow stopped 返回 + preserveOwnedBrowser，截图在进程退出时触发，若进程被杀则无）。
 - 复现：`PROMO_PROJECT_ROOT=$(pwd) node plan-publisher/run-plans.cjs --shop 敏敏高定私服`（会弹浏览器，观察卡住的页面）。
 
-### 卡点 2：敏敏店「联盟合伙人自动投」已开启（业务前提，需用户决策）
-- 证据：锚点候选诊断（run-plans.cjs anchor-candidate 日志）——30 个商品的绑定抽屉全部 `rows:1, labelDisabled:1, headerLabelDisabled:true`（账号「瑾漂亮私服」显示但置灰）；主表行全部 `手动添加抖音号 自动拉取 0 个`（0 手动绑定）。
-- 含义：商品已被联盟自动拉取投放，平台置灰手动绑定（代码常量 AUTO_PULL_MARK：添加手动绑定会关闭自动拉取功能）。
-- 用户决策项：(a) 平台关闭自动拉取后走手动绑定；(b) 用「全域升级为乘方计划」路径；(c) 保持现状（自动拉取本身在投放）。这是业务决策，程序不应擅自代做。
+### 卡点 2：乘方「可选不可绑」整批轮转（用户 2026-11-22 纠正——不是联盟自动投）
+- **误判更正**：此前把 `labelDisabled` / `account-anchor-no-usable-product` / 主表「手动添加抖音号 自动拉取 0 个」归因成「联盟合伙人自动投」——**错误**。用户明确：这是千川新产品**乘方**平台 bug——**曾经发布过计划的商品仍可选进新草稿，但账号行全置灰无法绑定**。不要擅自去关联盟开关。
+- 正确策略：对本批 ≤30 个商品**穷举**绑定；**30 个都绑不上就整批丢掉、选目录下一批**；翻完目录才正常终止。有 hover「已存在计划」更好，但不是轮转前提。
+- 备注已写入：`.cursor/rules/chengfang-unbindable-batch-rotate.mdc`（alwaysApply）。
 
 ### 卡点 3：瑾漂亮店已推进到目录翻页（等下一 tick 自然重试）
 - 11-20 的 preparing 遗留已按严格零消费证明收口（`preparationClosed`，recoverLocalPreparationClose）。
@@ -63,7 +63,7 @@
 1. 先跑一次复现（§三卡点 1 的命令），人工看弹出的浏览器停在哪个页面；同时读 `overlay-diag.log` 的最新一条拿到浮窗类名。
 2. 若浮窗类名确认（例如引导卡容器类），两条路：(a) 加进 `guidanceActionInPage` 的 UNI_PROM 扫描（带 flag 写回，治本防再弹）；(b) 加进清扫器白名单（治标）。建议 (a)。
 3. 若翻页器是平台响应问题：抓 `transport` 批次响应（catalog transport 已有 anomaly 采样框架，参照 catalog-json-anomaly.log 的接入方式）确认是风控页/空响应/结构变更。
-4. 敏敏店业务决策（§三卡点 2）等用户拍板后，按选择改流程或配置。
+4. 卡点 2 按「穷举→整批换下一批」实现/回归，勿再提「关联盟自动投」方案。
 5. 值守与发布互相独立：值守的 fail-closed 门（realMode+pauseEnabled+时段）不要动；发布链路的浮窗清扫不影响值守安全语义。
 
 ## 七、验证基线
@@ -71,3 +71,10 @@
 - 新增/更新测试全绿：ui-shop-login 5、update-shop-fields 6、shop-activity 6、plan-refill-hook 6、patrol-fixes 4、sensitive-scrub 9。
 - 严格契约：flow-hardening 33/33、drawer-settle/decimal-guard 等 53/53 绿（本次改动后复跑确认）。
 - 已知基线失败（与本次无关，详见记忆/此前记录）：monitor.test 3-4 个、session-cookie-checkpoint 13 个（缺兄弟仓 bill-manager）、balance-display（缺 ../bill-manager）。
+
+## 八、macOS 发布器修复（2026-11-23）
+
+- 排程发布与账号发现使用完整 Chromium 的无头模式。数字翻页遇到相邻页商品相同，须核对目标页的目录响应、抽屉状态与当前页码。
+- 账本恢复核对店铺身份、独立发布记录和提交记录。仅在证明目标计划未提交后恢复重试。
+- 草稿换品确认按 DOM 节点去重，忽略 Aurora 的空遮罩。遇到独立未知弹窗时停止。重绑回读不一致时，只有稳定主表能证明当前整批均可替换，才继续翻页换品。
+- 值守每次补发都从本机项目目录启动新的发布器进程。Cookie、账本、引导状态和诊断截图都保留在本机。

@@ -52,8 +52,8 @@ button{font-size:16px;padding:10px 18px}label{display:block;margin:6px 0}</style
 <p>业务日期（Asia/Shanghai）：<strong>${esc(frozen.businessDate)}</strong></p>
 <p>综合营销ROI目标：<strong>${esc(frozen.roi)}</strong>　日预算：<strong>${esc(frozen.dailyBudget)}</strong> 元　含达人佣金出价：<strong>${frozen.commissionIncluded ? '是' : '否'}</strong>　货款直投：<strong>${frozen.directPay ? '是' : '否'}</strong></p>
 <p>绑定目标账号（尝试绑定，${targetLabel}）：<strong>${esc(targets.join('、'))}</strong>；${targetHint}</p>
-<p>商品数量：<strong>${esc((frozen.productIds || []).length)}</strong> / ${esc(biz.productsPerPlan)}</p>
-<details><summary>展开 30 个商品 ID</summary><ol>${products}</ol></details>
+<p>商品数量：<strong>${esc((frozen.productIds || []).length)}</strong> / ${esc(Number.isInteger(frozen.productsPerPlan) ? frozen.productsPerPlan : biz.productsPerPlan)}${frozen.catalogExhaustedPartial === true ? '（目录耗尽·按剩余已绑发布）' : ''}</p>
+<details><summary>展开商品 ID</summary><ol>${products}</ol></details>
 <p class="warn">迁移提示（全店托管将停止投放该商品）：${d.migration && d.migration.length ? esc(d.migration.join('、')) : '无'}</p>
 <p class="warn">系统前置检测（可能审核不通过，非硬拒绝）：${d.precheck && d.precheck.length ? esc(d.precheck.join('、')) : '无'}</p>
 <p class="stop">已知最终互斥效果：${esc(FINAL_EXCLUSION_TEXT)}</p>

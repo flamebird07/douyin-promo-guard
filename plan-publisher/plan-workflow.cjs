@@ -535,9 +535,25 @@ function planRemovalAndBackfill(input) {
   const biz = bizOf(input.business);
   const capacity = Number.isInteger(input.capacity) ? input.capacity : biz.productsPerPlan;
   const rows = (input.rows || []).map(r => {
-    if (r && r.productId !== undefined && r.autoPullOnly !== undefined && r.manualAccounts !== undefined) return r;
+    if (r && r.unbindableExhausted === true) {
+      return Object.assign({}, r, {
+        autoPullOnly: true, manualAccounts: 0, manualEvidence: false, manualCountKnown: true,
+      });
+    }
+    if (r && r.productId != null && Number.isInteger(r.manualAccounts)
+      && (r.manualEvidence === true || r.autoPullOnly === true || r.alreadyPlanned === true || r.reviewFailed === true)) {
+      return r;
+    }
     const parsed = parseMainTableRow(String((r && r.text) || (r && r) || ""));
-    return Object.assign({}, r, parsed, { productId: (r && r.productId != null) ? r.productId : parsed.productId });
+    return Object.assign({}, r, parsed, {
+      productId: (r && r.productId != null) ? r.productId : parsed.productId,
+      alreadyPlanned: (r && r.alreadyPlanned === true) || parsed.alreadyPlanned === true,
+      reviewFailed: (r && r.reviewFailed === true) || parsed.reviewFailed === true,
+      autoPullOnly: (r && r.autoPullOnly === true) || parsed.autoPullOnly === true,
+      manualAccounts: Number.isInteger(r && r.manualAccounts) ? r.manualAccounts : parsed.manualAccounts,
+      manualEvidence: (r && r.manualEvidence === true) ? true : parsed.manualEvidence,
+      manualCountKnown: (r && r.manualCountKnown === true) || parsed.manualCountKnown === true,
+    });
   });
   const evidenceById = input.evidenceById && typeof input.evidenceById === 'object' ? input.evidenceById : {};
   const classifications = [];
@@ -798,6 +814,7 @@ function freezePlan(prepared, opts) {
   const o = opts || {};
   const biz = bizOf(o.business);
   const businessDate = prepared.businessDate || shanghaiDate(o.nowMs);
+  const productIds = (prepared.productIds || []).map(String);
   const plan = {
     planNumber: prepared.planNumber,
     runId: prepared.runId,
@@ -808,13 +825,19 @@ function freezePlan(prepared, opts) {
     commissionIncluded: prepared.commissionIncluded == null ? biz.commissionIncluded !== false : prepared.commissionIncluded !== false,
     directPay: prepared.directPay == null ? biz.directPay === true : prepared.directPay === true,
     boundAccounts: prepared.boundAccounts || biz.boundAccounts,
-    productIds: (prepared.productIds || []).map(String),
+    productIds,
     planName: prepared.planName || null,
     disclosures: prepared.disclosures || { migration: [], precheck: [], reviewFailed: [] },
   };
   const hash = manifestHash(plan);
+  const productsPerPlan = Number.isInteger(prepared.productsPerPlan)
+    ? prepared.productsPerPlan
+    : productIds.length;
   return {
     ...plan,
+    // 目录耗尽部分发布：容量可为 1..biz.productsPerPlan；不进 hash，靠 productIds 自洽。
+    productsPerPlan,
+    catalogExhaustedPartial: prepared.catalogExhaustedPartial === true,
     manifestHash: hash,
     nonce: o.nonce || makeNonce(),
     confirmationId: o.confirmationId || ('conf-' + hash.slice(0, 16) + '-' + (o.nonce ? String(o.nonce).slice(0, 8) : makeNonce().slice(0, 8))),
@@ -840,13 +863,19 @@ function validateConfirmation(frozen, request, opts) {
   if (!frozen || !frozen.nonce || req.nonce !== frozen.nonce) return deny('nonce-mismatch');
   if (!Number.isInteger(frozen.planNumber) || frozen.planNumber < 1 || frozen.planNumber > effectivePlanLimit(biz)) return deny('plan-number-invalid');
   if (!frozen.runId || !frozen.planName || !frozen.confirmationId) return deny('frozen-identity-incomplete');
+  const frozenCount = (frozen.productIds || []).length;
+  const frozenUnique = new Set((frozen.productIds || []).map(String)).size;
+  const expectedCount = Number.isInteger(frozen.productsPerPlan) ? frozen.productsPerPlan : biz.productsPerPlan;
+  // 目录耗尽部分发布：允许 1..productsPerPlan；常态仍必须正好满额。
+  const countOk = frozen.catalogExhaustedPartial === true
+    ? (frozenCount >= 1 && frozenCount <= biz.productsPerPlan && frozenCount === frozenUnique && frozenCount === expectedCount)
+    : (frozenCount === biz.productsPerPlan && frozenUnique === biz.productsPerPlan && expectedCount === biz.productsPerPlan);
   if (String(frozen.accountId) !== String(biz.accountId)
     || !(Number(frozen.roi) > 0) || Number(frozen.roi) !== Number(biz.roi) || Number(frozen.dailyBudget) !== Number(biz.dailyBudget)
     || frozen.commissionIncluded !== true || frozen.directPay !== false
     || !Array.isArray(frozen.boundAccounts) || frozen.boundAccounts.length < 1
     || (expectedBound && JSON.stringify([...(frozen.boundAccounts || [])].map(String).sort()) !== JSON.stringify(expectedBound.map(String).sort()))
-    || (frozen.productIds || []).length !== biz.productsPerPlan
-    || new Set((frozen.productIds || []).map(String)).size !== biz.productsPerPlan) return deny('frozen-manifest-invalid');
+    || !countOk) return deny('frozen-manifest-invalid');
   if (Number(req.planNumber) !== Number(frozen.planNumber)) return deny('plan-number-mismatch');
   if (req.manifestHash !== frozen.manifestHash || manifestHash(frozen) !== frozen.manifestHash) return deny('manifest-drift');
   if (req.businessDate !== frozen.businessDate) return deny('business-date-mismatch');
@@ -1067,24 +1096,92 @@ async function preparePlan(deps) {
 
   // 2) deterministic selection across category tabs / pages up to 30 unique valid
   //    products, honoring published history + per-day attempted set + same-day cursor.
+  // 目录耗尽且已选 ≥1：提交剩余 N 并继续发布（用户 2026-11-22）。
+  let catalogExhaustedPartial = false;
+  let effectiveCapacity = biz.productsPerPlan;
   let selected = [...(workingState.lastSelected || [])];
   let hints = { ...(workingState.hints || {}) };
   let browse = null;
+  const categories = d.categoryOrder || CATEGORY_TAB_ORDER;
+  const adoptBrowseSelection = async (browseResult) => {
+    selected = (browseResult.selectedIds || []).map(String);
+    hints = browseResult.hints || hints;
+    workingState = {
+      ...workingState, lastSelected: selected, hints,
+      attempted: [...new Set([...(workingState.attempted || []), ...((browseResult && browseResult.attempted) || [])])],
+      cursor: (browseResult && browseResult.cursor) || workingState.cursor,
+    };
+    await persistState(workingState);
+  };
+  const commitCatalogExhaustPartial = async (browseResult) => {
+    await adoptBrowseSelection(browseResult);
+    if (typeof d.commitPicker !== 'function') {
+      return { status: 'stopped', stage: 'selection', reason: 'catalog-exhausted-partial-commit-driver-missing', selected, businessDate };
+    }
+    const committed = await d.commitPicker({
+      baseSelectedCount: 0, expectedCapacity: selected.length, allowPartial: true,
+    });
+    if (!committed || committed.submitted !== true) {
+      return {
+        status: 'stopped', stage: 'selection',
+        reason: 'catalog-exhausted-partial-commit-failed:' + ((committed && committed.reason) || 'not-submitted'),
+        selected, businessDate,
+      };
+    }
+    catalogExhaustedPartial = true;
+    effectiveCapacity = selected.length;
+    return null;
+  };
   if (typeof d.browseProducts === 'function') {
     browse = await d.browseProducts({
       selectedIds: selected, hints, publishedSet, attemptedSet,
       cursor: workingState.cursor || { category: workingState.category || CATEGORY_TAB_ORDER[0], page: workingState.page || 1 },
       needed: biz.productsPerPlan - selected.length,
-      categories: d.categoryOrder || CATEGORY_TAB_ORDER,
+      categories,
       onProgress: saveProgress,
     });
     if (!browse || browse.ok !== true) {
-      return { status: 'stopped', stage: 'selection', reason: (browse && browse.reason) || 'real-selection-not-confirmed', selected: browse && browse.selectedIds || selected, businessDate };
+      let reason = String((browse && browse.reason) || 'real-selection-not-confirmed');
+      let partial = ((browse && browse.selectedIds) || selected || []).map(String);
+      // 目录耗尽且本轮 0 选中：不清空 attempted，从头复扫并允许勾选已 attempted 未发布商品。
+      // 避免上次未提交勾选被记入 attempted 后下轮永远选不满、也无法偏提交。
+      if (/catalog-exhausted/.test(reason) && partial.length < 1) {
+        browse = await d.browseProducts({
+          selectedIds: [], hints, publishedSet, attemptedSet,
+          cursor: { category: categories[0], page: 1 },
+          needed: biz.productsPerPlan,
+          categories,
+          onProgress: saveProgress,
+          allowAttemptedReuse: true,
+          resetCursor: true,
+        });
+        if (browse && browse.ok === true) {
+          await adoptBrowseSelection(browse);
+        } else {
+          reason = String((browse && browse.reason) || reason);
+          partial = ((browse && browse.selectedIds) || []).map(String);
+          if (/catalog-exhausted/.test(reason) && partial.length >= 1 && partial.length < biz.productsPerPlan
+            && (partial.length > 20 || (browse && browse.lastPageReached === true))) {
+            const stopped = await commitCatalogExhaustPartial(browse);
+            if (stopped) return stopped;
+          } else if (partial.length < 20 && !(browse && browse.lastPageReached === true)) {
+            return { status: 'stopped', stage: 'selection', reason: 'below-20-last-page-not-reached', selected: partial, businessDate };
+          } else {
+            return { status: 'stopped', stage: 'selection', reason, selected: partial, businessDate };
+          }
+        }
+      } else if (/catalog-exhausted/.test(reason) && partial.length >= 1 && partial.length < biz.productsPerPlan
+        && (partial.length > 20 || (browse && browse.lastPageReached === true))) {
+        const stopped = await commitCatalogExhaustPartial(browse);
+        if (stopped) return stopped;
+      } else if (partial.length > 0 && partial.length < 20 && !(browse && browse.lastPageReached === true)) {
+        return { status: 'stopped', stage: 'selection', reason: 'below-20-last-page-not-reached', selected: partial, businessDate };
+      } else {
+        return { status: 'stopped', stage: 'selection', reason, selected: partial, businessDate };
+      }
+    } else {
+      await adoptBrowseSelection(browse);
     }
-    selected = (browse.selectedIds || []).map(String);
-    hints = browse.hints || hints;
-    workingState = { ...workingState, lastSelected: selected, hints, attempted: [...new Set([...(workingState.attempted || []), ...(browse.attempted || [])])], cursor: browse.cursor || workingState.cursor };
-    await persistState(workingState);
   } else {
     let capacity = biz.productsPerPlan - selected.length;
     const categories = d.categoryOrder || CATEGORY_TAB_ORDER;
@@ -1107,9 +1204,13 @@ async function preparePlan(deps) {
       }
     }
   }
-  if (selected.length < biz.productsPerPlan) {
+  if (selected.length < 1) {
+    return { status: 'stopped', stage: 'selection-incomplete', reason: 'catalog-exhausted-no-products', selected, businessDate };
+  }
+  if (selected.length < biz.productsPerPlan && !catalogExhaustedPartial) {
     return { status: 'stopped', stage: 'selection-incomplete', reason: 'catalog-exhausted', selected, businessDate };
   }
+  if (catalogExhaustedPartial) effectiveCapacity = selected.length;
 
   // 3) bind the approved target accounts to every product (header select-all once
   //    + batch apply), then read the main table and remove/backfill until 30 valid,
@@ -1123,7 +1224,7 @@ async function preparePlan(deps) {
   // plain read is used exactly as before.
   const readRows = async () => {
     if (typeof d.awaitMainTableStable === 'function') {
-      const stable = await d.awaitMainTableStable({ capacity: biz.productsPerPlan });
+      const stable = await d.awaitMainTableStable({ capacity: effectiveCapacity });
       if (!stable || stable.ok !== true) {
         return { ok: false, reason: (stable && stable.reason) || 'main-table-not-stable', rows: [], stableReads: stable && stable.stableReads };
       }
@@ -1132,15 +1233,34 @@ async function preparePlan(deps) {
     return { ok: true, rows: await d.readMainTable(), stableReads: null };
   };
   let bindingFailedIds = (binding && Array.isArray(binding.failedIds)) ? binding.failedIds.map(String) : [];
-  const bindingRows = (binding && Array.isArray(binding.rows)) ? binding.rows : null;
-  const batchIdSet = new Set(selected.map(String));
+  let bindingRows = (binding && Array.isArray(binding.rows)) ? binding.rows : null;
   // Explicit per-product proofs that are allowed to survive into repair: only alreadyPlanned
-  // flags (explicit platform copy / settled hover tooltip) for THIS batch's exact ids.
-  const duplicateIdsOf = rows => [...new Set((Array.isArray(rows) ? rows : [])
-    .filter(r => r && r.alreadyPlanned === true && batchIdSet.has(String(r.productId)))
-    .map(r => String(r.productId)))];
+  // flags (explicit platform copy / settled hover tooltip) for the CURRENT batch's ids.
+  const duplicateIdsOf = rows => {
+    const batchIds = new Set((Array.isArray(rows) ? rows : []).map(r => r && String(r.productId)).filter(Boolean));
+    return [...new Set((Array.isArray(rows) ? rows : [])
+      .filter(r => r && r.alreadyPlanned === true && batchIds.has(String(r.productId)))
+      .map(r => String(r.productId)))];
+  };
   let provenDuplicateIds = [];
   let mainRows;
+  const normalizeReplacementRows = rows => rows.map(r => {
+    if (r && r.unbindableExhausted === true) {
+      return { ...r, autoPullOnly: true, manualAccounts: 0, manualEvidence: false, manualCountKnown: true };
+    }
+    if (r && r.productId != null && Number.isInteger(r.manualAccounts)
+      && (r.manualEvidence === true || r.autoPullOnly === true || r.alreadyPlanned === true || r.reviewFailed === true)) return r;
+    const parsed = parseMainTableRow(String(r?.text || ''));
+    return {
+      ...r, ...parsed, productId: r?.productId ?? parsed.productId,
+      alreadyPlanned: r?.alreadyPlanned === true || parsed.alreadyPlanned === true,
+      reviewFailed: r?.reviewFailed === true || parsed.reviewFailed === true,
+      autoPullOnly: r?.autoPullOnly === true || parsed.autoPullOnly === true,
+      manualAccounts: Number.isInteger(r?.manualAccounts) ? r.manualAccounts : parsed.manualAccounts,
+      manualEvidence: r?.manualEvidence === true || parsed.manualEvidence,
+      manualCountKnown: r?.manualCountKnown === true || parsed.manualCountKnown,
+    };
+  });
   if (d.requireRealDrivers === true && (!binding || binding.ok !== true)) {
     // A failed bind is NOT automatically a stop any more: when the binder itself returns
     // the REAL current rows, or the main table can be read, a WHOLE batch whose every row
@@ -1149,7 +1269,16 @@ async function preparePlan(deps) {
     // proven batch (a missing row, an unknown manual state, a gray checkbox, a partial set)
     // keeps the original zero-removal stop.
     let candidates = null;
-    if (typeof d.awaitMainTableStable === 'function') {
+    // 2026-11-22：binder 已穷举整批不可绑并带回证据行时，优先用这些行做轮转证明；
+    // 此时账号抽屉往往还开着，强行 awaitMainTableStable 会读空主表并中断轮转。
+    const binderExhaustedRows = binding && binding.batchUnbindableExhausted === true
+      && bindingRows && bindingRows.length === effectiveCapacity
+      && selected.every(id => bindingRows.some(r => String(r.productId) === String(id)))
+      ? bindingRows
+      : null;
+    if (binderExhaustedRows) {
+      candidates = binderExhaustedRows;
+    } else if (typeof d.awaitMainTableStable === 'function') {
       const rr = await readRows();
       if (!rr.ok) {
         return { status: 'stopped', stage: 'stable-read', reason: 'binding-failure-' + rr.reason, businessDate };
@@ -1168,26 +1297,27 @@ async function preparePlan(deps) {
     // 2026-11-22 整批轮转修复：新鲜主表行必须先过解析器（autoPullOnly/已知零绑定），
     // 否则 allProven 的 every() 在未解析行上全 false → 轮转永不触发（用户 2026-11-21 指令：
     // 30 个全部无法绑定就翻目录下一页换一批，翻完最后一页才正常终止）。
-    candidates = candidates.map(r => {
-      if (r && r.productId !== undefined && r.autoPullOnly !== undefined && r.manualAccounts !== undefined) return r;
-      const parsed = parseMainTableRow(String((r && r.text) || ""));
-      return Object.assign({}, r, parsed, { productId: (r && r.productId != null) ? r.productId : parsed.productId });
-    });
-    const readback = candidates && candidates.length ? evaluateReadiness(candidates, biz.productsPerPlan, biz) : null;
+    // 2026-11-22 续（用户纠正）：乘方 bug——曾发布商品可选但绑不上；reader 可能留下
+    // autoPullOnly:false + manualAccounts:null，必须允许再解析。binder 穷举置灰后的
+    // unbindableExhausted 也算整批可换证据（不必等待联盟/已存在计划文案）。
+    // 已有明确 manualAccounts/manualEvidence 的行绝不能被 parse 覆盖冲掉。
+    candidates = normalizeReplacementRows(candidates);
+    const readback = candidates && candidates.length ? evaluateReadiness(candidates, effectiveCapacity, biz) : null;
     const proof = candidates && candidates.length
-      ? planRemovalAndBackfill({ rows: candidates, capacity: biz.productsPerPlan, attemptedSet, publishedSet, catalogRemainingIds: d.catalogRemainingIds || [] })
+      ? planRemovalAndBackfill({ rows: candidates, capacity: effectiveCapacity, attemptedSet, publishedSet, catalogRemainingIds: d.catalogRemainingIds || [] })
       : null;
+    const batchUnbindableExhausted = binding && binding.batchUnbindableExhausted === true
+      && Array.isArray(binding.failedIds) && binding.failedIds.map(String).length === effectiveCapacity
+      && selected.every(id => binding.failedIds.map(String).includes(String(id)));
     const allProven = !!proof
-      && candidates.length === biz.productsPerPlan
-      && readback.uniqueCount === biz.productsPerPlan
+      && candidates.length === effectiveCapacity
+      && readback.uniqueCount === effectiveCapacity
       && readback.unknownManualIds.length === 0
       && readback.ambiguousCount === 0
       && proof.blockedUnknownIds.length === 0
-      && proof.removeIds.length === biz.productsPerPlan
-      // A whole batch is only replaceable on EXPLICIT per-product platform copy
-      // (already planned / review failed / auto-pull-only). A gray checkbox or a
-      // merely-unbound row (manual 0 before any bind) is NEVER such proof.
-      && candidates.every(r => r.alreadyPlanned === true || r.reviewFailed === true || r.autoPullOnly === true);
+      && proof.removeIds.length === effectiveCapacity
+      // Replaceable: explicit platform copy OR binder-exhausted unbindable batch (乘方可选不可绑).
+      && (batchUnbindableExhausted || candidates.every(r => r.alreadyPlanned === true || r.reviewFailed === true || r.autoPullOnly === true || r.unbindableExhausted === true));
     if (!allProven) {
       const bindingDiag = sanitizeBindingDiagnostic(binding && binding.diag);
       return {
@@ -1213,44 +1343,150 @@ async function preparePlan(deps) {
   })));
   workingState = { ...workingState, hints };
   await persistState(workingState);
-  let readiness = evaluateReadiness(mainRows, biz.productsPerPlan);
+  let readiness = evaluateReadiness(mainRows, effectiveCapacity);
   emitReadiness(readiness, 'initial', 0);
   let finalRows = mainRows;
-  for (let round = 0; !readiness.ready && round < biz.productsPerPlan; round++) {
+  // 2026-11-22：乘方可选不可绑密度高时，每轮 repair 往往只多绑 0~1 个；
+  // 原 productsPerPlan(30) 轮上限会在仍差十几时 still-not-30-valid 停死。
+  // 放宽到 90，仍有界；连续无进展由下方 repair-made-no-progress / readiness 门收住。
+  const maxRepairRounds = Math.max(biz.productsPerPlan * 3, 90);
+  // 超过 20 且不可绑数量连续两轮不降：删掉绑不上的，直接发布，不再补品。
+  let bindStall = 0;
+  let lastUnboundCount = null;
+  for (let round = 0; !readiness.ready && round < maxRepairRounds; round++) {
     if (readiness.unknownManualIds.length) {
       // 2026-11-21 诊断：未知绑定证据的主表行原文（本地 stdout，便于人工判断解析缺口）
       try { const unknownRows = mainRows.filter(r => readiness.unknownManualIds.includes(r.productId)); console.log(JSON.stringify({ op: 'diag-unknown-binding-rows', rows: unknownRows.map(r => ({ productId: r.productId, manualAccounts: r.manualAccounts, text: String(r.text || '').replace(/s+/g, ' ').slice(0, 160) })) }, null, 1)); } catch (_) {}
       return { status: 'stopped', stage: 'readiness', reason: 'manual-binding-evidence-unknown-no-removal', readiness, businessDate };
     }
     const plan = planRemovalAndBackfill({
-      rows: mainRows, capacity: biz.productsPerPlan,
+      rows: mainRows, capacity: effectiveCapacity,
       attemptedSet, publishedSet, catalogRemainingIds: d.catalogRemainingIds || [],
     });
     if (!plan.removeIds.length) {
       return { status: 'stopped', stage: 'readiness', reason: plan.catalogExhausted ? 'catalog-exhausted-no-safe-repair' : 'no-current-row-evidence-for-removal', readiness, plan, businessDate };
     }
-    const repaired = await d.repairDraft({
-      removeIds: plan.removeIds,
-      backfillIds: plan.backfillIds,
-      backfillCount: plan.need,
-      rows: mainRows,
-      state: workingState,
-      publishedSet,
-      attemptedSet,
-      hints,
-      // Bind-failure information and the ACTUAL main rows enter the prepare/repair
-      // contract. The repair driver may use them only as provenance (attempted /
-      // diagnostics); removal still requires explicit current-row evidence, so an
-      // unknown/failed binder message can never delete a good product.
-      failedIds: bindingFailedIds,
-      bindingRows: bindingRows || mainRows,
-      provenDuplicateIds,
-      repairMode: plan.mode,
-      requireNextPage: plan.requireNextPage,
-      onProgress: saveProgress,
-    });
+    // 目录已耗尽且本批全部不可绑：没有下一页可换，直接停（不再整批轮转）。
+    if (catalogExhaustedPartial && plan.mode === 'whole-batch-removal') {
+      return { status: 'stopped', stage: 'readiness', reason: 'catalog-exhausted-all-unbindable', readiness, plan, businessDate };
+    }
+    const boundCount = Math.max(0, effectiveCapacity - plan.need);
+    if (lastUnboundCount != null && plan.removeIds.length >= lastUnboundCount) bindStall += 1;
+    else bindStall = 0;
+    lastUnboundCount = plan.removeIds.length;
+    // 不足 20：不允许因绑不上提前发布，继续补到「全部」最后一页。
+    const publishBoundNow = boundCount > 20 && bindStall >= 2
+      && plan.mode === 'partial-removal' && plan.blockedUnknownIds.length === 0;
+    let repaired;
+    try {
+      repaired = await d.repairDraft({
+        removeIds: plan.removeIds,
+        backfillIds: publishBoundNow ? [] : plan.backfillIds,
+        backfillCount: publishBoundNow ? 0 : plan.need,
+        rows: mainRows,
+        state: workingState,
+        publishedSet,
+        attemptedSet,
+        hints,
+        failedIds: bindingFailedIds,
+        bindingRows: bindingRows || mainRows,
+        provenDuplicateIds,
+        repairMode: publishBoundNow ? 'remove-only-publish' : plan.mode,
+        requireNextPage: publishBoundNow ? false : plan.requireNextPage,
+        onProgress: saveProgress,
+      });
+    } catch (error) {
+      const msg = String((error && error.message) || error);
+      // 已绑 >20：补品滚动/引导失败不再整单停死，改走只删不补发布。
+      if (boundCount > 20 && /native-advance-guide-state-not-persisted|native-catalog-no-progress|catalog-exhausted/.test(msg)) {
+        repaired = { ok: false, reason: msg, publishBound: true };
+      } else {
+        throw error;
+      }
+    }
+    if (publishBoundNow && repaired && repaired.ok === true) {
+      finalRows = Array.isArray(repaired.mainRows) ? repaired.mainRows : [];
+      if (finalRows.length <= 20) {
+        return { status: 'stopped', stage: 'readiness-after-repair', reason: 'bind-stall-remaining-below-20', readiness, plan, businessDate };
+      }
+      effectiveCapacity = finalRows.length;
+      readiness = evaluateReadiness(finalRows, effectiveCapacity);
+      emitReadiness(readiness, 'bind-stall-publish-remaining', round + 1);
+      if (!readiness.ready) {
+        return { status: 'stopped', stage: 'readiness-after-repair', reason: 'bind-stall-remaining-not-ready', readiness, plan, businessDate };
+      }
+      catalogExhaustedPartial = true;
+      mainRows = finalRows;
+      break;
+    }
+    // 2026-11-22 用户：可选目录耗尽就直接发布，不需要重新来过。
+    // 注意：plan.catalogExhausted 在 catalogRemainingIds 未注入时会假阳性，不能作前置捷径；
+    // 必须以真实 browse/picker 回报的 catalog-exhausted* 为准。repairDraft 先删后补，
+    // 失败时坏行往往已删，剩余已绑可直接按 N 容量发布。
     if (!repaired || repaired.ok === false) {
-      return { status: 'stopped', stage: 'repair', reason: (repaired && repaired.reason) || 'repair-not-confirmed', readiness, plan, businessDate };
+      const repairReason = String((repaired && repaired.reason) || 'repair-not-confirmed');
+      const catalogGone = /catalog-exhausted|native-catalog-no-progress/.test(repairReason);
+      const remainingValid = effectiveCapacity - plan.need;
+      const lastPage = repaired && repaired.lastPageReached === true;
+      if (remainingValid < 20 && !lastPage && /catalog-exhausted|below-20-last-page|native-catalog-no-progress/.test(repairReason)) {
+        return { status: 'stopped', stage: 'repair', reason: 'below-20-last-page-not-reached', readiness, plan, businessDate };
+      }
+      if ((catalogGone || publishBoundNow || (repaired && repaired.publishBound) || (remainingValid > 20 && /native-catalog-no-progress|native-advance-guide/.test(repairReason))) && plan.mode === 'partial-removal' && remainingValid >= 1 && remainingValid < effectiveCapacity && (remainingValid > 20 || lastPage || (repaired && repaired.publishBound) || publishBoundNow)) {
+        let keptRows = Array.isArray(repaired && repaired.mainRows) ? repaired.mainRows : null;
+        if (!keptRows || keptRows.length < 1) {
+          // 剩余容量已是 remainingValid，绝不能再用满额 30 做稳定读（会永远 main-table-not-stable）。
+          if (typeof d.awaitMainTableStable === 'function') {
+            const stableKeep = await d.awaitMainTableStable({ capacity: remainingValid });
+            if (!stableKeep || stableKeep.ok !== true) {
+              return { status: 'stopped', stage: 'stable-read', reason: 'catalog-exhausted-remaining-unreadable:' + ((stableKeep && stableKeep.reason) || 'main-table-not-stable'), businessDate };
+            }
+            keptRows = Array.isArray(stableKeep.rows) ? stableKeep.rows : [];
+          } else {
+            keptRows = await d.readMainTable();
+          }
+        }
+        // 若坏行仍在（browse 失败发生在删除前的极端路径），再走只删不补。
+        const stillBad = plan.removeIds.filter(id => keptRows.some(r => String(r.productId) === String(id)));
+        if (stillBad.length) {
+          const removeOnly = await d.repairDraft({
+            removeIds: stillBad,
+            backfillIds: [],
+            backfillCount: 0,
+            rows: keptRows,
+            state: workingState,
+            publishedSet,
+            attemptedSet,
+            hints,
+            failedIds: bindingFailedIds,
+            bindingRows: bindingRows || keptRows,
+            provenDuplicateIds,
+            repairMode: 'remove-only-publish',
+            requireNextPage: false,
+            onProgress: saveProgress,
+          });
+          if (!removeOnly || removeOnly.ok === false) {
+            return { status: 'stopped', stage: 'repair', reason: (removeOnly && removeOnly.reason) || repairReason, readiness, plan, businessDate };
+          }
+          keptRows = Array.isArray(removeOnly.mainRows) ? removeOnly.mainRows : keptRows;
+        }
+        finalRows = keptRows;
+        hints = mergeCardHints(hints, finalRows.map(r => ({
+          productId: r.productId, text: r.text || '', migrationWarning: r.migrationWarning,
+          precheckRisk: r.precheckRisk || r.precheck, reviewFailed: r.reviewFailed,
+        })));
+        workingState = { ...workingState, hints };
+        await persistState(workingState);
+        effectiveCapacity = finalRows.length;
+        readiness = evaluateReadiness(finalRows, effectiveCapacity);
+        emitReadiness(readiness, 'catalog-exhausted-publish-remaining', round + 1);
+        if (!readiness.ready) {
+          return { status: 'stopped', stage: 'readiness-after-repair', reason: 'catalog-exhausted-remaining-not-ready', readiness, plan, businessDate };
+        }
+        catalogExhaustedPartial = true;
+        mainRows = finalRows;
+        break;
+      }
+      return { status: 'stopped', stage: 'repair', reason: repairReason, readiness, plan, businessDate };
     }
     if (Array.isArray(repaired.mainRows)) finalRows = repaired.mainRows;
     else {
@@ -1269,9 +1505,49 @@ async function preparePlan(deps) {
       return { status: 'stopped', stage: 'readiness-after-repair', reason: 'repair-made-no-progress', readiness: afterRepair, businessDate };
     }
     const rebound = await d.bindAccountsToAll({ productIds: afterRepair.uniqueIds, repairRound: round + 1 });
+    // 2026-11-22：partial 绑定成功时也要刷新 failedIds/rows，否则下一轮 repair 仍拿首轮失败集。
+    if (rebound && rebound.ok === true) {
+      bindingFailedIds = Array.isArray(rebound.failedIds) ? rebound.failedIds.map(String) : [];
+      if (Array.isArray(rebound.rows) && rebound.rows.length) bindingRows = rebound.rows;
+    }
     if (d.requireRealDrivers === true && (!rebound || rebound.ok !== true)) {
+      // 2026-11-22：换批后新 30 仍可能整批不可绑。与首轮相同——带着 binder 证据继续
+      // 下一轮 repair/轮转，不要在 account-rebinding 直接停死。
+      const rebindRows = Array.isArray(rebound && rebound.rows) ? rebound.rows : null;
+      const rebindExhausted = rebound && rebound.batchUnbindableExhausted === true
+        && rebindRows && rebindRows.length === biz.productsPerPlan
+        && afterRepair.uniqueIds.every(id => rebindRows.some(r => String(r.productId) === String(id)));
+      let replacementRows = rebindExhausted ? normalizeReplacementRows(rebindRows) : null;
+      if (!replacementRows && rebound?.reason === 'manual-account-bind-readback-does-not-match-recorded-outcome'
+        && typeof d.awaitMainTableStable === 'function') {
+        // 平台提交抖音号绑定后，主表仍可能明确显示整批为零。只按重新稳定读取的当前批次轮转。
+        const stable = await readRows();
+        if (stable.ok && stable.rows.length === effectiveCapacity) {
+          const candidates = normalizeReplacementRows(stable.rows);
+          const proof = planRemovalAndBackfill({ rows: candidates, capacity: effectiveCapacity, attemptedSet, publishedSet });
+          const candidateIds = new Set(candidates.map(r => String(r.productId)));
+          if (candidateIds.size === effectiveCapacity && afterRepair.uniqueIds.every(id => candidateIds.has(String(id)))
+            && proof.removeIds.length === effectiveCapacity && proof.blockedUnknownIds.length === 0
+            && candidates.every(r => r.alreadyPlanned === true || r.reviewFailed === true
+              || (r.autoPullOnly === true && r.manualAccounts === 0))) replacementRows = candidates;
+        }
+      }
+      if (replacementRows) {
+        mainRows = replacementRows;
+        bindingFailedIds = rebindExhausted && Array.isArray(rebound.failedIds)
+          ? rebound.failedIds.map(String) : replacementRows.map(r => String(r.productId));
+        bindingRows = replacementRows;
+        provenDuplicateIds = duplicateIdsOf(mainRows);
+        readiness = evaluateReadiness(mainRows, biz.productsPerPlan);
+        emitReadiness(readiness, 'rebind-unbindable-exhausted', round + 1);
+        finalRows = mainRows;
+        continue;
+      }
       const rebindDiag = sanitizeBindingDiagnostic(rebound && rebound.diag);
-      return { status: 'stopped', stage: 'account-rebinding', reason: (rebound && rebound.reason) || 'repair-rebinding-not-confirmed', bindingDiag: rebindDiag, businessDate };
+      const rebindReason = (rebound && rebound.closeError)
+        ? String(rebound.reason || 'repair-rebinding-not-confirmed') + ':' + String(rebound.closeError).slice(0, 180)
+        : ((rebound && rebound.reason) || 'repair-rebinding-not-confirmed');
+      return { status: 'stopped', stage: 'account-rebinding', reason: rebindReason, bindingDiag: rebindDiag, businessDate };
     }
     const rrAfter = await readRows();
     if (!rrAfter.ok) return { status: 'stopped', stage: 'stable-read', reason: 'after-rebind-' + rrAfter.reason, businessDate };
@@ -1313,19 +1589,20 @@ async function preparePlan(deps) {
   if (typeof d.awaitMainTableStable === 'function') {
     let postRepairs = 0;
     for (;;) {
-      const post = await d.awaitMainTableStable({ capacity: biz.productsPerPlan });
+      const post = await d.awaitMainTableStable({ capacity: effectiveCapacity });
       if (!post || post.ok !== true) {
         return { status: 'stopped', stage: 'stable-read', reason: 'post-configuration-' + ((post && post.reason) || 'main-table-not-stable'), businessDate };
       }
       const postRows = Array.isArray(post.rows) ? post.rows : [];
-      const gate = reviewStabilityContract({ rows: postRows, capacity: biz.productsPerPlan, business: biz, stableReads: post && post.stableReads });
+      const gate = reviewStabilityContract({ rows: postRows, capacity: effectiveCapacity, business: biz, stableReads: post && post.stableReads });
       if (gate.ready) { finalRows = postRows; break; }
-      const postReadiness = gate.readiness || evaluateReadiness(postRows, biz.productsPerPlan, biz);
+      const postReadiness = gate.readiness || evaluateReadiness(postRows, effectiveCapacity, biz);
       if (postReadiness.unknownManualIds.length || postReadiness.ambiguousCount > 0) {
         return { status: 'stopped', stage: 'readiness-after-configuration', reason: 'review-or-rows-not-stable-after-configuration', gateReasons: gate.reasons, readiness: postReadiness, businessDate };
       }
+      // 目录耗尽的部分计划：配置后若再出坏行，只删不补，继续用更少剩余发布。
       const latePlan = planRemovalAndBackfill({
-        rows: postRows, capacity: biz.productsPerPlan,
+        rows: postRows, capacity: effectiveCapacity,
         attemptedSet, publishedSet, catalogRemainingIds: d.catalogRemainingIds || [],
       });
       if (!latePlan.removeIds.length) {
@@ -1335,6 +1612,46 @@ async function preparePlan(deps) {
         return { status: 'stopped', stage: 'readiness-after-configuration', reason: 'configuration-repair-round-limit', gateReasons: gate.reasons, readiness: postReadiness, businessDate };
       }
       postRepairs++;
+      const lateRemaining = effectiveCapacity - latePlan.need;
+      // 已是目录耗尽部分计划：配置后再出坏行只删不补。否则先走正常回填；
+      // 仅当 browse 真回报 catalog-exhausted 时才降容量发布。
+      if (catalogExhaustedPartial === true && lateRemaining >= 1 && lateRemaining < effectiveCapacity) {
+        const repaired = await d.repairDraft({
+          removeIds: latePlan.removeIds,
+          backfillIds: [],
+          backfillCount: 0,
+          rows: postRows,
+          state: workingState,
+          publishedSet,
+          attemptedSet,
+          hints,
+          failedIds: bindingFailedIds,
+          bindingRows: postRows,
+          provenDuplicateIds: duplicateIdsOf(postRows),
+          repairMode: 'remove-only-publish',
+          requireNextPage: false,
+          onProgress: saveProgress,
+        });
+        if (!repaired || repaired.ok === false) {
+          return { status: 'stopped', stage: 'repair', reason: (repaired && repaired.reason) || 'remove-only-publish-not-confirmed', readiness: postReadiness, plan: latePlan, businessDate };
+        }
+        let repairedRows = Array.isArray(repaired.mainRows) ? repaired.mainRows : null;
+        if (!repairedRows) {
+          const rr = await readRows();
+          if (!rr.ok) return { status: 'stopped', stage: 'stable-read', reason: 'after-configuration-remove-only-' + rr.reason, businessDate };
+          repairedRows = rr.rows;
+        }
+        effectiveCapacity = repairedRows.length;
+        finalRows = repairedRows;
+        mainRows = repairedRows;
+        const reconfigured = await d.configurePlan({ planNumber: d.planNumber, businessDate, mainRows: finalRows });
+        if (!reconfigured || reconfigured.ok !== true || !reconfigured.planName) {
+          const reason = (reconfigured && reconfigured.reason) || 'settings-not-confirmed';
+          return { status: 'stopped', stage: 'plan-settings', reason, businessDate };
+        }
+        configured = reconfigured;
+        continue;
+      }
       const repaired = await d.repairDraft({
         removeIds: latePlan.removeIds,
         backfillIds: latePlan.backfillIds,
@@ -1352,7 +1669,27 @@ async function preparePlan(deps) {
         onProgress: saveProgress,
       });
       if (!repaired || repaired.ok === false) {
-        return { status: 'stopped', stage: 'repair', reason: (repaired && repaired.reason) || 'repair-not-confirmed', readiness: postReadiness, plan: latePlan, businessDate };
+        const lateReason = String((repaired && repaired.reason) || 'repair-not-confirmed');
+        if (/catalog-exhausted/.test(lateReason) && lateRemaining >= 1 && lateRemaining < effectiveCapacity) {
+          let keptRows = Array.isArray(repaired.mainRows) ? repaired.mainRows : null;
+          if (!keptRows) {
+            const rr = await readRows();
+            if (!rr.ok) return { status: 'stopped', stage: 'stable-read', reason: 'after-configuration-catalog-exhaust-' + rr.reason, businessDate };
+            keptRows = rr.rows;
+          }
+          effectiveCapacity = keptRows.length;
+          catalogExhaustedPartial = true;
+          finalRows = keptRows;
+          mainRows = keptRows;
+          const reconfigured = await d.configurePlan({ planNumber: d.planNumber, businessDate, mainRows: finalRows });
+          if (!reconfigured || reconfigured.ok !== true || !reconfigured.planName) {
+            const reason = (reconfigured && reconfigured.reason) || 'settings-not-confirmed';
+            return { status: 'stopped', stage: 'plan-settings', reason, businessDate };
+          }
+          configured = reconfigured;
+          continue;
+        }
+        return { status: 'stopped', stage: 'repair', reason: lateReason, readiness: postReadiness, plan: latePlan, businessDate };
       }
       let repairedRows = Array.isArray(repaired.mainRows) ? repaired.mainRows : null;
       if (!repairedRows) {
@@ -1360,7 +1697,7 @@ async function preparePlan(deps) {
         if (!rr.ok) return { status: 'stopped', stage: 'stable-read', reason: 'after-configuration-repair-' + rr.reason, businessDate };
         repairedRows = rr.rows;
       }
-      const afterRepair = evaluateReadiness(repairedRows, biz.productsPerPlan, biz);
+      const afterRepair = evaluateReadiness(repairedRows, effectiveCapacity, biz);
       hints = mergeCardHints(hints, repairedRows.map(r => ({
         productId: r.productId, text: r.text || '', migrationWarning: r.migrationWarning,
         precheckRisk: r.precheckRisk || r.precheck, reviewFailed: r.reviewFailed,
@@ -1384,7 +1721,7 @@ async function preparePlan(deps) {
       configured = reconfigured;
     }
   }
-  const finalIds = evaluateReadiness(finalRows, biz.productsPerPlan).uniqueIds;
+  const finalIds = evaluateReadiness(finalRows, effectiveCapacity).uniqueIds;
   // The frozen target set: live-discovered binding first, then an explicitly
   // injected set, then the profile's own configured targets (the legacy default
   // resolves to its frozen two). A generic shop that resolves to NONE must stop
@@ -1396,13 +1733,17 @@ async function preparePlan(deps) {
   if (d.requireRealDrivers === true && (!boundAccounts || boundAccounts.length < 1)) {
     return { status: 'stopped', stage: 'account-binding', reason: 'no-approved-bind-targets', businessDate };
   }
-  const frozen = await freezeReady(deps, finalIds, finalRows, businessDate, hints, configured && configured.planName, boundAccounts);
-  return { status: 'ready-awaiting-confirmation', businessDate, binding, readiness, frozen };
+  const frozen = await freezeReady(deps, finalIds, finalRows, businessDate, hints, configured && configured.planName, boundAccounts, {
+    productsPerPlan: effectiveCapacity,
+    catalogExhaustedPartial,
+  });
+  return { status: 'ready-awaiting-confirmation', businessDate, binding, readiness, frozen, catalogExhaustedPartial, productsPerPlan: effectiveCapacity };
 }
 
-async function freezeReady(deps, selectedIds, mainRows, businessDate, cardHints, configuredPlanName, boundAccounts) {
+async function freezeReady(deps, selectedIds, mainRows, businessDate, cardHints, configuredPlanName, boundAccounts, extras) {
   const d = deps || {};
   const biz = bizOf(d.business);
+  const x = extras || {};
   const hints = mergeCardHints(d.hints || {}, Object.entries(cardHints || {}).map(([productId, h]) => ({ productId, ...h })));
   const parsed = (mainRows || []).map(r => (r.productId !== undefined ? r : parseMainTableRow(r.text || r)));
   const migration = parsed.filter(r => r.productId && ((hints[String(r.productId)] && hints[String(r.productId)].migrationWarning) || r.migrationWarning)).map(r => String(r.productId));
@@ -1416,6 +1757,8 @@ async function freezeReady(deps, selectedIds, mainRows, businessDate, cardHints,
     productIds: selectedIds,
     boundAccounts: boundAccounts && boundAccounts.length ? boundAccounts : undefined,
     disclosures: { migration, precheck, reviewFailed: [] },
+    productsPerPlan: Number.isInteger(x.productsPerPlan) ? x.productsPerPlan : selectedIds.length,
+    catalogExhaustedPartial: x.catalogExhaustedPartial === true,
   }, { nowMs: d.nowMs, business: biz });
 }
 
@@ -1494,7 +1837,7 @@ async function publishConfirmedPlan(frozen, request, deps) {
     planName: frozen.planName,
     accountId: biz.accountId,
     existingPlanIds: d.existingPlanIds || [],
-    productsPerPlan: biz.productsPerPlan,
+    productsPerPlan: Number.isInteger(frozen.productsPerPlan) ? frozen.productsPerPlan : (frozen.productIds || []).length || biz.productsPerPlan,
     roi: biz.roi,
     dailyBudget: biz.dailyBudget,
   });

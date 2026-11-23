@@ -124,6 +124,32 @@ function makeCtx(bodyKids, locationOverride = {}) {
 }
 const plain = v => JSON.parse(JSON.stringify(v));
 
+test('draft removal counts an overlapping dialog and popover once and ignores its empty platform mask', () => {
+  const accountId = wf.BUSINESS.accountId;
+  const productId = '385000000000000001';
+  const removeProof = { rowProof: true, accountId, productId, route: 'create-ad/overall-product' };
+  const location = { pathname: '/' + removeProof.route, search: '?aavid=' + accountId };
+  const navigator = () => El('div', { class: 'qc-page-navigator-container', text: 'ID: ' + accountId });
+  const confirm = El('button', { text: '确认' });
+  const cancel = El('button', { text: '取消' });
+  const dialog = El('div', { class: 'oc-modal-wrap', attrs: { role: 'dialog' } }, [
+    El('div', { class: 'oc-popover-content', attrs: { role: 'dialog' } }, [
+      El('h2', { text: '确定要删除商品吗？' }),
+      El('div', { text: '删除商品时，已添加的抖音号、素材将同步被清空' }),
+      cancel, confirm,
+    ]),
+  ]);
+  const mask = El('div', { class: 'aurora-qc-modal-mask aurora-qc-modal-mask-blur' });
+  const unrelated = El('div', { attrs: { role: 'dialog' } }, [El('button', { text: '确认' })]);
+  const blocked = makeCtx([navigator(), mask, dialog, unrelated], location);
+  assert.throws(() => blocked.run(rp.confirmDraftRemovalInPage, { accountId, productId, removeProof }), /draft-remove-known-modal-not-unique/);
+  assert.equal(confirm.__clicks || 0, 0);
+  const ready = makeCtx([navigator(), mask, dialog.__kids[0]], location);
+  assert.deepEqual(plain(ready.run(rp.confirmDraftRemovalInPage, { accountId, productId, removeProof })), { confirmed: true, known: true });
+  assert.equal(confirm.__clicks, 1);
+  assert.equal(cancel.__clicks || 0, 0);
+});
+
 // ── 1. known creation guidance: 跳过 / 我知道了 only ─────────────────────────
 test('R123 guidance accepts 跳过 / 我知道了 inside the known mask only, unknown label stays untouched', () => {
   const mask = (label, rect = [300, 200]) => El('div', { class: 'c-lib-guide-mask', rect }, [
@@ -664,16 +690,32 @@ test('R125 hover tooltip on every account row of all 30 panels proves a real who
   assert.ok(res.rows[4].text.includes(wf.ALREADY_PLANNED_MARK));
   assert.equal(res.bindingEvidence.proven, true);
 });
-test('R125 unknown hover copy / residual tooltip / usable account each void that product proof', async () => {
-  const cases = [{ opt: { unknownTooltip: IDS30[3] }, bad: IDS30[3] }, { opt: { residual: IDS30[5] }, bad: IDS30[5] }, { opt: { usable: IDS30[7] }, bad: IDS30[7] }];
-  for (const { opt, bad } of cases) {
+test('R125 unknown hover / residual tooltip never forge alreadyPlanned; full-gray still batch-rotates; usable voids exhaust', async () => {
+  // 2026-11-22 用户纠正：乘方可选不可绑 —— hover 文案不是整批轮转前提；穷举置灰即可换批。
+  // usable 账号出现则不得宣称「整批不可绑穷尽」。
+  {
     const ids = IDS30.slice();
-    const res = await tooltipDriver(ids, opt).bindAccountsToAll({ productIds: ids });
+    const res = await tooltipDriver(ids, { unknownTooltip: IDS30[3] }).bindAccountsToAll({ productIds: ids });
     assert.equal(res.ok, false);
-    assert.notEqual(res.duplicateProven, true, JSON.stringify(opt));
-    const badRow = res.rows.find(r => String(r.productId) === String(bad));
-    assert.notEqual(badRow.alreadyPlanned, true, 'the unproven product is never marked duplicate: ' + JSON.stringify(opt));
-    assert.equal(res.bindingEvidence.proven, false, 'an unproven panel never makes the batch removable: ' + JSON.stringify(opt));
+    assert.notEqual(res.duplicateProven, true);
+    const badRow = res.rows.find(r => String(r.productId) === String(IDS30[3]));
+    assert.notEqual(badRow.alreadyPlanned, true, 'unknown hover must not forge alreadyPlanned');
+    assert.equal(res.batchUnbindableExhausted, true, 'full-gray exhaust still rotates the batch');
+    assert.equal(res.failedIds.length, 30);
+  }
+  {
+    const ids = IDS30.slice();
+    const res = await tooltipDriver(ids, { residual: IDS30[5] }).bindAccountsToAll({ productIds: ids });
+    assert.equal(res.ok, false);
+    assert.notEqual(res.duplicateProven, true);
+    assert.notEqual((res.rows.find(r => String(r.productId) === String(IDS30[5])) || {}).alreadyPlanned, true);
+    assert.equal(res.batchUnbindableExhausted, true);
+  }
+  {
+    const ids = IDS30.slice();
+    const res = await tooltipDriver(ids, { usable: IDS30[7] }).bindAccountsToAll({ productIds: ids });
+    assert.equal(res.ok, false);
+    assert.notEqual(res.batchUnbindableExhausted, true, 'a usable account voids whole-batch unbindable exhaust');
   }
 });
 
@@ -698,6 +740,98 @@ test('R125 a fresh stable read without the tooltip text still repairs the hover-
   assert.equal(repairArgs.removeIds.length, 30);
   assert.equal(repairArgs.provenDuplicateIds.length, 30, 'the explicit proof is handed to repair');
   assert.equal(repairArgs.repairMode, 'whole-batch-removal');
+});
+
+// ── 12c. 乘方可选不可绑：穷举置灰整批轮转（用户 2026-11-22，非联盟自动投）────
+test('R125 chengfang selectable-but-unbindable batch rotates without hover alreadyPlanned copy', async () => {
+  const ids = IDS30.slice();
+  let repairArgs = null;
+  // Main-table shape seen live: 「手动添加抖音号 自动拉取 0 个」with null manualAccounts from an
+  // outdated reader; binder proves every panel gray via batchUnbindableExhausted.
+  const fresh = ids.map(productId => ({
+    productId,
+    text: '商品 ID：' + productId + ' 手动添加抖音号 自动拉取 0 个',
+    manualAccounts: null,
+    manualEvidence: false,
+    manualCountKnown: false,
+    autoPullOnly: false,
+  }));
+  const bindingRows = ids.map(productId => ({
+    productId,
+    text: fresh.find(r => r.productId === productId).text,
+    unbindableExhausted: true,
+    autoPullOnly: true,
+    manualAccounts: 0,
+    manualEvidence: false,
+    manualCountKnown: true,
+    duplicateEvidence: 'panel-unbindable-exhausted',
+  }));
+  const res = await wf.preparePlan({
+    requireRealDrivers: true, businessDate: '2026-11-22', planNumber: 1, runId: 'r125-unbindable', persistState: async () => {},
+    dayState: wf.newDayState('2026-11-22'), catalogRemainingIds: ids.map((_, i) => '90000000000000' + String(i).padStart(4, '0')),
+    openCreationPage: async () => ({ header: { originOk: true, accountId: wf.BUSINESS.accountId, commissionOptionPresent: true } }),
+    browseProducts: async () => ({ ok: true, selectedIds: ids, attempted: [], cursor: { category: '全部', page: 3 } }),
+    bindAccountsToAll: async () => ({
+      ok: false, reason: 'account-anchor-no-usable-product', rows: bindingRows, failedIds: ids.slice(),
+      batchUnbindableExhausted: true, duplicateProven: false,
+    }),
+    readMainTable: async () => fresh,
+    awaitMainTableStable: async () => ({ ok: true, rows: fresh, stableReads: 2 }),
+    repairDraft: async args => { repairArgs = args; return { ok: false, reason: 'offline-stop-after-proven-removal' }; },
+    configurePlan: async () => { throw new Error('must not configure an unbindable batch'); },
+  });
+  assert.equal(res.stage, 'repair', JSON.stringify(res.reason));
+  assert.equal(repairArgs.removeIds.length, 30);
+  assert.equal(repairArgs.repairMode, 'whole-batch-removal');
+  assert.equal(repairArgs.requireNextPage, true);
+});
+
+test('R125 parseMainTableRow treats 自动拉取 N 个 without 预估 as autoPullOnly', () => {
+  const p = wf.parseMainTableRow('秋冬外套 ID：385000000000000002 店铺新品 手动添加抖音号 自动拉取 0 个');
+  assert.equal(p.autoPullOnly, true);
+  assert.equal(p.manualAccounts, 0);
+  assert.equal(p.manualCountKnown, true);
+});
+
+test('rebinding mismatch rotates a fresh exact zero-binding batch and stops on an unknown row', async () => {
+  const firstIds = IDS30.slice();
+  const nextIds = firstIds.map((_, i) => '90000000000000' + String(i).padStart(4, '0'));
+  const zeroRows = ids => ids.map(productId => ({
+    productId, text: '商品 ID：' + productId + ' 手动添加抖音号 自动拉取 0 个',
+  }));
+  for (const ambiguous of [false, true]) {
+    let binds = 0;
+    const repairs = [];
+    const replacement = zeroRows(nextIds);
+    if (ambiguous) replacement[0].text = '商品 ID：' + nextIds[0] + ' 手动添加抖音号';
+    const read = () => repairs.length ? replacement : zeroRows(firstIds).map(row => ({
+      ...row, manualAccounts: 0, manualCountKnown: true, autoPullOnly: true,
+    }));
+    const res = await wf.preparePlan({
+      requireRealDrivers: true, businessDate: '2026-11-23', planNumber: 1, runId: 'offline-rebind-mismatch',
+      dayState: wf.newDayState('2026-11-23'), persistState: async () => {},
+      openCreationPage: async () => ({ header: { originOk: true, accountId: wf.BUSINESS.accountId, commissionOptionPresent: true } }),
+      browseProducts: async () => ({ ok: true, selectedIds: firstIds, attempted: [], cursor: { category: '全部', page: 3 } }),
+      bindAccountsToAll: async () => ++binds === 1 ? { ok: true }
+        : { ok: false, reason: 'manual-account-bind-readback-does-not-match-recorded-outcome' },
+      readMainTable: async () => read(),
+      awaitMainTableStable: async () => ({ ok: true, rows: read(), stableReads: 2 }),
+      repairDraft: async args => {
+        repairs.push(args);
+        return repairs.length === 1 ? { ok: true, mainRows: replacement, selectedCount: 30, progress: true }
+          : { ok: false, reason: 'offline-stop-after-second-rotation' };
+      },
+      configurePlan: async () => { throw new Error('must not configure an unbindable batch'); },
+    });
+    if (ambiguous) {
+      assert.equal(res.reason, 'manual-account-bind-readback-does-not-match-recorded-outcome');
+      assert.equal(repairs.length, 1);
+    } else {
+      assert.equal(res.reason, 'offline-stop-after-second-rotation');
+      assert.deepEqual(repairs[1].removeIds, nextIds);
+      assert.equal(repairs[1].requireNextPage, true);
+    }
+  }
 });
 
 // ── 13. repair ordering: close the drawer BEFORE the first removal ───────────
@@ -732,9 +866,8 @@ function repairDriver(page, extra = {}) {
 test('R125 repair closes the open drawer (cancel -> confirm -> proven closed) before the first removal', async () => {
   const h = repairPage({ drawer: true });
   const drv = repairDriver(h.page);
-  let err = null;
-  try { await drv.repairDraft({ removeIds: [IDS30[0]], backfillCount: 1, repairMode: 'partial-removal' }); } catch (e) { err = e; }
-  assert.equal(err && err.message, 'ROOT_END_AFTER_FIRST_REMOVAL');
+  const result = await drv.repairDraft({ removeIds: [IDS30[0]], backfillCount: 1, repairMode: 'partial-removal' });
+  assert.deepEqual(result, { ok: false, reason: 'repair-draft-remove-click-failed:ROOT_END_AFTER_FIRST_REMOVAL' });
   assert.deepEqual(h.calls, ['cancel', 'confirm', 'remove']);
   assert.equal(h.state.drawer, false);
   assert.equal(h.state.confirm, false);
@@ -748,24 +881,21 @@ test('R125 an unknown cancel-confirm leaves the drawer open and performs zero re
 });
 test('R125 no drawer initially: proof still runs and the legacy path keeps removing', async () => {
   const h = repairPage({ drawer: false });
-  let err = null;
-  try { await repairDriver(h.page).repairDraft({ removeIds: [IDS30[0]], backfillCount: 1, repairMode: 'partial-removal' }); } catch (e) { err = e; }
-  assert.equal(err && err.message, 'ROOT_END_AFTER_FIRST_REMOVAL');
+  const result = await repairDriver(h.page).repairDraft({ removeIds: [IDS30[0]], backfillCount: 1, repairMode: 'partial-removal' });
+  assert.deepEqual(result, { ok: false, reason: 'repair-draft-remove-click-failed:ROOT_END_AFTER_FIRST_REMOVAL' });
   assert.deepEqual(h.calls, ['remove'], 'no cancel on a drawer-less page');
 });
 test('R125 a page without the drawer census keeps the pre-R125 path (no unknown evaluate regression)', async () => {
   const h = repairPage({ drawer: false, supported: false });
-  let err = null;
-  try { await repairDriver(h.page).repairDraft({ removeIds: [IDS30[0]], backfillCount: 1, repairMode: 'partial-removal' }); } catch (e) { err = e; }
-  assert.equal(err && err.message, 'ROOT_END_AFTER_FIRST_REMOVAL');
+  const result = await repairDriver(h.page).repairDraft({ removeIds: [IDS30[0]], backfillCount: 1, repairMode: 'partial-removal' });
+  assert.deepEqual(result, { ok: false, reason: 'repair-draft-remove-click-failed:ROOT_END_AFTER_FIRST_REMOVAL' });
   assert.deepEqual(h.calls, ['remove']);
 });
 test('R125 repair accepts a hover-proven duplicate id even when the fresh row has no manual evidence', async () => {
   const rows = [{ productId: IDS30[0], text: 'ID：' + IDS30[0], manualAccounts: null, manualEvidence: false, manualCountKnown: false }];
   const h = repairPage({ drawer: false, rows });
-  let err = null;
-  try { await repairDriver(h.page).repairDraft({ removeIds: [IDS30[0]], backfillCount: 1, repairMode: 'partial-removal', provenDuplicateIds: [IDS30[0]] }); } catch (e) { err = e; }
-  assert.equal(err && err.message, 'ROOT_END_AFTER_FIRST_REMOVAL');
+  const result = await repairDriver(h.page).repairDraft({ removeIds: [IDS30[0]], backfillCount: 1, repairMode: 'partial-removal', provenDuplicateIds: [IDS30[0]] });
+  assert.deepEqual(result, { ok: false, reason: 'repair-draft-remove-click-failed:ROOT_END_AFTER_FIRST_REMOVAL' });
   assert.deepEqual(h.calls, ['remove']);
 
   const h2 = repairPage({ drawer: false, rows });
@@ -937,7 +1067,8 @@ function r128Page(mode, shape) {
   const page = {
     url: () => 'https://qianchuan.jinritemai.com/uni-creation/overall-product-multi?aavid=' + wf.BUSINESS.accountId,
     evaluate: async (fn, arg) => {
-      if (fn === rp.readMainTableInPage) return { ok: true, rows };
+      if (fn === rp.readMainTableInPage) return { ok: true, rows: shape === 'zero' && calls.commit
+        ? rows.map(r => ({ ...r, manualAccounts: r.productId === R128_FAIL ? 0 : 1 })) : rows };
       if (fn === rp.bindingDrawerSnapshotInPage) return active === R128_FAIL ? failing() : proven(active);
       if (fn === rp.selectBindingDrawerPanelInPage) { active = String(arg); return { clicked: true, id: String(arg) }; }
       if (fn === rp.selectAllAccountsInPage) { calls.header++; return { clicked: true }; }
@@ -966,8 +1097,6 @@ test('R128 the real bind target stop carries the LAST fresh numeric diag (partia
   const cases = [
     ['partial unknown-row', 'partial', 'unknown', R128_DIAG_UNKNOWN],
     ['no-modal full unknown-row', 'full', 'unknown', R128_DIAG_UNKNOWN],
-    ['no-modal full definite-zero', 'full', 'zero',
-      { phase: 'panel-navigation', rowCount: 1, knownCheckedCount: 0, unknownStateCount: 0, selectedCount: 0, totalCount: 30 }],
     ['no-modal full unreadable snapshot', 'full', 'missing',
       { phase: 'panel-navigation', rowCount: null, knownCheckedCount: null, unknownStateCount: null, selectedCount: null, totalCount: null }],
   ];
@@ -989,6 +1118,13 @@ test('R128 the real bind target stop carries the LAST fresh numeric diag (partia
     assert.equal(raw.includes('ID：'), false, name + ': no row text');
     assert.equal(/https?:|\//.test(raw), false, name + ': no URL/path');
   }
+});
+test('a definite zero without a result modal is handed to draft repair after the other panels are verified', async () => {
+  const fx = r128Page('full', 'zero');
+  const res = await fx.driver().bindAccountsToAll({ productIds: R128_IDS.slice() });
+  assert.equal(res.ok, true, res.reason);
+  assert.deepEqual(res.failedIds, [R128_FAIL]);
+  assert.equal(fx.calls.commit, 1);
 });
 test('R128 that panel-navigation diag survives the real preparePlan stop and the scheduler packet verbatim', async () => {
   const fx = r128Page('full', 'unknown');

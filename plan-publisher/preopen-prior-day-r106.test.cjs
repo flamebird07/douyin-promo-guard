@@ -171,6 +171,29 @@ test('release proof: failed record + failed entry 1 releases via the ONLY schedu
   fs.rmSync(store.dir, { recursive: true, force: true });
 });
 
+test('release proof binds the independent publication store and refuses a current-day plan', () => {
+  const store = buildStore();
+  try {
+    const ledger = seedLedger(store.dir, JIN_REC(), SHOP);
+    const publishedFile = path.join(store.dir, 'published-products.json');
+    const identityFile = path.join(store.dir, 'shop-identity.json');
+    const paths = { ...store, publishedFile };
+    const sourceExtraFiles = [publishedFile, identityFile];
+    const spec = { businessDate: TODAY, shop: SHOP, planNumber: 1, accountId: ACCOUNT, sourceExtraFiles };
+    fs.writeFileSync(identityFile, JSON.stringify({ shop: SHOP, accountId: ACCOUNT }));
+    fs.writeFileSync(publishedFile, JSON.stringify({ publishedIds: [], plans: [] }));
+    const result = rp.proveSchedulerReleaseProof(ledger, paths, spec);
+    assert.equal(result.ok, true, result.reason);
+    assert.deepEqual(result.proof.sourceExtraFiles, sourceExtraFiles);
+    assert.equal(result.proof.sourceHash, rp.currentPreOpenSourceHash(store.stateFile, store.attemptsFile, sourceExtraFiles));
+    fs.writeFileSync(publishedFile, JSON.stringify({ publishedIds: [], plans: [{ date: TODAY, planNumber: 1, planId: PLAN_IDS[0] }] }));
+    assert.notEqual(result.proof.sourceHash, rp.currentPreOpenSourceHash(store.stateFile, store.attemptsFile, sourceExtraFiles));
+    assert.equal(rp.proveSchedulerReleaseProof(ledger, paths, spec).reason, 'local-recovery-published-plan-recorded');
+  } finally {
+    fs.rmSync(store.dir, { recursive: true, force: true });
+  }
+});
+
 test('release proof negatives: terminal-success record / unknown entry / no entry all refuse', () => {
   const base = buildStore();
   // A terminal-success record must carry its own entry: otherwise the shape gate would first hit

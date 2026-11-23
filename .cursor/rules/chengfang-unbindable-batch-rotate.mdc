@@ -1,0 +1,24 @@
+---
+description: 乘方可选不可绑商品——穷举后整批换下一批（勿误判为联盟自动投）
+alwaysApply: true
+---
+
+# 乘方「可选不可绑」整批轮转
+
+## 事实（用户 2026-11-22 纠正）
+
+千川新产品**乘方**有平台 bug：此前已发布过计划的商品，**仍可选进**新计划草稿，但账号行全置灰、**无法手动绑定**。
+
+这**不是**「联盟合伙人自动投」导致的。不要再把 `labelDisabled` / `account-anchor-no-usable-product` / `手动添加抖音号 自动拉取 0 个` 默认归因成联盟开关，也不要擅自去关联盟自动投。
+
+## 正确处理
+
+1. 对本批最多 30 个商品穷举尝试绑定（逐面板，置灰则跳过）。
+2. **30 个都无法绑定** → 整批移除，从目录**下一页/下一批**重选，继续尝试。
+3. 目录翻完仍无可用商品 → 才正常终止（catalog exhausted）。
+4. 有 hover「已存在投放计划」文案更好，但**不是**整批轮转的前提；穷举置灰即足够。
+
+## 相关代码
+
+- `plan-publisher/run-plans.cjs`：`bindAccountsToAllInner` 穷举锚点后返回整批 `failedIds`
+- `plan-publisher/plan-workflow.cjs`：`preparePlan` 整批轮转 / `planRemovalAndBackfill`

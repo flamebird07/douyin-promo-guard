@@ -4,6 +4,7 @@
 // opens a browser. Project root comes ONLY from PROMO_PROJECT_ROOT.
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const readline = require('readline');
 
 const REQUIRED_ROOT_FILES = ['src/config.js', 'src/adapters/chengfang-reader.js'];
@@ -466,7 +467,12 @@ function pageObserve() {
     const budget = budgetInputs.length === 1 && budgetInputs[0].info.value != null ? String(budgetInputs[0].info.value) : 'unknown';
     // a non-boolean checked (or a non-unique checkbox) is unknown, never false
     const checkboxState = hits => hits.length !== 1 ? 'unknown' : (typeof hits[0].checked === 'boolean' ? hits[0].checked : 'unknown');
-    const commissionChecked = checkboxState(labeledCheckboxes(/含达人佣金/));
+    // 新创建页的佣金开关属于独立营销卡。ROI 标题和说明也会提到佣金。
+    const commissionCards = [...document.querySelectorAll('[class*="cardWrapper-"]')].filter(card =>
+      visible(card) && !card.closest(dialogSel) && text(card).replace(/\s+/g, '').startsWith('含达人佣金出价'));
+    const commissionChecked = checkboxState(commissionCards.length === 1
+      ? [...commissionCards[0].querySelectorAll('input[type="checkbox"]')].filter(visible)
+      : commissionCards.length === 0 ? labeledCheckboxes(/含达人佣金/) : []);
     const nameInputs = [...document.querySelectorAll('input,textarea')].filter(visible).filter(inp => {
       if (/计划名称/.test(inp.getAttribute('placeholder') || '')) return true;
       let anc = inp.parentElement, level = 0;
@@ -859,10 +865,13 @@ function publishApply(cmd) {
     }
   }
   const ids = productRows.map(r => r.productId);
-  if (ids.length !== 30) throw new Error('Product row count is not 30');
-  if (new Set(ids).size !== 30) throw new Error('Product ids not unique');
   const want = new Set((cmd.productIds || []).map(String));
-  if (want.size !== 30 || ids.some(id => !want.has(id))) throw new Error('Product id set mismatch');
+  const expN = want.size;
+  // 目录耗尽部分发布：以冻结/授权商品数为准（1..30），不再写死满额 30。
+  if (!Number.isInteger(expN) || expN < 1 || expN > 30) throw new Error('Product id set size invalid');
+  if (ids.length !== expN) throw new Error('Product row count is not ' + expN);
+  if (new Set(ids).size !== expN) throw new Error('Product ids not unique');
+  if (ids.some(id => !want.has(id))) throw new Error('Product id set mismatch');
   if (!productRows.every(r => Number.isInteger(r.manualAccounts) && r.manualAccounts >= 1)) throw new Error('Every product row must have at least one manual douyin account (1 or 2)');
   function labeledCheckboxChecked(labelRe) {
     const hits = [...document.querySelectorAll('input[type="checkbox"]')].filter(visible).filter(inp => {
@@ -927,7 +936,15 @@ function publishApply(cmd) {
   if (cmd && cmd.budget != null) {
     if (!sameDec(uniqueLabeledValue('budget'), cmd.budget)) throw new Error('Daily budget value in DOM does not match the authorized budget');
   } else if (!sameDec(uniqueLabeledValue('budget'), 300)) throw new Error('Daily budget value in DOM is not 300');
-  if (labeledCheckboxChecked(/含达人佣金/) !== true) throw new Error('Commission checkbox not checked');
+  const commissionCards = [...document.querySelectorAll('[class*="cardWrapper-"]')].filter(card =>
+    visible(card) && !card.closest(dialogSel) && text(card).replace(/\s+/g, '').startsWith('含达人佣金出价'));
+  const commissionInputs = commissionCards.length === 1
+    ? [...commissionCards[0].querySelectorAll('input[type="checkbox"]')].filter(visible)
+    : [];
+  const commissionChecked = commissionCards.length === 0
+    ? labeledCheckboxChecked(/含达人佣金/)
+    : commissionInputs.length === 1 && commissionInputs[0].checked === true;
+  if (commissionChecked !== true) throw new Error('Commission checkbox not checked');
   const nameInputs = [...document.querySelectorAll('input,textarea')].filter(visible).filter(inp => {
     if (/计划名称/.test(inp.getAttribute('placeholder') || '')) return true;
     let anc = inp.parentElement, level = 0;
@@ -1248,9 +1265,22 @@ function loadAttemptsStore(file) {
   return { ...parsed, finalConsumed: parsed.finalConsumed || {} };
 }
 function persistAttemptsStore(file, store) {
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
-  fs.renameSync(tmp, file);
+  // 固定 .tmp 会与并发/崩溃残留冲突；用唯一临时名 + fsync，与 publisher atomicWrite 同口径。
+  const dir = path.dirname(file);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+  const tmp = file + '.tmp-' + process.pid + '-' + crypto.randomBytes(4).toString('hex');
+  let fd = null;
+  try {
+    fd = fs.openSync(tmp, 'wx', 0o600);
+    fs.writeFileSync(fd, JSON.stringify(store, null, 2));
+    fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = null;
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    if (fd != null) { try { fs.closeSync(fd); } catch (_) {} }
+    try { fs.unlinkSync(tmp); } catch (_) {}
+    throw e;
+  }
 }
 // R42 one-shot retry consumption. This is the ONLY branch that may open a new
 // confirmation for the SAME business date + planNumber that already has a

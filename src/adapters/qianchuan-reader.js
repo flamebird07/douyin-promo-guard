@@ -1100,16 +1100,21 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
   // addCookies 之前拒绝（关闭并抛错，走既有 catch 收口），绝不带着旧 Cookie 进程重载。
   // 生产默认 fallbackLaunch 每次 chromium.launch 全新进程，行为不变。onResource 早登记
   // 语义由工厂内部同步完成（与下方候选工厂同一协议），launcher 范围证明照旧包住启动调用。
+  const launchBrowser = () => {
+    const { chromium } = require('playwright');
+    const headless = opts.headless !== false;
+    const executable = launchExecutableOption(loginCfg);
+    // macOS 排程发布的商品目录曾向无头 Shell 返回空响应。完整 Chromium 提供同一无头入口。
+    return chromium.launch({
+      headless,
+      ...executable,
+      ...(opts.useFullChromium === true && headless && !executable.executablePath ? { channel: 'chromium' } : {}),
+      args: ['--window-size=1920,1080'],
+    });
+  };
   const shopBrowserFactory = createCandidateBrowserFactory({
     injectedFactory: typeof opts.browserFactory === 'function' ? opts.browserFactory : null,
-    fallbackLaunch: () => {
-      const { chromium } = require('playwright');
-      return chromium.launch({
-        headless: opts.headless !== false,
-        ...launchExecutableOption(loginCfg), // MAC-1：edgePath 可选解析
-        args: ['--window-size=1920,1080'],
-      });
-    },
+    fallbackLaunch: launchBrowser,
     onResource: typeof opts.onResource === 'function' ? opts.onResource : null,
   });
   const launchShopBrowser = async () => {
@@ -1149,14 +1154,7 @@ async function openQianchuanHome(loginCfg, shopCfg, opts = {}) {
     ? opts.restoreCandidateBrowserFactory
     : createCandidateBrowserFactory({
       injectedFactory: typeof opts.browserFactory === 'function' ? opts.browserFactory : null,
-      fallbackLaunch: () => {
-        const { chromium } = require('playwright');
-        return chromium.launch({
-          headless: opts.headless !== false,
-          ...launchExecutableOption(loginCfg), // MAC-1：edgePath 可选解析
-          args: ['--window-size=1920,1080'],
-        });
-      },
+      fallbackLaunch: launchBrowser,
       onResource: typeof opts.onResource === 'function' ? opts.onResource : null,
     });
   const candidateBrowserFactory = async () => {

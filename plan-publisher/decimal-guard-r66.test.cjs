@@ -168,8 +168,12 @@ function creationFixture(o = {}) {
     ]),
     ...Array.from({ length: count }, (_, i) => rowOf(i)),
   ]));
-  kids.push(El('div', { class: 'oc-switch-card-item', rect: [400, 60], text: '含达人佣金出价 说明' }, [
-    El('input', { type: 'checkbox', cls: 'ovui-checkbox__input', checked: o.commissionChecked === undefined ? true : o.commissionChecked, rect: [20, 20] })]));
+  const commission = () => El('div', { class: o.marketingCard ? 'cardWrapper-example' : 'oc-switch-card-item', rect: [400, 60], text: '含达人佣金出价 说明' }, [
+    El('input', { type: 'checkbox', cls: 'ovui-checkbox__input', checked: o.commissionChecked === undefined ? true : o.commissionChecked, rect: [20, 20] })]);
+  kids.push(commission());
+  if (o.marketingCard) kids.push(El('div', { rect: [400, 60], text: '说明：含达人佣金的成本口径' }, [
+    El('input', { type: 'checkbox', checked: true, rect: [20, 20] })]));
+  if (o.duplicateCommission) kids.push(commission());
   kids.push(El('div', { class: 'ovui-field-row', rect: [320, 60] }, [
     El('label', { rect: [180, 24], text: '综合营销ROI目标(含达人佣金)' }),
     El('input', { rect: [120, 30], cls: 'ovui-input', placeholder: '请输入', value: o.roi == null ? '15' : o.roi })]));
@@ -211,6 +215,21 @@ function runPublish(p, obs, o = {}) {
 function throwsMessage(fn) {
   try { fn(); return null; } catch (e) { return String((e && e.message) || e); }
 }
+
+test('the marketing commission card determines the state despite other commission text', () => {
+  const ready = makeCreationPage({ marketingCard: true });
+  const obs = ready.run(c.pageObserve);
+  assert.equal(obs.creation.commissionChecked, true);
+  runPublish(ready, obs);
+  assert.equal(publishBtnOf(ready).__clicked, 1);
+  for (const [options, expected] of [[{ commissionChecked: false }, false], [{ duplicateCommission: true }, 'unknown']]) {
+    const page = makeCreationPage({ marketingCard: true, ...options });
+    const observation = page.run(c.pageObserve);
+    assert.equal(observation.creation.commissionChecked, expected);
+    assert.throws(() => runPublish(page, observation), /Commission checkbox not checked/);
+    assert.equal(publishBtnOf(page).__clicked, 0);
+  }
+});
 
 // ---------- 1. exported helper matrix ----------
 const ACCEPT_PAIRS = [

@@ -18,33 +18,70 @@ function overlaySweepInPage(opts) {
   const visible = (el) => {
     try { const r = el.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) return false; const cs = getComputedStyle(el); return cs.visibility !== 'hidden' && cs.display !== 'none'; } catch (_) { return false; }
   };
+  const clsOf = (el) => String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || ''));
   const txt = (el) => String(el.textContent || '').replace(/\s+/g, ' ').trim();
   const SKIP_RE = /^(跳过|跳过引导|我知道了|知道了|关闭|不再提示|以后再说|暂不|暂不开启|×|✕)$/;
   const closeHint = (el) => {
-    const cls = String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || ''));
+    const cls = clsOf(el);
     const al = String((el.getAttribute && el.getAttribute('aria-label')) || '');
-    return /close|Close|关闭|叉|dialog-close|modal-close|icon[-_]?close/i.test(cls + ' ' + al);
+    const title = String((el.getAttribute && el.getAttribute('title')) || '');
+    return /close|Close|关闭|叉|dialog-close|modal-close|popup__close|icon[-_]?close/i.test(cls + ' ' + al + ' ' + title);
   };
-  const DANGER = /(删除|暂停|终止|不可恢复|确认发布|提交|报名|去开启|立即投放|授权登录|扫码登录|重新登录)/;
+  const DANGER = /(删除|暂停|终止|不可恢复|确认发布|提交|报名|去开启|立即投放|授权登录|扫码登录|重新登录|去设置)/;
   const depth = (el) => { let d = 0; let n = el; while (n && n !== document.body) { d += 1; n = n.parentElement; } return d; };
+  const inPopupChrome = (el) => {
+    for (let n = el, i = 0; n && n !== document.body && i < 12; n = n.parentElement, i++) {
+      if (/ovui-popup|guideAnchor|GuideAnchor|c-lib-guide|firefly-popper|shepherd|tour[-_]/i.test(clsOf(n))) return true;
+    }
+    return false;
+  };
+  // 左侧蓝色引导卡（「乘方商品投放升级」+ 跳过/下一步）常挂在商品抽屉的祖先里。
+  // 整页祖先文本会同时含「已选 n/30」和「下一步」，旧逻辑因此把「跳过」当成抽屉控件跳过。
+  // 卡片本身不含「已选」，尺寸也远小于抽屉：这种「跳过」必须点。
+  const guideSkipCard = (el) => {
+    if (!/^跳过(引导)?$/.test(txt(el))) return false;
+    for (let n = el, i = 0; n && n !== document.body && i < 8; n = n.parentElement, i++) {
+      let r = null; try { r = n.getBoundingClientRect(); } catch (_) { continue; }
+      if (r.width < 180 || r.height < 72 || r.width > 560 || r.height > 400) continue;
+      const card = txt(n);
+      if (!/跳过/.test(card) || !/下一步/.test(card)) continue;
+      if (/已选\s*\d+\s*\/\s*/.test(card) || /当前商品已选/.test(card) || /为商品添加抖音号/.test(card)) continue;
+      return true;
+    }
+    return false;
+  };
   const all = Array.prototype.slice.call(document.querySelectorAll('button, a, [role="button"], span, div, svg, i, em')).filter(visible);
   const picked = [];
   for (const el of all) {
     if (picked.length >= maxClicks * 3) break;
     const t = txt(el);
     const isSkip = SKIP_RE.test(t);
-    const isClose = !isSkip && t.length === 0 && closeHint(el);
+    const guideSkip = isSkip && guideSkipCard(el);
+    // 2026-11-22 实机：ovui-popup / guideAnchor 全屏遮罩经常只有 aria-label/class 关闭叉，
+    // 文本为空或仅有符号；放宽 close 判定，但必须落在 popup/guide chrome 内（或原有空文本+hint）。
+    const isClose = !isSkip && closeHint(el) && (t.length === 0 || t.length <= 2 || SKIP_RE.test(t) || inPopupChrome(el));
     if (!isSkip && !isClose) continue;
     // 危险守卫：控件自身文本或最近浮层祖先文本带危险业务词 → 绝不点
     // 工作面排除：控件位于 drawer/panel（流程工作面，如商品目录抽屉）内 → 不是浮窗，绝不点
+    // 例外：真正的 popup/shepherd chrome 且 DOM 上不在工作抽屉内（常见为 body 级 portal）
+    // 才允许点。抽屉面板自身若也带 ovui-popup 类，仍按工作面处理，绝不点其叉。
     let inWorkSurface = false;
     let root = el;
-    for (let i = 0; i < 10 && root && root !== document.body; i++) {
-      const cls = String((root.className && root.className.baseVal !== undefined) ? root.className.baseVal : (root.className || ''));
-      if (/oc-drawer|drawer|panel/i.test(cls)) { inWorkSurface = true; break; }
+    for (let i = 0; i < 14 && root && root !== document.body; i++) {
+      const cls = clsOf(root);
+      const tt = txt(root);
+      if (/已选\s*\d+\s*\/\s*(?:[1-9]|[12]\d|30)/.test(tt) && /下一步/.test(tt)) { inWorkSurface = true; break; }
+      if (/当前商品已选/.test(tt) || /为商品添加抖音号/.test(tt)) { inWorkSurface = true; break; }
+      if (/oc-drawer|ovui-drawer(?!__wrap)|drawer|panel/i.test(cls)) {
+        try {
+          const rr = root.getBoundingClientRect();
+          if (rr.width >= 400 && rr.height >= 400) { inWorkSurface = true; break; }
+        } catch (_) { inWorkSurface = true; break; }
+      }
       root = root.parentElement || root;
     }
-    if (inWorkSurface) continue;
+    // 工作抽屉内的关闭叉不点。引导卡上的「跳过」除外（见 guideSkipCard）。
+    if (inWorkSurface && !guideSkip) continue;
     // 浮层判定（放宽，2026-11-21 用户截图实证）：跳过控件的祖先链里存在 position:fixed/absolute
     // 且面积可观的浮层容器即可（UNI_PROM 蓝色引导卡不带 modal/guide 类名也能接住）。
     root = el;
@@ -53,9 +90,10 @@ function overlaySweepInPage(opts) {
       let cs = null; try { cs = getComputedStyle(root); } catch (_) {}
       let r = null; try { r = root.getBoundingClientRect(); } catch (_) {}
       if (cs && (cs.position === 'fixed' || cs.position === 'absolute') && r && r.width >= 200 && r.height >= 100) { hasFloatRoot = true; break; }
+      if (/ovui-popup|guideAnchor|GuideAnchor|shepherd/i.test(clsOf(root))) { hasFloatRoot = true; break; }
       root = root.parentElement || root;
     }
-    if (!hasFloatRoot) continue; // 不在定位浮层里的零散控件 → 不动
+    if (!hasFloatRoot && !guideSkip) continue; // 不在定位浮层里的零散控件 → 不动
     if (DANGER.test(txt(root)) || DANGER.test(t)) continue;
     picked.push({ el, kind: isSkip ? 'skip' : 'close', text: t.slice(0, 12), d: depth(el), rootCls: String(root.className || '').slice(0, 60) });
   }
@@ -67,7 +105,18 @@ function overlaySweepInPage(opts) {
     if (clicked >= maxClicks) break;
     try { p.el.click(); clicked += 1; actions.push({ kind: p.kind, text: p.text, cls: p.rootCls }); } catch (_) {}
   }
-  return { clicked, actions };
+  // 2026-11-22 live7：页面里常驻的 ovui-popup__lock/mask 节点可能 width/height>0 但
+  // opacity:0 / pointer-events:none，被当成遮罩后触发无意义 Escape，关掉账号绑定抽屉。
+  const popupMaskPresent = Array.prototype.slice.call(document.querySelectorAll('[class*="ovui-popup__mask"],[class*="ovui-popup__lock"]')).some((el) => {
+    if (!visible(el)) return false;
+    let cs = null; try { cs = getComputedStyle(el); } catch (_) { return false; }
+    if (!cs) return false;
+    if (cs.pointerEvents === 'none') return false;
+    const op = Number(cs.opacity);
+    if (Number.isFinite(op) && op <= 0.05) return false;
+    return true;
+  });
+  return { clicked, actions, popupMaskPresent: !!popupMaskPresent };
 }
 const { createConfirmationServer } = require('./confirmation-ui.cjs');
 const shopProfile = require('./shop-profile.cjs');
@@ -1039,8 +1088,23 @@ function proveSchedulerReleaseProof(ledgerFile, statePaths, spec) {
   const policyCancel = entryProvenanceMethod === 'pre-initial-policy-cancel';
   if (!policyCancel && rec.status !== 'failed' && rec.status !== 'blocked' && !(rec.status === 'failed-permanent' && (entry.status === 'preparation-stopped' || entry.status === 'unsubmitted'))) return { ok: false, reason: 'release-record-not-terminal-failure:' + String(rec.status) };
   if (!policyCancel && entry.status !== 'failed' && entry.status !== 'preparation-stopped' && entry.status !== 'unsubmitted') return { ok: false, reason: 'release-entry-not-prepublication:' + String(entry.status) };
-  const pub = proveNoPublicationPreOpen(statePaths.stateFile, statePaths.attemptsFile, businessDate, { planNumber, accountId: s.accountId, shop });
+  const extraFiles = Array.isArray(s.sourceExtraFiles) ? s.sourceExtraFiles : [];
+  const { stateFile, attemptsFile } = statePaths;
+  const sourceHash = currentPreOpenSourceHash(stateFile, attemptsFile, extraFiles);
+  const pub = proveNoPublicationPreOpen(stateFile, attemptsFile, businessDate, { planNumber, accountId: s.accountId, shop });
   if (!pub.ok) return { ok: false, reason: pub.reason };
+  if (statePaths.publishedFile && extraFiles.includes(statePaths.publishedFile)) {
+    const raw = readStoreTextSafe(stateFile);
+    let plans;
+    try { plans = raw === null ? [] : JSON.parse(raw).plans; }
+    catch (_) { return { ok: false, reason: 'release-state-unreadable' }; }
+    const published = proveLocalPublishedStoreClean(statePaths.publishedFile, businessDate, null, planNumber, plans);
+    if (!published.ok) return published;
+  }
+  if (sourceHash === null || sourceHash !== currentPreOpenSourceHash(stateFile, attemptsFile, extraFiles)
+    || pub.proof.sourceHash !== currentPreOpenSourceHash(stateFile, attemptsFile)) {
+    return { ok: false, reason: 'release-source-drift' };
+  }
   if (policyCancel && String(pub.proof.sourceHash) !== String(policyCancelProof.sourceHash)) {
     return { ok: false, reason: 'release-policy-cancel-source-drift' };
   }
@@ -1067,7 +1131,8 @@ function proveSchedulerReleaseProof(ledgerFile, statePaths, spec) {
     policyCancelProof,
     // Fresh-source re-read anchors: the mutation-time releaser recomputes the source hash from
     // these exact bound paths and refuses on any changed / deleted bytes.
-    sourceHash: pub.proof.sourceHash,
+    sourceHash,
+    sourceExtraFiles: extraFiles,
     sourceStateFile: statePaths.stateFile,
     sourceAttemptsFile: statePaths.attemptsFile,
     publicationProof: pub.proof,
@@ -1264,6 +1329,15 @@ function resolveLocalPreparationState(shop, accountId, stateRoot) {
   return { ok: true, legacy: false, accountId: only.account, paths: scheduledStatePaths(profile, false, root), identityFile: only.identityFile };
 }
 
+function resolvePublisherStatePaths(shopLike, stateRoot) {
+  const shop = String(shopLike?.shop || shopLike?.name || '').trim();
+  if (!shop) return { ok: false, reason: 'local-recovery-shop-missing' };
+  const accountId = shopLike?.accountId == null || shopLike.accountId === '' ? null : String(shopLike.accountId);
+  const resolved = resolveLocalPreparationState(shop, accountId, stateRoot);
+  if (!resolved.ok || !resolved.paths) return resolved;
+  return { ...resolved, sourceExtraFiles: [resolved.paths.publishedFile, resolved.identityFile].filter(Boolean) };
+}
+
 async function recoverLocalPreparationClose(shopLike, businessDate, opts) {
   const o = opts || {};
   const nowMs = typeof o.nowMs === 'function' ? o.nowMs : () => Date.now();
@@ -1366,6 +1440,9 @@ async function recoverLocalPreparationClose(shopLike, businessDate, opts) {
         reason: String(fact.reason || ''), preparationClosure: fact, zeroConsumptionProof: fact.zeroConsumptionProof,
         sourceHash: hashNow, sourceStateFile: paths.stateFile, sourceAttemptsFile: paths.attemptsFile,
       });
+    }
+    if (o.existingClosureOnly === true) {
+      return bind({ ok: false, status: 'refused', reason: 'local-recovery-existing-closure-required' });
     }
     if (a.status !== 'preparing') {
       return bind({ ok: true, status: 'unknown', reason: 'local-recovery-not-preparing-phase:' + String(a.status || '') });
@@ -1729,14 +1806,31 @@ function openPickerInPage() {
 
 async function ensureCommissionInPage() {
   const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
-  const target = () => [...document.querySelectorAll('input[type="checkbox"]')].filter(visible).filter(input => {
-    let p = input.parentElement;
-    for (let i = 0; p && i < 8; i++, p = p.parentElement) {
-      const owned = [...p.querySelectorAll('input[type="checkbox"]')].filter(visible);
-      if (owned.length === 1 && owned[0] === input && /含达人佣金/.test((p.innerText || p.textContent || '').replace(/\s+/g, ' '))) return true;
+  const inTransient = e => {
+    let p = e;
+    for (let i = 0; p && i < 16; i++, p = p.parentElement) {
+      const cls = String(p.className || '');
+      if (/(ovui-modal|oc-modal|ovui-drawer|oc-drawer|shepherd|guide-modal|popup-mask)/i.test(cls)) return true;
+      if (p.getAttribute && (p.getAttribute('role') === 'dialog' || p.getAttribute('aria-modal') === 'true')) return true;
     }
     return false;
-  });
+  };
+  const target = () => {
+    const cards = [...document.querySelectorAll('[class*="cardWrapper-"]')].filter(card =>
+      visible(card) && !inTransient(card)
+      && (card.innerText || card.textContent || '').replace(/\s+/g, '').startsWith('含达人佣金出价'));
+    if (cards.length > 1) throw new Error('commission-checkbox-not-unique');
+    if (cards.length === 1) return [...cards[0].querySelectorAll('input[type="checkbox"]')].filter(visible);
+    return [...document.querySelectorAll('input[type="checkbox"]')].filter(visible).filter(input => {
+      if (inTransient(input)) return false;
+      let p = input.parentElement;
+      for (let i = 0; p && i < 8; i++, p = p.parentElement) {
+        const owned = [...p.querySelectorAll('input[type="checkbox"]')].filter(visible);
+        if (owned.length === 1 && owned[0] === input && /含达人佣金/.test((p.innerText || p.textContent || '').replace(/\s+/g, ' '))) return true;
+      }
+      return false;
+    });
+  };
   const disabled = input => {
     let p=input;
     for(let i=0;p&&i<9;i++,p=p.parentElement) {
@@ -1749,8 +1843,8 @@ async function ensureCommissionInPage() {
     const boxes=target();
     if(boxes.length>1)throw new Error('commission-checkbox-not-unique');
     if(boxes.length===0) {
-      if(actionTaken){await new Promise(resolve=>setTimeout(resolve,50));continue;}
-      throw new Error('commission-checkbox-not-unique');
+      await new Promise(resolve=>setTimeout(resolve,50));
+      continue;
     }
     const input=boxes[0];
     if(typeof input.checked!=='boolean')throw new Error('commission-checkbox-state-unknown');
@@ -1767,6 +1861,7 @@ async function ensureCommissionInPage() {
     actionTaken=true;
     await new Promise(resolve=>setTimeout(resolve,50));
   }
+  if (!actionTaken) throw new Error('commission-checkbox-not-unique');
   throw new Error('commission-check-not-confirmed');
 }
 
@@ -1840,7 +1935,10 @@ function drawerSnapshotInPage() {
   const { owners, leaf } = scopeTabs(root);
   const active = owners.filter(el => /active|selected|current/i.test(String(el.className || '')) || el.getAttribute('aria-selected') === 'true').map(leaf);
   const pager = [...root.querySelectorAll('[class*="pagination"],[class*="Pagination"],[class*="page-item"],[class*="pager"],[class*="Pager"],[class*="pages"]')].filter(visible);
-  return { ok: true, cards, selectedCount: footer ? Number(footer[1]) : null, remainingCapacity: footer ? Number(footer[2]) : null, activeTabs: active, rootText: txt(root).slice(0, 1000), pagerCount: pager.length };
+  // 2026-11-22：数字翻页后列表中部常出现 ovui-spin，旧卡仍在 DOM → listPageComplete 为真
+  // 但 cardIds 未变。把 spinner 暴露给落地证明，spinner 未消不得算翻页完成。
+  const spinnerCount = [...root.querySelectorAll('.ovui-spin__block,[class*="ovui-spin"],[class*="Spin"]')].filter(visible).length;
+  return { ok: true, cards, selectedCount: footer ? Number(footer[1]) : null, remainingCapacity: footer ? Number(footer[2]) : null, activeTabs: active, rootText: txt(root).slice(0, 1000), pagerCount: pager.length, spinnerCount };
 }
 
 // R28: the real "全部" (All) numeric picker pager observed live in
@@ -1915,11 +2013,38 @@ function numericPickerPagingInPage(payload) {
   if (roots.length !== 1) return { ok: false, reason: 'numeric-pager-drawer-not-unique', clicked: false };
   const root = roots[0];
 
-  // any visible dialog disjoint from this unique drawer root (an unrelated guide/confirm/
-  // ad popup elsewhere on screen) is a blocking overlay; nested dialogs inside the drawer
-  // itself are part of it, never a separate blocker
-  const otherOverlays = [...document.querySelectorAll(DIALOG_SEL)].filter(visible).filter(el => el !== root && !root.contains(el) && !el.contains(root));
-  if (otherOverlays.length > 0) return { ok: false, reason: 'numeric-pager-blocking-overlay-present', clicked: false };
+  // any visible SEPARATE modal/dialog disjoint from this unique drawer root is a blocking
+  // overlay. 2026-11-22 实机：DIALOG_SEL 的 [class*="drawer"] 会命中商品抽屉内部大量节点
+  // （product-drawer-header-tab-item / ovui-drawer__header 等）；它们已被 contains 排除，但
+  // 页面上其它仅因 class 含 drawer 字样、或透明全屏 wrap 的节点若被误判成“另一浮层”，会
+  // 把可翻页状态打成 blocking-overlay。因此 otherOverlays 只认真正的独立 modal/dialog：
+  // role=dialog / aria-modal=true / class 含 modal|dialog|popup（不含单纯 drawer chrome）。
+  // 2026-11-22 续（live6）：商品抽屉已翻到第 2 页且 catalog 200，但左侧「商品选择视角升级」
+  // 蓝卡常带 role=dialog，被当成 blocking-overlay，落地证明永远过不了。这类 ovui-popup /
+  // guideAnchor / tour chrome 由 overlaySweep 单独清掉，不挡住数字翻页器的范围证明。
+  const isGuideChrome = (el) => {
+    for (let n = el, i = 0; n && i < 10; n = n.parentElement, i++) {
+      if (/ovui-popup|guideAnchor|GuideAnchor|c-lib-guide|firefly-popper|shepherd|tour[-_]/i.test(clsOf(n))) return true;
+    }
+    return false;
+  };
+  const otherOverlays = [...document.querySelectorAll(DIALOG_SEL)].filter(visible).filter(el => {
+    if (el === root || root.contains(el) || el.contains(root)) return false;
+    const cls = clsOf(el);
+    if (/product-drawer-header|ovui-drawer__header|oc-drawer-header|drawer__body|drawer__footer/i.test(cls)) return false;
+    if (isGuideChrome(el)) return false;
+    const role = el.getAttribute('role') || '';
+    const ariaModal = el.getAttribute('aria-modal') === 'true';
+    if (role === 'dialog' || ariaModal) return true;
+    if (/modal|Modal|dialog|Dialog|popup|Popup/i.test(cls)) return true;
+    return false;
+  });
+  if (otherOverlays.length > 0) {
+    return {
+      ok: false, reason: 'numeric-pager-blocking-overlay-present', clicked: false,
+      overlayClasses: otherOverlays.slice(0, 4).map(el => clsOf(el).slice(0, 80)),
+    };
+  }
 
   // "全部" must be the single active tab in this exact drawer
   const { owners, leaf } = scopeTabs(root);
@@ -2039,12 +2164,42 @@ function numericPickerPagingInPage(payload) {
 // drawer. The scroll root is NOT disabled-tab evidence; it only reports the
 // native scroll geometry and the accumulated visible card count. Self-contained
 // for page.evaluate.
+// 2026-11-22：全页 `.product-list` 会命中抽屉外残留 → native-scroll-root-not-unique；
+// 与 drawerSnapshotInPage 同一抽屉签名后，再在抽屉内取唯一 .product-list。
 function nativeScrollStateInPage() {
   const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
-  const roots = [...document.querySelectorAll('.product-list')].filter(visible);
-  const unique = roots.filter(el => !roots.some(o => o !== el && o.contains(el)));
-  if (unique.length !== 1) return { ok: false, reason: 'native-scroll-root-not-unique', count: unique.length };
-  const root = unique[0];
+  const txt = e => (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
+  const DIALOG_SEL = '[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="drawer"],[class*="Drawer"],[class*="modal"],[class*="Modal"]';
+  const TAB_SEL = '[class*="product-drawer-header-tab-item"],[class*="ovui-tabs__tab"]';
+  const scopeTabs = scope => { const els = [...scope.querySelectorAll(TAB_SEL)].filter(visible); const leaf = e => { const desc = els.filter(x => x !== e && e.contains(x)); if (!desc.length) return txt(e); const deepest = desc.filter(d => !desc.some(o => o !== d && d.contains(o))); return txt(deepest[0]); }; return { owners: els.filter(e => !els.some(o => o !== e && o.contains(e))), leaf }; };
+  const candidates = [...document.querySelectorAll(DIALOG_SEL)].filter(visible).filter(el => {
+    const all = txt(el);
+    if (/为商品添加抖音号/.test(all)) return false;
+    const { owners, leaf } = scopeTabs(el);
+    const tabs = owners.map(leaf).map(s => s.replace(/\s+/g, '').replace(/流量扶持/g, ''));
+    const has = x => tabs.includes(x) || (x === '搜索趋势' && tabs.includes('搜索趋势推荐'));
+    return has('全部') && has('店铺新品') && has('破圈尖货') && has('搜索趋势') && /已选\s*\d+\s*\/\s*(?:[1-9]|[12]\d|30)/.test(all) && [...el.querySelectorAll('button,[role="button"]')].some(b => visible(b) && txt(b) === '下一步');
+  });
+  const drawerRoots = candidates.filter(el => !candidates.some(other => other !== el && other.contains(el)));
+  const pickUniqueList = (scopeEl) => {
+    const all = [...(scopeEl || document).querySelectorAll('.product-list')].filter(visible);
+    const leaf = all.filter(el => !all.some(o => o !== el && o.contains(el)));
+    if (leaf.length === 1) return leaf[0];
+    if (leaf.length > 1) {
+      const scored = leaf.map(el => {
+        const n = [...el.querySelectorAll('.card-container')].filter(visible).length;
+        const r = el.getBoundingClientRect();
+        return { el, n, area: Math.round((r.width || 0) * (r.height || 0)), scrollHeight: el.scrollHeight || 0 };
+      });
+      scored.sort((a, b) => (b.n - a.n) || (b.area - a.area) || (b.scrollHeight - a.scrollHeight));
+      // 多个可见列表时取卡片数/面积最大者（实机偶发双 .product-list）
+      if (scored[0].area > 0) return scored[0].el;
+    }
+    return null;
+  };
+  let root = drawerRoots.length === 1 ? pickUniqueList(drawerRoots[0]) : null;
+  if (!root) root = pickUniqueList(document);
+  if (!root) return { ok: false, reason: 'native-scroll-root-not-unique', count: 0, drawerCount: drawerRoots.length };
   return { ok: true, scrollTop: root.scrollTop || 0, scrollHeight: root.scrollHeight || 0, clientHeight: root.clientHeight || 0, cardCount: [...root.querySelectorAll('.card-container')].filter(visible).length };
 }
 
@@ -2068,11 +2223,39 @@ function nativeScrollStateInPage() {
 // behavior with zero style change.
 function nativeScrollStepInPage() {
   const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
+  const txt = e => (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
   const NUDGE_PX = '5px';
-  const roots = [...document.querySelectorAll('.product-list')].filter(visible);
-  const unique = roots.filter(el => !roots.some(o => o !== el && o.contains(el)));
-  if (unique.length !== 1) throw new Error('native-scroll-root-not-unique');
-  const root = unique[0];
+  // 2026-11-22：必须限制在唯一商品抽屉内，避免全页多个 .product-list 误伤。
+  const DIALOG_SEL = '[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="drawer"],[class*="Drawer"],[class*="modal"],[class*="Modal"]';
+  const TAB_SEL = '[class*="product-drawer-header-tab-item"],[class*="ovui-tabs__tab"]';
+  const scopeTabs = scope => { const els = [...scope.querySelectorAll(TAB_SEL)].filter(visible); const leaf = e => { const desc = els.filter(x => x !== e && e.contains(x)); if (!desc.length) return txt(e); const deepest = desc.filter(d => !desc.some(o => o !== d && d.contains(o))); return txt(deepest[0]); }; return { owners: els.filter(e => !els.some(o => o !== e && o.contains(e))), leaf }; };
+  const candidates = [...document.querySelectorAll(DIALOG_SEL)].filter(visible).filter(el => {
+    const all = txt(el);
+    if (/为商品添加抖音号/.test(all)) return false;
+    const { owners, leaf } = scopeTabs(el);
+    const tabs = owners.map(leaf).map(s => s.replace(/\s+/g, '').replace(/流量扶持/g, ''));
+    const has = x => tabs.includes(x) || (x === '搜索趋势' && tabs.includes('搜索趋势推荐'));
+    return has('全部') && has('店铺新品') && has('破圈尖货') && has('搜索趋势') && /已选\s*\d+\s*\/\s*(?:[1-9]|[12]\d|30)/.test(all) && [...el.querySelectorAll('button,[role="button"]')].some(b => visible(b) && txt(b) === '下一步');
+  });
+  const drawerRoots = candidates.filter(el => !candidates.some(other => other !== el && other.contains(el)));
+  const pickUniqueList = (scopeEl) => {
+    const all = [...(scopeEl || document).querySelectorAll('.product-list')].filter(visible);
+    const leaf = all.filter(el => !all.some(o => o !== el && o.contains(el)));
+    if (leaf.length === 1) return leaf[0];
+    if (leaf.length > 1) {
+      const scored = leaf.map(el => {
+        const n = [...el.querySelectorAll('.card-container')].filter(visible).length;
+        const r = el.getBoundingClientRect();
+        return { el, n, area: Math.round((r.width || 0) * (r.height || 0)), scrollHeight: el.scrollHeight || 0 };
+      });
+      scored.sort((a, b) => (b.n - a.n) || (b.area - a.area) || (b.scrollHeight - a.scrollHeight));
+      if (scored[0].area > 0) return scored[0].el;
+    }
+    return null;
+  };
+  let root = drawerRoots.length === 1 ? pickUniqueList(drawerRoots[0]) : null;
+  if (!root) root = pickUniqueList(document);
+  if (!root) throw new Error('native-scroll-root-not-unique');
   const before = { scrollTop: root.scrollTop || 0, scrollHeight: root.scrollHeight || 0, clientHeight: root.clientHeight || 0, cardCount: [...root.querySelectorAll('.card-container')].filter(visible).length };
   // The native loading edge is the deepest offset the root can reach in one
   // action: scrollHeight minus clientHeight. A single clientHeight step stalls
@@ -2130,10 +2313,38 @@ function nativeScrollStepInPage() {
 // changed) it does nothing and reports restored:false.
 function restoreNativeMarkerNudgeInPage(previous) {
   const NUDGE_PX = '5px';
-  const roots = [...document.querySelectorAll('.product-list')].filter(e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; });
-  const unique = roots.filter(el => !roots.some(o => o !== el && o.contains(el)));
-  if (unique.length !== 1) return { restored: false, reason: 'native-scroll-root-not-unique' };
-  const root = unique[0];
+  const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
+  const txt = e => (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
+  const DIALOG_SEL = '[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="drawer"],[class*="Drawer"],[class*="modal"],[class*="Modal"]';
+  const TAB_SEL = '[class*="product-drawer-header-tab-item"],[class*="ovui-tabs__tab"]';
+  const scopeTabs = scope => { const els = [...scope.querySelectorAll(TAB_SEL)].filter(visible); const leaf = e => { const desc = els.filter(x => x !== e && e.contains(x)); if (!desc.length) return txt(e); const deepest = desc.filter(d => !desc.some(o => o !== d && d.contains(o))); return txt(deepest[0]); }; return { owners: els.filter(e => !els.some(o => o !== e && o.contains(e))), leaf }; };
+  const candidates = [...document.querySelectorAll(DIALOG_SEL)].filter(visible).filter(el => {
+    const all = txt(el);
+    if (/为商品添加抖音号/.test(all)) return false;
+    const { owners, leaf } = scopeTabs(el);
+    const tabs = owners.map(leaf).map(s => s.replace(/\s+/g, '').replace(/流量扶持/g, ''));
+    const has = x => tabs.includes(x) || (x === '搜索趋势' && tabs.includes('搜索趋势推荐'));
+    return has('全部') && has('店铺新品') && has('破圈尖货') && has('搜索趋势') && /已选\s*\d+\s*\/\s*(?:[1-9]|[12]\d|30)/.test(all) && [...el.querySelectorAll('button,[role="button"]')].some(b => visible(b) && txt(b) === '下一步');
+  });
+  const drawerRoots = candidates.filter(el => !candidates.some(other => other !== el && other.contains(el)));
+  const pickUniqueList = (scopeEl) => {
+    const all = [...(scopeEl || document).querySelectorAll('.product-list')].filter(visible);
+    const leaf = all.filter(el => !all.some(o => o !== el && o.contains(el)));
+    if (leaf.length === 1) return leaf[0];
+    if (leaf.length > 1) {
+      const scored = leaf.map(el => {
+        const n = [...el.querySelectorAll('.card-container')].filter(visible).length;
+        const r = el.getBoundingClientRect();
+        return { el, n, area: Math.round((r.width || 0) * (r.height || 0)), scrollHeight: el.scrollHeight || 0 };
+      });
+      scored.sort((a, b) => (b.n - a.n) || (b.area - a.area) || (b.scrollHeight - a.scrollHeight));
+      if (scored[0].area > 0) return scored[0].el;
+    }
+    return null;
+  };
+  let root = drawerRoots.length === 1 ? pickUniqueList(drawerRoots[0]) : null;
+  if (!root) root = pickUniqueList(document);
+  if (!root) return { restored: false, reason: 'native-scroll-root-not-unique' };
   const childEls = [...(root.children || [])];
   const marker = childEls.length ? childEls[childEls.length - 1] : null;
   const isNudgedSentinel = !!marker && String(marker.tagName).toUpperCase() === 'DIV'
@@ -2310,8 +2521,34 @@ function confirmDraftRemovalInPage(input) {
   // product is clicked (once). A real draft removal success requires the target row to be
   // genuinely ABSENT AND no OTHER modal open: any present-but-unrecognised modal is an
   // unknown-dialog stop with ZERO confirm (never reported as noDialog success).
-  const sel='[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="modal"],[class*="Modal"]';
-  const allVisible=[...document.querySelectorAll(sel)].filter(visible);
+  const sel='[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="modal"],[class*="Modal"],[class*="popconfirm"],[class*="Popconfirm"],[class*="pop-confirm"]';
+  const clsOfGuide=e=>String((e.className&&e.className.baseVal!==undefined)?e.className.baseVal:(e.className||''));
+  // 2026-11-22：Shepherd / guide chrome 常带 role=dialog，不能当成业务删除确认弹窗。
+  const isGuideChrome=el=>{
+    for(let n=el,i=0;n&&i<10;n=n.parentElement,i++){
+      if(/guideAnchor|GuideAnchor|c-lib-guide|firefly-popper|shepherd|tour[-_]/i.test(clsOfGuide(n))) return true;
+    }
+    return false;
+  };
+  // 2026-11-22：不能用泛 [class*=popover]——页面常驻几十个 ocean-vmok-plugin-oc-popover
+  // 空壳，会把删除确认打成 draft-remove-unknown-modal{modalCount:29}。只收「确定+取消」的气泡。
+  const clsOfEarly=el=>String((el.getAttribute&&el.getAttribute('class'))||el.className||'');
+  const confirmPops=[...document.querySelectorAll('[class*="popover"],[class*="Popover"]')].filter(visible).filter(el=>{
+    if(/ocean-vmok-plugin|vmok-plugin|shepherd|guideAnchor/i.test(clsOfEarly(el))) return false;
+    const btns=[...el.querySelectorAll('button,[role="button"]')].filter(visible);
+    const ok=btns.some(b=>['确定','确认','删除'].includes(txt(b)));
+    const cancel=btns.some(b=>['取消','再想想'].includes(txt(b)));
+    return ok&&cancel;
+  });
+  // 同一弹窗可能同时匹配语义模态和带确认按钮的 popover，只计一个实际 DOM 节点。
+  const allVisible=[...new Set([...document.querySelectorAll(sel),...confirmPops])].filter(visible).filter(el=>{
+    if(isGuideChrome(el)) return false;
+    // Aurora 把模态遮罩挂在弹窗外。只有无文本、无控件的原生遮罩才可排除。
+    const decorativeMask=/(^|\s)aurora-qc-modal-mask(\s|$)/.test(clsOfEarly(el))
+      && el.getAttribute('role')!=='dialog' && el.getAttribute('aria-modal')!=='true'
+      && txt(el)==='' && el.querySelectorAll('button,[role="button"],a,input,select,textarea,[tabindex]').length===0;
+    return !decorativeMask;
+  });
   const rootsOf=arr=>arr.filter(el=>!arr.some(o=>o!==el&&o.contains(el)));
   const rowExists=id=>[...document.querySelectorAll('tr,[role="row"],.ovui-table__row')].filter(visible).some(r=>{const rid=[...txt(r).matchAll(/ID\s*[:：]\s*(\d{15,20})/g)].map(m=>m[1]);return rid.length===1&&rid[0]===String(id);});
   // 有界脱敏现场诊断（随原 Error 文本携带）：只读描述可见模态根的 tag/class/role、短文本、
@@ -2332,7 +2569,7 @@ function confirmDraftRemovalInPage(input) {
   const del=allVisible.filter(d=>txt(d).includes(String(productId))&&/删除|移除/.test(txt(d)));
   const delRoots=rootsOf(del);
   if(delRoots.length===1){
-    const buttons=[...delRoots[0].querySelectorAll('button,[role="button"]')].filter(visible).filter(b=>['确定','删除','移除'].includes(txt(b)));
+    const buttons=[...delRoots[0].querySelectorAll('button,[role="button"]')].filter(visible).filter(b=>['确定','删除','移除','确认'].includes(txt(b)));
     if(buttons.length!==1) throw new Error('draft-remove-confirm-not-unique');
     buttons[0].click();
     return { confirmed: true };
@@ -2355,7 +2592,7 @@ function confirmDraftRemovalInPage(input) {
   const allRoots=rootsOf(allVisible);
   const knownRoots=allRoots.filter(el=>{const t=txt(el);return t.includes(KNOWN_DRAFT_TITLE)&&t.includes(KNOWN_DRAFT_BODY);});
   if(knownRoots.length>0){
-    if(knownRoots.length!==1||allRoots.length!==1) throw new Error('draft-remove-known-modal-not-unique');
+    if(knownRoots.length!==1||allRoots.length!==1) throw new Error('draft-remove-known-modal-not-unique '+sceneOf(allVisible,productId));
     const proof=(input&&typeof input==='object')?input.removeProof:null;
     const proofOk=!!proof&&typeof proof==='object'&&proof.rowProof===true
       &&String(proof.productId)===String(productId)&&String(proof.accountId)===String(ACCOUNT)
@@ -2366,9 +2603,29 @@ function confirmDraftRemovalInPage(input) {
     confirms[0].click();
     return { confirmed: true, known: true };
   }
+  // 2026-11-22：行内「删除」后常见 ovui/antd Popconfirm（不在 dialog 选择器里）。
+  // 仅在携带 removeProof 时，点唯一「确定/确认」；取消旁必须有取消类按钮防误点。
+  const proof=(input&&typeof input==='object')?input.removeProof:null;
+  const proofOk=!!proof&&typeof proof==='object'&&proof.rowProof===true
+    &&String(proof.productId)===String(productId)&&String(proof.accountId)===String(ACCOUNT)
+    &&(proof.route==='uni-creation/overall-product-multi'||proof.route==='create-ad/overall-product');
+  if(proofOk){
+    const popRoots=allRoots.filter(el=>{
+      const t=txt(el); const cls=clsOf(el);
+      if(!/popconfirm|Popconfirm|popover|Popover|pop-confirm/i.test(cls) && !/确定删除|确认删除|删除该商品|是否删除/.test(t)) return false;
+      const btns=[...el.querySelectorAll('button,[role="button"]')].filter(visible);
+      const ok=btns.filter(b=>['确定','确认','删除'].includes(txt(b))&&!isDisabled(b));
+      const cancel=btns.filter(b=>['取消','再想想'].includes(txt(b)));
+      return ok.length===1&&cancel.length>=1;
+    });
+    if(popRoots.length===1){
+      const okBtn=[...popRoots[0].querySelectorAll('button,[role="button"]')].filter(visible).filter(b=>['确定','确认','删除'].includes(txt(b))&&!isDisabled(b));
+      if(okBtn.length===1){ okBtn[0].click(); return { confirmed: true, popconfirm: true }; }
+    }
+  }
   if(allVisible.length>0) throw new Error('draft-remove-unknown-modal ' + sceneOf(allVisible, productId));
   const rowStill=rowExists(productId);
-  if(rowStill) throw new Error('draft-remove-row-still-present');
+  if(rowStill) throw new Error('draft-remove-row-still-present ' + sceneOf(allVisible, productId));
   return { noDialog: true };
 }
 
@@ -2899,11 +3156,21 @@ function closeKnownPartialResultInPage(authorizedIds) {
   const rectOf = e => { try { return e.getBoundingClientRect()||null; } catch(_) { return null; } };
   const KNOWN=/以下商品部分抖音号添加失败|部分抖音号添加失败|以下商品抖音号添加失败/;
   const clsOf=el=>String((el.getAttribute&&el.getAttribute('class'))||(typeof el.className==='string'?el.className:''));
+  // 2026-11-22：Shepherd / guide chrome 带 role=dialog，会把「未知弹窗」/抽屉唯一性打挂。
+  // 注意：部分失败通知本身可能挂在 ovui-popup 上——绝不能把 ovui-popup 当引导过滤掉，
+  // 否则快照看得到通知、close 侧 KNOWN 列表为空 → known-partial-result-notice-absent。
+  const isGuideChrome=el=>{
+    if(KNOWN.test(txt(el))) return false;
+    for(let n=el,i=0;n&&i<10;n=n.parentElement,i++){
+      if(/guideAnchor|GuideAnchor|c-lib-guide|firefly-popper|shepherd|tour[-_]/i.test(clsOf(n))) return true;
+    }
+    return false;
+  };
   const inputObj=authorizedIds&&typeof authorizedIds==='object'&&!Array.isArray(authorizedIds);
   const idList=(inputObj?authorizedIds.productIds:authorizedIds)||[];
   const anchorId=inputObj&&authorizedIds.anchorProductId!=null?String(authorizedIds.anchorProductId):null;
   const allowed=new Set(idList.map(String));
-  const all=[...document.querySelectorAll('[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="drawer"],[class*="Drawer"],[class*="modal"],[class*="Modal"]')].filter(visible);
+  const all=[...document.querySelectorAll('[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="drawer"],[class*="Drawer"],[class*="modal"],[class*="Modal"]')].filter(visible).filter(e=>!isGuideChrome(e));
   const known=all.filter(e=>KNOWN.test(txt(e)));
   if(known.length===0) throw new Error('known-partial-result-notice-absent');
   const noticeRoots=known.filter(el=>!known.some(o=>o!==el&&o.contains(el)));
@@ -3217,11 +3484,37 @@ function selectBindingDrawerPanelInPage(productId) {
 function bindingOverlaySnapshotInPage() {
   const visible = e => { const r=e.getBoundingClientRect(); return r.width>0&&r.height>0&&getComputedStyle(e).visibility!=='hidden'; };
   const txt = e => (e.innerText||e.textContent||'').replace(/\s+/g,' ').trim();
+  const clsOf = e => String((e.className && e.className.baseVal !== undefined) ? e.className.baseVal : (e.className || ''));
   const sel='[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="drawer"],[class*="Drawer"],[class*="modal"],[class*="Modal"]';
   const all=[...document.querySelectorAll(sel)].filter(visible);
   const outer=all.filter(el=>!all.some(o=>o!==el&&o.contains(el)));
   const drawerRoots=outer.filter(e=>/为商品添加抖音号/.test(txt(e)));
-  return {accountDrawerCount:drawerRoots.length, blockingOverlayPresent:outer.some(e=>!/为商品添加抖音号/.test(txt(e)))};
+  // 2026-11-22：关账号抽屉后证明「无阻挡浮层」时，左侧蓝卡 guide / ovui-popup 常带
+  // role=dialog，被误判成 blockingOverlay → repair 停在
+  // account-drawer-not-proven-closed-before-draft-removal。引导由 sweepOverlays 清；
+  // 此处只认真正的业务 modal（非 guide chrome、非单纯 drawer chrome）。
+  const isGuideChrome = (el) => {
+    for (let n = el, i = 0; n && i < 10; n = n.parentElement, i++) {
+      // 2026-11-22 实机：Shepherd 引导（shepherd-element / shepherd-modal-overlay-container）
+      // 带 role=dialog，关账号抽屉后挡住 closed 证明。
+      if (/ovui-popup|guideAnchor|GuideAnchor|c-lib-guide|firefly-popper|shepherd|tour[-_]/i.test(clsOf(n))) return true;
+    }
+    return false;
+  };
+  const blockingOverlayPresent = outer.some((e) => {
+    if (/为商品添加抖音号/.test(txt(e))) return false;
+    if (isGuideChrome(e)) return false;
+    const cls = clsOf(e);
+    if (/product-drawer-header|ovui-drawer__header|oc-drawer-header|drawer__body|drawer__footer/i.test(cls)) return false;
+    // 商品选择抽屉若仍开着，才算真阻挡（整批轮转前应已关掉）
+    if (/已选\s*\d+\s*\/\s*(?:[1-9]|[12]\d|30)/.test(txt(e)) && /全部/.test(txt(e)) && /下一步/.test(txt(e))) return true;
+    const role = e.getAttribute('role') || '';
+    const ariaModal = e.getAttribute('aria-modal') === 'true';
+    if (role === 'dialog' || ariaModal) return true;
+    if (/modal|Modal|dialog|Dialog|popup|Popup/i.test(cls) && !/ovui-drawer/i.test(cls)) return true;
+    return false;
+  });
+  return { accountDrawerCount: drawerRoots.length, blockingOverlayPresent };
 }
 
 function classifyAndCancelAutoPullInPage() {
@@ -3256,7 +3549,16 @@ function readMainTableInPage() {
   const scored=tables.map(el=>({el,rows:[...el.querySelectorAll('tr,[role="row"],.ovui-table__row')].filter(visible).filter(r=>/ID\s*[:：]\s*\d{15,20}/.test(txt(r))).length}));
   const max=Math.max(0,...scored.map(x=>x.rows));
   const roots=scored.filter(x=>x.rows===max).filter(x=>!scored.some(y=>y!==x&&y.rows===max&&x.el.contains(y.el)));
-  if(roots.length!==1||max===0)return {ok:false,reason:'creation-table-not-unique-or-empty',rootCount:roots.length,rowCount:max};
+  // 2026-11-22：整批轮转删光 30 个草稿后，可能是「表头在、行=0」，也可能是空态连
+  // 表头都不渲染。创建路由上若页面已无任何商品 ID 行，视为合法空草稿。
+  if(roots.length!==1){
+    const onCreation=/^\/(uni-creation\/overall-product-multi|create-ad\/overall-product)\/?$/.test(String(location.pathname||''));
+    const anyProductRow=[...document.querySelectorAll('tr,[role="row"],.ovui-table__row')].filter(visible)
+      .filter(r=>!r.closest(dialogs)&&/ID\s*[:：]\s*\d{15,20}/.test(txt(r)));
+    if(onCreation&&anyProductRow.length===0)return {ok:true,rows:[],emptyDraft:true};
+    return {ok:false,reason:'creation-table-not-unique-or-empty',rootCount:roots.length,rowCount:max};
+  }
+  if(max===0)return {ok:true,rows:[],emptyDraft:true};
   // Native single-manual layout (the real Minmin 30 rows): NO "N个抖音号" counter at all.
   // Positive proof = exactly one VISIBLE manual .aweme-entry outside the auto-pull subtree
   // carrying the 管理(手动添加)抖音号 control AND a visible .item-info-wrapper whose text is a
@@ -3286,7 +3588,9 @@ function readMainTableInPage() {
     const scope=cell===null?text:cell;
     const count=scope.match(/(\d+)\s*个抖音号\s*管理(?:手动添加)?抖音号/);
     const singleManual=!count&&cell!==null&&singleManualCell(aweme[0]);
-    const explicitAuto=!singleManual&&/预估自动拉取\s*\d+\s*个/.test(scope)&&!count;
+    // 2026-11-22：与 parseMainTableRow 对齐——Mac 乘方创建页常见「自动拉取 N 个」（无「预估」前缀）。
+    // 只认「预估…」会把「手动添加抖音号 自动拉取 0 个」读成 manualAccounts=null → 整批轮转永不触发。
+    const explicitAuto=!singleManual&&/(?:预估)?自动拉取\s*\d+\s*个/.test(scope)&&!count;
     const emptyAwemeCell=cell!==null&&!count&&!singleManual&&!explicitAuto&&!/管理(?:手动添加)?抖音号/.test(cell)&&/(^|\s)添加(?:手动添加)?抖音号(\s|$)/.test(cell);
     rows.push({productId:ids[0],text,manualAccounts:count?Number(count[1]):singleManual?1:(explicitAuto||emptyAwemeCell)?0:null,manualEvidence:!!count||singleManual||emptyAwemeCell,manualCountKnown:!!count||singleManual||explicitAuto||emptyAwemeCell,autoPullOnly:explicitAuto,reviewFailed:text.includes('当前商品广告审核不通过'),migrationWarning:text.includes('该商品已创建「全店托管」计划'),precheckRisk:text.includes('根据系统前置检测，当前商品可能审核不通过')});
   }
@@ -3857,7 +4161,7 @@ async function handleLateGuidanceBeforeNativeAdvance(page, accountId, runGuidanc
 // desensitized pagination metadata and IDs are retained in memory; raw URLs,
 // headers, bodies, cookies and opaque cursor values are never logged or written.
 // The numeric category 全部 (tab 1) carries no native hasMore/mode field and is
-// deliberately ignored here so the numeric guard path stays authoritative.
+// observed passively to corroborate a numeric landing when adjacent pages return the same IDs.
 function createCatalogTransport(getPage, accountId) {
   let attachedPage = null;
   let onRequest = null;
@@ -3903,13 +4207,48 @@ function createCatalogTransport(getPage, accountId) {
       if (parsed.origin !== CATALOG_ORIGIN || parsed.pathname !== CATALOG_PATH) return;
       const tabAll = parsed.searchParams.getAll(CATALOG_TAB_KEY);
       const cursorAll = parsed.searchParams.getAll(CATALOG_CURSOR_KEY);
-      requestMeta.set(request, { seq: seqCounter++, epoch: drawerEpoch, tab: tabAll.length === 1 ? tabAll[0] : null, cursor: cursorAll.length === 1 ? cursorAll[0] : null, url });
+      const meta = { seq: seqCounter++, epoch: drawerEpoch, tab: tabAll.length === 1 ? tabAll[0] : null, cursor: cursorAll.length === 1 ? cursorAll[0] : null, url };
+      if (meta.tab === CATEGORY_TAB['全部']) {
+        const query = parsed.searchParams;
+        const accounts = query.getAll(CATALOG_ACCOUNT_KEY);
+        const pages = query.getAll('page');
+        const keywords = query.getAll(CATALOG_KEYWORD_KEY);
+        if (accounts.length === 1 && accounts[0] === String(accountId)
+          && pages.length === 1 && /^[1-9]\d{0,3}$/.test(pages[0])
+          && (keywords.length === 0 || (keywords.length === 1 && keywords[0] === ''))) {
+          meta.numericPage = Number(pages[0]);
+        }
+      }
+      requestMeta.set(request, meta);
     };
-    onResponse = response => { processing = processing.then(() => processResponse(response)).catch(() => {}); };
+    onResponse = response => {
+      let request; try { request = response.request(); } catch (_) { return; }
+      const meta = requestMeta.get(request);
+      if (!meta) return;
+      if (meta.tab === CATEGORY_TAB['全部']) {
+        try { meta.httpStatus = response.status(); } catch (_) { /* status unavailable */ }
+        if (meta.numericPage && meta.httpStatus === 200) {
+          recordNumericPage(response, request, meta).catch(() => {});
+        }
+        return;
+      }
+      processing = processing.then(() => processResponse(response)).catch(() => {});
+    };
     page.on('request', onRequest);
     page.on('response', onResponse);
     attachedPage = page;
     return true;
+  }
+  async function recordNumericPage(response, request, meta) {
+    const json = await response.json();
+    if (!isCurrentBinding(request, meta) || json?.status_code !== 0
+      || json.data?.pagination?.page !== meta.numericPage) return;
+    const rows = json.data.productListInfos;
+    if (!Array.isArray(rows) || !rows.length) return;
+    const ids = rows.map(row => row?.productInfo?.id);
+    if (ids.some(id => typeof id !== 'string' || !/^\d{15,20}$/.test(id))
+      || new Set(ids).size !== ids.length) return;
+    meta.numericCardIds = ids.sort().join(',');
   }
   async function processResponse(response) {
     let request; try { request = response.request(); } catch (_) { return; }
@@ -3960,6 +4299,20 @@ function createCatalogTransport(getPage, accountId) {
     detach,
     get available() { return !!attachedPage; },
     beginDrawerEpoch() { drawerEpoch++; batches.length = 0; anomalies.length = 0; requestMeta.clear(); lastCursorByTab.clear(); consumedCursorsByTab.clear(); seqCounter = 0; },
+    requestSequence() { return seqCounter; },
+    numericHttpStatusesSince(firstSeq) {
+      if (!attachedPage) return null;
+      return [...requestMeta.values()]
+        .filter(meta => meta.seq >= firstSeq && meta.tab === CATEGORY_TAB['全部']
+          && new URL(meta.url).searchParams.getAll(CATALOG_ACCOUNT_KEY).join(',') === String(accountId))
+        .map(meta => meta.httpStatus ?? null);
+    },
+    numericPageMatches(firstSeq, pageNumber, cardIds) {
+      if (!attachedPage || !cardIds) return false;
+      const matching = [...requestMeta.values()].filter(meta =>
+        meta.seq >= firstSeq && meta.numericPage === pageNumber);
+      return matching.length === 1 && matching[0].numericCardIds === cardIds;
+    },
     async flush() { try { await processing; } catch (_) {} },
     anomaly() { return anomalies.length ? anomalies[0].reason : null; },
     batchesForTab(tab) { const t = String(tab); return batches.filter(b => b.epoch === drawerEpoch && b.tab === t); },
@@ -4348,7 +4701,7 @@ function createRealDrivers(ctx) {
   // and must stop the whole workflow immediately (never caught and continued past).
   // After a proven click, a bounded FRESH read-only re-verification (never a re-click)
   // waits for the exact landing state: active page === before+1, a complete non-empty
-  // unique valid card set that actually changed, the footer/capacity preserved, the
+  // unique valid card set that changed or matches the new page's response, the footer/capacity preserved, the
   // category still active, and no unknown-checked drift. A timeout or any intermediate
   // unproven state is a hard stop — never a false confirmed and never a stale pageNo+1.
   async function changePageViaNumericOvuiPager(context, beforeObs, before) {
@@ -4359,6 +4712,7 @@ function createRealDrivers(ctx) {
       expectedSelectedCount: before.selectedCount, expectedCapacity: before.remainingCapacity,
       selectedIds: context.selectedIds || [], accountId,
     };
+    const firstRequestSeq = transport.requestSequence();
     const next = await page.evaluate(numericPickerPagingInPage, payload);
     if (!next || next.ok !== true) throw new Error('numeric-ovui-page-advance-not-proven:' + (next && next.reason || 'unknown'));
     if (next.boundary === true) return { boundary: true, currentPage: next.currentPage };
@@ -4370,12 +4724,18 @@ function createRealDrivers(ctx) {
     }), x => x.result.ok === true
       && x.result.currentPage === expectedCurrentPage + 1
       && x.snap.ok === true && categoryIsActive(x.snap, '全部') && listPageComplete(x.snap)
-      && x.snap.cards.map(c => c.id).filter(Boolean).sort().join(',') !== beforeIds
+      && numericCardsLanded(x.snap, beforeIds, firstRequestSeq, expectedCurrentPage + 1)
       && x.result.footerSelectedCount === before.selectedCount
       && x.result.footerRemainingCapacity === before.remainingCapacity
       && x.result.checkedIds.every(id => (context.selectedIds || []).map(String).includes(id)),
       nativeTimeoutMs, 'numeric-ovui-page-advance');
     return { confirmed: true, observedPage: after.result.currentPage, snap: after.snap };
+  }
+  function numericCardsLanded(snap, beforeIds, firstRequestSeq, pageNumber) {
+    if (Number(snap.spinnerCount || 0) !== 0) return false;
+    const cardIds = snap.cards.map(card => card.id).sort().join(',');
+    // 页码可先于列表更新。相邻页商品相同时，只接受点击后该页的成功响应与 DOM 一致。
+    return cardIds !== beforeIds || transport.numericPageMatches(firstRequestSeq, pageNumber, cardIds);
   }
   // R29 narrow helper: advance the All numeric picker through the FROZEN generic guard by
   // clicking the observed, affirmatively-enabled number leaf of currentPage+1. The leaf must come
@@ -4386,7 +4746,7 @@ function createRealDrivers(ctx) {
   // footer delta/capacity, checked subset, main table vs this round's base, account/origin/path,
   // no guide overlay); pageApply performs its own fresh read before that click. After it, a
   // bounded read-only re-verification must land on exactly currentPage+1 with a complete,
-  // unique, valid and actually changed card set, preserved footer, no checked drift and the same
+  // unique, valid card set supported by changed IDs or the target page's response, preserved footer, no checked drift and the same
   // account/category — a paged:true dispatch alone is never success, and nothing is re-clicked.
   // Returns null ONLY when no next number leaf was observed, keeping R28's svg fallback in force.
   async function changePageViaNumericLeafPager(context, beforeObs, before) {
@@ -4422,22 +4782,47 @@ function createRealDrivers(ctx) {
           const diag = await page.evaluate(() => {
             const visible = (el) => { try { const r = el.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) return false; const cs = getComputedStyle(el); return cs.visibility !== 'hidden' && cs.display !== 'none'; } catch (_) { return false; } };
             const txt = (el) => String(el.textContent || '').replace(/\s+/g, ' ').trim();
+            const clsOf = (el) => String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || ''));
             const skipBtns = Array.prototype.slice.call(document.querySelectorAll('button, a, [role="button"], span, div'))
               .filter(el => visible(el) && ['跳过', '跳过引导', '我知道了', '知道了'].includes(String(el.textContent || '').replace(/\s+/g, '')))
               .slice(0, 6)
-              .map(el => ({ tag: el.tagName.toLowerCase(), cls: String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || '')).slice(0, 100), text: txt(el).slice(0, 16) }));
+              .map(el => ({ tag: el.tagName.toLowerCase(), cls: clsOf(el).slice(0, 100), text: txt(el).slice(0, 16) }));
+            const DIALOG_SEL = '[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="drawer"],[class*="Drawer"],[class*="modal"],[class*="Modal"]';
+            const dialogSelHits = Array.prototype.slice.call(document.querySelectorAll(DIALOG_SEL))
+              .filter(visible)
+              .slice(0, 12)
+              .map(el => ({ cls: clsOf(el).slice(0, 110), role: el.getAttribute('role') || '', ariaModal: el.getAttribute('aria-modal') || '', rect: (rr => Math.round(rr.width) + 'x' + Math.round(rr.height) + '@' + Math.round(rr.x) + ',' + Math.round(rr.y))(el.getBoundingClientRect()), text: txt(el).slice(0, 40) }));
+            const isGuideChrome = (el) => {
+              for (let n = el, i = 0; n && i < 10; n = n.parentElement, i++) {
+                if (/ovui-popup|guideAnchor|GuideAnchor|c-lib-guide|firefly-popper|shepherd|tour[-_]/i.test(clsOf(n))) return true;
+              }
+              return false;
+            };
+            const filteredOtherOverlays = Array.prototype.slice.call(document.querySelectorAll(DIALOG_SEL))
+              .filter(visible)
+              .filter(el => {
+                const cls = clsOf(el);
+                if (/product-drawer-header|ovui-drawer__header|oc-drawer-header|drawer__body|drawer__footer|ovui-drawer/i.test(cls)) return false;
+                if (isGuideChrome(el)) return false;
+                const role = el.getAttribute('role') || '';
+                const ariaModal = el.getAttribute('aria-modal') === 'true';
+                return role === 'dialog' || ariaModal || /modal|Modal|dialog|Dialog|popup|Popup/i.test(cls);
+              })
+              .slice(0, 6)
+              .map(el => ({ cls: clsOf(el).slice(0, 110), role: el.getAttribute('role') || '', ariaModal: el.getAttribute('aria-modal') || '', text: txt(el).slice(0, 40) }));
             const overlays = Array.prototype.slice.call(document.querySelectorAll('[class*="guide"], [class*="Guide"], [class*="tour"], [class*="Tour"], [class*="modal"], [class*="Modal"], [class*="popup"], [class*="pop"], [class*="mask"], [class*="Mask"], [class*="dialog"], [class*="Dialog"], [class*="wrap"], [class*="Wrap"], [class*="overlay"], [class*="Overlay"], [class*="banner"], [class*="activity"], [class*="float"], [class*="Float"]'))
               .filter(el => visible(el) && el.getBoundingClientRect().width > 150 && el.getBoundingClientRect().height > 80)
               .slice(0, 10)
-              .map(el => ({ cls: String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || '')).slice(0, 110), rect: (rr => Math.round(rr.width) + 'x' + Math.round(rr.height) + '@' + Math.round(rr.x) + ',' + Math.round(rr.y))(el.getBoundingClientRect()), text: txt(el).slice(0, 40) }));
-            return { url: String(location.href).slice(0, 130), skipBtns, overlays };
+              .map(el => ({ cls: clsOf(el).slice(0, 110), rect: (rr => Math.round(rr.width) + 'x' + Math.round(rr.height) + '@' + Math.round(rr.x) + ',' + Math.round(rr.y))(el.getBoundingClientRect()), text: txt(el).slice(0, 40) }));
+            return { url: String(location.href).slice(0, 130), skipBtns, dialogSelHits, filteredOtherOverlays, overlays };
           });
           fs.writeFileSync(require('path').join(ROOT, 'overlay-diag.log'),
             new Date().toISOString() + ' [numeric-pager-blocking-overlay]\n' + JSON.stringify(diag, null, 1) + '\n\n', { flag: 'a' });
           console.warn('[plan-publisher] numeric-pager overlay-diag written');
         } catch (_) { /* 诊断失败不影响原 fail-closed */ }
-        try { await sweepOverlays(page, 3); } catch (_) {}
+        try { await sweepOverlays(page, 4); } catch (_) {}
         try { await guidancePhase(); } catch (_) {}
+        try { await sweepOverlays(page, 2); } catch (_) {}
         await settleProductPage({ cat: context.cat, native: false, pageNo: currentPage, selectedIds, baseSelectedCount: context.baseSelectedCount });
         const scopeRetry = await page.evaluate(numericPickerPagingInPage, {
           mode: 'read', expectedCurrentPage: currentPage,
@@ -4493,23 +4878,122 @@ function createRealDrivers(ctx) {
     }
     const beforeIds = effective.cards.map(c => c.id).filter(Boolean).sort().join(',');
     const activeBefore = (effective.activeTabs || []).map(x => String(x).replace(/\s/g, '')).sort().join('|');
+    const firstRequestSeq = transport.requestSequence();
     await page.evaluate(guard.pageApply, { ...target, observation: targetObs.observation });
-    const after = await until(async () => ({
-      obs: await observe(),
-      result: await page.evaluate(numericPickerPagingInPage, { mode: 'read', expectedCurrentPage: null, selectedIds, accountId }),
-      snap: await page.evaluate(drawerSnapshotInPage),
-    }), x => x.obs.pagination && x.obs.pagination.currentPage === nextPage
-      && x.result.ok === true && x.result.currentPage === nextPage
+    // Landing proof never re-clicks the pager. 2026-11-22 实机：带 Escape 的 sweepOverlays
+    // 会把商品抽屉关掉（timeout：catalog 200 + drawer-not-unique，截图回到「添加商品」）。
+    // 落地轮询只用 overlaySweepInPage（可点 span/div「跳过」与 popup 叉，无 Escape），
+    // 清掉左侧蓝卡引导后再读数字翻页器——绝不用 keyboard Escape。
+    const readAdvance = async () => {
+      try { await page.evaluate(overlaySweepInPage, { maxClicks: 2 }); } catch (_) { /* offline hosts / sweep failures never invent readiness */ }
+      // 2026-11-22：翻页落地时左侧蓝卡「跳过」常挡列表刷新；再点一次精确「跳过」（不点业务下一步）。
+      try {
+        await page.evaluate(() => {
+          const visible = (el) => { try { const r = el.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) return false; const cs = getComputedStyle(el); return cs.visibility !== 'hidden' && cs.display !== 'none'; } catch (_) { return false; } };
+          const txt = (el) => String(el.textContent || '').replace(/\s+/g, '');
+          const btns = Array.prototype.slice.call(document.querySelectorAll('button,a,[role="button"],span,div')).filter(visible).filter(el => txt(el) === '跳过');
+          const leaf = btns.sort((a, b) => {
+            const depth = (el) => { let d = 0; let n = el; while (n && n !== document.body) { d += 1; n = n.parentElement; } return d; };
+            return depth(b) - depth(a);
+          })[0];
+          if (leaf) leaf.click();
+        });
+      } catch (_) { /* 无跳过按钮时零动作 */ }
+      return {
+        obs: await observe(),
+        result: await page.evaluate(numericPickerPagingInPage, { mode: 'read', expectedCurrentPage: null, selectedIds, accountId }),
+        snap: await page.evaluate(drawerSnapshotInPage),
+      };
+    };
+    const advanceReady = x => !!(x && x.obs && x.obs.pagination && x.obs.pagination.currentPage === nextPage
+      && x.result && x.result.ok === true && x.result.currentPage === nextPage
       && String(x.result.accountId) === String(accountId)
       && x.result.footerSelectedCount === effective.selectedCount
       && x.result.footerRemainingCapacity === effective.remainingCapacity
-      && x.result.checkedIds.every(id => selectedIds.includes(id))
-      && x.snap.ok === true && categoryIsActive(x.snap, '全部') && listPageComplete(x.snap)
-      && x.snap.cards.map(c => c.id).filter(Boolean).sort().join(',') !== beforeIds,
-      nativeTimeoutMs, 'numeric-leaf-page-advance');
-    const activeAfter = (after.snap.activeTabs || []).map(x => String(x).replace(/\s/g, '')).sort().join('|');
-    if (activeBefore !== activeAfter) throw new Error('numeric-leaf-category-drift');
-    return { confirmed: true, observedPage: after.obs.pagination.currentPage, snap: after.snap };
+      && Array.isArray(x.result.checkedIds) && x.result.checkedIds.every(id => selectedIds.includes(id))
+      && x.snap && x.snap.ok === true && categoryIsActive(x.snap, '全部') && listPageComplete(x.snap)
+      && numericCardsLanded(x.snap, beforeIds, firstRequestSeq, nextPage));
+    function confirmLanding(after) {
+      const activeAfter = (after.snap.activeTabs || []).map(x => String(x).replace(/\s/g, '')).sort().join('|');
+      if (activeBefore !== activeAfter) throw new Error('numeric-leaf-category-drift');
+      return { confirmed: true, observedPage: after.obs.pagination.currentPage, snap: after.snap };
+    }
+    function timeoutArtifactDir() {
+      const base = projectRoot || ROOT;
+      const dir = path.join(base, 'plan-publisher');
+      try { fs.mkdirSync(dir, { recursive: true }); } catch (_) { /* directory may already exist */ }
+      return dir;
+    }
+    let after;
+    try {
+      after = await until(readAdvance, advanceReady, nativeTimeoutMs, 'numeric-leaf-page-advance');
+    } catch (error) {
+      if (!/numeric-leaf-page-advance-timeout/.test(String(error && error.message || ''))) throw error;
+      // The final polling sleep can cross the deadline as the list settles. Check which
+      // parts of the original compound predicate still fail, plus the actual landing view.
+      // Never retry the click, infer EOF, or include account/product identifiers in the log.
+      let last = null;
+      try { last = await readAdvance(); } catch (_) { /* sample failure must not suppress logging or screenshot */ }
+      if (advanceReady(last)) return confirmLanding(last);
+      // 2026-11-22：页码已到、仍在转圈或旧卡未换 → 再等一轮（不重点翻页），给列表 HTTP 收尾。
+      const pageOk = !!(last && last.obs && last.obs.pagination && last.obs.pagination.currentPage === nextPage
+        && last.result && last.result.ok === true && last.result.currentPage === nextPage);
+      const stillLoading = !!(last && last.snap && (Number(last.snap.spinnerCount || 0) > 0
+        || (listPageComplete(last.snap) && last.snap.cards.map(c => c.id).filter(Boolean).sort().join(',') === beforeIds)));
+      if (pageOk && stillLoading) {
+        try {
+          after = await until(readAdvance, advanceReady, nativeTimeoutMs, 'numeric-leaf-page-advance-settle');
+          return confirmLanding(after);
+        } catch (_) { /* fall through to original timeout evidence */ }
+        try { last = await readAdvance(); } catch (_) {}
+        if (advanceReady(last)) return confirmLanding(last);
+      }
+      try {
+        const obsPage = last && last.obs && last.obs.pagination && last.obs.pagination.currentPage;
+        const result = last && last.result || {};
+        const snap = last && last.snap || {};
+        const idsNow = Array.isArray(snap.cards) ? snap.cards.map(c => c && c.id).filter(Boolean).sort().join(',') : '';
+        const checks = {
+          observePageAdvanced: obsPage === nextPage,
+          numericPagerReadOk: result.ok === true,
+          numericPagerPageAdvanced: result.currentPage === nextPage,
+          accountUnchanged: String(result.accountId || '') === String(accountId),
+          selectedCountPreserved: result.footerSelectedCount === effective.selectedCount,
+          remainingCapacityPreserved: result.footerRemainingCapacity === effective.remainingCapacity,
+          checkedIdsRemainSubset: Array.isArray(result.checkedIds) && result.checkedIds.every(id => selectedIds.includes(id)),
+          drawerSnapshotOk: snap.ok === true,
+          allCategoryActive: snap.ok === true && categoryIsActive(snap, '全部'),
+          listPageComplete: snap.ok === true && listPageComplete(snap),
+          cardIdsChanged: !!idsNow && idsNow !== beforeIds,
+          catalogPageMatchesCards: transport.numericPageMatches(firstRequestSeq, nextPage, idsNow),
+        };
+        let safeUrl = 'unavailable';
+        try { safeUrl = String(await page.url()); } catch (_) {}
+        const safeUrlPath = (() => { try { const u = new URL(safeUrl); return u.origin + u.pathname; } catch (_) { return 'unavailable'; } })();
+        const evidence = {
+          at: new Date().toISOString(), reason: 'numeric-leaf-page-advance-timeout',
+          sampleReadOk: !!last, catalogHttpStatuses: transport.numericHttpStatusesSince(firstRequestSeq),
+          url: safeUrlPath, expectedPage: nextPage, observedPage: Number.isInteger(obsPage) ? obsPage : null,
+          numericPagerReason: typeof result.reason === 'string' ? result.reason.slice(0, 80) : null,
+          overlayClasses: Array.isArray(result.overlayClasses) ? result.overlayClasses.slice(0, 4) : null,
+          drawerReason: typeof snap.reason === 'string' ? snap.reason.slice(0, 80) : null,
+          observedCardCount: Array.isArray(snap.cards) ? snap.cards.length : null,
+          observedCheckedCount: Array.isArray(result.checkedIds) ? result.checkedIds.length : null,
+          checks,
+        };
+        fs.writeFileSync(path.join(timeoutArtifactDir(), 'numeric-pager-timeout.log'), JSON.stringify(evidence) + '\n', { flag: 'a' });
+      } catch (_) { /* diagnostic failure never changes the timeout refusal */ }
+      // Keep screenshot capture independent from the post-timeout read and log. This is the
+      // only preserved view of the actual landing state; bound it so diagnostics cannot hold
+      // the stopped workflow open indefinitely.
+      try {
+        if (typeof page.screenshot === 'function' && !(typeof page.isClosed === 'function' && page.isClosed())) {
+          await page.screenshot({ path: path.join(timeoutArtifactDir(), 'numeric-pager-timeout.png'), fullPage: false, timeout: Math.min(nativeTimeoutMs, 3000) });
+        }
+      } catch (_) { /* screenshot failure never changes the timeout refusal */ }
+      throw error;
+    }
+    return confirmLanding(after);
   }
   // S21 narrow helper: step the All numeric picker BACKWARD by exactly one page through the
   // frozen strict in-page proof (numericPickerPagingInPage mode 'prev' — unique drawer /
@@ -4732,7 +5216,32 @@ function createRealDrivers(ctx) {
     const prevDom=new Set((await drawer()).cards.map(c=>String(c.id||'')).filter(Boolean));
     // 2026-11-21 用户指令：任何操作之前都要检查浮窗——滚动翻页前清一次
     await sweepOverlays(page, 2).catch(() => {});
-    const step=await page.evaluate(nativeScrollStepInPage);
+    let step=null;
+    try {
+      step=await page.evaluate(nativeScrollStepInPage);
+    } catch (scrollErr) {
+      // 2026-11-22：native-scroll-root-not-unique 时 dump 可见列表候选类名，便于对齐新 DOM。
+      try {
+        const diag=await page.evaluate(()=>{
+          const visible=e=>{try{const r=e.getBoundingClientRect();if(!(r.width>0&&r.height>0))return false;const cs=getComputedStyle(e);return cs.visibility!=='hidden'&&cs.display!=='none';}catch(_){return false;}};
+          const clsOf=e=>String((e.className&&e.className.baseVal!==undefined)?e.className.baseVal:(e.className||''));
+          const cands=[...document.querySelectorAll('[class*="product-list"],[class*="ProductList"],[class*="productList"],[class*="goods-list"],[class*="card-list"],[class*="scroll"]')]
+            .filter(visible)
+            .slice(0,20)
+            .map(el=>{const r=el.getBoundingClientRect();return {cls:clsOf(el).slice(0,120),w:Math.round(r.width),h:Math.round(r.height),cards:[...el.querySelectorAll('.card-container')].filter(visible).length,scrollH:el.scrollHeight||0,clientH:el.clientHeight||0};});
+          const cardHosts=[...document.querySelectorAll('.card-container')].filter(visible).slice(0,3).map(el=>{
+            let n=el, chain=[];
+            for(let i=0;n&&i<8;i++,n=n.parentElement) chain.push(clsOf(n).slice(0,60));
+            return chain;
+          });
+          const drawerText=[...document.querySelectorAll('[class*="drawer"],[role="dialog"]')].filter(visible).slice(0,4).map(el=>({cls:clsOf(el).slice(0,80),text:String(el.textContent||'').replace(/\s+/g,' ').trim().slice(0,40),w:Math.round(el.getBoundingClientRect().width),h:Math.round(el.getBoundingClientRect().height)}));
+          return {url:String(location.href).slice(0,140),cands,cardHosts,drawerText,productListExact:[...document.querySelectorAll('.product-list')].length,productListVisible:[...document.querySelectorAll('.product-list')].filter(visible).length};
+        });
+        fs.writeFileSync(path.join(ROOT,'native-scroll-diag.log'),new Date().toISOString()+' '+JSON.stringify(diag)+'\n',{flag:'a'});
+        console.warn('[plan-publisher] native-scroll-diag written cands='+(diag&&diag.cands&&diag.cands.length));
+      } catch(_){ /* diag never changes refusal */ }
+      throw scrollErr;
+    }
     if(!step||!step.ok)throw new Error('native-scroll-step-failed');
     const markerNudged=!!(step.marker&&step.marker.nudged===true);
     try {
@@ -4864,7 +5373,9 @@ function createRealDrivers(ctx) {
     if(!/^\d{15,20}$/.test(id))return {selected:false,reason:'product-id-unknown'};
     const parsed=wf.parseProductCard(card);
     hints[id]=wf.mergeCardHints(hints, [parsed])[id];
-    if(parsed.reviewFailed||!parsed.selectable||publishedIds.has(id)||attemptedSet.has(id))return {selected:false,reason:parsed.reviewFailed?'review-failed':'not-eligible'};
+    // allowAttemptedReuse：目录耗尽后的复扫，允许勾选已 attempted 但未发布的商品（不清空 attempted 账本）。
+    const reuseAttempted=pickerRunContext&&pickerRunContext.allowAttemptedReuse===true;
+    if(parsed.reviewFailed||!parsed.selectable||publishedIds.has(id)||(attemptedSet.has(id)&&!reuseAttempted))return {selected:false,reason:parsed.reviewFailed?'review-failed':'not-eligible'};
     attemptedSet.add(id);
     dayState.attempted=[...attemptedSet];dayState.hints=hints;dayState.cursor={...dayState.cursor,seenProductIds:[...new Set([...(dayState.cursor.seenProductIds||[]),id])]};
     await persist(dayState);
@@ -4915,6 +5426,16 @@ function createRealDrivers(ctx) {
     // category never depends on it, so pages without .on stay fully supported.
     transport.attach();
     try {
+    const allowAttemptedReuse=input.allowAttemptedReuse===true;
+    const ordered=input.categories||wf.CATEGORY_TAB_ORDER;
+    if(input.resetCursor===true){
+      // 复扫：重置分页游标到首类目第 1 页；保留 seenProductIds，绝不清空 attempted。
+      dayState.cursor={
+        category:ordered[0], page:1, nativeEof:false,
+        seenProductIds:[...new Set((dayState.cursor&&dayState.cursor.seenProductIds)||[])],
+      };
+      dayState.category=ordered[0]; dayState.page=1; await persist(dayState);
+    }
     let snap;
     try { snap=await drawer(); } catch (_) { snap=await openPicker(); }
     let selectedIds=(input.selectedIds||[]).map(String);
@@ -4929,13 +5450,14 @@ function createRealDrivers(ctx) {
     // position (it was not proven in this epoch) and can never be walked back to.
     pickerEpoch+=1;
     selectedPositions.clear();
-    pickerRunContext={baseSelectedCount,expectedCapacity};
+    pickerRunContext={baseSelectedCount,expectedCapacity,allowAttemptedReuse};
     dayState.lastSelected=selectedIds.slice();
-    const ordered=input.categories||wf.CATEGORY_TAB_ORDER;
+    let lastPageReached=false;
     let cat=dayState.cursor&&ordered.includes(dayState.cursor.category)?dayState.cursor.category:ordered[0];
     let categoryIndex=Math.max(0,ordered.indexOf(cat));
     let pageNo=1;
-    if(!categoryIsActive(snap,cat)){snap=await switchCategory(cat);pageNo=1;}
+    // resetCursor 时强制 switchCategory：抽屉可能仍停在旧页码，仅改 cursor 不会回到第 1 页。
+    if(input.resetCursor===true||!categoryIsActive(snap,cat)){snap=await switchCategory(cat);pageNo=1;}
     if(!isNativeScrollCategory(cat)&&dayState.cursor&&Number.isInteger(dayState.cursor.page)&&dayState.cursor.page>1) {
       // Reopening starts at page one; restore only through observed forward steps.
       // Native scroll categories always rescan from the top and dedup via
@@ -5066,14 +5588,29 @@ function createRealDrivers(ctx) {
           if(!pickerBatchStateMatches(afterCancel,baseSelectedCount,currentBatchCount))throw new Error('auto-pull-backfill-footer-count-unknown');
           const hasCurrentPageReplacement=afterCancel.cards.some(card=>{
             const id=String(card.id||'');
-            if(!/^\d{15,20}$/.test(id)||selectedIds.includes(id)||attemptedSet.has(id)||publishedIds.has(id))return false;
+            const reuse=pickerRunContext&&pickerRunContext.allowAttemptedReuse===true;
+            if(!/^\d{15,20}$/.test(id)||selectedIds.includes(id)||publishedIds.has(id))return false;
+            if(attemptedSet.has(id)&&!reuse)return false;
             const parsed=wf.parseProductCard(card);
             return parsed.selectable&&!parsed.reviewFailed;
           });
           if(hasCurrentPageReplacement)continue;
         }
         if(native){
-          const adv=await nativeAdvance(tab);
+          let adv;
+          try {
+            adv=await nativeAdvance(tab);
+          } catch (error) {
+            // 无进展/滚动卡住：只结束本原生类目，转入下一类目或「全部」。
+            // 绝不能冒泡成 scheduled-run-exception 把整店选品停死（2026-11-23 publish47）。
+            const msg=String((error&&error.message)||error);
+            if(/native-catalog-no-progress|native-scroll-step-failed|native-scroll-root/.test(msg)){
+              dayState.cursor=nativeAdvanceCursor(dayState.cursor,cat,'budget',nativeAdvances);
+              await persist(dayState);
+              break;
+            }
+            throw error;
+          }
           if(adv.eof){
             // 真实 EOF：transport 已证明本类目 hasMore=false 且累计 id 全部落到 DOM。诚实耗尽。
             dayState.cursor=nativeAdvanceCursor(dayState.cursor,cat,'eof',nativeAdvances);
@@ -5091,17 +5628,33 @@ function createRealDrivers(ctx) {
           continue;
         }
         const advanced=await changePage({cat,native,selectedIds,baseSelectedCount,expectedCapacity});
-        if(advanced&&advanced.boundary===true)break;
+        if(advanced&&advanced.boundary===true){
+          if(cat==='全部')lastPageReached=true;
+          break;
+        }
         if(!advanced.confirmed||advanced.observedPage!==pageNo+1)throw new Error('page-advance-unconfirmed-before-cursor-write');
         pageNo=advanced.observedPage;
       }
     }
-    return {ok:false,reason:'catalog-exhausted-or-safe-pagination-boundary',selectedIds,hints,attempted:[...attemptedSet],cursor:dayState.cursor};
+    // 不足 20 且「全部」没到真正最后一页：不能当成目录耗尽。
+    if(selectedIds.length<20&&lastPageReached!==true){
+      return {ok:false,reason:'below-20-last-page-not-reached',lastPageReached:false,selectedIds,hints,attempted:[...attemptedSet],cursor:dayState.cursor};
+    }
+    return {ok:false,reason:'catalog-exhausted-or-safe-pagination-boundary',lastPageReached,selectedIds,hints,attempted:[...attemptedSet],cursor:dayState.cursor};
     } finally { pickerRunContext=null;selectedPositions.clear();transport.detach(); }
   }
-  async function commitPicker({baseSelectedCount=0,expectedCapacity=wf.BUSINESS.productsPerPlan}={}) {
+  async function commitPicker({baseSelectedCount=0,expectedCapacity=wf.BUSINESS.productsPerPlan,allowPartial=false}={}) {
     const snap=await drawer();
-    if(!pickerBatchStateMatches(snap,baseSelectedCount,expectedCapacity)||baseSelectedCount+expectedCapacity!==wf.BUSINESS.productsPerPlan||dayState.lastSelected.length!==wf.BUSINESS.productsPerPlan||new Set(dayState.lastSelected.map(String)).size!==wf.BUSINESS.productsPerPlan)throw new Error('picker-selection-not-exactly-30');
+    const n=dayState.lastSelected.length;
+    const uniq=new Set(dayState.lastSelected.map(String)).size;
+    if(allowPartial===true){
+      // 目录耗尽：允许提交 1..29；footer 分母仍为 30（remainingCapacity 字段实为上限）。
+      if(!Number.isInteger(expectedCapacity)||expectedCapacity<1||expectedCapacity>29)throw new Error('picker-partial-capacity-invalid');
+      if(n!==expectedCapacity||uniq!==expectedCapacity)throw new Error('picker-partial-selection-count-mismatch');
+      if(!pickerBatchStateMatches(snap,baseSelectedCount,expectedCapacity))throw new Error('picker-partial-batch-state-mismatch');
+    }else if(!pickerBatchStateMatches(snap,baseSelectedCount,expectedCapacity)||baseSelectedCount+expectedCapacity!==wf.BUSINESS.productsPerPlan||n!==wf.BUSINESS.productsPerPlan||uniq!==wf.BUSINESS.productsPerPlan){
+      throw new Error('picker-selection-not-exactly-30');
+    }
     const selected=dayState.lastSelected.map(String);
     const obs=await observe();const next=obs.elements.filter(e=>e.text==='下一步'&&e.tag==='BUTTON');
     if(next.length!==1)throw new Error('product-picker-next-button-not-unique');
@@ -5140,7 +5693,21 @@ function createRealDrivers(ctx) {
     let reads = 0;
     let sigSince = null;
     while (Date.now() < deadline) {
-      const rows = await readMainTable();
+      let rows;
+      try {
+        rows = await readMainTable();
+      } catch (e) {
+        // 2026-11-22：账号抽屉未关时主表可能读成 creation-table-not-unique-or-empty；
+        // 稳定读必须返回 ok:false，绝不能把 throw 冒泡成 scheduled-run-exception，
+        // 否则整批 unbindable 轮转来不及用 binder 已给出的证据行。
+        return {
+          ok: false,
+          rows: lastRows,
+          stableReads: reads,
+          stable: false,
+          reason: String((e && e.message) || e || 'main-table-read-failed'),
+        };
+      }
       reads++;
       lastRows = rows;
       const sig = sigOf(rows);
@@ -5242,7 +5809,7 @@ function createRealDrivers(ctx) {
         knownCheckedCount:rows?rows.filter(r=>r&&r.checked===true).length:null,
         unknownStateCount:rows?rows.filter(r=>!r||(r.checked!==true&&r.checked!==false)).length:null,
         selectedCount:(s&&typeof s.selectedCount==='number')?s.selectedCount:null,
-        totalCount:(s&&typeof s.totalCount==='number')?s.totalCount:null
+        totalCount:(s&&typeof s.totalCount==='number')?s.totalCount:null,
       };
     };
     // A legitimate reuse target is any product that is itself bound to at least 1 manual
@@ -5420,7 +5987,23 @@ function createRealDrivers(ctx) {
       // 一律不算 0（算 unknown，直接停），绝不把"没结果/一直在加载"当成 0。
       const provesZero=(s,pid)=>!!s&&s.ok===true&&exactTwo(s)&&consistentSelectionState(s)&&s.totalCount===30&&s.selectedCount===0
         &&Array.isArray(s.rows)&&s.rows.length>=1&&s.rows.every(r=>r.checked===false)&&panelSetEqualsIds(s)&&provePanelSet(s)===String(pid);
-      const proves=(s,pid)=>partial?(provesTarget(s,pid)||provesZero(s,pid)):provesTarget(s,pid);
+      // 2026-11-22：乘方可选不可绑——部分失败通知关闭后，逐商品回读常见「两行全置灰」。
+      // 这不是 unknown，应记入 zeroIds 交给 removal/backfill，否则 batch-result-panel-target-not-verified。
+      const provesGrayZero=(s,pid)=>!!s&&s.ok===true&&exactTwo(s)&&panelSetEqualsIds(s)&&provePanelSet(s)===String(pid)
+        &&Number(s.selectedCount)===0&&Number(s.totalCount)===30
+        &&Array.isArray(s.rows)&&s.rows.length>=1&&s.rows.every(r=>r.checked!==true&&r.labelDisabled===true);
+      // 2026-11-22 实机：部分失败后回读某商品可能列出 8 行抖音号（非 exactTwo 的 1-2 目标）。
+      // 多行面板仍应核对每行状态。页脚仅在与实际选中数一致时参与证明。
+      const provesByFooter=(s,pid)=>!!s&&s.ok===true&&panelSetEqualsIds(s)&&provePanelSet(s)===String(pid)
+        &&Number(s.totalCount)===30&&Array.isArray(s.rows)&&s.rows.length>2
+        &&s.rows.every(r=>r.checked===true||r.checked===false)
+        &&s.rows.filter(r=>r.checked===true).length===s.selectedCount
+        &&s.rows.filter(r=>r.checked===true).every(r=>Array.isArray(r.ids)&&r.ids.length===1&&matchTargets(r.ids.map(String)));
+      const proves=(s,pid)=>{
+        if(!partial) return provesTarget(s,pid);
+        if(provesTarget(s,pid)||provesZero(s,pid)||provesGrayZero(s,pid)) return true;
+        return provesByFooter(s,pid);
+      };
       const zeroIds=[],boundIds=[];
       const noBlocking=async()=>{ const ov=await page.evaluate(bindingOverlaySnapshotInPage).catch(()=>null); return !!ov&&ov.accountDrawerCount===1&&ov.blockingOverlayPresent===false; };
       // 2026-11-21 阻挡浮窗先清后查：检测到阻挡遮罩时先清一次引导浮窗（跳过优先）再复查；
@@ -5452,9 +6035,15 @@ function createRealDrivers(ctx) {
         // R128: a target that cannot be positively proven is still the SAME fail-closed stop; only
         // the sanitized numeric footer/row-state of THIS LAST fresh read is attached (never row
         // text, ids, URLs or cookies), so a real run's stop can be told apart from a stale cache.
-        if(!proves(fresh,pid)) return {ok:false,reason:'batch-result-panel-target-not-verified',diag:footerStateDiag(fresh,'panel-navigation')};
+        if(!proves(fresh,pid)){
+          try { console.warn('[plan-publisher] panel-target-not-verified ' + JSON.stringify(footerStateDiag(fresh,'panel-navigation'))); } catch(_){}
+          return {ok:false,reason:'batch-result-panel-target-not-verified',diag:footerStateDiag(fresh,'panel-navigation')};
+        }
         if(!(await noBlockingOrClearGuidance())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
-        if(partial){ (provesTarget(fresh,pid)?boundIds:zeroIds).push(String(pid)); }
+        if(partial){
+          const bound=provesTarget(fresh,pid)||(provesByFooter(fresh,pid)&&Number(fresh.selectedCount)>=1);
+          (bound?boundIds:zeroIds).push(String(pid));
+        }
         prev=pid;
       }
       // All 30 proven: navigate back to the original batch anchor and fresh-prove it before the commit.
@@ -5507,8 +6096,12 @@ function createRealDrivers(ctx) {
         if((!snap||!snap.ok||!exactTwo(snap))&&anchor) return {ok:false,reason:'anchor-account-management-button-not-unique'};
       }
     }
-    if(!snap||!snap.ok||!exactTwo(snap))return {ok:false,reason:'account-drawer-does-not-show-exact-two-target-accounts'};
-    if(snap.totalCount!==30||![0,1,2].includes(snap.selectedCount))return {ok:false,reason:'account-drawer-selected-count-not-0-1-or-2-of-30'};
+    // 2026-11-22：抽屉在但初始 active 不是 exactTwo（0 行 / 8 行等）时，旧逻辑直接
+    // account-drawer-does-not-show-exact-two 停死，永远进不了穷举换锚。无主表锚点时放行到
+    // 下方 panel walk；有锚点仍要求 reopen 后 exactTwo。
+    if(!snap||!snap.ok)return {ok:false,reason:'account-drawer-does-not-show-exact-two-target-accounts'};
+    if(anchor&&!exactTwo(snap))return {ok:false,reason:'account-drawer-does-not-show-exact-two-target-accounts'};
+    if(exactTwo(snap)&&(snap.totalCount!==30||![0,1,2].includes(snap.selectedCount)))return {ok:false,reason:'account-drawer-selected-count-not-0-1-or-2-of-30'};
     // A LABEL-disabled header, or an unselected LABEL-disabled account row, forbids the
     // header select-all. Reuse the already-bound anchor once (its reopened drawer shows a
     // settled known subset with >=1 checked at footer checked-count/30) instead of clicking;
@@ -5520,10 +6113,11 @@ function createRealDrivers(ctx) {
     // navigation / header / batch the drawer must expose a trustworthy 30-product panel list whose
     // set is exactly this batch, with a SINGLE active product that belongs to it (provePanelSet is
     // defined above reopenBoundAnchor). The real batch target is ALWAYS the strict object form.
-    if(!consistentSelectionState(snap))return {ok:false,reason:'account-drawer-footer-row-state-conflict',diag:footerStateDiag(snap,'initial-auto-drawer')};
+    // 非 exactTwo 初始面板：页脚/行一致门可能不适用，只要 panel 身份可读就进穷举。
+    if(exactTwo(snap)&&!consistentSelectionState(snap))return {ok:false,reason:'account-drawer-footer-row-state-conflict',diag:footerStateDiag(snap,'initial-auto-drawer')};
     let batchAnchorId=provePanelSet(snap);
     if(!batchAnchorId)return {ok:false,reason:'account-drawer-panel-identity-unverified'};
-    let state=snap.rows.map(r=>r.checked);
+    let state=Array.isArray(snap.rows)?snap.rows.map(r=>r.checked):[];
     // settled-checked (R33): at least one row actually checked and every row reads a
     // definite state (checked, or unchecked whether LABEL-disabled or an enabled target
     // left intentionally unbound — the approved min-1 subset)
@@ -5558,12 +6152,12 @@ function createRealDrivers(ctx) {
       fullyChecked=settledChecked(snap);
       if(!fullyChecked&&(snap.headerLabelDisabled===true||rowsBlockedUnchecked(snap)))return {ok:false,reason:'native-account-header-select-all-disabled'};
       batchAnchorId=reopenedAnchor;
-    } else if(!anchor&&blockedHeaderOrRows(snap)){
-      // NO bound anchor exists and the current active's accounts/header are disabled: bounded,
-      // ordinary .panel navigation across the proven known ids looks for an active product whose
-      // 1-or-2 target rows are ALL-UNCHECKED (0/30) with at least one ENABLED row (a LABEL-disabled
-      // row is an unavailable target: the single header select-all then selects the remaining
-      // available ones in ONE action), then a single header select-all.
+    } else if(!anchor&&(blockedHeaderOrRows(snap)||!exactTwo(snap))){
+      // NO bound anchor exists and the current active is unusable (header/rows disabled, OR not
+      // exactTwo — e.g. 0/8 rows): bounded .panel navigation across the proven known ids looks
+      // for an active product whose 1-or-2 target rows are ALL-UNCHECKED (0/30) with at least one
+      // ENABLED row (a LABEL-disabled row is an unavailable target: the single header select-all
+      // then selects the remaining available ones in ONE action), then a single header select-all.
       // Each candidate re-proves consistency / panel set / active and stops with ZERO further action
       // on any drift/duplicate/foreign/partial/footer anomaly; a fully-disabled candidate is skipped
       // without ever clicking a disabled checkbox; if none is usable we stop bounded.
@@ -5575,18 +6169,29 @@ function createRealDrivers(ctx) {
       // disabled panel there can be a real duplicate product (its copy only exists in
       // the hover tooltip), and only a per-account hover proof may record it.
       const provenDuplicates=new Map();
+      // 2026-11-22 用户纠正：乘方 bug——曾发布商品可选进草稿但账号全置灰无法绑定。
+      // 穷举本批面板后仍无可用账号 → 整批换下一批（不必等 hover「已存在计划」文案；
+      // 也绝不是「联盟合伙人自动投」默认归因）。
+      const unbindableExhausted=new Set();
       const initialFullyDisabled=settledChecked(snap)===false&&Array.isArray(snap.rows)&&snap.rows.length>=1&&snap.rows.every(r=>r.labelDisabled===true);
       if(initialFullyDisabled){
+        unbindableExhausted.add(String(initialActive));
         const dup=await proveDisabledActivePanelDuplicate(String(initialActive));
         if(dup.proven===true) provenDuplicates.set(String(initialActive),dup.text);
       }
-      for(const pid of panelIds){
-        if(pid===String(initialActive)) continue;
-        let clk=null;
-        try { clk=await page.evaluate(selectBindingDrawerPanelInPage,pid); } catch(_) { return {ok:false,reason:'account-anchor-panel-navigation-rejected'}; }
-        if(!clk||clk.clicked!==true||String(clk.id)!==pid) return {ok:false,reason:'account-anchor-panel-navigation-not-confirmed'};
-        // 2026-11-21 用户指令：切换商品后立即清浮窗（UNI_PROM 蓝色引导卡带「跳过」在此阶段出现）
-        try { await sweepOverlays(page, 1); } catch (_) {}
+      // 2026-11-22：必须穷举本批 selected 的全部 ids，不能只扫 snap.panelProductIds。
+      // 实机 panelProductIds 曾短于 30，只判了 7 个就停，整批 unbindable 轮转永不触发。
+      // 初值 active 也要走同一套判定（不再 continue 跳过），否则 initialFullyDisabled
+      // 为 false 时该 id 永不进 unbindableExhausted，整批轮转条件永远不成立。
+      const walkIds=ids.map(String);
+      for(const pid of walkIds){
+        if(pid!==String(batchAnchorId)){
+          let clk=null;
+          try { clk=await page.evaluate(selectBindingDrawerPanelInPage,pid); } catch(_) { return {ok:false,reason:'account-anchor-panel-navigation-rejected'}; }
+          if(!clk||clk.clicked!==true||String(clk.id)!==pid) return {ok:false,reason:'account-anchor-panel-navigation-not-confirmed'};
+          // 2026-11-21 用户指令：切换商品后立即清浮窗（UNI_PROM 蓝色引导卡带「跳过」在此阶段出现）
+          try { await sweepOverlays(page, 1); } catch (_) {}
+        }
         // 2026-11-21 锚点诊断：逐候选记录抽屉行数/勾选/禁用形态（本地 stdout），人工据此判断
         // 是"店铺无手动抖音号"（业务前提缺失）还是浮窗/页面形态问题。
         try {
@@ -5634,33 +6239,39 @@ function createRealDrivers(ctx) {
         // 候选如实 continue 换下一个已知候选。绝不把空行计入绑定/成功/消费；整批皆空则循环穷尽 → 原
         // account-anchor-no-usable-product 诚实停止（零假成功）。
         const noEligibleForProduct=fresh.ok===true&&Array.isArray(fresh.rows)&&fresh.rows.length===0&&Number(fresh.selectedCount)===0&&Number(fresh.totalCount)===30&&panelSetEqualsIds(fresh)&&provePanelSet(fresh)===String(pid);
-        if(noEligibleForProduct) continue;
-        if(!consistentSelectionState(fresh)) return {ok:false,reason:'account-drawer-footer-row-state-conflict',diag:footerStateDiag(fresh,'panel-candidate')};
+        if(noEligibleForProduct){ unbindableExhausted.add(String(pid)); continue; }
         // Distinguish a broken 30-panel SET from a broken ACTIVE product so the stop reason is
         // meaningful: first prove the panel set still equals this batch, then prove the single
         // active still equals the candidate we navigated to.
         if(!panelSetEqualsIds(fresh)) return {ok:false,reason:'account-anchor-panel-set-drift'};
         const fAnchor=provePanelSet(fresh);
         if(!fAnchor||String(fAnchor)!==pid) return {ok:false,reason:'account-anchor-active-drift'};
-        if(!exactTwo(fresh)) return {ok:false,reason:'account-anchor-account-identity-drift'};
+        // 2026-11-22：非 exactTwo / 页脚短暂不一致不能当锚点，但穷举中必须 continue，
+        // 否则最后一个候选的 footer 抖动会整批 account-drawer-footer-row-state-conflict 停死，
+        // 永远到不了 batchUnbindableExhausted 换批。
+        if(!exactTwo(fresh)||!consistentSelectionState(fresh)){
+          unbindableExhausted.add(String(pid));
+          try { console.warn('[plan-publisher] anchor-skip-unusable ' + String(pid) + ' ' + JSON.stringify(footerStateDiag(fresh,'walk-unusable'))); } catch(_){}
+          continue;
+        }
         const checkedCount=fresh.rows.filter(r=>r.checked===true).length;
         if(checkedCount>0&&!settledChecked(fresh)) return {ok:false,reason:'account-anchor-partial-selection'};
         if(fresh.headerLabelDisabled===true||fresh.rows.every(r=>r.labelDisabled===true)){
-          // No account of this product is usable. That is a candidate for the REAL
-          // "already planned for this account" duplicate, but only the bounded hover
-          // proof above may say so; an unknown/gray panel is skipped with no proof.
+          // Prefer hover「已存在计划」proof when present. Only count as unbindableExhausted when
+          // EVERY account row is label-disabled (乘方可选不可绑). Header-disabled alone with an
+          // enabled row is NOT whole-product unbindable — do not mark it for batch rotate.
+          const fullyGray=Array.isArray(fresh.rows)&&fresh.rows.length>=1&&fresh.rows.every(r=>r.labelDisabled===true);
+          if(fullyGray) unbindableExhausted.add(String(pid));
           const dup=await proveDisabledActivePanelDuplicate(pid);
           if(dup.proven===true) provenDuplicates.set(pid,dup.text);
-          continue; // nothing selectable => next known candidate, never click a disabled checkbox
+          continue; // nothing selectable via header path => next known candidate
         }
         snap=fresh; state=fresh.rows.map(r=>r.checked); fullyChecked=settledChecked(fresh); batchAnchorId=pid; found=true; break;
       }
       if(!found){
         // Whole-batch duplicate: every one of the 30 products had EVERY account row
-        // individually hover-proven with the exact platform copy. Only then does the
-        // batch carry explicit per-product evidence for a whole-batch draft repair;
-        // 29/30 or an unknown/gray panel stays the original zero-removal stop.
-        const allDuplicated=panelIds.length===ids.length&&ids.every(id=>provenDuplicates.has(String(id)));
+        // individually hover-proven with the exact platform copy.
+        const allDuplicated=ids.every(id=>provenDuplicates.has(String(id)));
         if(allDuplicated){
           const evidenceRows=ids.map(id=>{
             const baseRow=(rows||[]).find(r=>String(r.productId)===String(id));
@@ -5670,6 +6281,32 @@ function createRealDrivers(ctx) {
           });
           lastBindMainRows=evidenceRows;
           return {ok:false,reason:'account-anchor-no-usable-product',rows:evidenceRows,failedIds:ids.slice(),duplicateProven:true};
+        }
+        // 乘方可选不可绑：穷举本批每个面板均为置灰/无可用账号 → 整批换下一批。
+        const allUnbindable=ids.every(id=>unbindableExhausted.has(String(id))||provenDuplicates.has(String(id)));
+        if(allUnbindable){
+          const evidenceRows=ids.map(id=>{
+            const baseRow=(rows||[]).find(r=>String(r.productId)===String(id));
+            const proof=provenDuplicates.get(String(id));
+            if(proof){
+              const text=(String((baseRow&&baseRow.text)||'')+' '+proof).replace(/\s+/g,' ').trim().slice(0,600);
+              return {...(baseRow||{productId:String(id)}),text,alreadyPlanned:true,duplicateEvidence:'hover-tooltip'};
+            }
+            return {
+              ...(baseRow||{productId:String(id)}),
+              unbindableExhausted:true,
+              autoPullOnly:true,
+              manualAccounts:0,
+              manualEvidence:false,
+              manualCountKnown:true,
+              duplicateEvidence:'panel-unbindable-exhausted',
+            };
+          });
+          lastBindMainRows=evidenceRows;
+          return {
+            ok:false,reason:'account-anchor-no-usable-product',rows:evidenceRows,failedIds:ids.slice(),
+            batchUnbindableExhausted:true,duplicateProven:false,
+          };
         }
         return {ok:false,reason:'account-anchor-no-usable-product'};
       }
@@ -5756,10 +6393,24 @@ function createRealDrivers(ctx) {
         // 零抽屉提交。全部读完才允许进入既有 确定 + 部分提交警告。
         let closed=null, closeErr=null;
         try { closed=await page.evaluate(closeKnownPartialResultInPage,batchTarget); } catch(e) { closeErr=e; }
+        // 2026-11-22：快照刚读到 known 通知，close 时已消失（平台自消 / 竞态）→ 视为已关闭，
+        // 继续 panel 逐商品探测；通知仍在则保留原 fail-closed。
+        if((!closed||closed.closed!==true) && closeErr && /known-partial-result-notice-absent/.test(String(closeErr.message||''))){
+          await sleep(400);
+          const rsGone=await page.evaluate(batchResultSnapshotInPage,batchTarget).catch(()=>null);
+          if(!rsGone||rsGone.present!==true){
+            closed={present:false,closed:true,listedCount:0,listedFailedIds:[],listedSuccessCount:0,listedTruncatedCount:0,anchorProductId:batchAnchorId,alreadyGone:true};
+            closeErr=null;
+            try { console.warn('[plan-publisher] partial-result-notice already gone after absent race'); } catch(_){}
+          } else {
+            try { closed=await page.evaluate(closeKnownPartialResultInPage,batchTarget); closeErr=null; } catch(e2) { closeErr=e2; closed=null; }
+          }
+        }
         if(!closed||closed.closed!==true){
           // 保留 specific close error 的有界脱敏诊断（绝不 catch 全抹成 generic）：只做掩码+截断，不再吞掉
           // 具体拒绝原因；零点击/零提交语义不变。
           const closeError=closeErr?String(closeErr.message||'').replace(/\s+/g,' ').replace(/\d{8,}/g,'***').trim().slice(0,200):null;
+          try { console.warn('[plan-publisher] partial-result-close-failed ' + (closeError || 'no-detail')); } catch (_) {}
           return {ok:false,reason:'known-partial-result-notice-not-closeable',...(closeError?{closeError}:{})};
         }
         let gone=false;
@@ -5780,9 +6431,31 @@ function createRealDrivers(ctx) {
         const ov=await page.evaluate(bindingOverlaySnapshotInPage).catch(()=>null);
         if(!rs||rs.present===true) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
         if(!ov||ov.accountDrawerCount!==1||ov.blockingOverlayPresent===true) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
-        const probe=await proveAllSuccessByPanelNavigation(batchAnchorId);
+        // 2026-11-22：无结果弹窗≠整批成功。乘方可选不可绑时 select-all 后常无弹窗，
+        // 部分商品仍是 0/30。用 partial 探测把明确 0 记入 failedIds 交给换批，
+        // 避免 batch-result-panel-target-not-verified 卡死。
+        const probe=await proveAllSuccessByPanelNavigation(batchAnchorId,'partial');
         if(probe.ok!==true) return probe;
-        failedIds=[];failedSet=new Set();knownFailures=false;
+        failedIds=(probe.zeroIds||[]).map(String);
+        failedSet=new Set(failedIds);
+        knownFailures=failedIds.length>0;
+        // 整批探测后 bound 为空 → 等同穷举不可绑，交给换批，勿对空草稿点确定。
+        if((probe.boundIds||[]).length===0&&failedIds.length===ids.length){
+          const evidenceRows=ids.map(id=>{
+            const baseRow=(rows||[]).find(r=>String(r.productId)===String(id));
+            return {
+              ...(baseRow||{productId:String(id)}),
+              unbindableExhausted:true,autoPullOnly:true,manualAccounts:0,
+              manualEvidence:false,manualCountKnown:true,
+              duplicateEvidence:'panel-unbindable-exhausted',
+            };
+          });
+          lastBindMainRows=evidenceRows;
+          return {
+            ok:false,reason:'account-anchor-no-usable-product',rows:evidenceRows,failedIds:ids.slice(),
+            batchUnbindableExhausted:true,duplicateProven:false,
+          };
+        }
       }
     }
     // STEP 5: commit the drawer DRAFT with 确定 (identity re-verified in the callback), then
@@ -5798,7 +6471,7 @@ function createRealDrivers(ctx) {
     // outcome is never widened into success.
     let final;
     try {
-      final=await until(readMainTable,rs=>rs.length===30&&new Set(rs.map(r=>String(r.productId))).size===30&&ids.every(id=>rs.some(r=>String(r.productId)===id))&&rs.every(r=>(Number.isInteger(r.manualAccounts)&&r.manualAccounts>=1)||failedSet.has(String(r.productId))),15000,'manual-account-bind-readback');
+      final=await until(readMainTable,rs=>rs.length===ids.length&&new Set(rs.map(r=>String(r.productId))).size===ids.length&&ids.every(id=>rs.some(r=>String(r.productId)===id))&&rs.every(r=>(Number.isInteger(r.manualAccounts)&&r.manualAccounts>=1)||failedSet.has(String(r.productId))),15000,'manual-account-bind-readback');
     } catch(_) { return {ok:false,reason:'manual-account-bind-readback-does-not-match-recorded-outcome'}; }
     lastBindMainRows=final;
     await guidancePhase();
@@ -5811,6 +6484,13 @@ function createRealDrivers(ctx) {
   // instead of trusting a mock. An unknown/gray row is never added to failedIds.
   async function bindAccountsToAll(input) {
     const res = await bindAccountsToAllInner(input);
+    try {
+      console.warn('[plan-publisher] bind-result ok=' + !!(res && res.ok === true)
+        + ' reason=' + String((res && res.reason) || (res && res.ok === true ? 'ok' : 'unknown'))
+        + ' failed=' + (res && Array.isArray(res.failedIds) ? res.failedIds.length : 0)
+        + ' exhausted=' + !!(res && res.batchUnbindableExhausted === true)
+        + ' round=' + String((input && input.repairRound) || 0));
+    } catch (_) {}
     if (res && res.ok === true) return res;
     const baseRows = Array.isArray(res && res.rows) && res.rows.length ? res.rows : (lastBindMainRows || []);
     // Merge SETTLED panel evidence for the exact product. The mark must appear verbatim;
@@ -5903,40 +6583,73 @@ function createRealDrivers(ctx) {
         }
       }
     }
+    // 点完取消后清一次引导（跳过/叉），避免 guide role=dialog 挡住 closed 证明。
+    try { await sweepOverlays(page, 2); } catch (_) {}
     const closed=async()=>{
+      try { await page.evaluate(overlaySweepInPage, { maxClicks: 1 }); } catch (_) {}
       const s=await page.evaluate(bindingDrawerSnapshotInPage).catch(()=>null);
-      if(!s||s.ok!==false||Number(s.count)!==0)return false;
+      if(!s||s.ok!==false||Number(s.count)!==0)return {ok:false,gate:'drawer-still-open',snapOk:s&&s.ok,count:s&&s.count};
       if(ctx.cancelConfirmHandling===true){
         const c=await page.evaluate(accountDrawerCancelConfirmInPage,{mode:'snapshot',accountId}).catch(()=>null);
-        if(!c||c.present!==false)return false;
+        if(!c||c.present!==false)return {ok:false,gate:'cancel-confirm-still-present',present:c&&c.present};
       }
       const ov=await page.evaluate(bindingOverlaySnapshotInPage).catch(()=>null);
-      if(!ov||ov.accountDrawerCount!==0||ov.blockingOverlayPresent!==false)return false;
+      if(!ov||ov.accountDrawerCount!==0||ov.blockingOverlayPresent!==false){
+        return {ok:false,gate:'blocking-overlay',accountDrawerCount:ov&&ov.accountDrawerCount,blocking:ov&&ov.blockingOverlayPresent};
+      }
       const a=authorized();
-      return productionDrawerContract?a===true:a!==false;
+      const authOk=productionDrawerContract?a===true:a!==false;
+      return authOk?{ok:true}:{ok:false,gate:'page-not-authorized'};
     };
-    try{ await until(closed,x=>x===true,6000,'draft-removal-drawer-closed'); }
-    catch(_){ return {ok:false,supported:true,reason:'account-drawer-not-proven-closed-before-draft-removal'}; }
+    try{
+      await until(closed,x=>x&&x.ok===true,8000,'draft-removal-drawer-closed');
+    } catch(_){
+      let last=null;
+      try { last=await closed(); } catch (__) { last=null; }
+      try {
+        const diag=await page.evaluate(()=>{
+          const visible=e=>{try{const r=e.getBoundingClientRect();if(!(r.width>0&&r.height>0))return false;const cs=getComputedStyle(e);return cs.visibility!=='hidden'&&cs.display!=='none';}catch(_){return false;}};
+          const txt=e=>String(e.textContent||'').replace(/\s+/g,' ').trim();
+          const clsOf=e=>String((e.className&&e.className.baseVal!==undefined)?e.className.baseVal:(e.className||''));
+          const sel='[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="drawer"],[class*="Drawer"],[class*="modal"],[class*="Modal"]';
+          return Array.prototype.slice.call(document.querySelectorAll(sel)).filter(visible).slice(0,12).map(el=>({
+            cls:clsOf(el).slice(0,100), role:el.getAttribute('role')||'', ariaModal:el.getAttribute('aria-modal')||'',
+            text:txt(el).slice(0,60),
+          }));
+        });
+        fs.writeFileSync(path.join(ROOT,'drawer-close-diag.log'),
+          new Date().toISOString()+' '+JSON.stringify({last,diag},null,1)+'\n',{flag:'a'});
+        console.warn('[plan-publisher] drawer-close-diag written gate='+(last&&last.gate));
+      } catch (__){ /* diag failure never changes refusal */ }
+      return {ok:false,supported:true,reason:'account-drawer-not-proven-closed-before-draft-removal'+(last&&last.gate?(':'+last.gate):'')};
+    }
     return {ok:true,supported:true,drawerWasOpen:drawerOpen,closed:true};
   }
   async function repairDraft({removeIds,backfillCount,onProgress,failedIds,bindingRows,repairMode,requireNextPage,provenDuplicateIds}) {
     // Proven bind failures and the ACTUAL main rows are provenance only: every removal
     // below still requires explicit current-row evidence, so an unknown binding result
     // (unauthorized account / unknown load / gray checkbox) can never delete a product.
-    if(repairMode==='whole-batch-removal'&&removeIds.length!==30)return {ok:false,reason:'whole-batch-removal-size-mismatch'};
-    if(repairMode==='partial-removal'&&removeIds.length>=30)return {ok:false,reason:'partial-removal-size-mismatch'};
+    if(repairMode==='whole-batch-removal'&&(!Array.isArray(removeIds)||removeIds.length<1||removeIds.length>30))return {ok:false,reason:'whole-batch-removal-size-mismatch'};
+    if(repairMode==='partial-removal'&&(!Array.isArray(removeIds)||removeIds.length<1||removeIds.length>=30))return {ok:false,reason:'partial-removal-size-mismatch'};
+    // 2026-11-22 用户：可选目录耗尽时不要重开选品；只删不可绑，用剩余已绑直接发布。
+    if(repairMode==='remove-only-publish'){
+      if(!Array.isArray(removeIds)||removeIds.length<1||removeIds.length>=30)return {ok:false,reason:'remove-only-publish-size-mismatch'};
+    }
     const cursorBefore=dayState.cursor?{...dayState.cursor,seenProductIds:[...(dayState.cursor.seenProductIds||[])]}:null;
     // A hover-tooltip duplicate proof belongs to THIS batch's exact product/account set; it
     // is only accepted for an id that is still present in the fresh main table below.
     const provenDuplicates=new Set((Array.isArray(provenDuplicateIds)?provenDuplicateIds:[]).map(String));
-    const before=await readMainTable();
     // Ordering is part of the safety contract: close the real drawer (positive proof) BEFORE
-    // the first product removal, never remove behind a modal. Zero drawer => the same fresh
-    // proof is still required; any unknown/not-unique/still-open state => zero removals.
+    // reading the main table for removal evidence and before the first product removal.
+    // 2026-11-22：原先先 readMainTable 再关抽屉——绑号抽屉仍开时主表常读空/不唯一，
+    // 整批不可绑轮转直接 scheduled-run-exception。
     if(removeIds.length){
       const gate=await closeAccountDrawerBeforeDraftRemoval();
       if(gate.ok!==true)return {ok:false,reason:gate.reason||'account-drawer-not-proven-closed-before-draft-removal'};
     }
+    let before;
+    try { before=await readMainTable(); }
+    catch(e){ return {ok:false,reason:'repair-main-table-unreadable:'+String((e&&e.message)||e)}; }
     for(const id of removeIds) {
       const row=before.find(r=>r.productId===String(id));
       if(!row)return {ok:false,reason:'removal-lacks-explicit-current-row-evidence:'+id};
@@ -5946,7 +6659,9 @@ function createRealDrivers(ctx) {
         ||row.alreadyPlanned===true
         ||provenDuplicates.has(String(id));
       if(!rowProven)return {ok:false,reason:'removal-lacks-explicit-current-row-evidence:'+id};
-      const removed=await page.evaluate(removeNativeCardInPage,{productId:String(id),accountId});
+      let removed;
+      try { removed=await page.evaluate(removeNativeCardInPage,{productId:String(id),accountId}); }
+      catch(e){ return {ok:false,reason:'repair-draft-remove-click-failed:'+String((e&&e.message)||e).slice(0,160)}; }
       await sleep(350);
       // 草稿删除后的引导浮窗只走**既有严格 guidance 身份/允许按钮**通道（未知一律不操作）；
       // 处理完后 confirm 仍按原规则：无对话框=即时移除，识别到的删除对话框=一次确认，
@@ -5966,16 +6681,96 @@ function createRealDrivers(ctx) {
       const removeProof=(removed&&removed.clicked===true&&String(removed.productId)===String(id)&&liveRoute)
         ?{rowProof:true,productId:String(id),accountId:String(accountId),route:liveRoute}:null;
       try { await guidancePhase(); } catch (_) { /* guidance 未知/失败：不改动作，交由 confirm 严格停止 */ }
-      await page.evaluate(confirmDraftRemovalInPage,{productId:String(id),accountId,removeProof});
-      await until(readMainTable,rows=>!rows.some(r=>r.productId===String(id)),10000,'draft-row-removal');
+      // 2026-11-22：必须先 confirm 删除框，再 sweepOverlays。否则 Escape/点叉会把
+      // 「确定要删除商品吗？」直接关掉，行还在 → draft-remove-row-still-present。
+      // 删除失败不得再冒泡成 scheduled-run-exception，统一收成 repair ok:false。
+      {
+        const deadline = Date.now() + 10000;
+        let lastErr = null;
+        let confirmed = false;
+        while (Date.now() < deadline) {
+          try {
+            await page.evaluate(confirmDraftRemovalInPage, { productId: String(id), accountId, removeProof });
+            confirmed = true;
+            break;
+          } catch (e) {
+            lastErr = e;
+            const msg = String((e && e.message) || e);
+            if (/draft-remove-row-still-present/.test(msg)) {
+              await sleep(400);
+              continue;
+            }
+            return { ok: false, reason: 'repair-draft-remove-confirm-failed:' + msg.slice(0, 180) };
+          }
+        }
+        if (!confirmed) {
+          return { ok: false, reason: 'repair-draft-remove-confirm-failed:' + String((lastErr && lastErr.message) || lastErr || 'timeout').slice(0, 180) };
+        }
+      }
+      await sweepOverlays(page, 2).catch(() => {});
+      // 2026-11-22：删除确认后不要用会 throw 的 readMainTable 做 until——抽屉/浮层
+      // 残留时 creation-table-not-unique-or-empty 会冒泡成 scheduled-run-exception，
+      // 打断整批轮转。改为页内只查该 productId 行是否还在。
+      try {
+        await until(async () => page.evaluate((pid) => {
+          const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
+          const txt = e => (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
+          const still = [...document.querySelectorAll('tr,[role="row"],.ovui-table__row')].filter(visible).some(r => {
+            const ids = [...txt(r).matchAll(/ID\s*[:：]\s*(\d{15,20})/g)].map(m => m[1]);
+            return ids.length === 1 && ids[0] === String(pid);
+          });
+          return { gone: !still };
+        }, String(id)), x => x && x.gone === true, 10000, 'draft-row-removal');
+      } catch (e) {
+        return { ok: false, reason: 'repair-draft-row-still-present:' + String(id) };
+      }
       attemptedSet.add(String(id));
     }
-    dayState.lastSelected=(await readMainTable()).map(r=>String(r.productId));dayState.attempted=[...attemptedSet];await persist(dayState);
+    let afterRows;
+    try { afterRows = await readMainTable(); }
+    catch (e) {
+      // 整批删光后偶发仍读不到表头：若本轮确实删了满容量，按空草稿继续选品。
+      if (repairMode === 'whole-batch-removal' && removeIds.length === 30
+        && /creation-table-not-unique-or-empty/.test(String((e && e.message) || e))) {
+        afterRows = [];
+      } else {
+        return { ok: false, reason: 'repair-after-removal-table-unreadable:' + String((e && e.message) || e) };
+      }
+    }
+    if (repairMode === 'whole-batch-removal' && removeIds.length === 30 && afterRows.length !== 0) {
+      return { ok: false, reason: 'whole-batch-removal-rows-remain:' + afterRows.length };
+    }
+    dayState.lastSelected=afterRows.map(r=>String(r.productId));dayState.attempted=[...attemptedSet];await persist(dayState);
+    // 目录耗尽：只删不补，剩余已绑行直接交给后续配置/发布（容量可为 1..29）。
+    if(repairMode==='remove-only-publish'){
+      const kept=afterRows.map(r=>String(r.productId));
+      if(kept.length<1||kept.length>29)return {ok:false,reason:'remove-only-publish-remaining-count-invalid:'+kept.length};
+      if(removeIds.some(id=>kept.includes(String(id))))return {ok:false,reason:'remove-only-publish-removed-id-still-present'};
+      dayState.lastSelected=kept;dayState.hints=hints;await persist(dayState);
+      return {ok:true,mainRows:afterRows,selectedCount:kept.length,progress:true,mode:'remove-only-publish',catalogExhaustedPartial:true,bindFailedIds:(failedIds||[]).map(String),backfillCount:0};
+    }
     const snap=await openPicker();
     const selected=dayState.lastSelected.map(String);
     if(selected.length!==30-removeIds.length||snap.selectedCount!==0||snap.remainingCapacity!==30-selected.length)throw new Error('post-removal-picker-selected-count-mismatch');
     const result=await browseProducts({selectedIds:selected,needed:30-selected.length,hints,publishedSet:new Set(publishedIds),attemptedSet,cursor:dayState.cursor,categories:wf.CATEGORY_TAB_ORDER,onProgress,requireNextPage:requireNextPage===true});
-    if(!result.ok)return {ok:false,reason:result.reason,selectedCount:result.selectedIds.length,progress:result.selectedIds.length>selected.length};
+    if(!result.ok){
+      // 坏行已删；browse 失败（含目录耗尽）时关掉选品抽屉，把剩余主表行带回，供上层按 N 发布。
+      try { await page.keyboard.press('Escape'); } catch (_) {}
+      await sweepOverlays(page, 2).catch(() => {});
+      let keptRows = afterRows;
+      try { keptRows = await readMainTable(); } catch (_) { keptRows = afterRows; }
+      dayState.lastSelected = (keptRows || []).map(r => String(r.productId));
+      dayState.attempted = [...attemptedSet];
+      await persist(dayState);
+      return {
+        ok: false,
+        reason: result.reason,
+        lastPageReached: result.lastPageReached === true,
+        mainRows: keptRows,
+        selectedCount: (keptRows || []).length,
+        progress: (keptRows || []).length > 0 || result.selectedIds.length > selected.length,
+      };
+    }
     const newIds=result.selectedIds;
     // requireNextPage is really executed, never a pass-through flag: a repair round may not
     // reload the exact exhausted batch. The durable shop cursor may never rewind, and a
@@ -6004,8 +6799,10 @@ function createRealDrivers(ctx) {
     return {ok:true,mainRows:rows,selectedCount:newIds.length,progress:true,mode:repairMode||null,bindFailedIds:(failedIds||[]).map(String),backfillCount:Number.isInteger(backfillCount)?backfillCount:null};
   }
   async function configurePlan({businessDate}) {
-    const obs=await observe();if(!obs.creation||obs.creation.accountId!==accountId||!obs.creation.mainTableUnique)return {ok:false,reason:'creation-settings-observation-incomplete'};
+    const initial=await observe();if(!initial.creation||initial.creation.accountId!==accountId||!initial.creation.mainTableUnique)return {ok:false,reason:'creation-settings-observation-incomplete'};
     await guidancePhase();
+    await sweepOverlays(page, 2).catch(() => {});
+    const obs=await observe();if(!obs.creation||obs.creation.accountId!==accountId||!obs.creation.mainTableUnique)return {ok:false,reason:'creation-settings-observation-incomplete'};
     if(obs.creation.commissionChecked!==true) await page.evaluate(ensureCommissionInPage);
     if(obs.creation.optionalDirectPayChecked!==false) await page.evaluate(ensureDirectPayOffInPage);
     const toggles=await observe();
@@ -6456,7 +7253,6 @@ async function resumeKnownFinalCore(d, authorityMode) {
   // 显式传入则按该店身份/ROI 泛化；默认路径行为不变（legacy 兼容）。
   const business = wf.bizOf(d.business);
   const account = String(business.accountId);
-  const productsPerPlan = Number.isInteger(business.productsPerPlan) ? business.productsPerPlan : wf.BUSINESS.productsPerPlan;
   const expectedRoi = (typeof business.roi === 'number' && Number.isFinite(business.roi) && business.roi > 0) ? business.roi : 15;
   // 日预算随可信 business（S4：排程 policy 可到 450）；缺失回落 legacy 300，legacy 原行为不变。
   const expectedBudget = (typeof business.dailyBudget === 'number' && Number.isFinite(business.dailyBudget) && business.dailyBudget > 0) ? business.dailyBudget : 300;
@@ -6466,6 +7262,12 @@ async function resumeKnownFinalCore(d, authorityMode) {
   if (!d.stateFile || !d.publishedFile || !d.attemptsFile) throw new Error('resume-file-scope-missing');
 
   const frozen = d.frozen;
+  // 目录耗尽部分发布：以冻结商品数为准（1..店配置上限），不再强制满额 30。
+  const productsPerPlan = (frozen && Number.isInteger(frozen.productsPerPlan) && frozen.productsPerPlan >= 1)
+    ? frozen.productsPerPlan
+    : ((frozen && Array.isArray(frozen.productIds) && frozen.productIds.length >= 1)
+      ? frozen.productIds.length
+      : (Number.isInteger(business.productsPerPlan) ? business.productsPerPlan : wf.BUSINESS.productsPerPlan));
   if (!frozen || !frozen.confirmationId || !frozen.manifestHash || !frozen.planName
     || !(Number.isInteger(frozen.planNumber) && frozen.planNumber >= 1 && frozen.planNumber <= 10)
     || !frozen.businessDate || !frozen.runId) return refuse('expected-frozen-incomplete');
@@ -6843,7 +7645,6 @@ async function reconcilePublishedReadbackOnly(deps) {
   // trusted business（客户 2026-10-11）：默认回落 legacy 冻结默认；显式传入按该店身份/ROI 泛化。
   const business = wf.bizOf(d.business);
   const account = String(business.accountId);
-  const productsPerPlan = Number.isInteger(business.productsPerPlan) ? business.productsPerPlan : wf.BUSINESS.productsPerPlan;
   const expectedRoi = (typeof business.roi === 'number' && Number.isFinite(business.roi) && business.roi > 0) ? business.roi : 15;
   const refuse = (reason) => ({ status: 'refused', reason, clicked: false, clicks: 0, noAction: true });
 
@@ -6864,6 +7665,11 @@ async function reconcilePublishedReadbackOnly(deps) {
   if (String(frozen.accountId) !== account) return refuse('expected-frozen-account-mismatch');
   if (wf.shanghaiDate(now) !== String(frozen.businessDate)) return refuse('business-date-changed');
   const businessDate = String(frozen.businessDate);
+  const productsPerPlan = (Number.isInteger(frozen.productsPerPlan) && frozen.productsPerPlan >= 1)
+    ? frozen.productsPerPlan
+    : ((Array.isArray(frozen.productIds) && frozen.productIds.length >= 1)
+      ? frozen.productIds.length
+      : (Number.isInteger(business.productsPerPlan) ? business.productsPerPlan : wf.BUSINESS.productsPerPlan));
 
   let state;
   try { state = wf.loadDayState(d.stateFile, businessDate); } catch (e) { return refuse('day-state-unreadable:' + (e && e.message)); }
@@ -6993,25 +7799,86 @@ async function sweepOverlays(page, rounds) {
   // 2026-11-22 深扫（用户实证：UNI_PROM 蓝色引导卡页面内 querySelectorAll 看不见——高度怀疑
   // shadow DOM/iframe）：Playwright 定位器自动穿透 open shadow DOM，page.frames() 覆盖全部
   // iframe；精确匹配跳过家族文本的可见按钮，找到即点（用户指令：浮窗出现立即点掉）。
+  // 2026-11-22 续：敏敏店实机数字翻页器被 ovui-popup__mask + guideAnchor 挡住且无「跳过」
+  // 文案——补扫 popup/guide 关闭叉；若遮罩仍在且本轮零点击，再发一次 Escape（不点业务 CTA）。
   const DEEP_LABELS = ['跳过', '跳过引导', '我知道了', '知道了'];
+  const CLOSE_SELS = [
+    '[class*="ovui-popup"] [class*="close"]',
+    '[class*="ovui-popup__close"]',
+    '[class*="guideAnchor"] [aria-label*="关闭"]',
+    '[class*="ovui-popup"] [aria-label*="关闭"]',
+    '[class*="ovui-popup"] [title*="关闭"]',
+    '[class*="shepherd"] [class*="cancel"]',
+    '[class*="shepherd"] [class*="close"]',
+    '[class*="shepherd"] [aria-label*="关闭"]',
+    '[class*="shepherd"] [aria-label*="Close"]',
+    '.shepherd-cancel-icon',
+  ];
   let total = 0;
+  let lastMask = false;
+  let escapedOnce = false;
   for (let i = 0; i < (rounds || 2); i++) {
     let clickedThisRound = 0;
     try {
       for (const frame of page.frames()) {
         for (const label of DEEP_LABELS) {
           let cand = null;
-          try { cand = frame.locator('button:has-text("' + label + '"), a:has-text("' + label + '"), [role="button"]:has-text("' + label + '")'); } catch (_) { continue; }
+          try {
+            // 「跳过」在蓝色引导卡上经常是 span/div，且可能在 open shadow 里。
+            // getByText exact 能穿透 shadow，并且不会匹配外层整张卡片。
+            cand = (label === '跳过' || label === '跳过引导')
+              ? frame.getByText(label, { exact: true })
+              : frame.locator('button:has-text("' + label + '"), a:has-text("' + label + '"), [role="button"]:has-text("' + label + '")');
+          } catch (_) { continue; }
+          let n = 0; try { n = await cand.count(); } catch (_) { continue; }
+          const limit = (label === '跳过' || label === '跳过引导') ? 6 : 2;
+          for (let k = 0; k < Math.min(n, limit); k++) {
+            const el = cand.nth(k);
+            let vis = false; try { vis = await el.isVisible(); } catch (_) { continue; }
+            if (!vis) continue;
+            const t = String(await el.innerText().catch(() => '')).replace(/\s+/g, '');
+            if (t !== label) continue; // 精确关闭语义文本（绝不点业务 CTA）
+            try { await el.click({ timeout: 2500 }); clickedThisRound += 1; total += 1;
+              console.warn('[plan-publisher] deep-sweep clicked "' + label + '" frame=' + String(frame.url()).slice(0, 90));
+            } catch (e) { console.warn('[plan-publisher] deep-sweep found-but-click-failed "' + label + '": ' + String(e && e.message || e).slice(0, 80)); }
+          }
+        }
+        for (const sel of CLOSE_SELS) {
+          let cand = null;
+          try { cand = frame.locator(sel); } catch (_) { continue; }
           let n = 0; try { n = await cand.count(); } catch (_) { continue; }
           for (let k = 0; k < Math.min(n, 2); k++) {
             const el = cand.nth(k);
             let vis = false; try { vis = await el.isVisible(); } catch (_) { continue; }
             if (!vis) continue;
-            const t = String(await el.innerText().catch(() => '')).replace(/s+/g, '');
-            if (t !== label) continue; // 精确关闭语义文本（绝不点业务 CTA）
+            const t = String(await el.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+            if (/(删除|暂停|终止|确认发布|提交|去设置|去开启|立即投放)/.test(t)) continue;
+            // 2026-11-22：深扫点关闭叉曾把商品选择抽屉一起关掉（随后 native-scroll 找不到
+            // .product-list）。凡祖先是选品/绑号工作抽屉，一律不点——即便该叉也挂在
+            // ovui-popup 下（抽屉面板本身可能带 popup 类）。body 级 shepherd/guide
+            // 不在抽屉 DOM 内，仍可点。
+            let inWorkDrawer = true;
+            try {
+              inWorkDrawer = await el.evaluate((node) => {
+                const txt = (e) => String(e.textContent || '').replace(/\s+/g, ' ').trim();
+                const clsOf = (e) => String((e.className && e.className.baseVal !== undefined) ? e.className.baseVal : (e.className || ''));
+                for (let n = node, i = 0; n && i < 16; n = n.parentElement, i++) {
+                  const tt = txt(n);
+                  const cls = clsOf(n);
+                  if (/已选\s*\d+\s*\/\s*(?:[1-9]|[12]\d|30)/.test(tt) && /下一步/.test(tt)) return true;
+                  if (/当前商品已选/.test(tt) || /为商品添加抖音号/.test(tt)) return true;
+                  if (/ovui-drawer(?!__wrap)/i.test(cls)) {
+                    const rr = n.getBoundingClientRect();
+                    if (rr.width >= 400 && rr.height >= 400) return true;
+                  }
+                }
+                return false;
+              });
+            } catch (_) { inWorkDrawer = true; }
+            if (inWorkDrawer) continue;
             try { await el.click({ timeout: 2500 }); clickedThisRound += 1; total += 1;
-              console.warn('[plan-publisher] deep-sweep clicked "' + label + '" frame=' + String(frame.url()).slice(0, 90));
-            } catch (e) { console.warn('[plan-publisher] deep-sweep found-but-click-failed "' + label + '": ' + String(e && e.message || e).slice(0, 80)); }
+              console.warn('[plan-publisher] deep-sweep clicked popup-close frame=' + String(frame.url()).slice(0, 90));
+            } catch (e) { console.warn('[plan-publisher] deep-sweep popup-close-failed: ' + String(e && e.message || e).slice(0, 80)); }
           }
         }
       }
@@ -7020,10 +7887,57 @@ async function sweepOverlays(page, rounds) {
     try { r = await page.evaluate(overlaySweepInPage, { maxClicks: 3 }); } catch (_) {}
     if (r && r.clicked) { clickedThisRound += r.clicked; total += r.clicked;
       console.warn('[plan-publisher] overlay-sweep round ' + (i + 1) + ' clicked=' + r.clicked + ' ' + JSON.stringify(r.actions || [])); }
-    if (!clickedThisRound) return { clicked: 0, rounds: i };
+    lastMask = !!(r && r.popupMaskPresent);
+    // Escape 只能用于「没有任何业务抽屉」的纯弹层。商品选择抽屉 / 账号绑定抽屉打开时
+    // Escape 会直接关掉抽屉（2026-11-22：pager timeout 回到「添加商品」；live7 绑定阶段
+    // Escape 把账号抽屉关掉后反复 bind-start）。有抽屉时只点 popup 关闭叉 / 跳过文案。
+    // 同一轮 sweepOverlays 调用最多 Escape 一次——遮罩若不消，重复 Escape 只会伤抽屉。
+    if (!clickedThisRound && lastMask && !escapedOnce && page && page.keyboard && typeof page.keyboard.press === 'function') {
+      let businessSurfaceOpen = false;
+      try {
+        businessSurfaceOpen = await page.evaluate(() => {
+          const visible = (el) => { try { const r = el.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) return false; const cs = getComputedStyle(el); return cs.visibility !== 'hidden' && cs.display !== 'none'; } catch (_) { return false; } };
+          const txt = (el) => String(el.textContent || '').replace(/\s+/g, ' ').trim();
+          const clsOf = (el) => String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || ''));
+          return Array.prototype.slice.call(document.querySelectorAll('[role="dialog"],[aria-modal="true"],[class*="drawer"],[class*="Drawer"],[class*="modal"],[class*="Modal"]'))
+            .filter(visible)
+            .some(el => {
+              const t = txt(el);
+              const cls = clsOf(el);
+              // 商品选择抽屉
+              if (/已选\s*\d+\s*\/\s*(?:[1-9]|[12]\d|30)/.test(t) && /全部/.test(t) && /下一步/.test(t)) return true;
+              // 账号绑定抽屉（当前商品已选 / 抖音号+确定）
+              if (/当前商品已选/.test(t)) return true;
+              if (/抖音号/.test(t) && /确定/.test(t) && /ovui-drawer|Drawer/i.test(cls)) return true;
+              // 2026-11-22：草稿「删除」确认框——Escape 会直接关掉确认且行仍在，
+              // 随后 confirmDraftRemoval 报 draft-remove-row-still-present。
+              if (/确定要删除商品吗/.test(t) || (/删除商品时/.test(t) && /已添加的抖音号/.test(t))) return true;
+              if (/(^|[^\w])删除([^\w]|$)/.test(t) && /确认|确定/.test(t) && /取消/.test(t)) return true;
+              // 任何足够大的 ovui-drawer 面板都当工作面（禁止 Escape）
+              if (/ovui-drawer(?!__wrap)/i.test(cls)) {
+                const rr = el.getBoundingClientRect();
+                if (rr.width >= 400 && rr.height >= 400) return true;
+              }
+              return false;
+            });
+        });
+      } catch (_) { businessSurfaceOpen = true; /* 探测失败时保守：禁止 Escape */ }
+      if (!businessSurfaceOpen) {
+        try {
+          await page.keyboard.press('Escape');
+          clickedThisRound += 1; total += 1; escapedOnce = true;
+          console.warn('[plan-publisher] overlay-sweep Escape after persistent ovui-popup mask');
+          await new Promise(res => setTimeout(res, 400));
+          try { r = await page.evaluate(overlaySweepInPage, { maxClicks: 0 }); lastMask = !!(r && r.popupMaskPresent); } catch (_) {}
+        } catch (_) { /* Escape 失败不阻断 */ }
+      } else {
+        console.warn('[plan-publisher] overlay-sweep skip Escape while business surface open');
+      }
+    }
+    if (!clickedThisRound) return { clicked: total, rounds: i, popupMaskPresent: lastMask };
     await new Promise(res => setTimeout(res, 400));
   }
-  return { clicked: total };
+  return { clicked: total, popupMaskPresent: lastMask };
 }
 
 async function main() {
@@ -7206,7 +8120,7 @@ async function main() {
           result=await wf.publishConfirmedPlan(frozen,request,{
             nowMs:()=>Date.now(),observe:drivers.observe,runPublishPlan:guard.runPublishPlan,business,
             publishDeps:{attemptsFile:ATTEMPTS_FILE,evaluate:drivers.evaluate,onEvent:()=>{},
-              contract:{boundAccounts:frozen.boundAccounts,productsPerPlan:business.productsPerPlan,roi:business.roi,dailyBudget:business.dailyBudget,maxPlansPerDay:business.maxPlansPerDay,isLegacy:legacyDefault}},
+              contract:{boundAccounts:frozen.boundAccounts,productsPerPlan:Number.isInteger(frozen.productsPerPlan)?frozen.productsPerPlan:((frozen.productIds||[]).length||business.productsPerPlan),roi:business.roi,dailyBudget:business.dailyBudget,maxPlansPerDay:business.maxPlansPerDay,isLegacy:legacyDefault}},
             approvedFirstPlan:planNumber===1?null:dayState.firstPublishedPlan,
             readFinalDialog:drivers.readFinalDialog,awaitFinalDialog:drivers.awaitFinalDialog,consumeFinalConfirmation:(_f,_a)=>reserveFinalAndRecord(ATTEMPTS_FILE,frozen),
             recordFinalConfirmationOutcome:(_f,status)=>guard.recordFinalConfirmationOutcome(ATTEMPTS_FILE,frozen.confirmationId,status),
@@ -7227,10 +8141,15 @@ async function main() {
           }
           if(result.finalClick&&result.finalClick.clicked===true) {
             const finalStatus=guard.recordFinalConfirmationOutcome(ATTEMPTS_FILE,frozen.confirmationId,outcome==='success'?'success':'unknown');
-            if(finalStatus!==true){outcome='unknown';result={...result,status:'unknown',reason:'final-confirm-outcome-not-durable'};}
+            if(finalStatus!==true){const prior=result.reason||'unknown';outcome='unknown';result={...result,status:'unknown',reason:'final-confirm-outcome-not-durable:'+prior};}
           }
           const initialStatus=guard.recordPublicationOutcome(ATTEMPTS_FILE,frozen.confirmationId,outcome);
-          if(initialStatus!==true){outcome='unknown';result={...result,status:'unknown',reason:'publication-outcome-not-durable'};}
+          if(initialStatus!==true){
+            const prior=result.reason||'unknown';
+            const hasConsume=!!(guard.loadAttemptsStore(ATTEMPTS_FILE).consumed||{})[frozen.confirmationId];
+            outcome='unknown';
+            result={...result,status:'unknown',reason:hasConsume?('publication-outcome-not-durable:'+prior):('publication-consume-missing:'+prior)};
+          }
           updated.active={status:outcome==='success'?'post-publish-enable-check-pending':'publish-unknown',planNumber,frozen,reason:result.reason||null,planId:result.planId||null,cookieStatus:cookie.status};
           if(outcome==='success'){updated.lastSelected=[];updated.runId=runId;updated.businessDate=date;}
           wf.persistDayState(STATE_FILE,updated);dayState=updated;
@@ -7607,7 +8526,12 @@ async function runScheduledPlan(businessInput, opts) {
     const readAccountFn = typeof o.readAccountInPage === 'function' ? o.readAccountInPage : readers.readChengfangAccountInPage;
     const clickSubTabFn = typeof o.clickSubTab === 'function' ? o.clickSubTab : readers.clickChengfangSubTab;
     if (typeof openShopFn !== 'function' || typeof readAccountFn !== 'function') return result('failed', 'scheduled-reader-capability-missing', { noAction: true });
-    opened = await openShopFn({ loginCfg: cfg.config.login, shopCfg: navigationShopCfg(shopCfg, business.accountId), headless: o.headless === true });
+    opened = await openShopFn({
+      loginCfg: cfg.config.login,
+      shopCfg: navigationShopCfg(shopCfg, business.accountId),
+      headless: o.headless === true,
+      ...(process.platform === 'darwin' && o.headless === true ? { useFullChromium: true } : {}),
+    });
     if (!opened || !opened.target || !opened.context) { preserveOwnedBrowser = true; return result('failed', 'scheduled-shop-open-incomplete', { noAction: true }); }
     // 严格当前 Cookie 广告身份验证：配置账号未知即采用实时账号；已知但不符一律拒绝。
     const identity = await opened.target.evaluate(readAccountFn);
@@ -7755,9 +8679,27 @@ async function runScheduledPlan(businessInput, opts) {
     dayState.lastSelected = frozen.productIds.slice(); dayState.hints = hints; persist(dayState);
     const existingPlanIds = await drivers.readExistingPlanIds();
     // 派发前 fresh 跨日检查：绝不用今天的身份/manifest 组合配昨天的业务日。
+    // 未发生任何消费/点击：用既有 pre-initial policy-cancel 收口，避免跨日后
+    // ready-awaiting-confirmation 卡住新业务日（2026-11-23 瑾漂亮一夜备好未发）。
     if (wf.shanghaiDate(nowOf()) !== businessDate || frozen.businessDate !== businessDate) {
+      const driftReason = 'business-date-changed-before-dispatch';
+      let closure = null;
+      try {
+        closure = applyProvenPreInitialPolicyCancelClose(STATE_FILE, ATTEMPTS_FILE, businessDate, {
+          reason: driftReason,
+          source: 'scheduled-business-date-changed-before-dispatch',
+          shop: business.shop, accountId: business.accountId,
+        }, { nowMs: nowOf });
+      } catch (_) { closure = null; }
+      if (closure && closure.closed === true) {
+        log('warn', 'scheduled-preparation-closed ' + closure.fact.planNumber + ' ' + closure.fact.runId + ' ' + closure.fact.reason);
+        return result('preparation-stopped', driftReason, {
+          planNumber: closure.fact.planNumber, businessDate, runId: closure.fact.runId,
+          noAction: true, noReplay: true, preparationClosure: closure.fact,
+        });
+      }
       preserveOwnedBrowser = true;
-      return result('blocked', 'business-date-changed-before-dispatch', { planNumber, noAction: true, noReplay: true });
+      return result('blocked', driftReason, { planNumber, noAction: true, noReplay: true });
     }
     const request = {
       method: 'POST', action: '确认发布本计划', nonce: frozen.nonce, planNumber: Number(frozen.planNumber),
@@ -7809,7 +8751,11 @@ async function runScheduledPlan(businessInput, opts) {
         business, consumed: confirmationConsumed,
         publishDeps: {
           attemptsFile: ATTEMPTS_FILE, evaluate: drivers.evaluate, onEvent: () => {},
-          contract: { boundAccounts: frozen.boundAccounts, productsPerPlan: business.productsPerPlan, roi: business.roi, dailyBudget: business.dailyBudget, maxPlansPerDay: business.maxPlansPerDay, isLegacy: legacyDefault },
+          contract: {
+            boundAccounts: frozen.boundAccounts,
+            productsPerPlan: Number.isInteger(frozen.productsPerPlan) ? frozen.productsPerPlan : (frozen.productIds || []).length || business.productsPerPlan,
+            roi: business.roi, dailyBudget: business.dailyBudget, maxPlansPerDay: business.maxPlansPerDay, isLegacy: legacyDefault,
+          },
         },
         approvedFirstPlan: planNumber === 1 ? null : dayState.firstPublishedPlan,
         readFinalDialog: drivers.readFinalDialog, awaitFinalDialog: drivers.awaitFinalDialog,
@@ -7851,10 +8797,25 @@ async function runScheduledPlan(businessInput, opts) {
       }
       if (res.finalClick && res.finalClick.clicked === true) {
         const recorded = guard.recordFinalConfirmationOutcome(ATTEMPTS_FILE, frozen.confirmationId, outcome === 'success' ? 'success' : 'unknown');
-        if (recorded !== true) { outcome = 'unknown'; res = { ...res, status: 'unknown', reason: 'final-confirm-outcome-not-durable' }; }
+        if (recorded !== true) {
+          const prior = res.reason || 'unknown';
+          outcome = 'unknown';
+          res = { ...res, status: 'unknown', reason: 'final-confirm-outcome-not-durable:' + prior };
+        }
       }
       const initialRecorded = guard.recordPublicationOutcome(ATTEMPTS_FILE, frozen.confirmationId, outcome);
-      if (initialRecorded !== true) { outcome = 'unknown'; res = { ...res, status: 'unknown', reason: 'publication-outcome-not-durable' }; }
+      // 账本无 CID（消费从未落盘）时绝不能盖掉真实失败原因，否则只剩 publication-outcome-not-durable 无法排障。
+      if (initialRecorded !== true) {
+        const prior = res.reason || 'unknown';
+        const hasConsume = !!(guard.loadAttemptsStore(ATTEMPTS_FILE).consumed || {})[frozen.confirmationId];
+        outcome = 'unknown';
+        res = {
+          ...res, status: 'unknown',
+          reason: hasConsume
+            ? ('publication-outcome-not-durable:' + prior)
+            : ('publication-consume-missing:' + prior),
+        };
+      }
       updated.active = { status: outcome === 'success' ? 'post-publish-enable-check-pending' : 'publish-unknown', planNumber, frozen, reason: res.reason || null, planId: res.planId || null, cookieStatus: cookie.status, authorizedBy: AUTHORIZED_BY };
       if (outcome === 'success') { updated.lastSelected = []; updated.runId = runId; updated.businessDate = businessDate; }
       wf.persistDayState(STATE_FILE, updated); dayState = updated;
@@ -8122,6 +9083,7 @@ async function discoverShopAccountByLiveSession(shopCfg, business, opts) {
       loginCfg,
       shopCfg: navigationShopCfg(shopCfg, business && business.accountId),
       headless: o.headless === true,
+      ...(process.platform === 'darwin' && o.headless === true ? { useFullChromium: true } : {}),
       restoreCandidatePolicy,
     });
     if (!opened || !opened.target) return { error: 'discovery-open-incomplete' };
@@ -8237,6 +9199,44 @@ async function recoverShopDayReadback(shopLike, businessDate, opts) {
     // (a) scheduled-origin same-day publish-unknown promotion, proof-first.
     if (a.status === 'publish-unknown' && String(stateRaw.businessDate || '') === businessDate && a.authorizedBy === 'recurring-user-policy' && cid) {
       const unresolved = listManualUnresolved(attempts);
+      // 2026-11-22：publication-outcome-not-durable 且 attempts 对该 CID 完全无记录
+      // （consume 从未落盘），confirmationConsumptions 也无该 CID，管理页按 planName 也找不到
+      // → 证明「未入账且平台无计划」，收口为 preparation-stopped，允许同日重派。
+      // 绝不能在这里升格成功；有任何 ledger / 管理页命中仍走原 recovery。
+      const rec0 = (attempts.consumed || {})[cid];
+      const cc0 = Array.isArray(stateRaw.confirmationConsumptions) ? stateRaw.confirmationConsumptions : [];
+      const ccHit = cc0.some(c => c && String(c.confirmationId || '') === cid);
+      if (!rec0 && unresolved.length === 0 && !ccHit && frozen.planName) {
+        let rbAbsent = null;
+        try { rbAbsent = await drivers.readManagementRow({ planName: String(frozen.planName), accountId: business.accountId }); } catch (_) { rbAbsent = null; }
+        const absent = !rbAbsent || rbAbsent.found !== true || rbAbsent.rowCount === 0
+          || (Array.isArray(rbAbsent.rows) && rbAbsent.rows.length === 0);
+        if (absent) {
+          const latest = wf.loadDayState(STATE_FILE, businessDate);
+          const la = latest.active || {};
+          if (!la || String((la.frozen || {}).confirmationId || '') !== cid || la.status !== 'publish-unknown') {
+            return { ok: true, status: 'unknown', noReplay: true, reason: 'state-changed-before-absent-close', ...summaryBase, accountId: business.accountId };
+          }
+          latest.active = {
+            status: 'preparation-stopped',
+            planNumber: Number(frozen.planNumber),
+            runId: String(frozen.runId || ''),
+            businessDate,
+            originalPhase: 'publish-unknown',
+            reason: 'publish-unknown-unledgered-absent:' + String(a.reason || ''),
+            source: 'scheduled-readback-absent-close',
+            closedAt: new Date(nowMs()).toISOString(),
+            authorizedBy: 'recurring-user-policy',
+          };
+          wf.persistDayState(STATE_FILE, latest);
+          return {
+            ok: true, status: 'closedAbsent', noReplay: true,
+            reason: 'publish-unknown-unledgered-absent',
+            planNumber: Number(frozen.planNumber), planName: String(frozen.planName),
+            confirmationId: cid, ...summaryBase, accountId: business.accountId,
+          };
+        }
+      }
       // 只允许同一冻结确认号的初始/最终未决（真实发布中断会同时留下两种记录）；
       // 跨 CID、跨店、跨日或任何其他人工未决一律拒绝。
       const soleScope = unresolved.every(u => u.id === cid);
@@ -8796,7 +9796,15 @@ async function closeExpiredScheduledKnownFinalUnsubmitted(deps) {
   if (wf.manifestHash(af) !== af.manifestHash) return refuse('frozen-manifest-tampered');
   if ((af.productIds || []).map(String).join(',') !== (frozen.productIds || []).map(String).join(',')) return refuse('frozen-product-ids-mismatch');
   if (String(af.shop != null ? af.shop : business.shop) !== String(business.shop)) return refuse('frozen-shop-mismatch');
-  if (frozen.productsPerPlan != null && Number(frozen.productsPerPlan) !== Number(business.productsPerPlan)) return refuse('frozen-products-per-plan-drift');
+  // 目录耗尽部分发布允许 frozen.productsPerPlan < 店配置上限；其它情况仍必须对齐店配置。
+  if (frozen.productsPerPlan != null) {
+    const fp = Number(frozen.productsPerPlan);
+    const bp = Number(business.productsPerPlan);
+    const partialOk = frozen.catalogExhaustedPartial === true
+      && Number.isInteger(fp) && fp >= 1 && fp <= bp
+      && Array.isArray(frozen.productIds) && frozen.productIds.length === fp;
+    if (!partialOk && fp !== bp) return refuse('frozen-products-per-plan-drift');
+  }
 
   // (3) 同 CID 初始消费：unknown（待收口）或已是同一 resolution 的终态 failed（幂等续完）。
   //     finalConsumed 与 reopenConsumed 必须**双双缺席**。
@@ -9018,6 +10026,8 @@ async function closeExpiredScheduledKnownFinalUnsubmitted(deps) {
   }
 }
 
-module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,bindingPanelSettled,accountDrawerCancelConfirmInPage,managementObstructionActionInPage,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,provePreInitialPolicyCancelState,applyProvenPreInitialPolicyCancelClose,recoverLocalPreparationClose,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,bindingRowTooltipInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,buildScheduledPreparationDiagnostic,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,resumeScheduledKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,closeExpiredScheduledKnownFinalUnsubmitted,main};
+module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,bindingPanelSettled,accountDrawerCancelConfirmInPage,managementObstructionActionInPage,publishExplicitFailureReplacementOnly,atomicWrite,acquireLock,until,listManualUnresolved,shouldRunReadOnlyRecovery,proveNoPublicationPreOpen,proveSchedulerReleaseProof,provePreInitialPolicyCancelState,applyProvenPreInitialPolicyCancelClose,recoverLocalPreparationClose,sha256Hex,preOpenSourceHash,currentPreOpenSourceHash,nativeAdvanceCursor,navigationShopCfg,pickerBatchStateMatches,normalizeCatalogCategory,catalogTabForCategory,isNativeScrollCategory,isNativeScrollTab,unionCatalogIds,parseCatalogRequestUrl,parseCatalogResponseBody,nativeScrollStateInPage,nativeScrollStepInPage,restoreNativeMarkerNudgeInPage,createCatalogTransport,CATEGORY_TAB,NATIVE_SCROLL_CATEGORIES,NATIVE_SCROLL_TABS,CATALOG_ORIGIN,CATALOG_PATH,CATALOG_INITIAL_CURSOR,CATALOG_NATIVE_MODE,openPickerInPage,ensureCommissionInPage,ensureDirectPayOffInPage,drawerSnapshotInPage,clickDrawerTabInPage,numericPickerPagingInPage,selectNativeCardInPage,deselectNativeCardInPage,removeNativeCardInPage,confirmDraftRemovalInPage,bindingDrawerSnapshotInPage,bindingRowTooltipInPage,selectAllAccountsInPage,applyBatchAccountsInPage,confirmBatchAccountsApplyInPage,batchAddAllModalSnapshotInPage,confirmBatchAddAllModalInPage,batchResultSnapshotInPage,acknowledgeBatchResultInPage,closeKnownPartialResultInPage,acceptPartialDraftWarningInPage,openAnchorManagementInPage,cancelAutoOpenedDrawerInPage,selectBindingDrawerPanelInPage,bindingOverlaySnapshotInPage,classifyAndCancelAutoPullInPage,readMainTableInPage,creationPlanNameInPage,readManagementRowsInPage,dialogLandscapeSnapshotInPage,finalDialogSnapshotInPage,clickFinalConfirmInPage,guidanceActionInPage,guidanceStorageCaptureInPage,guidanceRestoreInitScript,isAllowedGuidanceKey,validateGuidanceState,guidanceFilePath,guidanceScopeFor,readPrivateGuidanceState,persistPrivateGuidanceState,installGuidanceRestore,runGuidanceOnPage,runGuidancePhase,handleLateGuidanceBeforeNativeAdvance,createRealDrivers,buildScheduledPreparationDiagnostic,shanghaiPlanName,inspectRecoveryOnly,resumeKnownFinalOnly,resumeScheduledKnownFinalOnly,reconcilePublishedReadbackOnly,runScheduledPlan,readDaySuccessForShop,discoverShopAccountByLiveSession,classifyProvenEnableStoppedState,applyProvenEnableStoppedClose,recoverShopDayReadback,scheduledErrorText,reconcileManualUiPublication,manualUiSuccessPlanNumbers,nextPlanNumberForDay,closeExpiredScheduledKnownFinalUnsubmitted,sweepOverlays,main};
+
+module.exports.resolvePublisherStatePaths = resolvePublisherStatePaths;
 
 if(require.main===module)main();

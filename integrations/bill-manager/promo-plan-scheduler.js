@@ -376,6 +376,7 @@ function applySchedulerReleaseToRecord(rec, proof, nowMs, plansPerShopPerDay) {
   // 记录错误恰为未决终态标记、条目没有任何 CID/planId/manifest/nonce/frozen 消费痕迹、
   // 记录本身也无确认痕迹，且证明的份号/（在途时）startedAt 与本条目逐字一致。
   const localPreparation = proof.recStatus === 'unknown' && proof.entryProvenanceMethod === 'local-preparation-closed';
+  const recoveryGateStop = localPreparation && proof.entryStatus === 'unknown' && e.reason === 'read-only-recovery-required';
   if (localPreparation) {
     if (proof.entryStatus !== 'in-progress' && proof.entryStatus !== 'unknown') return { changed: false, rec };
     const c = proof.preparationClosureProof;
@@ -386,6 +387,14 @@ function applySchedulerReleaseToRecord(rec, proof, nowMs, plansPerShopPerDay) {
       // 只允许"唯一一条在途"被释放：多条在途说明还有其它未证明的派发，绝不整店放开。
       const inFlight = Object.keys(rec.entries).filter((k) => rec.entries[k] && rec.entries[k].status === 'in-progress');
       if (inFlight.length !== 1 || inFlight[0] !== key) return { changed: false, rec };
+    } else if (recoveryGateStop) {
+      // 旧账本可能先记录恢复门拒绝，随后同日首份才完成耐久的零消费收口。
+      const observedAt = Date.parse(e.at);
+      const closedAt = Date.parse(c.closedAt);
+      if (proof.planNumber !== 1 || rec.plans !== 0 || Object.keys(rec.entries).length !== 1
+        || rec.error !== 'unknown:read-only-recovery-required'
+        || !Number.isFinite(observedAt) || !Number.isFinite(closedAt) || closedAt < observedAt
+        || (e.runId != null && e.runId !== c.runId)) return { changed: false, rec };
     } else if (!/^(scheduled-run-exception|dispatch-exception):/.test(String(e.reason || ''))) {
       return { changed: false, rec };
     }
@@ -451,14 +460,15 @@ function applySchedulerReleaseToRecord(rec, proof, nowMs, plansPerShopPerDay) {
     at: atIso, planNumber: proof.planNumber, reason: 'scheduler-release-prepublication',
     proof: { method: proof.method, entryReasonHash: proof.entryReasonHash, entryProvenanceMethod: proof.entryProvenanceMethod || null },
   });
-  if (clearInProgress) {
+  if (clearInProgress || recoveryGateStop) {
     // 该份**从未提交**（publisher 已严格证明零消费）：条目标为 preparation-stopped 并保留
     // 原在途 startedAt 与恢复 runId 作为审计；绝不是 success，成功计数不变。
     rec.entries[key] = {
       planNumber: Number(key), status: 'preparation-stopped',
       reason: String(proof.preparationClosureProof.reason || 'preparation-closed'),
       preparationRunId: String(proof.preparationClosureProof.runId),
-      startedAt: String(e.startedAt), closedAt: atIso, recoveredBy: 'local-preparation-recovery',
+      ...(clearInProgress ? { startedAt: String(e.startedAt) } : {}),
+      closedAt: atIso, recoveredBy: 'local-preparation-recovery',
     };
     rec.error = 'local-preparation-recovered:' + String(proof.preparationClosureProof.reason || 'preparation-closed');
   }

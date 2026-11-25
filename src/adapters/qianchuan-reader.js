@@ -790,7 +790,14 @@ function readQianchuanAccountViewInPage(arg) {
     popup.present = visibleCloses.length > 0 || dialogs.length > 0 || knownRootOrMaskVisible;
     const block = reason => { popup.safe = false; popup.reason = reason; };
     if (popup.present) {
-      if (closes.length !== 1) {
+      // Firefly's shop-data walkthrough has a closed shadow root. Escape dismisses
+      // this step without selecting a control inside it.
+      const tip = dialogs.length === 1 && dialogs[0];
+      if (tip && !knownRootOrMaskVisible && closes.length === 0 && shopView && switchPresent &&
+          tip.matches?.('.shepherd-element.shepherd-firefly-custom[role="dialog"][data-shepherd-step-id="shop-prom-data"][aria-describedby="shop-prom-data-description"]') &&
+          tip.querySelector('.shepherd-content #shop-prom-data-description > firefly-react-content')) {
+        popup.reason = 'shop-prom-data-guide';
+      } else if (closes.length !== 1) {
         block('close-not-unique');
       } else if (visibleCloses.length !== 1) {
         block('close-not-visible-unique');
@@ -906,6 +913,7 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
   const expectedName = String((shopCfg && (shopCfg.compassShopName || shopCfg.name)) || '').trim();
   let switched = false;
   let popupClosed = false;
+  let guideDismissed = false;
   let blockedSwitchUrl = null;
   // SWITCH-CLICK-RETRY-20261103：独立的有界重试计数（只对非遮挡类瞬时错误）。
   let switchClickRetries = 0;
@@ -940,6 +948,25 @@ async function ensureQianchuanAccountView(target, shopCfg, opts = {}) {
     }
     if (target.url() !== before) return fail('千川视图核验期间发生导航：未取得账户数据');
     const popup = view.popup || { present: false, safe: false, reason: 'none', closeTag: null };
+    if (popup.reason === 'shop-prom-data-guide') {
+      if (guideDismissed || !expectedName) return fail('千川店铺数据引导未能收口');
+      const title = target.getByText('店铺视图：' + expectedName, { exact: true });
+      if (await title.count() !== 1 || !await title.isVisible() || target.url() !== before) {
+        return fail('千川店铺数据引导的店铺身份未核实');
+      }
+      const guide = target.locator('.shepherd-element.shepherd-firefly-custom[role="dialog"][data-shepherd-step-id="shop-prom-data"][aria-describedby="shop-prom-data-description"]').filter({
+        has: target.locator('.shepherd-content #shop-prom-data-description > firefly-react-content'),
+      });
+      try {
+        if (await guide.count() === 1 && await guide.isVisible()) {
+          await guide.press('Escape', { timeout: Math.min(timeoutMs, 2000) });
+          await guide.waitFor({ state: 'hidden', timeout: Math.min(timeoutMs, 3000) });
+        }
+      } catch (_) { return fail('千川店铺数据引导关闭未获确认'); }
+      if (target.url() !== before) return fail('千川店铺数据引导关闭期间发生导航');
+      guideDismissed = true;
+      continue;
+    }
     let closedThisRound = false;
     // 任何可见弹窗都必须先被证明是已证营销弹窗：未知/不唯一/结构不符/危险文本 → 立即零点击停止。
     // 已证弹窗的关闭不依赖店铺视图是否已渲染（实测浮窗可能先于店铺视图出现并遮挡切换按钮）。

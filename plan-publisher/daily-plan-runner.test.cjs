@@ -459,3 +459,45 @@ test('HYBRID：daily-runner 传入 leaseDir；他方持有同店同日 lease 时
   assert.deepStrictEqual(rec.retryHistory || [], []);
   realScheduler.releaseProcessLock(leaseFile, held.token);
 });
+
+test('predispatch discovery retries survive restart and never replay an unresolved dispatch', async t => {
+  const shops = SHOPS.map(shop => ({ ...shop, accountId: null }));
+  const env = makeEnv(shops, { plansPerShopPerDay: 1 });
+  t.after(() => fs.rmSync(env.root, { recursive: true, force: true }));
+  env.writeCfg();
+  const ledger = path.join(env.dataDir, 'ledger.json');
+  const overlay = 'discovery-open-failed:浮窗阻断（乘方管理页-子标签等待）：unknown-overlay:1，停止自动操作';
+  const navigation = 'discovery-open-failed:抖店主页面在有界自动登录收敛期内未到达首页（15 次探测）；未见登录正证据，按导航事实处理，需人工核实';
+  writeJson(ledger, { version: 1, days: { [DATE]: { shops: {
+    min: { status: 'blocked', plans: 0, error: 'account-discovery:' + overlay, entries: { 1: { planNumber: 1, status: 'preparation-stopped', retryable: true } } },
+    jianshang: { status: 'blocked', plans: 0, error: 'account-discovery:' + navigation, entries: {} },
+    jin: { status: 'blocked', plans: 0, error: 'account-discovery:' + navigation, entries: { 1: { planNumber: 1, status: 'unknown' } } },
+  } } } });
+  const spy = makeSpyDeps({});
+  const discover = spy.deps.discoverAccount;
+  let shouldFail = true;
+  spy.deps.resolvePublisherPaths = ({ shop }) => shop === shops[2].name
+    ? { ok: true, paths: {}, accountId: '123456789' } : null;
+  spy.deps.discoverAccount = async (...args) => {
+    const account = await discover(...args);
+    return shouldFail ? { error: navigation } : account;
+  };
+  const clock = { ms: T0 };
+  await makeRunner(env, spy, clock).tick();
+  assert.equal(spy.calls.runPlan.length, 0);
+  assert.deepEqual(spy.calls.discover.map(x => x.accountId), [null, '123456789']);
+  const afterFailure = readJson(ledger).days[DATE].shops;
+  assert.equal(afterFailure.min.discoveryRetry.attempts, 1);
+  assert.equal(afterFailure.min.entries[1].status, 'preparation-stopped');
+  assert.equal(afterFailure.jianshang.discoveryRetry.attempts, 1);
+  shouldFail = false;
+  const restarted = makeRunner(env, spy, clock);
+  await restarted.tick();
+  assert.equal(spy.calls.discover.length, 2);
+  clock.ms += 60_000;
+  await restarted.tick();
+  assert.deepEqual(spy.calls.runPlan.map(x => x.shop), [shops[1].name, shops[2].name]);
+  await restarted.tick();
+  assert.equal(spy.calls.runPlan.length, 2);
+  assert.equal(readJson(ledger).days[DATE].shops.jin.entries[1].status, 'unknown');
+});

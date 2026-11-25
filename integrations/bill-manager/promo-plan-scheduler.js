@@ -198,6 +198,32 @@ function hasInProgress(rec) {
   return false;
 }
 
+// These failures occurred during navigation, before the scheduler wrote a dispatch entry.
+function isRetryableDiscoveryError(error) {
+  const prefix = 'account-discovery:discovery-open-failed:';
+  if (typeof error !== 'string' || !error.startsWith(prefix)) return false;
+  const detail = error.slice(prefix.length);
+  return /^抖店主页面在有界自动登录收敛期内未到达首页.*；未见登录正证据，按导航事实处理/.test(detail)
+    || /^浮窗阻断（乘方管理页-子标签等待）：unknown-overlay:\d+，停止自动操作$/.test(detail)
+    || /^(?:page\.goto: )?net::ERR_(?:CONNECTION_CLOSED|CONNECTION_RESET|TIMED_OUT)\b/.test(detail);
+}
+
+function canRetryDiscovery(rec, limit) {
+  if (!rec || !isRetryableDiscoveryError(rec.error)) return false;
+  const attempts = rec.discoveryRetry?.attempts ?? 0;
+  if (!Number.isInteger(attempts) || attempts < 0 || attempts > limit) return false;
+  const { plans, entries } = rec;
+  if (!Number.isInteger(plans) || plans < 0 || !entries || Array.isArray(entries) || typeof entries !== 'object') return false;
+  return Object.entries(entries).every(([key, entry]) => {
+    const number = Number(key);
+    if (!entry || !Number.isInteger(number) || number < 1 || Number(entry.planNumber) !== number) return false;
+    if (entry.status === 'success') return number <= plans && !!entry.planId;
+    return number === plans + 1 && entry.retryable === true
+      && (entry.status === 'preparation-stopped' || entry.status === 'unsubmitted')
+      && !entry.planId && !entry.confirmationId && !entry.manifestHash && !entry.frozen;
+  });
+}
+
 /**
  * S129 陈旧准备状态收敛判据：**只**凭本店本日账本 entries 的完整成功证据返回 true。
  * 要求 entries 恰好覆盖 1..shopLimit 每一份，每份 status==='success'、planNumber 唯一且
@@ -524,6 +550,14 @@ function acquireProcessLock(file, nowMs, staleMs) {
   }
 }
 
+function shopDayLeaseKey({ accountId, shopId, businessDate }) {
+  return sha256Hex(JSON.stringify([String(businessDate), accountId == null || accountId === '' ? 'shop:' + String(shopId) : 'account:' + String(accountId)]));
+}
+
+function shopDayLeasePath(leaseDir, key) {
+  return path.join(leaseDir, key + '.lock');
+}
+
 function releaseProcessLock(file, token) {
   try {
     if (!fs.existsSync(file)) return;
@@ -567,6 +601,7 @@ function createScheduler(opts = {}) {
   const onLog = typeof o.onLog === 'function' ? o.onLog : () => {};
   const ledgerFile = o.ledgerFile || path.join(__dirname, 'promo-plan-scheduler-ledger.json');
   const lockFile = o.lockFile || (ledgerFile + '.lock');
+  const leaseDir = typeof o.leaseDir === 'string' && o.leaseDir.length ? o.leaseDir : null;
   const lockStaleMs = Number.isFinite(o.lockStaleMs) && o.lockStaleMs > 0 ? o.lockStaleMs : 30 * 60 * 1000;
   const validated = validatePlanPublishing(o.planPublishing);
   let cfg = validated.value;
@@ -669,7 +704,8 @@ function createScheduler(opts = {}) {
       const rec = dayRec[shopId];
       return rec && (rec.plans >= limit
         || rec.status === 'failed' || rec.status === 'unknown'
-        || rec.status === 'failed-permanent' || rec.status === 'blocked');
+        || rec.status === 'failed-permanent'
+        || (rec.status === 'blocked' && !canRetryDiscovery(rec, maxUnsubmittedRetries)));
     });
   }
 
@@ -678,6 +714,7 @@ function createScheduler(opts = {}) {
     st.ticking = true;
     st.lastTickAt = new Date(nowMs()).toISOString();
     let lock = null;
+    let activeShopLease = null;
     try {
       if (!cfg.enabled || !cfg.autoConfirm) {
         return { skipped: 'not-authorized', enabled: cfg.enabled, autoConfirm: cfg.autoConfirm };
@@ -778,8 +815,14 @@ function createScheduler(opts = {}) {
           results.push({ shopId, status: rec.status, plans: rec.plans });
           continue;
         }
-        // 本日已进入失败/未知/阻塞终态：**不推进、不重放**（跨日才由新 businessDate 重新生成新身份）。
-        if (rec.status === 'failed' || rec.status === 'unknown' || rec.status === 'failed-permanent' || rec.status === 'blocked') {
+        const retryDiscovery = rec.status === 'blocked' && canRetryDiscovery(rec, maxUnsubmittedRetries);
+        if (retryDiscovery) {
+          const nextAt = Date.parse(rec.discoveryRetry?.nextAt);
+          if (Number.isFinite(nextAt) && nowMs() < nextAt) {
+            results.push({ shopId, status: 'blocked', plans: rec.plans, error: rec.error, retryWaiting: true });
+            continue;
+          }
+        } else if (rec.status === 'failed' || rec.status === 'unknown' || rec.status === 'failed-permanent' || rec.status === 'blocked') {
           results.push({ shopId, status: rec.status, plans: rec.plans, error: rec.error }); continue;
         }
 
@@ -797,9 +840,12 @@ function createScheduler(opts = {}) {
             try {
               const found = await discoverAccount(shop, business);
               if (found && typeof found === 'object' && typeof found.error === 'string' && found.error) {
-                // 具体的身份发现失败：逐字保留发现侧原因（绝不吞成通用 unknown-account，
-                // 绝不据此自动重试或当作登录过期）。
                 rec.status = 'blocked'; rec.error = 'account-discovery:' + found.error;
+                if (canRetryDiscovery(rec, maxUnsubmittedRetries)) {
+                  const attempts = (rec.discoveryRetry?.attempts ?? 0) + 1;
+                  const delay = retryBackoffMs[Math.min(attempts - 1, retryBackoffMs.length - 1)];
+                  rec.discoveryRetry = { attempts, nextAt: new Date(nowMs() + delay).toISOString() };
+                }
                 saveLedger(ledgerFile, ledger);
                 results.push({ shopId, status: 'blocked', error: rec.error }); continue;
               }
@@ -816,6 +862,18 @@ function createScheduler(opts = {}) {
           saveLedger(ledgerFile, ledger);
           results.push({ shopId, status: 'blocked', error: rec.error }); continue;
         }
+        if (leaseDir) {
+          const file = shopDayLeasePath(leaseDir, shopDayLeaseKey({ accountId: business.accountId, shopId, businessDate: t.date }));
+          let lease;
+          try { lease = acquireProcessLock(file, nowMs, lockStaleMs); }
+          catch (error) { lease = { error: (error && error.message) || String(error) }; }
+          if (!lease.held) {
+            results.push({ shopId, status: 'coordination-yield', plans: rec.plans, error: lease.error || null });
+            continue;
+          }
+          activeShopLease = { file, token: lease.token };
+        }
+        delete rec.discoveryRetry;
         // 预算/ROI 对齐 trusted 配置：native fill/guard/freeze/readback 由 runPlan 内部据此执行。
         // 不就地改写（buildShopProfile 等可能返回 frozen），用浅拷贝携带 cfg 预算与校验后的 ROI。
         const roi = (typeof business.roi === 'number' && Number.isFinite(business.roi) && business.roi > 0) ? business.roi : 15;
@@ -976,6 +1034,10 @@ function createScheduler(opts = {}) {
         }
         saveLedger(ledgerFile, ledger);
         results.push({ shopId, status: rec.status, plans: rec.plans, error: rec.error || null, stopped: stopped || null });
+        if (activeShopLease) {
+          releaseProcessLock(activeShopLease.file, activeShopLease.token);
+          activeShopLease = null;
+        }
         if (stopped === 'disabled' || stopped === 'cross-day') { interrupted = stopped; break; }
       }
       // 当日容器必须先于 lastRunAt 存在：空店/全删除名单循环零执行时旧代码在此
@@ -991,6 +1053,7 @@ function createScheduler(opts = {}) {
       st.nextRunAt = nx == null ? null : new Date(nx).toISOString();
       return { ran: true, date: t.date, results, interrupted, nextRunAt: st.nextRunAt };
     } finally {
+      if (activeShopLease) releaseProcessLock(activeShopLease.file, activeShopLease.token);
       if (lock && lock.held) releaseProcessLock(lockFile, lock.token);
       st.ticking = false;
     }
@@ -1143,4 +1206,6 @@ module.exports = {
   sha256Hex,
   acquireProcessLock,
   releaseProcessLock,
+  shopDayLeaseKey,
+  shopDayLeasePath,
 };

@@ -793,17 +793,18 @@ test('R125 parseMainTableRow treats 自动拉取 N 个 without 预估 as autoPul
   assert.equal(p.manualCountKnown, true);
 });
 
-test('rebinding mismatch rotates a fresh exact zero-binding batch and stops on an unknown row', async () => {
+test('rebinding mismatch repairs exact zero rows, keeps bound rows and stops on unknown rows', async () => {
   const firstIds = IDS30.slice();
   const nextIds = firstIds.map((_, i) => '90000000000000' + String(i).padStart(4, '0'));
   const zeroRows = ids => ids.map(productId => ({
     productId, text: '商品 ID：' + productId + ' 手动添加抖音号 自动拉取 0 个',
   }));
-  for (const ambiguous of [false, true]) {
+  for (const readback of ['zero', 'mixed', 'unknown']) {
     let binds = 0;
     const repairs = [];
     const replacement = zeroRows(nextIds);
-    if (ambiguous) replacement[0].text = '商品 ID：' + nextIds[0] + ' 手动添加抖音号';
+    if (readback === 'mixed') replacement[0].text = '商品 ID：' + nextIds[0] + ' 1个抖音号 管理手动添加抖音号';
+    if (readback === 'unknown') replacement[0].text = '商品 ID：' + nextIds[0] + ' 手动添加抖音号';
     const read = () => repairs.length ? replacement : zeroRows(firstIds).map(row => ({
       ...row, manualAccounts: 0, manualCountKnown: true, autoPullOnly: true,
     }));
@@ -823,12 +824,12 @@ test('rebinding mismatch rotates a fresh exact zero-binding batch and stops on a
       },
       configurePlan: async () => { throw new Error('must not configure an unbindable batch'); },
     });
-    if (ambiguous) {
+    if (readback === 'unknown') {
       assert.equal(res.reason, 'manual-account-bind-readback-does-not-match-recorded-outcome');
       assert.equal(repairs.length, 1);
     } else {
       assert.equal(res.reason, 'offline-stop-after-second-rotation');
-      assert.deepEqual(repairs[1].removeIds, nextIds);
+      assert.deepEqual(repairs[1].removeIds, readback === 'mixed' ? nextIds.slice(1) : nextIds);
       assert.equal(repairs[1].requireNextPage, true);
     }
   }
@@ -1036,10 +1037,10 @@ const R128_DIAG_UNKNOWN = {
   phase: 'panel-navigation', rowCount: 2, knownCheckedCount: 1,
   unknownStateCount: 1, selectedCount: 5, totalCount: 30,
 };
-function r128Page(mode, shape) {
+function r128Page(mode, shape, ids = R128_IDS) {
   let active = R128_ANCHOR;
-  const calls = { commit: 0, warning: 0, header: 0 };
-  const rows = R128_IDS.map((productId, i) => ({
+  const calls = { commit: 0, warning: 0, header: 0, batch: 0, removal: 0 };
+  const rows = ids.map((productId, i) => ({
     productId, text: 'ID：' + productId, manualAccounts: i === 0 ? 1 : 0,
     manualEvidence: true, manualCountKnown: true, autoPullOnly: false,
     reviewFailed: false, alreadyPlanned: false,
@@ -1047,39 +1048,46 @@ function r128Page(mode, shape) {
   const proven = pid => ({
     ok: true, spinnerCount: 0, headerLabelDisabled: false,
     rows: [{ ids: [A1], checked: true, labelDisabled: false }],
-    panelProductIds: R128_IDS.slice(), activeProductIds: [pid], selectedCount: 1, totalCount: 30,
+    panelProductIds: ids.slice(), activeProductIds: [pid], selectedCount: 1, totalCount: 30,
   });
   // A "previous" panel stays fully proven; only the panel the batch navigated TO is broken.
   const failing = () => {
     if (shape === 'missing') return null;
-    if (shape === 'zero') return {
+    if (shape === 'zero' || shape === 'zero-hidden-after-commit') return {
       ok: true, spinnerCount: 0, headerLabelDisabled: false,
       rows: [{ ids: [A1], checked: false, labelDisabled: false }],
-      panelProductIds: R128_IDS.slice(), activeProductIds: [active], selectedCount: 0, totalCount: 30,
+      panelProductIds: ids.slice(), activeProductIds: [active], selectedCount: 0, totalCount: 30,
     };
     // unknown row state + a footer that disagrees with the known checked count
     return {
       ok: true, spinnerCount: 0, headerLabelDisabled: false,
       rows: [{ ids: [A1], checked: true, labelDisabled: false }, { ids: [A2], checked: undefined, labelDisabled: false }],
-      panelProductIds: R128_IDS.slice(), activeProductIds: [active], selectedCount: 5, totalCount: 30,
+      panelProductIds: ids.slice(), activeProductIds: [active], selectedCount: 5, totalCount: 30,
     };
   };
   const page = {
     url: () => 'https://qianchuan.jinritemai.com/uni-creation/overall-product-multi?aavid=' + wf.BUSINESS.accountId,
     evaluate: async (fn, arg) => {
-      if (fn === rp.readMainTableInPage) return { ok: true, rows: shape === 'zero' && calls.commit
-        ? rows.map(r => ({ ...r, manualAccounts: r.productId === R128_FAIL ? 0 : 1 })) : rows };
-      if (fn === rp.bindingDrawerSnapshotInPage) return active === R128_FAIL ? failing() : proven(active);
+      if (fn === rp.readMainTableInPage) return { ok: true, rows: (shape === 'zero' || shape === 'zero-hidden-after-commit') && calls.commit
+        ? rows.map(r => r.productId === R128_FAIL && shape === 'zero-hidden-after-commit'
+          ? { ...r, manualAccounts: null, manualEvidence: false, manualCountKnown: false }
+          : { ...r, manualAccounts: r.productId === R128_FAIL ? 0 : 1 }) : rows };
+      if (fn === rp.bindingDrawerSnapshotInPage) {
+        if (shape === 'zero-hidden-after-commit' && calls.commit) return { ok: false, count: 0 };
+        return active === R128_FAIL ? failing() : proven(active);
+      }
+      if (fn === rp.removeNativeCardInPage) { calls.removal++; throw new Error('ROOT_END_AFTER_FIRST_REMOVAL'); }
+      if (fn === rp.accountDrawerCancelConfirmInPage) return { present: false, count: 0 };
       if (fn === rp.selectBindingDrawerPanelInPage) { active = String(arg); return { clicked: true, id: String(arg) }; }
       if (fn === rp.selectAllAccountsInPage) { calls.header++; return { clicked: true }; }
-      if (fn === rp.applyBatchAccountsInPage) return { clicked: true };
-      if (fn === rp.batchAddAllModalSnapshotInPage) return { modalCount: 1, productCount: 29, accountCount: 1, drawerSettled: true };
+      if (fn === rp.applyBatchAccountsInPage) { calls.batch++; return { clicked: true }; }
+      if (fn === rp.batchAddAllModalSnapshotInPage) return { modalCount: 1, productCount: ids.length - 1, accountCount: 1, drawerSettled: true };
       if (fn === rp.confirmBatchAddAllModalInPage) return { clicked: true };
       if (fn === rp.batchResultSnapshotInPage) return mode === 'partial'
         ? { present: true, known: true, settled: false }
         : { present: false, known: false, settled: false };
       if (fn === rp.closeKnownPartialResultInPage) return { closed: true };
-      if (fn === rp.bindingOverlaySnapshotInPage) return { accountDrawerCount: 1, blockingOverlayPresent: false };
+      if (fn === rp.bindingOverlaySnapshotInPage) return { accountDrawerCount: shape === 'zero-hidden-after-commit' && calls.commit ? 0 : 1, blockingOverlayPresent: false };
       if (fn === rp.confirmBatchAccountsApplyInPage) { calls.commit++; return { clicked: true }; } // drawer 确定
       if (fn === rp.acceptPartialDraftWarningInPage) { calls.warning++; return { accepted: true }; }
       if (fn === rp.guidanceActionInPage) return { present: false, unknown: null, roots: [] };
@@ -1218,4 +1226,190 @@ test('R128 that panel-navigation diag survives the real preparePlan stop and the
   assert.equal(all.includes(A2), false);
   assert.equal(all.includes('ID：'), false);
   assert.equal(fx2.calls.commit, 0, 'scheduler failure still performs zero drawer 确定');
+});
+
+test('catalog-end batches bind exactly their selected products, including a single product', async () => {
+  for (const count of [1, 3]) {
+    const ids = R128_IDS.slice(0, count);
+    const fx = r128Page('full', 'zero', ids);
+    const refused = await fx.driver().bindAccountsToAll({ productIds: ids });
+    assert.equal(refused.reason, 'product-ids-not-exactly-30');
+    assert.equal(fx.calls.commit, 0);
+    const bound = await fx.driver().bindAccountsToAll({ productIds: ids, catalogExhaustedPartial: true });
+    assert.equal(bound.ok, true, bound.reason);
+    assert.equal(bound.productCount, count);
+    assert.equal(fx.calls.commit, 1);
+    assert.equal(fx.calls.batch, count === 1 ? 0 : 1);
+    assert.deepEqual(bound.failedIds, count === 1 ? [] : [R128_FAIL]);
+  }
+});
+
+test('a zero-selection retry scans from the start and only commits a small draft with last-page proof', async () => {
+  const selectedRows = readyRows().slice(0, 3);
+  const ids = selectedRows.map(r => r.productId);
+  const targets = ['23000000'];
+  const business = { ...wf.BUSINESS, shop: '合成店', accountId: '78000000', boundAccounts: null };
+  for (const lastPageReached of [false, true]) {
+    let scans = 0, commits = 0;
+    let draft = selectedRows.map((row, i) => i === 0 ? { ...row, reviewFailed: true } : row);
+    const result = await wf.preparePlan({
+      business, businessDate: '2026-10-17', planNumber: 1, runId: 'catalog-end-offline',
+      requireRealDrivers: true, persistState: async () => {},
+      openCreationPage: async () => ({ header: { originOk: true, accountId: business.accountId, commissionOptionPresent: true } }),
+      browseProducts: async request => {
+        if (++scans === 1) return { ok: false, reason: 'below-20-last-page-not-reached', selectedIds: [] };
+        assert.equal(request.allowAttemptedReuse, true);
+        assert.equal(request.resetCursor, true);
+        return { ok: false, reason: 'catalog-exhausted-or-safe-pagination-boundary', selectedIds: ids, lastPageReached };
+      },
+      commitPicker: async request => {
+        commits++;
+        assert.deepEqual(request, { baseSelectedCount: 0, expectedCapacity: 3, allowPartial: true });
+        return { submitted: true };
+      },
+      bindAccountsToAll: async request => {
+        assert.deepEqual(request, { productIds: ids, catalogExhaustedPartial: true });
+        return { ok: true, rows: draft };
+      },
+      getResolvedBoundAccounts: () => targets,
+      awaitMainTableStable: async request => {
+        assert.equal(request.capacity, draft.length);
+        return { ok: true, rows: draft, stableReads: 2 };
+      },
+      readMainTable: async () => draft,
+      repairDraft: async request => {
+        assert.equal(request.repairMode, 'remove-only-publish');
+        assert.equal(request.backfillCount, 0);
+        assert.deepEqual(request.removeIds, ids.slice(0, 1));
+        draft = draft.slice(1);
+        return { ok: true, mainRows: draft };
+      },
+      configurePlan: async () => ({ ok: true, planName: '2026-10-17_千川乘方_12:00:00' }),
+    });
+    assert.equal(scans, 2);
+    assert.equal(commits, lastPageReached ? 1 : 0);
+    if (lastPageReached) {
+      assert.equal(result.status, 'ready-awaiting-confirmation', result.reason);
+      assert.deepEqual(result.frozen.productIds, ids.slice(1));
+      assert.deepEqual(result.frozen.boundAccounts, targets);
+      assert.equal(result.frozen.productsPerPlan, 2);
+    } else {
+      assert.equal(result.reason, 'below-20-last-page-not-reached');
+    }
+  }
+});
+
+test('same-draft zero confirmed in the binder reaches removal even when the table hides the count', async () => {
+  const ids = R128_IDS.slice(0, 3);
+  const fixture = r128Page('full', 'zero-hidden-after-commit', ids);
+  const drivers = fixture.driver();
+  const bound = await drivers.bindAccountsToAll({ productIds: ids, catalogExhaustedPartial: true });
+  assert.equal(bound.ok, true, bound.reason);
+  assert.equal(bound.rows.find(row => row.productId === R128_FAIL).panelZeroConfirmed, true);
+  const repaired = await drivers.repairDraft({ removeIds: [R128_FAIL], repairMode: 'remove-only-publish' });
+  assert.match(repaired.reason, /ROOT_END_AFTER_FIRST_REMOVAL/);
+  assert.equal(fixture.calls.removal, 1);
+  const freshDriver = fixture.driver();
+  const refused = await freshDriver.repairDraft({ removeIds: [R128_FAIL], repairMode: 'remove-only-publish' });
+  assert.match(refused.reason, /^removal-lacks-explicit-current-row-evidence/);
+  assert.equal(fixture.calls.removal, 1);
+});
+
+test('a catalog-end backfill can continue as a shorter exact batch after a rotation', async () => {
+  const ids = IDS30.slice();
+  const remaining = readyRows().slice(0, 2).map((row, index) => ({
+    ...row, productId: '390000000000000000' + (index + 1),
+  }));
+  let draft = readyRows().map(row => ({ ...row, manualAccounts: 0, manualEvidence: false, autoPullOnly: true }));
+  let binds = 0;
+  const result = await wf.preparePlan({
+    businessDate: '2026-10-17', planNumber: 1, runId: 'short-backfill-offline',
+    requireRealDrivers: true, persistState: async () => {},
+    openCreationPage: async () => ({ header: { originOk: true, accountId: wf.BUSINESS.accountId, commissionOptionPresent: true } }),
+    browseProducts: async () => ({ ok: true, selectedIds: ids }),
+    bindAccountsToAll: async request => {
+      if (++binds === 1) assert.deepEqual(request.productIds, ids);
+      else {
+        assert.equal(request.catalogExhaustedPartial, true);
+        assert.deepEqual(request.productIds, remaining.map(row => row.productId));
+      }
+      return { ok: true, rows: draft, accountIds: wf.BUSINESS.boundAccounts };
+    },
+    readMainTable: async () => draft,
+    awaitMainTableStable: async request => {
+      assert.equal(request.capacity, draft.length);
+      return { ok: true, rows: draft, stableReads: 2 };
+    },
+    repairDraft: async request => {
+      assert.equal(request.repairMode, 'whole-batch-removal');
+      assert.equal(request.removeIds.length, 30);
+      draft = remaining;
+      return { ok: true, selectedCount: 2, mainRows: draft, catalogExhaustedPartial: true, lastPageReached: true };
+    },
+    configurePlan: async () => ({ ok: true, planName: '2026-10-17_千川乘方_12:00:00' }),
+  });
+  assert.equal(result.status, 'ready-awaiting-confirmation', result.reason);
+  assert.equal(binds, 2);
+  assert.deepEqual(result.frozen.productIds, remaining.map(row => row.productId));
+});
+
+test('a broken native cursor falls back to the independently checked all-products list with an empty picker', async () => {
+  for (const hasSelection of [false, true]) {
+    const calls = [];
+    const phase = wf.preparePlan({
+      businessDate: '2026-10-17', planNumber: 1, runId: 'native-fallback-offline',
+      persistState: async () => {},
+      openCreationPage: async () => ({ header: { originOk: true, accountId: wf.BUSINESS.accountId, commissionOptionPresent: true } }),
+      browseProducts: async request => {
+        calls.push(request.categories);
+        if (calls.length === 1) {
+          if (hasSelection) await request.onProgress({ lastSelected: IDS30.slice(0, 1) });
+          throw new Error('native-catalog-anomaly:catalog-cursor-chain-broken');
+        }
+        assert.equal(request.resetCursor, true);
+        assert.equal(request.allowAttemptedReuse, true);
+        return { ok: true, selectedIds: IDS30 };
+      },
+      bindAccountsToAll: async () => ({ ok: true, accountIds: wf.BUSINESS.boundAccounts }),
+      readMainTable: async () => readyRows(),
+      configurePlan: async () => ({ ok: true, planName: '2026-10-17_千川乘方_12:00:00' }),
+    });
+    if (hasSelection) {
+      await assert.rejects(phase, /catalog-cursor-chain-broken/);
+      assert.equal(calls.length, 1);
+    } else {
+      const result = await phase;
+      assert.equal(result.status, 'ready-awaiting-confirmation', result.reason);
+      assert.deepEqual(calls[1], ['全部']);
+    }
+  }
+});
+
+test('explicit Aurora choose-account notice proves zero while a bare add button remains unknown', () => {
+  const row = '女装 ID：' + IDS30[0];
+  const unbound = wf.parseMainTableRow(row + ' 请为该商品选择要投放的抖音号，或开启联盟合作达人自动投 添加抖音号');
+  assert.equal(unbound.manualAccounts, 0);
+  assert.equal(unbound.manualCountKnown, true);
+  assert.equal(wf.parseMainTableRow(row + ' 添加抖音号').manualAccounts, null);
+});
+
+test('a blocked headless shop releases its owned browser so the patrol worker can exit', async () => {
+  const shop = { name: '离线店', accountId: '1888123400000001' };
+  const browser = {};
+  const closed = [];
+  const result = await rp.runScheduledPlan({ shop: shop.name, accountId: shop.accountId }, {
+    projectRoot: __dirname, headless: true,
+    autoConfirm: true, policy: { enabled: true, autoConfirm: true },
+    loadConfig: () => ({ ready: true, config: { login: {}, shops: [shop] } }),
+    readers: {
+      openChengfangShop: async () => ({ browser, context: {}, target: {
+        evaluate: async () => ({ accountId: '1888123400000002' }),
+      } }),
+      readChengfangAccountInPage: () => {},
+      closeBrowser: async owned => { closed.push(owned); },
+    },
+  });
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.noAction, true);
+  assert.deepEqual(closed, [browser]);
 });

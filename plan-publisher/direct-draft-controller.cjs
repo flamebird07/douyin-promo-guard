@@ -146,6 +146,11 @@ function pageObserve() {
   // page / cost / bid context is refused. Bounded to a few levels so it cannot
   // swallow the whole page.
   function classifyFillField(input) {
+    // A checkbox's explanatory copy can mention ROI. Only editable value
+    // inputs can be the numeric target or budget field.
+    if (input.tagName !== 'INPUT' || !['', 'text', 'number', 'tel'].includes(String(input.getAttribute('type') || '').toLowerCase())) {
+      return { ok: false, field: null, reason: 'not-numeric-value-input' };
+    }
     const ownHint = [input.getAttribute('placeholder') || '', input.getAttribute('aria-label') || '', input.getAttribute('title') || ''].join(' ');
     // The real ROI label sits far above the input ("综合营销ROI目标(含达人佣金)",
     // with help text mentioning 出价分析/综合成本), so the walk is bounded at 12
@@ -424,17 +429,36 @@ function pageObserve() {
     // the 管理(手动添加)抖音号 control AND a visible .item-info-wrapper with a non-empty name +
     // a non-empty explicit ID. A lone manage button, a lone name/ID, hidden/duplicate entries,
     // an empty name/ID or an unknown layout never count as 1; an explicit counter outranks it.
+    const accountHeaders = mainRoots.length === 1
+      ? [...mainRoots[0].querySelectorAll('tr,[role="row"]')].filter(visible)
+        .map(row => [...row.children].filter(visible).map(text))
+        .filter(labels => ['商品信息', '投放抖音号', '素材', '操作'].every(label => labels.includes(label)))
+      : [];
+    const accountHeader = accountHeaders.length === 1 ? accountHeaders[0] : null;
+    const accountColumn = accountHeader?.indexOf('投放抖音号') ?? -1;
     const singleManualAwemeRow = row => {
       const wraps = [...row.querySelectorAll('.aweme-wrapper')].filter(visible);
-      if (wraps.length !== 1) return false;
-      const auto = [...wraps[0].querySelectorAll('.auto-pull-aweme-wrapper')];
-      const entries = [...wraps[0].querySelectorAll('.aweme-entry')].filter(e => !auto.some(a => a.contains(e)));
-      if (entries.length !== 1 || !visible(entries[0])) return false;
-      if (!/管理(?:手动添加)?抖音号/.test(text(entries[0]))) return false;
-      const infos = [...entries[0].querySelectorAll('.item-info-wrapper')].filter(visible);
-      if (infos.length !== 1) return false;
-      const m = text(infos[0]).match(/^(\S.*?)\s*ID\s*[:：]\s*(\S.*?)$/);
-      return !!m && m[1].trim() !== '' && m[2].trim() !== '';
+      if (wraps.length > 1) return false;
+      const cells = [...row.children].filter(visible);
+      const auroraCells = cells.filter(cell => {
+        if (cell.tagName !== 'TD' && !cell.classList.contains('aurora-qc-table-cell')) return false;
+        const account = text(cell).match(/^\S.*?\s+ID\s*[:：]\s*([A-Za-z0-9_-]{4,32})\s+管理(?:手动添加)?抖音号(?:\s+(?:预估)?自动拉取\s*\d+\s*个)?$/);
+        return !!account && !/^\d{15,20}$/.test(account[1]);
+      });
+      const columnCell = accountColumn >= 0 && cells.length === accountHeader.length ? cells[accountColumn] : null;
+      const wrap = wraps[0] || columnCell || (auroraCells.length === 1 ? auroraCells[0] : null);
+      if (!wrap) return false;
+      const auto = [...wrap.querySelectorAll('.auto-pull-aweme-wrapper')];
+      const entries = [...wrap.querySelectorAll('.aweme-entry')].filter(e => visible(e) && !auto.some(a => a.contains(e)));
+      if (entries.length > 1) return false;
+      const entry = entries[0];
+      if (entry && /管理(?:手动添加)?抖音号/.test(text(entry))) {
+        const infos = [...entry.querySelectorAll('.item-info-wrapper')].filter(visible);
+        if (infos.length === 1 && /^\S.*?\s*ID\s*[:：]\s*\S.*$/.test(text(infos[0]))) return true;
+      }
+      const cellText = text(wrap.closest('td,[role="cell"]') || wrap);
+      const linked = [...cellText.matchAll(/(?:^|\s)\S+\s+ID\s*[:：]\s*([A-Za-z0-9_-]{4,32})\s+管理(?:手动添加)?抖音号(?=\s|$)/g)];
+      return linked.length === 1 && !/^\d{15,20}$/.test(linked[0][1]);
     };
     if (mainRoots.length === 1) {
       for (const row of [...mainRoots[0].querySelectorAll('tr,[role="row"]')].filter(visible)) {
@@ -689,6 +713,11 @@ function actionApply(action) {
   // NEAREST ancestor that owns exactly this one visible editable input and carries
   // a unique ROI or budget label; big/mixed/search/page/cost/bid contexts refused.
   function classifyFillField(input) {
+    // A checkbox's explanatory copy can mention ROI. Only editable value
+    // inputs can be the numeric target or budget field.
+    if (input.tagName !== 'INPUT' || !['', 'text', 'number', 'tel'].includes(String(input.getAttribute('type') || '').toLowerCase())) {
+      return { ok: false, field: null, reason: 'not-numeric-value-input' };
+    }
     const ownHint = [input.getAttribute('placeholder') || '', input.getAttribute('aria-label') || '', input.getAttribute('title') || ''].join(' ');
     // The real ROI label sits far above the input ("综合营销ROI目标(含达人佣金)",
     // with help text mentioning 出价分析/综合成本), so the walk is bounded at 12
@@ -842,17 +871,36 @@ function publishApply(cmd) {
   // serialized closure stays self-contained): one VISIBLE manual .aweme-entry outside the
   // auto-pull subtree, carrying 管理(手动添加)抖音号 AND a visible .item-info-wrapper with a
   // non-empty name + explicit non-empty ID. Anything weaker stays 0 -> the guard throws.
+  const accountHeaders = mainRoots.length === 1
+    ? [...mainRoots[0].querySelectorAll('tr,[role="row"]')].filter(visible)
+      .map(row => [...row.children].filter(visible).map(text))
+      .filter(labels => ['商品信息', '投放抖音号', '素材', '操作'].every(label => labels.includes(label)))
+    : [];
+  const accountHeader = accountHeaders.length === 1 ? accountHeaders[0] : null;
+  const accountColumn = accountHeader?.indexOf('投放抖音号') ?? -1;
   const singleManualAwemeRow = row => {
     const wraps = [...row.querySelectorAll('.aweme-wrapper')].filter(visible);
-    if (wraps.length !== 1) return false;
-    const auto = [...wraps[0].querySelectorAll('.auto-pull-aweme-wrapper')];
-    const entries = [...wraps[0].querySelectorAll('.aweme-entry')].filter(e => !auto.some(a => a.contains(e)));
-    if (entries.length !== 1 || !visible(entries[0])) return false;
-    if (!/管理(?:手动添加)?抖音号/.test(text(entries[0]))) return false;
-    const infos = [...entries[0].querySelectorAll('.item-info-wrapper')].filter(visible);
-    if (infos.length !== 1) return false;
-    const m = text(infos[0]).match(/^(\S.*?)\s*ID\s*[:：]\s*(\S.*?)$/);
-    return !!m && m[1].trim() !== '' && m[2].trim() !== '';
+    if (wraps.length > 1) return false;
+    const cells = [...row.children].filter(visible);
+    const auroraCells = cells.filter(cell => {
+      if (cell.tagName !== 'TD' && !cell.classList.contains('aurora-qc-table-cell')) return false;
+      const account = text(cell).match(/^\S.*?\s+ID\s*[:：]\s*([A-Za-z0-9_-]{4,32})\s+管理(?:手动添加)?抖音号(?:\s+(?:预估)?自动拉取\s*\d+\s*个)?$/);
+      return !!account && !/^\d{15,20}$/.test(account[1]);
+    });
+    const columnCell = accountColumn >= 0 && cells.length === accountHeader.length ? cells[accountColumn] : null;
+    const wrap = wraps[0] || columnCell || (auroraCells.length === 1 ? auroraCells[0] : null);
+    if (!wrap) return false;
+    const auto = [...wrap.querySelectorAll('.auto-pull-aweme-wrapper')];
+    const entries = [...wrap.querySelectorAll('.aweme-entry')].filter(e => visible(e) && !auto.some(a => a.contains(e)));
+    if (entries.length > 1) return false;
+    const entry = entries[0];
+    if (entry && /管理(?:手动添加)?抖音号/.test(text(entry))) {
+      const infos = [...entry.querySelectorAll('.item-info-wrapper')].filter(visible);
+      if (infos.length === 1 && /^\S.*?\s*ID\s*[:：]\s*\S.*$/.test(text(infos[0]))) return true;
+    }
+    const cellText = text(wrap.closest('td,[role="cell"]') || wrap);
+    const linked = [...cellText.matchAll(/(?:^|\s)\S+\s+ID\s*[:：]\s*([A-Za-z0-9_-]{4,32})\s+管理(?:手动添加)?抖音号(?=\s|$)/g)];
+    return linked.length === 1 && !/^\d{15,20}$/.test(linked[0][1]);
   };
   for (const row of [...mainRoots[0].querySelectorAll('tr,[role="row"]')].filter(visible)) {
     if (row.closest(dialogSel)) continue;
@@ -893,6 +941,7 @@ function publishApply(cmd) {
     // same nearest-unique-labeled-container rule the observer uses for fills
     const found = [];
     for (const inp of [...document.querySelectorAll('input,textarea')].filter(visible)) {
+      if (inp.tagName !== 'INPUT' || !['', 'text', 'number', 'tel'].includes(String(inp.getAttribute('type') || '').toLowerCase())) continue;
       let anc = inp.parentElement, level = 0;
       while (anc && level < 12) {
         const edits = [...anc.querySelectorAll('input,textarea')].filter(visible);

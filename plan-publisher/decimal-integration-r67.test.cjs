@@ -68,7 +68,7 @@ function makeFakePage(stateOver) {
   return { page, state, calls };
 }
 
-function makeDriver(page, bizOver) {
+function makeDriver(page, bizOver, settingsReadbackSettleMs = 20) {
   return rp.createRealDrivers({
     page, managerPage: page, context: {}, dayState: {}, persist: async () => {},
     publishedIds: new Set(), attemptedSet: new Set(), hints: {},
@@ -77,7 +77,7 @@ function makeDriver(page, bizOver) {
     boundAccounts: ['79863866', '9zmao_fushi'], productsPerPlan: 30,
     creationUrl: 'https://qianchuan.jinritemai.com/uni-creation/overall-product-multi?aavid=' + ACCOUNT,
     opened: {}, projectRoot: __dirname, planNumber: 1, runId: 'r67-offline',
-    settingsReadbackSettleMs: 20,
+    settingsReadbackSettleMs,
   });
 }
 
@@ -182,6 +182,27 @@ test('C4 direct-pay left true never reaches ready', async () => {
   assert.strictEqual(result.reason, 'commission-or-direct-pay-state-unknown');
   assert.strictEqual(calls.directPayFix, 1);
   assert.strictEqual(calls.publishClicks, 0);
+});
+
+test('settings remount settles in the same draft and persistent ambiguity stops before filling', async () => {
+  for (const transient of [true, false]) {
+    const { page, calls } = makeFakePage();
+    const evaluate = page.evaluate;
+    let ambiguousReads = 0;
+    page.evaluate = async (fn, arg) => {
+      const result = await evaluate(fn, arg);
+      if (fn === guard.pageObserve && calls.observes >= 3 && (!transient || ambiguousReads === 0)) {
+        result.elements.push({ ...result.elements[0], index: 2 });
+        ambiguousReads++;
+      }
+      return result;
+    };
+    const result = await makeDriver(page, {}, transient ? 2000 : 20).configurePlan({ businessDate: BUSINESS_DATE });
+    assert.strictEqual(result.ok, transient);
+    if (!transient) assert.strictEqual(result.reason, 'roi-budget-fields-not-unique');
+    assert.deepStrictEqual(calls.fills, []);
+    assert.strictEqual(calls.nameWrites.length, transient ? 1 : 0);
+  }
 });
 
 test('C5 wrong budget stops with budget-kind fill attempted', async () => {

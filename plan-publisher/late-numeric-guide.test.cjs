@@ -43,7 +43,7 @@ function lateGuidePagerHost(cfg = {}) {
   const capacity = wf.BUSINESS.productsPerPlan - baseIds.length;
   const checked = new Set((cfg.checkedIds || []).map(String));
   const batchCount = () => [...checked].filter(id => !baseSet.has(id)).length;
-  let page = 1, submitClicks = 0, selectCalls = 0, leafClickCalls = 0, nextClickCalls = 0, readCalls = 0, screenshotCalls = 0, screenshotTimeout = null, postClickObserveReads = 0;
+  let page = cfg.openPage || 1, submitClicks = 0, selectCalls = 0, leafClickCalls = 0, nextClickCalls = 0, readCalls = 0, screenshotCalls = 0, screenshotTimeout = null, postClickObserveReads = 0;
   let closed = false, guideArmed = false, guideActive = false, guideSeen = false, guideSteps = 0, cookieSaves = 0, flagSaves = 0;
   let driftLive = false;
   const STRANGER = '399999999999999991';
@@ -469,4 +469,15 @@ test('numeric pager preserves its cursor when repeated cards lack a matching tar
       }
     });
   }
+});
+
+
+test('reopening All on the saved page resumes there without advancing past its products', async () => {
+  const ids = Array.from({ length: 30 }, (_, i) => '384581162524855' + String(2000 + i));
+  const host = lateGuidePagerHost({ openPage: 2, cursorPage: 2, page2Ids: ids });
+  const result = await host.run();
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.selectedIds, ids);
+  assert.equal(host.state().leafClickCalls, 0);
+  assert.equal(host.state().cursorPage, 2);
 });

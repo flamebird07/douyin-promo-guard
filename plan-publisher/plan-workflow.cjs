@@ -257,6 +257,8 @@ function loadDayState(file, businessDate) {
       category: CATEGORY_TAB_ORDER.includes(p.category) ? p.category : CATEGORY_TAB_ORDER[0],
       lastSelected: Array.isArray(p.lastSelected) ? p.lastSelected.map(String) : [],
       attempted: Array.isArray(p.attempted) ? p.attempted.map(String) : [],
+      autoPullExcluded: Array.isArray(p.autoPullExcluded) ? p.autoPullExcluded.map(String) : [],
+      catalogFallbackToAll: p.catalogFallbackToAll === true,
       cursor: p.cursor && typeof p.cursor === 'object'
         ? { category: CATEGORY_TAB_ORDER.includes(p.cursor.category) ? p.cursor.category : CATEGORY_TAB_ORDER[0], page: Number.isInteger(p.cursor.page) && p.cursor.page >= 1 ? p.cursor.page : 1, seenProductIds: Array.isArray(p.cursor.seenProductIds) ? p.cursor.seenProductIds.map(String) : [] }
         : { category: CATEGORY_TAB_ORDER.includes(p.category) ? p.category : CATEGORY_TAB_ORDER[0], page: Number.isInteger(p.page) && p.page >= 1 ? p.page : 1, seenProductIds: [] },
@@ -429,10 +431,8 @@ function classifyAvailabilityEvidence(input) {
 
 // The fresh main table is the source of truth for COUNTS, but it cannot show a hover-only
 // duplicate tooltip. When a failed bind already proved per-product explicit evidence for
-// THIS batch, that evidence is merged onto the matching fresh row — only the explicit
-// alreadyPlanned / reviewFailed / autoPullOnly flags, never a count, never a foreign id.
-// Fresh rows keep their own manualAccounts / manualEvidence, so a good row can never turn
-// into a removal just because an old (or another product's) proof existed.
+// THIS batch, merge only matching explicit availability flags and a settled panel zero.
+// The panel zero fills missing negative evidence and cannot replace a positive live count.
 function mergeSettledPanelEvidence(freshRows, evidenceRows) {
   const rows = Array.isArray(freshRows) ? freshRows : [];
   const evidence = new Map((Array.isArray(evidenceRows) ? evidenceRows : [])
@@ -444,7 +444,9 @@ function mergeSettledPanelEvidence(freshRows, evidenceRows) {
     const already = ev.alreadyPlanned === true;
     const review = ev.reviewFailed === true;
     const auto = ev.autoPullOnly === true;
-    if (!already && !review && !auto) return r;
+    const panelZero = ev.panelZeroConfirmed === true
+      && !(Number.isInteger(r.manualAccounts) && r.manualAccounts >= 1);
+    if (!already && !review && !auto && !panelZero) return r;
     const text = String(r.text || '');
     return {
       ...r,
@@ -452,6 +454,7 @@ function mergeSettledPanelEvidence(freshRows, evidenceRows) {
       alreadyPlanned: r.alreadyPlanned === true || already,
       reviewFailed: r.reviewFailed === true || review,
       autoPullOnly: r.autoPullOnly === true || auto,
+      ...(panelZero ? { manualAccounts: 0, manualCountKnown: true, manualEvidence: true } : {}),
     };
   });
 }
@@ -474,7 +477,9 @@ function parseMainTableRow(rowText) {
   // 「自动拉取 N 个」两种形态（前者旧版/部分页面，后者当前创建页实测），同为 auto-pull-only
   // 已知零手动绑定状态，正则同时接受两种前缀。
   const autoPullOnly = !mm && !singleManual && /(?:预估)?自动拉取\s*\d+\s*个/.test(text);
-  const manualAccounts = mm ? Number(mm[1]) : (singleManual ? 1 : (autoPullOnly ? 0 : null));
+  const explicitUnbound = !mm && !singleManual && !/管理(?:手动添加)?抖音号/.test(text)
+    && text.includes('请为该商品选择要投放的抖音号，或开启联盟合作达人自动投 添加抖音号');
+  const manualAccounts = mm ? Number(mm[1]) : (singleManual ? 1 : (autoPullOnly || explicitUnbound ? 0 : null));
   return {
     productId: uniq.length === 1 ? uniq[0] : null,
     ambiguous: uniq.length > 1,
@@ -486,8 +491,8 @@ function parseMainTableRow(rowText) {
     // A visible auto-pull-only counter is known state (zero manual bindings),
     // but it is not manual-binding evidence. Keep it distinct from an unknown
     // parse so the exact deficient row can be repaired without guessing.
-    manualEvidence: !!mm || singleManual,
-    manualCountKnown: !!mm || singleManual || autoPullOnly,
+    manualEvidence: !!mm || singleManual || explicitUnbound,
+    manualCountKnown: !!mm || singleManual || autoPullOnly || explicitUnbound,
     autoPullOnly,
     reviewFailed: text.includes(REVIEW_FAILED_MARK),
     alreadyPlanned: text.includes(ALREADY_PLANNED_MARK),
@@ -637,6 +642,14 @@ function advanceCatalogCursor(cursor, proof) {
 // Final fresh gate before any publish: 30 unique rows, each with >=1 manual account,
 // no review-failed row, and the exact settings, observed on at least two consecutive
 // stable reads. Unknown / not-yet-stable / drifting settings is never ready.
+function bindingReadbackReconciled(readiness, expectedIds) {
+  const actual = new Set(readiness.uniqueIds);
+  return readiness.rowCount === expectedIds.length && actual.size === expectedIds.length
+    && expectedIds.every(id => actual.has(String(id))) && readiness.ambiguousCount === 0
+    && readiness.unknownManualIds.length === 0
+    && (readiness.ready || readiness.deficientIds.length > 0);
+}
+
 function reviewStabilityContract(input) {
   const o = input || {};
   const cap = Number.isInteger(o.capacity) ? o.capacity : bizOf(o.business).productsPerPlan;
@@ -1112,7 +1125,13 @@ async function preparePlan(deps) {
       cursor: (browseResult && browseResult.cursor) || workingState.cursor,
     };
     await persistState(workingState);
+    if (browseResult.catalogExhaustedPartial === true && browseResult.lastPageReached === true
+      && selected.length > 0 && selected.length < biz.productsPerPlan) {
+      catalogExhaustedPartial = true;
+      catalogLastPageReached = true;
+    }
   };
+  let catalogLastPageReached = false;
   const commitCatalogExhaustPartial = async (browseResult) => {
     await adoptBrowseSelection(browseResult);
     if (typeof d.commitPicker !== 'function') {
@@ -1129,24 +1148,40 @@ async function preparePlan(deps) {
       };
     }
     catalogExhaustedPartial = true;
+    catalogLastPageReached = browseResult.lastPageReached === true;
     effectiveCapacity = selected.length;
     return null;
   };
+  const browseFrom = async request => {
+    try {
+      return await d.browseProducts(request);
+    } catch (error) {
+      // A broken native cursor cannot prove the next native list. Switching to the
+      // independently verified numeric list is allowed only with an empty picker.
+      if (error?.message !== 'native-catalog-anomaly:catalog-cursor-chain-broken'
+        || request.categories.length === 1 || request.selectedIds.length !== 0 || workingState.lastSelected.length !== 0) throw error;
+      await saveProgress({ catalogFallbackToAll: true });
+      return d.browseProducts({ ...request, categories: ['全部'], resetCursor: true, allowAttemptedReuse: true });
+    }
+  };
   if (typeof d.browseProducts === 'function') {
-    browse = await d.browseProducts({
+    const rescan = d.restartExhaustedCatalog === true && selected.length === 0;
+    browse = await browseFrom({
       selectedIds: selected, hints, publishedSet, attemptedSet,
       cursor: workingState.cursor || { category: workingState.category || CATEGORY_TAB_ORDER[0], page: workingState.page || 1 },
       needed: biz.productsPerPlan - selected.length,
       categories,
       onProgress: saveProgress,
+      ...(rescan || d.reuseClosedDraftCandidates === true ? { allowAttemptedReuse: true } : {}),
+      ...(rescan ? { resetCursor: true } : {}),
     });
     if (!browse || browse.ok !== true) {
       let reason = String((browse && browse.reason) || 'real-selection-not-confirmed');
       let partial = ((browse && browse.selectedIds) || selected || []).map(String);
       // 目录耗尽且本轮 0 选中：不清空 attempted，从头复扫并允许勾选已 attempted 未发布商品。
       // 避免上次未提交勾选被记入 attempted 后下轮永远选不满、也无法偏提交。
-      if (/catalog-exhausted/.test(reason) && partial.length < 1) {
-        browse = await d.browseProducts({
+      if (!rescan && partial.length === 0 && /catalog-exhausted|^below-20-last-page-not-reached$/.test(reason)) {
+        browse = await browseFrom({
           selectedIds: [], hints, publishedSet, attemptedSet,
           cursor: { category: categories[0], page: 1 },
           needed: biz.productsPerPlan,
@@ -1215,7 +1250,8 @@ async function preparePlan(deps) {
   // 3) bind the approved target accounts to every product (header select-all once
   //    + batch apply), then read the main table and remove/backfill until 30 valid,
   //    each with at least 1 manually bound target account (R32; 2 is also fine).
-  const binding = await d.bindAccountsToAll({ productIds: selected });
+  const binding = await d.bindAccountsToAll({ productIds: selected, ...(catalogExhaustedPartial ? { catalogExhaustedPartial } : {}) });
+  let latestBinding = binding && binding.ok === true ? binding : null;
   // Account binding and plan configuration are both followed by a bounded PASSIVE read
   // of the CURRENT 30 rows: the platform can raise 广告审核不通过 a few seconds after the
   // first ready read. When the real driver exposes awaitMainTableStable the contract
@@ -1318,7 +1354,9 @@ async function preparePlan(deps) {
       && proof.removeIds.length === effectiveCapacity
       // Replaceable: explicit platform copy OR binder-exhausted unbindable batch (乘方可选不可绑).
       && (batchUnbindableExhausted || candidates.every(r => r.alreadyPlanned === true || r.reviewFailed === true || r.autoPullOnly === true || r.unbindableExhausted === true));
-    if (!allProven) {
+    const reconciled = binding?.reason === 'manual-account-bind-readback-does-not-match-recorded-outcome'
+      && readback && bindingReadbackReconciled(readback, selected);
+    if (!allProven && !reconciled) {
       const bindingDiag = sanitizeBindingDiagnostic(binding && binding.diag);
       return {
         status: 'stopped', stage: 'account-binding',
@@ -1334,7 +1372,7 @@ async function preparePlan(deps) {
     if (!rr.ok) {
       return { status: 'stopped', stage: 'stable-read', reason: 'pre-configuration-' + rr.reason, businessDate };
     }
-    mainRows = rr.rows;
+    mainRows = mergeSettledPanelEvidence(rr.rows, bindingRows);
   }
   provenDuplicateIds = duplicateIdsOf(mainRows);
   hints = mergeCardHints(hints, mainRows.map(r => ({
@@ -1377,12 +1415,15 @@ async function preparePlan(deps) {
     // 不足 20：不允许因绑不上提前发布，继续补到「全部」最后一页。
     const publishBoundNow = boundCount > 20 && bindStall >= 2
       && plan.mode === 'partial-removal' && plan.blockedUnknownIds.length === 0;
+    const removeWithoutBackfill = publishBoundNow || (catalogExhaustedPartial
+      && (catalogLastPageReached || boundCount > 20)
+      && boundCount > 0 && plan.mode === 'partial-removal' && plan.blockedUnknownIds.length === 0);
     let repaired;
     try {
       repaired = await d.repairDraft({
         removeIds: plan.removeIds,
-        backfillIds: publishBoundNow ? [] : plan.backfillIds,
-        backfillCount: publishBoundNow ? 0 : plan.need,
+        backfillIds: removeWithoutBackfill ? [] : plan.backfillIds,
+        backfillCount: removeWithoutBackfill ? 0 : plan.need,
         rows: mainRows,
         state: workingState,
         publishedSet,
@@ -1391,8 +1432,8 @@ async function preparePlan(deps) {
         failedIds: bindingFailedIds,
         bindingRows: bindingRows || mainRows,
         provenDuplicateIds,
-        repairMode: publishBoundNow ? 'remove-only-publish' : plan.mode,
-        requireNextPage: publishBoundNow ? false : plan.requireNextPage,
+        repairMode: removeWithoutBackfill ? 'remove-only-publish' : plan.mode,
+        requireNextPage: removeWithoutBackfill ? false : plan.requireNextPage,
         onProgress: saveProgress,
       });
     } catch (error) {
@@ -1404,10 +1445,13 @@ async function preparePlan(deps) {
         throw error;
       }
     }
-    if (publishBoundNow && repaired && repaired.ok === true) {
+    if (removeWithoutBackfill && repaired && repaired.ok === true) {
       finalRows = Array.isArray(repaired.mainRows) ? repaired.mainRows : [];
-      if (finalRows.length <= 20) {
-        return { status: 'stopped', stage: 'readiness-after-repair', reason: 'bind-stall-remaining-below-20', readiness, plan, businessDate };
+      const removedIds = new Set(plan.removeIds.map(String));
+      const expectedIds = new Set(mainRows.map(row => String(row.productId)).filter(id => !removedIds.has(id)));
+      const actualIds = new Set(finalRows.map(row => String(row.productId)));
+      if (finalRows.length !== boundCount || actualIds.size !== expectedIds.size || [...actualIds].some(id => !expectedIds.has(id))) {
+        return { status: 'stopped', stage: 'readiness-after-repair', reason: 'remove-only-remaining-products-mismatch', readiness, plan, businessDate };
       }
       effectiveCapacity = finalRows.length;
       readiness = evaluateReadiness(finalRows, effectiveCapacity);
@@ -1427,7 +1471,7 @@ async function preparePlan(deps) {
       const repairReason = String((repaired && repaired.reason) || 'repair-not-confirmed');
       const catalogGone = /catalog-exhausted|native-catalog-no-progress/.test(repairReason);
       const remainingValid = effectiveCapacity - plan.need;
-      const lastPage = repaired && repaired.lastPageReached === true;
+      const lastPage = catalogLastPageReached || (repaired && repaired.lastPageReached === true);
       if (remainingValid < 20 && !lastPage && /catalog-exhausted|below-20-last-page|native-catalog-no-progress/.test(repairReason)) {
         return { status: 'stopped', stage: 'repair', reason: 'below-20-last-page-not-reached', readiness, plan, businessDate };
       }
@@ -1483,6 +1527,7 @@ async function preparePlan(deps) {
           return { status: 'stopped', stage: 'readiness-after-repair', reason: 'catalog-exhausted-remaining-not-ready', readiness, plan, businessDate };
         }
         catalogExhaustedPartial = true;
+        catalogLastPageReached = lastPage === true;
         mainRows = finalRows;
         break;
       }
@@ -1500,13 +1545,21 @@ async function preparePlan(deps) {
     })));
     workingState = { ...workingState, hints };
     await persistState(workingState);
-    const afterRepair = evaluateReadiness(finalRows, biz.productsPerPlan);
+    if (repaired.catalogExhaustedPartial === true && repaired.lastPageReached === true
+      && finalRows.length > 0 && finalRows.length < biz.productsPerPlan) {
+      effectiveCapacity = finalRows.length;
+      catalogExhaustedPartial = true;
+      catalogLastPageReached = true;
+    }
+    const afterRepair = evaluateReadiness(finalRows, effectiveCapacity);
     if (repaired.selectedCount === 0 || repaired.progress === false) {
       return { status: 'stopped', stage: 'readiness-after-repair', reason: 'repair-made-no-progress', readiness: afterRepair, businessDate };
     }
-    const rebound = await d.bindAccountsToAll({ productIds: afterRepair.uniqueIds, repairRound: round + 1 });
+    const rebound = await d.bindAccountsToAll({ productIds: afterRepair.uniqueIds, repairRound: round + 1,
+      ...(catalogExhaustedPartial ? { catalogExhaustedPartial } : {}) });
     // 2026-11-22：partial 绑定成功时也要刷新 failedIds/rows，否则下一轮 repair 仍拿首轮失败集。
     if (rebound && rebound.ok === true) {
+      latestBinding = rebound;
       bindingFailedIds = Array.isArray(rebound.failedIds) ? rebound.failedIds.map(String) : [];
       if (Array.isArray(rebound.rows) && rebound.rows.length) bindingRows = rebound.rows;
     }
@@ -1515,30 +1568,27 @@ async function preparePlan(deps) {
       // 下一轮 repair/轮转，不要在 account-rebinding 直接停死。
       const rebindRows = Array.isArray(rebound && rebound.rows) ? rebound.rows : null;
       const rebindExhausted = rebound && rebound.batchUnbindableExhausted === true
-        && rebindRows && rebindRows.length === biz.productsPerPlan
+        && rebindRows && rebindRows.length === effectiveCapacity
         && afterRepair.uniqueIds.every(id => rebindRows.some(r => String(r.productId) === String(id)));
       let replacementRows = rebindExhausted ? normalizeReplacementRows(rebindRows) : null;
       if (!replacementRows && rebound?.reason === 'manual-account-bind-readback-does-not-match-recorded-outcome'
         && typeof d.awaitMainTableStable === 'function') {
-        // 平台提交抖音号绑定后，主表仍可能明确显示整批为零。只按重新稳定读取的当前批次轮转。
+        // The batch response can disagree with the settled current draft. Keep
+        // positive rows and repair confirmed zero rows only if every exact ID is known.
         const stable = await readRows();
-        if (stable.ok && stable.rows.length === effectiveCapacity) {
+        if (stable.ok) {
           const candidates = normalizeReplacementRows(stable.rows);
-          const proof = planRemovalAndBackfill({ rows: candidates, capacity: effectiveCapacity, attemptedSet, publishedSet });
-          const candidateIds = new Set(candidates.map(r => String(r.productId)));
-          if (candidateIds.size === effectiveCapacity && afterRepair.uniqueIds.every(id => candidateIds.has(String(id)))
-            && proof.removeIds.length === effectiveCapacity && proof.blockedUnknownIds.length === 0
-            && candidates.every(r => r.alreadyPlanned === true || r.reviewFailed === true
-              || (r.autoPullOnly === true && r.manualAccounts === 0))) replacementRows = candidates;
+          const current = evaluateReadiness(candidates, effectiveCapacity, biz);
+          if (bindingReadbackReconciled(current, afterRepair.uniqueIds)) replacementRows = candidates;
         }
       }
       if (replacementRows) {
         mainRows = replacementRows;
         bindingFailedIds = rebindExhausted && Array.isArray(rebound.failedIds)
-          ? rebound.failedIds.map(String) : replacementRows.map(r => String(r.productId));
+          ? rebound.failedIds.map(String) : evaluateReadiness(replacementRows, effectiveCapacity).deficientIds;
         bindingRows = replacementRows;
         provenDuplicateIds = duplicateIdsOf(mainRows);
-        readiness = evaluateReadiness(mainRows, biz.productsPerPlan);
+        readiness = evaluateReadiness(mainRows, effectiveCapacity);
         emitReadiness(readiness, 'rebind-unbindable-exhausted', round + 1);
         finalRows = mainRows;
         continue;
@@ -1551,14 +1601,14 @@ async function preparePlan(deps) {
     }
     const rrAfter = await readRows();
     if (!rrAfter.ok) return { status: 'stopped', stage: 'stable-read', reason: 'after-rebind-' + rrAfter.reason, businessDate };
-    mainRows = rrAfter.rows;
+    mainRows = mergeSettledPanelEvidence(rrAfter.rows, bindingRows);
     hints = mergeCardHints(hints, mainRows.map(r => ({
       productId: r.productId, text: r.text || '', migrationWarning: r.migrationWarning,
       precheckRisk: r.precheckRisk || r.precheck, reviewFailed: r.reviewFailed,
     })));
     workingState = { ...workingState, hints };
     await persistState(workingState);
-    readiness = evaluateReadiness(mainRows, biz.productsPerPlan);
+    readiness = evaluateReadiness(mainRows, effectiveCapacity);
     emitReadiness(readiness, 'after-rebind', round + 1);
     finalRows = mainRows;
     if (readiness.ready) break;
@@ -1616,6 +1666,9 @@ async function preparePlan(deps) {
       // 已是目录耗尽部分计划：配置后再出坏行只删不补。否则先走正常回填；
       // 仅当 browse 真回报 catalog-exhausted 时才降容量发布。
       if (catalogExhaustedPartial === true && lateRemaining >= 1 && lateRemaining < effectiveCapacity) {
+        if (lateRemaining <= 20 && !catalogLastPageReached) {
+          return { status: 'stopped', stage: 'repair', reason: 'below-20-last-page-not-reached', readiness: postReadiness, businessDate };
+        }
         const repaired = await d.repairDraft({
           removeIds: latePlan.removeIds,
           backfillIds: [],
@@ -1670,7 +1723,9 @@ async function preparePlan(deps) {
       });
       if (!repaired || repaired.ok === false) {
         const lateReason = String((repaired && repaired.reason) || 'repair-not-confirmed');
-        if (/catalog-exhausted/.test(lateReason) && lateRemaining >= 1 && lateRemaining < effectiveCapacity) {
+        const lateLastPage = repaired?.lastPageReached === true;
+        if (/catalog-exhausted/.test(lateReason) && lateRemaining >= 1 && lateRemaining < effectiveCapacity
+          && (lateLastPage || lateRemaining > 20)) {
           let keptRows = Array.isArray(repaired.mainRows) ? repaired.mainRows : null;
           if (!keptRows) {
             const rr = await readRows();
@@ -1679,6 +1734,7 @@ async function preparePlan(deps) {
           }
           effectiveCapacity = keptRows.length;
           catalogExhaustedPartial = true;
+          catalogLastPageReached = lateLastPage;
           finalRows = keptRows;
           mainRows = keptRows;
           const reconfigured = await d.configurePlan({ planNumber: d.planNumber, businessDate, mainRows: finalRows });
@@ -1697,6 +1753,12 @@ async function preparePlan(deps) {
         if (!rr.ok) return { status: 'stopped', stage: 'stable-read', reason: 'after-configuration-repair-' + rr.reason, businessDate };
         repairedRows = rr.rows;
       }
+      if (repaired.catalogExhaustedPartial === true && repaired.lastPageReached === true
+        && repairedRows.length > 0 && repairedRows.length < biz.productsPerPlan) {
+        effectiveCapacity = repairedRows.length;
+        catalogExhaustedPartial = true;
+        catalogLastPageReached = true;
+      }
       const afterRepair = evaluateReadiness(repairedRows, effectiveCapacity, biz);
       hints = mergeCardHints(hints, repairedRows.map(r => ({
         productId: r.productId, text: r.text || '', migrationWarning: r.migrationWarning,
@@ -1704,11 +1766,13 @@ async function preparePlan(deps) {
       })));
       workingState = { ...workingState, hints };
       await persistState(workingState);
-      const rebound = await d.bindAccountsToAll({ productIds: afterRepair.uniqueIds, repairRound: 'post-configuration' });
+      const rebound = await d.bindAccountsToAll({ productIds: afterRepair.uniqueIds, repairRound: 'post-configuration',
+        ...(catalogExhaustedPartial ? { catalogExhaustedPartial } : {}) });
       if (d.requireRealDrivers === true && (!rebound || rebound.ok !== true)) {
         const rebindDiag = sanitizeBindingDiagnostic(rebound && rebound.diag);
         return { status: 'stopped', stage: 'account-rebinding', reason: (rebound && rebound.reason) || 'post-configuration-rebinding-not-confirmed', bindingDiag: rebindDiag, businessDate };
       }
+      if (rebound && rebound.ok === true) latestBinding = rebound;
       const rrStable = await readRows();
       if (!rrStable.ok) return { status: 'stopped', stage: 'stable-read', reason: 'post-configuration-rebind-' + rrStable.reason, businessDate };
       mainRows = rrStable.rows;
@@ -1727,9 +1791,10 @@ async function preparePlan(deps) {
   // resolves to its frozen two). A generic shop that resolves to NONE must stop
   // here (fail-closed) instead of freezing an unauthorizable plan or silently
   // inheriting the legacy default.
-  const boundAccounts = (binding && Array.isArray(binding.accountIds) && binding.accountIds.length)
-    ? binding.accountIds.map(String)
-    : (d.boundAccounts || approvedTargets(biz) || null);
+  const driverTargets = typeof d.getResolvedBoundAccounts === 'function' ? d.getResolvedBoundAccounts() : null;
+  const bindingTargets = latestBinding && latestBinding.accountIds;
+  const boundAccounts = [driverTargets, bindingTargets, d.boundAccounts, approvedTargets(biz)]
+    .find(targets => Array.isArray(targets) && targets.length > 0)?.map(String) || null;
   if (d.requireRealDrivers === true && (!boundAccounts || boundAccounts.length < 1)) {
     return { status: 'stopped', stage: 'account-binding', reason: 'no-approved-bind-targets', businessDate };
   }
@@ -1777,6 +1842,7 @@ async function publishConfirmedPlan(frozen, request, deps) {
   // Re-observe and re-check against the frozen info before consuming/clicking.
   const obs = await d.observe();
   if (!obs || !obs.observation) return { status: 'refused', reason: 'fresh-observation-missing' };
+  if (obs.creation?.visibleDialogCount > 0) return { status: 'refused', reason: 'blocking-dialog-before-initial' };
   const authorization = { ...verdict.authorization, observation: obs.observation };
   const cmd = { op: 'publish-plan', planNumber: frozen.planNumber, authorization };
   let clickResult;

@@ -1449,31 +1449,8 @@ async function recoverLocalPreparationClose(shopLike, businessDate, opts) {
     }
     // 手动发布事实也是消费面：缺数组（错型）一律不可知，绝不当成"没有手动发布"。
     if (!Array.isArray(raw.manualUiPublicationFacts)) return bind({ ok: false, status: 'refused', reason: 'local-recovery-manual-facts-unreadable' });
-    // 2026-11-21 新机首跑适配（Mac）：attempts 文件在**首次真实派发**前不存在——发布器自身
-    // loader 的官方语义即"仅缺文件 = 首次尝试"（direct-draft-controller loadAttemptsStore
-    // ENOENT → {consumed:{},finalConsumed:{}}）。本仓严格恢复 reader 却拒缺文件，导致全新
-    // 机器一旦在准备期异常（如目录响应异常）就永久卡死、无人能解。窄门物化：仅当
-    // ①state.businessDate 与恢复目标日一致 ②active.status==='preparing' ③runId 为**当日**
-    // scheduled origin ④attempts 文件确实缺失——四条同时成立，才按 loader 官方空表形态
-    // 物化三表（consumed/finalConsumed/reopenConsumed = {}），随后走既有严格证明链
-    // （R127 语义对齐：缺键=空表；证明/哈希 CAS 照常覆盖新文件）。任何一条不成立照旧拒绝。
-    if (!fs.existsSync(paths.attemptsFile)
-        && String(raw.businessDate || '') === date
-        && a.status === 'preparing'
-        && String(a.runId || '') !== '') {
-      const activeOrigin = SCHEDULED_RUN_ORIGIN_RE.exec(String(a.runId || ''));
-      if (activeOrigin && activeOrigin[1] === date) {
-        try {
-          const emptyStore = { consumed: {}, finalConsumed: {}, reopenConsumed: {} };
-          const tmpAttempts = `${paths.attemptsFile}.tmp-${process.pid}`;
-          fs.writeFileSync(tmpAttempts, JSON.stringify(emptyStore, null, 2) + '\n');
-          fs.renameSync(tmpAttempts, paths.attemptsFile);
-          try { console.warn('[plan-publisher] local-recovery-attempts-materialized', shop, date, 'planNumber=' + Number(a.planNumber), '（新机首跑：缺文件按 loader 首次尝试官方语义物化空表）'); } catch (_) {}
-        } catch (e) {
-          return bind({ ok: false, status: 'refused', reason: 'local-recovery-attempts-materialize-failed:' + scheduledErrorText(e) });
-        }
-      }
-    }
+    // The generic recovery route needs the original attempts record. First-run
+    // recovery with an absent file uses the separate proof of no publication.
     // B：三张表必须原始存在且为对象；缺表/错型 = 不可知，绝不把 guard loader 的默认补表当零。
     const attemptsStrict = readStrictLocalAttemptsStore(paths.attemptsFile);
     if (!attemptsStrict.ok) return bind({ ok: false, status: 'refused', reason: attemptsStrict.reason });
@@ -1908,7 +1885,7 @@ async function ensureDirectPayOffInPage() {
   throw new Error('direct-pay-uncheck-not-confirmed');
 }
 
-function drawerSnapshotInPage() {
+function drawerSnapshotInPage(request) {
   const visible = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
   const txt = e => (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
   const selector = '[role="dialog"],[aria-modal="true"],[class*="dialog"],[class*="Dialog"],[class*="drawer"],[class*="Drawer"],[class*="modal"],[class*="Modal"]';
@@ -1932,6 +1909,12 @@ function drawerSnapshotInPage() {
     return { id: m ? m[1] : null, text: text.slice(0, 1200), disabled: card.getAttribute('aria-disabled') === 'true' || !!card.querySelector('.card-product-item--disabled,[aria-disabled="true"],[disabled]'), checkboxCount: checks.length, checked: checks.length === 1 ? checks[0].checked === true : null };
   });
   const footer = root.innerText.match(/已选\s*(\d+)\s*\/\s*(\d{1,2})/);
+  if (request?.emptyPickerCancelTarget === true) {
+    const cancel = [...root.querySelectorAll('button,[role="button"]')].filter(b => visible(b) && txt(b) === '取消');
+    return footer && Number(footer[1]) === 0 && Number(footer[2]) === request.capacity
+      && cancel.length === 1 && !cancel[0].disabled && cancel[0].getAttribute('aria-disabled') !== 'true'
+      ? cancel[0] : null;
+  }
   const { owners, leaf } = scopeTabs(root);
   const active = owners.filter(el => /active|selected|current/i.test(String(el.className || '')) || el.getAttribute('aria-selected') === 'true').map(leaf);
   const pager = [...root.querySelectorAll('[class*="pagination"],[class*="Pagination"],[class*="page-item"],[class*="pager"],[class*="Pager"],[class*="pages"]')].filter(visible);
@@ -3567,14 +3550,25 @@ function readMainTableInPage() {
   // "N个抖音号" counter always outranks this inference (contradiction keeps the counter).
   const singleManualCell=cellEl=>{
     const auto=[...cellEl.querySelectorAll('.auto-pull-aweme-wrapper')];
-    const entries=[...cellEl.querySelectorAll('.aweme-entry')].filter(e=>!auto.some(a=>a.contains(e)));
-    if(entries.length!==1||!visible(entries[0]))return false;
-    if(!/管理(?:手动添加)?抖音号/.test(txt(entries[0])))return false;
-    const infos=[...entries[0].querySelectorAll('.item-info-wrapper')].filter(visible);
-    if(infos.length!==1)return false;
-    const m=txt(infos[0]).match(/^(\S.*?)\s*ID\s*[:：]\s*(\S.*?)$/);
-    return !!m&&m[1].trim()!==''&&m[2].trim()!=='';
+    const entries=[...cellEl.querySelectorAll('.aweme-entry')].filter(e=>visible(e)&&!auto.some(a=>a.contains(e)));
+    if(entries.length>1)return false;
+    const entry=entries[0];
+    if(entry&&/管理(?:手动添加)?抖音号/.test(txt(entry))){
+      const infos=[...entry.querySelectorAll('.item-info-wrapper')].filter(visible);
+      if(infos.length===1&&/^\S.*?\s*ID\s*[:：]\s*\S.*$/.test(txt(infos[0])))return true;
+    }
+    // In the one-account layout the manage control can be a sibling of the
+    // account entry. The exact visible name, account ID and control must form a
+    // single record inside the unique account column.
+    const text=txt(cellEl.closest('td,[role="cell"]')||cellEl);
+    const linked=[...text.matchAll(/(?:^|\s)\S+\s+ID\s*[:：]\s*([A-Za-z0-9_-]{4,32})\s+管理(?:手动添加)?抖音号(?=\s|$)/g)];
+    return linked.length===1&&!/^\d{15,20}$/.test(linked[0][1]);
   };
+  const directCells=row=>[...row.children].filter(visible);
+  const headerRows=[...roots[0].el.querySelectorAll('tr,[role="row"],.ovui-table__row')].filter(visible)
+    .map(row=>directCells(row).map(txt)).filter(columns=>req.every(label=>columns.includes(label)));
+  const header=headerRows.length===1 ? headerRows[0] : null;
+  const column=header?.indexOf('投放抖音号') ?? -1;
   const rows=[];
   for(const row of [...roots[0].el.querySelectorAll('tr,[role="row"],.ovui-table__row')].filter(visible)){
     const text=txt(row); const ids=[...text.matchAll(/ID\s*[:：]\s*(\d{15,20})/g)].map(m=>m[1]);
@@ -3584,14 +3578,26 @@ function readMainTableInPage() {
     // empty (0) claim is never inferred from unrelated product-notice text: without a
     // unique .aweme-wrapper showing only the exact 添加抖音号 button the count stays null.
     const aweme=[...row.querySelectorAll('.aweme-wrapper')].filter(visible);
-    const cell=aweme.length===1?txt(aweme[0]):null;
+    const cells=directCells(row);
+    const exactColumn=column>=0&&cells.length===header.length ? cells[column] : null;
+    const auroraCells=cells.filter(node=>{
+      if(node.tagName!=='TD' && !node.classList.contains('aurora-qc-table-cell'))return false;
+      const account=txt(node).match(/^\S.*?\s+ID\s*[:：]\s*([A-Za-z0-9_-]{4,32})\s+管理(?:手动添加)?抖音号(?:\s+(?:预估)?自动拉取\s*\d+\s*个)?$/);
+      return !!account&&!/^\d{15,20}$/.test(account[1]);
+    });
+    const accountCell=aweme.length===1 ? aweme[0] : aweme.length===0
+      ? exactColumn||(auroraCells.length===1?auroraCells[0]:null) : null;
+    const cell=accountCell ? txt(accountCell) : null;
     const scope=cell===null?text:cell;
     const count=scope.match(/(\d+)\s*个抖音号\s*管理(?:手动添加)?抖音号/);
-    const singleManual=!count&&cell!==null&&singleManualCell(aweme[0]);
+    const singleManual=!count&&accountCell!==null&&singleManualCell(accountCell);
     // 2026-11-22：与 parseMainTableRow 对齐——Mac 乘方创建页常见「自动拉取 N 个」（无「预估」前缀）。
     // 只认「预估…」会把「手动添加抖音号 自动拉取 0 个」读成 manualAccounts=null → 整批轮转永不触发。
     const explicitAuto=!singleManual&&/(?:预估)?自动拉取\s*\d+\s*个/.test(scope)&&!count;
-    const emptyAwemeCell=cell!==null&&!count&&!singleManual&&!explicitAuto&&!/管理(?:手动添加)?抖音号/.test(cell)&&/(^|\s)添加(?:手动添加)?抖音号(\s|$)/.test(cell);
+    const unboundNotice=text.includes('请为该商品选择要投放的抖音号，或开启联盟合作达人自动投')
+      &&cells.filter(node=>txt(node)==='添加抖音号').length===1;
+    const emptyAwemeCell=!count&&!singleManual&&!explicitAuto&&(unboundNotice
+      ||(cell!==null&&!/管理(?:手动添加)?抖音号/.test(cell)&&/(^|\s)添加(?:手动添加)?抖音号(\s|$)/.test(cell)));
     rows.push({productId:ids[0],text,manualAccounts:count?Number(count[1]):singleManual?1:(explicitAuto||emptyAwemeCell)?0:null,manualEvidence:!!count||singleManual||emptyAwemeCell,manualCountKnown:!!count||singleManual||explicitAuto||emptyAwemeCell,autoPullOnly:explicitAuto,reviewFailed:text.includes('当前商品广告审核不通过'),migrationWarning:text.includes('该商品已创建「全店托管」计划'),precheckRisk:text.includes('根据系统前置检测，当前商品可能审核不通过')});
   }
   return {ok:true,rows};
@@ -4337,7 +4343,15 @@ function createRealDrivers(ctx) {
   // one, so a stale proof cannot outlive the batch that observed it.
   let bindEvidenceEpoch = 0;
   let bindEvidenceScope = null;
+  const settledZeroIds = new Set();
   const { managerPage, context, dayState, persist, publishedIds, attemptedSet, hints, accountId, opened, projectRoot, planNumber, runId } = ctx;
+  const autoPullExcluded = new Set((dayState.autoPullExcluded || []).map(String));
+  const assertPreparationDay = () => {
+    if (typeof ctx.assertPreparationDay === 'function') ctx.assertPreparationDay();
+  };
+  const retryEligibleIds = Array.isArray(ctx.retryEligibleIds) ? new Set(ctx.retryEligibleIds.map(String)) : null;
+  const attemptedInDraft = new Set(retryEligibleIds ? [...attemptedSet].filter(id => !retryEligibleIds.has(id)) : []);
+  let reusePriorAttempts = false;
   // Per-shop business facts threaded into every serialized in-page helper. When a
   // caller (the legacy main / old tests) provides nothing, these fall back to the
   // frozen default business so behaviour is unchanged.
@@ -4570,7 +4584,12 @@ function createRealDrivers(ctx) {
       const obs = await observe();
       const pg = obs && obs.pagination;
       if (!pg || pg.modalPresent !== true || pg.inProductModal !== true) throw new Error('current-product-page-pagination-observation-incomplete');
-      if (pg.currentPage !== pageNo) throw new Error('current-product-page-number-drift');
+      if (pg.currentPage !== pageNo) {
+        const direct = Number.isInteger(pg.currentPage) ? null : await page.evaluate(numericPickerPagingInPage,{
+          mode:'read',accountId,selectedIds,expectedSelectedCount:snap.selectedCount,expectedCapacity:snap.remainingCapacity,
+        }).catch(()=>null);
+        if (direct?.ok !== true || direct.currentPage !== pageNo) throw new Error('current-product-page-number-drift');
+      }
       if (obs && obs.creation) {
         const c = obs.creation;
         const knownFirstEmptyShape = baseSelectedCount === 0
@@ -4608,7 +4627,7 @@ function createRealDrivers(ctx) {
     return snap;
   }
   async function waitForDrawer() { return until(()=>page.evaluate(drawerSnapshotInPage), x=>x.ok, 15000, 'product-drawer'); }
-  async function switchCategory(category) {
+  async function switchCategory(category, selectedIds = dayState.lastSelected || []) {
     const before=await drawer();
     if (isNativeScrollCategory(category)) {
       const tab=catalogTabForCategory(category);
@@ -4630,12 +4649,42 @@ function createRealDrivers(ctx) {
       if(scrollState.scrollTop!==0)throw new Error('native-scroll-root-not-at-top');
       return after.snap;
     }
+    const firstRequestSeq=transport.requestSequence();
     const action=await page.evaluate(clickDrawerTabInPage,category);
     const beforeIds=before.cards.map(x=>x.id).filter(Boolean).sort().join(',');
-    const after=await until(()=>page.evaluate(drawerSnapshotInPage),x=>x.ok&&categoryIsActive(x,category)&&(!action.clicked||x.cards.map(c=>c.id).filter(Boolean).sort().join(',')!==beforeIds),10000,'category-tab-and-cards');
-    const afterObs=await observe();
-    if(afterObs.pagination.currentPage!==1||!categoryIsActive(after,category))throw new Error('category-switch-page-state-unknown');
-    return after;
+    try {
+      const settled=await until(async()=>{
+        const snap=await page.evaluate(drawerSnapshotInPage);
+        if(!snap.ok||!categoryIsActive(snap,category)||!listPageComplete(snap))return null;
+        const pg=(await observe())?.pagination;
+        let pageNo=pg?.currentPage;
+        if(!Number.isInteger(pageNo)||pageNo<1) {
+          const direct=await page.evaluate(numericPickerPagingInPage,{
+            mode:'read',accountId,selectedIds,expectedSelectedCount:snap.selectedCount,expectedCapacity:snap.remainingCapacity,
+          }).catch(()=>null);
+          pageNo=direct?.ok===true ? direct.currentPage : null;
+        }
+        if(!Number.isInteger(pageNo)||pageNo<1)return null;
+        if(action.clicked&&!numericCardsLanded(snap,beforeIds,firstRequestSeq,pageNo))return null;
+        return {snap,pageNo};
+      },Boolean,10000,'category-tab-page-one-and-cards');
+      if(settled.pageNo===1)return settled.snap;
+      // Aurora can reopen the All tab on its last remembered page, including
+      // the final page. Return to the start through verified single-page steps.
+      const baseSelectedCount=30-settled.snap.remainingCapacity;
+      if(!pickerBatchStateMatches(settled.snap,baseSelectedCount,selectedIds.length-baseSelectedCount)){
+        throw new Error('category-switch-page-state-unknown');
+      }
+      let current=settled.pageNo;
+      while(current>1){
+        assertPreparationDay();
+        current=await stepAllNumericPrev({selectedIds,baseSelectedCount},current);
+      }
+      return drawer();
+    } catch(error) {
+      if(!/category-tab-page-one-and-cards-timeout/.test(String(error?.message)))throw error;
+      throw new Error('category-switch-page-state-unknown');
+    }
   }
   async function changePage(context) {
     const beforeObs=await observe(); const before=await drawer();
@@ -5010,6 +5059,7 @@ function createRealDrivers(ctx) {
   async function stepAllNumericPrev(context, curPage) {
     const before = await drawer();
     const selectedIds = (context.selectedIds || []).map(String);
+    const firstRequestSeq = transport.requestSequence();
     const res = await page.evaluate(numericPickerPagingInPage, {
       mode: 'prev', expectedCurrentPage: curPage,
       expectedSelectedCount: before.selectedCount, expectedCapacity: before.remainingCapacity,
@@ -5030,7 +5080,7 @@ function createRealDrivers(ctx) {
       && x.result.footerRemainingCapacity === before.remainingCapacity
       && x.result.checkedIds.every(id => selectedIds.includes(String(id)))
       && x.snap.ok === true && categoryIsActive(x.snap, '全部') && listPageComplete(x.snap)
-      && x.snap.cards.map(c => c.id).filter(Boolean).sort().join(',') !== beforeIds,
+      && numericCardsLanded(x.snap,beforeIds,firstRequestSeq,curPage-1),
       nativeTimeoutMs, 'numeric-prev-page-step');
     await settleProductPage({ cat: '全部', native: false, pageNo: curPage - 1, selectedIds, baseSelectedCount: context.baseSelectedCount });
     return after.result.currentPage;
@@ -5171,7 +5221,7 @@ function createRealDrivers(ctx) {
     dayState.lastSelected = (dayState.lastSelected || []).map(String).filter(x => x !== String(id));
     selectedPositions.delete(String(id));
     await settleProductPage({ cat: pos.cat, native: true, tab, pageNo: 1, selectedIds: unionSelected(), baseSelectedCount });
-    await switchCategory('全部');
+    await switchCategory('全部', unionSelected());
     let cur = 1;
     while (cur < fromPage) {
       const advanced = await changePage({ cat: '全部', native: false, selectedIds: unionSelected(), baseSelectedCount, expectedCapacity: run.expectedCapacity });
@@ -5350,6 +5400,8 @@ function createRealDrivers(ctx) {
         }
         if(pendingChecked!=null && pendingChecked===String(id)) pendingChecked=null;
         attemptedSet.add(id);
+        autoPullExcluded.add(String(id));
+        dayState.autoPullExcluded=[...autoPullExcluded];
         cancelledNow.push(String(id));
         dayState.attempted=[...attemptedSet];dayState.hints=hints;await persist(dayState);
     }
@@ -5374,8 +5426,12 @@ function createRealDrivers(ctx) {
     const parsed=wf.parseProductCard(card);
     hints[id]=wf.mergeCardHints(hints, [parsed])[id];
     // allowAttemptedReuse：目录耗尽后的复扫，允许勾选已 attempted 但未发布的商品（不清空 attempted 账本）。
-    const reuseAttempted=pickerRunContext&&pickerRunContext.allowAttemptedReuse===true;
-    if(parsed.reviewFailed||!parsed.selectable||publishedIds.has(id)||(attemptedSet.has(id)&&!reuseAttempted))return {selected:false,reason:parsed.reviewFailed?'review-failed':'not-eligible'};
+    const retryScanIds=pickerRunContext?.retryScanIds;
+    if(parsed.reviewFailed||!parsed.selectable||publishedIds.has(id)||autoPullExcluded.has(id)
+      ||(attemptedSet.has(id)&&(!retryScanIds||retryScanIds.has(id))))return {selected:false,reason:parsed.reviewFailed?'review-failed':'not-eligible'};
+    // An ID may be retried across scans, once per scan. Auto-pull cancellations must
+    // not cause the same row to look like a replacement on every pass of this page.
+    attemptedInDraft.add(id);
     attemptedSet.add(id);
     dayState.attempted=[...attemptedSet];dayState.hints=hints;dayState.cursor={...dayState.cursor,seenProductIds:[...new Set([...(dayState.cursor.seenProductIds||[]),id])]};
     await persist(dayState);
@@ -5421,12 +5477,16 @@ function createRealDrivers(ctx) {
     return {selected:true};
   }
   async function browseProducts(input) {
+    assertPreparationDay();
     // Best-effort passive listener registration before any drawer/category/scroll
     // action. Native categories hard-require it inside switchCategory; the numeric
     // category never depends on it, so pages without .on stay fully supported.
     transport.attach();
     try {
-    const allowAttemptedReuse=input.allowAttemptedReuse===true;
+    // Repair opens a fresh picker on the same draft. Keep the rescan policy and
+    // its tried IDs across those openings so a replacement can come from an
+    // older failed run, while an ID already tried in this draft stays excluded.
+    if(input.allowAttemptedReuse===true)reusePriorAttempts=true;
     const ordered=input.categories||wf.CATEGORY_TAB_ORDER;
     if(input.resetCursor===true){
       // 复扫：重置分页游标到首类目第 1 页；保留 seenProductIds，绝不清空 attempted。
@@ -5450,18 +5510,28 @@ function createRealDrivers(ctx) {
     // position (it was not proven in this epoch) and can never be walked back to.
     pickerEpoch+=1;
     selectedPositions.clear();
-    pickerRunContext={baseSelectedCount,expectedCapacity,allowAttemptedReuse};
+    pickerRunContext={baseSelectedCount,expectedCapacity,retryScanIds:reusePriorAttempts?attemptedInDraft:null};
     dayState.lastSelected=selectedIds.slice();
     let lastPageReached=false;
+    let nativeForwardObserved=false;
     let cat=dayState.cursor&&ordered.includes(dayState.cursor.category)?dayState.cursor.category:ordered[0];
     let categoryIndex=Math.max(0,ordered.indexOf(cat));
     let pageNo=1;
     // resetCursor 时强制 switchCategory：抽屉可能仍停在旧页码，仅改 cursor 不会回到第 1 页。
     if(input.resetCursor===true||!categoryIsActive(snap,cat)){snap=await switchCategory(cat);pageNo=1;}
     if(!isNativeScrollCategory(cat)&&dayState.cursor&&Number.isInteger(dayState.cursor.page)&&dayState.cursor.page>1) {
-      // Reopening starts at page one; restore only through observed forward steps.
-      // Native scroll categories always rescan from the top and dedup via
-      // seenProductIds/attempted/published, so no numeric restore is attempted.
+      // A reopened All picker can retain its last page. Use the observed
+      // position only inside the already recorded range; never skip new pages.
+      const pagination=(await observe())?.pagination;
+      if(pagination?.modalPresent===true && pagination.inProductModal===true
+        && Number.isInteger(pagination.currentPage) && pagination.currentPage>1){
+        pageNo=pagination.currentPage;
+        await settleProductPage({cat,native:false,pageNo,selectedIds,baseSelectedCount});
+        while(pageNo>dayState.cursor.page){
+          assertPreparationDay();
+          pageNo=await stepAllNumericPrev({selectedIds,baseSelectedCount},pageNo);
+        }
+      }
       while(pageNo<dayState.cursor.page){const restored=await changePage({cat,native:isNativeScrollCategory(cat),selectedIds,baseSelectedCount,expectedCapacity});if(!restored.confirmed||restored.observedPage!==pageNo+1)throw new Error('cursor-restore-page-unconfirmed');pageNo=restored.observedPage;}
     }
     // A repair round must really BROWSE FROM THE NEXT PAGE, not just carry a flag: when the
@@ -5487,11 +5557,16 @@ function createRealDrivers(ctx) {
         if(!categoryIsActive(snap,cat))snap=await switchCategory(cat);
       }
       for(;;) {
+        assertPreparationDay();
         // Execute the forward requirement as real browsing: step over the already-exhausted
         // page(s) before scanning. A boundary here is an honest end of this category.
         if(!native&&pageNo<forwardFloor){
           const advanced=await changePage({cat,native,selectedIds,baseSelectedCount,expectedCapacity});
-          if(advanced&&advanced.boundary===true){forwardFloor=1;break;}
+          if(advanced&&advanced.boundary===true){
+            if(cat==='全部')lastPageReached=true;
+            forwardFloor=1;
+            break;
+          }
           if(!advanced.confirmed||advanced.observedPage!==pageNo+1)throw new Error('repair-forward-page-unconfirmed');
           pageNo=advanced.observedPage;
           continue;
@@ -5543,11 +5618,13 @@ function createRealDrivers(ctx) {
           ?(tab?{epoch:pickerEpoch,cat,tab,native:true}:null)
           :(cat==='全部'?{epoch:pickerEpoch,cat,page:pageNo}:null);
         for(const raw of snap.cards) {
+          if(selectedIds.length>=wf.BUSINESS.productsPerPlan)break;
+          const id=String(raw.id);
+          if(selectedIds.includes(id)||publishedIds.has(id)||autoPullExcluded.has(id)
+            ||(attemptedSet.has(id)&&(!reusePriorAttempts||attemptedInDraft.has(id))))continue;
           const current=await drawer();
           const selectedNow=current.cards.filter(c=>c.checked===true&&c.id).map(c=>String(c.id));
-          if(selectedNow.some(id=>!selectedIds.includes(id)))throw new Error('visible-selection-drift-from-persisted-ids');
-          if(selectedIds.length>=wf.BUSINESS.productsPerPlan)break;
-          if(selectedIds.includes(String(raw.id)))continue;
+          if(selectedNow.some(checkedId=>!selectedIds.includes(checkedId)))throw new Error('visible-selection-drift-from-persisted-ids');
           const result=await selectCard(raw,selectedIds,position);
           if(result.selected){
             chosen.push(String(raw.id));
@@ -5571,7 +5648,7 @@ function createRealDrivers(ctx) {
         if(latest.cards.filter(c=>c.checked===true&&c.id).some(c=>!selectedIds.includes(String(c.id))))throw new Error('picker-visible-selection-drift');
         if(selectedIds.length>=wf.BUSINESS.productsPerPlan){
           const submit=await commitPicker({baseSelectedCount,expectedCapacity});
-          if(submit&&submit.submitted===true)return {ok:true,selectedIds:selectedIds.slice(0,wf.BUSINESS.productsPerPlan),hints,attempted:[...attemptedSet],cursor:dayState.cursor};
+          if(submit&&submit.submitted===true)return {ok:true,selectedIds:selectedIds.slice(0,wf.BUSINESS.productsPerPlan),hints,attempted:[...attemptedSet],cursor:dayState.cursor,nativeForwardObserved};
           const cancelled=new Set((submit&&submit.productIds||[]).map(String));
           if(!submit||submit.autoPullCancelled!==true||!cancelled.size||[...cancelled].some(id=>!selectedIds.includes(id)))throw new Error('picker-submit-result-unknown');
           selectedIds=selectedIds.filter(id=>!cancelled.has(id));
@@ -5588,9 +5665,9 @@ function createRealDrivers(ctx) {
           if(!pickerBatchStateMatches(afterCancel,baseSelectedCount,currentBatchCount))throw new Error('auto-pull-backfill-footer-count-unknown');
           const hasCurrentPageReplacement=afterCancel.cards.some(card=>{
             const id=String(card.id||'');
-            const reuse=pickerRunContext&&pickerRunContext.allowAttemptedReuse===true;
-            if(!/^\d{15,20}$/.test(id)||selectedIds.includes(id)||publishedIds.has(id))return false;
-            if(attemptedSet.has(id)&&!reuse)return false;
+            const retryScanIds=pickerRunContext?.retryScanIds;
+            if(!/^\d{15,20}$/.test(id)||selectedIds.includes(id)||publishedIds.has(id)||autoPullExcluded.has(id))return false;
+            if(attemptedSet.has(id)&&(!retryScanIds||retryScanIds.has(id)))return false;
             const parsed=wf.parseProductCard(card);
             return parsed.selectable&&!parsed.reviewFailed;
           });
@@ -5618,6 +5695,7 @@ function createRealDrivers(ctx) {
             break;
           }
           nativeAdvances++;
+          if(cat===cursorCategoryAtStart)nativeForwardObserved=true;
           // 有界推进预算用尽 ≠ 诚实 EOF：只停止本类目并转入下一个类目（绝不硬抛
           // scheduled-run-exception 把整店卡死，也绝不放宽 nativeAdvance 内部的无进展/transport
           // 异常硬判据、绝不重复发布）。cursor 显式清除可能残留的 nativeEof（预算耗尽不是 EOF），
@@ -5636,6 +5714,20 @@ function createRealDrivers(ctx) {
         pageNo=advanced.observedPage;
       }
     }
+    // Keep the picker epoch alive while confirming a short batch. Auto-pull conflicts
+    // may refer to selections on earlier pages and need the original verified positions.
+    while(lastPageReached&&selectedIds.length>baseSelectedCount&&selectedIds.length<30){
+      const previousCount=selectedIds.length;
+      const submitted=await commitPicker({baseSelectedCount,expectedCapacity:previousCount-baseSelectedCount,allowPartial:true});
+      if(submitted.submitted===true){
+        return {ok:true,catalogExhaustedPartial:true,lastPageReached:true,selectedIds,hints,attempted:[...attemptedSet],cursor:dayState.cursor,nativeForwardObserved};
+      }
+      selectedIds=dayState.lastSelected.slice();
+      if(!submitted.autoPullCancelled||selectedIds.length<baseSelectedCount||selectedIds.length>=previousCount){
+        throw new Error('picker-partial-submit-result-unknown');
+      }
+      await input.onProgress({...dayState,lastSelected:selectedIds,hints,attempted:[...attemptedSet],cursor:dayState.cursor});
+    }
     // 不足 20 且「全部」没到真正最后一页：不能当成目录耗尽。
     if(selectedIds.length<20&&lastPageReached!==true){
       return {ok:false,reason:'below-20-last-page-not-reached',lastPageReached:false,selectedIds,hints,attempted:[...attemptedSet],cursor:dayState.cursor};
@@ -5649,8 +5741,8 @@ function createRealDrivers(ctx) {
     const uniq=new Set(dayState.lastSelected.map(String)).size;
     if(allowPartial===true){
       // 目录耗尽：允许提交 1..29；footer 分母仍为 30（remainingCapacity 字段实为上限）。
-      if(!Number.isInteger(expectedCapacity)||expectedCapacity<1||expectedCapacity>29)throw new Error('picker-partial-capacity-invalid');
-      if(n!==expectedCapacity||uniq!==expectedCapacity)throw new Error('picker-partial-selection-count-mismatch');
+      if(!Number.isInteger(expectedCapacity)||expectedCapacity<1||baseSelectedCount+expectedCapacity>29)throw new Error('picker-partial-capacity-invalid');
+      if(n!==baseSelectedCount+expectedCapacity||uniq!==n)throw new Error('picker-partial-selection-count-mismatch');
       if(!pickerBatchStateMatches(snap,baseSelectedCount,expectedCapacity))throw new Error('picker-partial-batch-state-mismatch');
     }else if(!pickerBatchStateMatches(snap,baseSelectedCount,expectedCapacity)||baseSelectedCount+expectedCapacity!==wf.BUSINESS.productsPerPlan||n!==wf.BUSINESS.productsPerPlan||uniq!==wf.BUSINESS.productsPerPlan){
       throw new Error('picker-selection-not-exactly-30');
@@ -5719,9 +5811,10 @@ function createRealDrivers(ctx) {
     }
     return { ok: false, rows: lastRows, stableReads: reads, stable: false, reason: 'main-table-not-stable' };
   }
-  async function bindAccountsToAllInner({productIds}) {
+  async function bindAccountsToAllInner({productIds,catalogExhaustedPartial=false}) {
     const ids=(productIds||[]).map(String);
-    if(ids.length!==30||new Set(ids).size!==30) return {ok:false,reason:'product-ids-not-exactly-30'};
+    const partialSize=catalogExhaustedPartial===true&&ids.length>=1&&ids.length<30;
+    if((ids.length!==30&&!partialSize)||new Set(ids).size!==ids.length)return {ok:false,reason:partialSize?'product-ids-not-unique':'product-ids-not-exactly-30'};
     // 2026-11-21 绑定阶段引导浮窗清理：创建页引导（带「跳过/我知道了」）会在绑定抽屉
     // 交互期间弹出/残留，遮住抽屉导致逐商品切换每次都等满 nativeTimeoutMs（30×15s 起）。
     // 绑定开始前先清一次（跳过优先；未持引导则零动作），不改变任何 fail-closed 门。
@@ -5734,10 +5827,9 @@ function createRealDrivers(ctx) {
     // dropped before a single new read, so nothing from an older batch/authorization leaks.
     bindEvidenceEpoch+=1;
     bindEvidenceScope={epoch:bindEvidenceEpoch,accountId:String(accountId),ids:[...ids]};
-    lastBindPanelEvidence.clear();
     const rows=await readMainTable();
     lastBindMainRows=rows;
-    if(rows.length!==30||new Set(rows.map(r=>String(r.productId))).size!==30||rows.some(r=>!ids.includes(r.productId))||ids.some(id=>!rows.some(r=>String(r.productId)===id)))return {ok:false,reason:'main-table-does-not-match-selected-ids'};
+    if(rows.length!==ids.length||new Set(rows.map(r=>String(r.productId))).size!==ids.length||rows.some(r=>!ids.includes(String(r.productId))))return {ok:false,reason:'main-table-does-not-match-selected-ids'};
     // R32 min-1: an anchor is any product whose main-table row shows at least 1 manual
     // account bound (1 or 2); the anchor's drawer may confirm 1 or 2 target accounts.
     const anchor=rows.find(r=>Number.isInteger(r.manualAccounts)&&r.manualAccounts>=1);
@@ -5766,7 +5858,7 @@ function createRealDrivers(ctx) {
     // UNSELECTED disabled row is present we reuse the already-bound anchor instead.
     const rowsBlockedUnchecked=s=>!!s&&s.ok===true&&Array.isArray(s.rows)&&s.rows.some(r=>r.checked!==true&&r.labelDisabled===true);
     // Proven batch identity helpers (defined here so reopenBoundAnchor can settle-wait on them):
-    // a trustworthy drawer must expose the exact 30-product panel set for this batch, a SINGLE
+    // a trustworthy drawer must expose the exact batch panel set for this batch, a SINGLE
     // active product inside it, and a CONSISTENT selection: all-unchecked-0/30, all-checked-k/30
     // (k=1 or 2), or checked-plus-disabled-unchecked at checked-count/30.
     const provePanelSet=s=>{
@@ -5831,7 +5923,7 @@ function createRealDrivers(ctx) {
     // A product is proven DUPLICATE only when EVERY one of its account rows is a disabled
     // label AND that row's own post-hover tooltip carries the exact platform copy. Any
     // enabled row (>=1 usable account) is normal binding, never a duplicate. The identity
-    // (unique active panel, exact 30-panel set, spinner gone, rows/footer/account ids) is
+    // (unique active panel, exact batch panel set, spinner gone, rows/footer/account ids) is
     // re-proven before AND after each hover, so a stale panel, a residual tooltip, another
     // product's popup or an unknown hover copy can never be recorded as proof.
     async function proveDisabledActivePanelDuplicate(pid){
@@ -5878,7 +5970,7 @@ function createRealDrivers(ctx) {
       // so a transiently-rendering row/footer no longer becomes a false footer-row-state-conflict
       // at the caller gate. Budget = the configured native timeout (a shorter test override is
       // honored), capped at the pre-existing 10s production window — never a fixed 10s per
-      // offline case. The FIRST positively-trusted identity (exact batch 30-panel set, single
+      // offline case. The FIRST positively-trusted identity (exact batch panel set, single
       // in-batch active, unique 1..2 row account ids) is FROZEN across the whole poll: unknown
       // or missing rows may still settle, but once a trustworthy identity was observed a later
       // read whose active or account ids switched is never adopted, and the post-timeout
@@ -5953,7 +6045,7 @@ function createRealDrivers(ctx) {
       if(!reopened||reopened.ok!==true) return null;
       // Bounded READ-ONLY settle for THIS reopen branch only. The freshly-managed drawer may
       // transiently read not-yet-checked accounts or an active that has not yet fallen back to the
-      // requested anchor; wait (no clicks) until it proves the exact 30-panel set, the SINGLE active
+      // requested anchor; wait (no clicks) until it proves the exact batch panel set, the SINGLE active
       // EQUALS the requested anchor, and the 1-or-2 target accounts form a settled known subset
       // (>=1 checked, remaining rows definite unchecked) at footer checked-count/30. Never loop
       // forever or click behind an overlay: on timeout return the last read for the caller guards.
@@ -5965,24 +6057,24 @@ function createRealDrivers(ctx) {
     // PARTIAL failure. A full-success batch leaves the drawer open with NO popup, so the settled
     // result wait times out. That must NOT be read as success and must NOT bypass any guard: we
     // prove completion by an entirely READ-ONLY UI readback, bounded ordinary .panel navigation
-    // across the batch's known unique 30 ids. Each target must show a settled known subset of the
+    // across the batch's known unique product ids. Each target must show a settled known subset of the
     // approved target accounts (R33 min-1: >=1 checked, remaining rows definite unchecked — an
     // enabled row left intentionally unbound is legitimate) at footer checked-count/30
-    // with the SAME exact 30-panel set and a SINGLE active === the target; before
+    // with the SAME exact batch panel set and a SINGLE active === the target; before
     // every navigation the PREVIOUS active/drawer identity/panel set/accounts/footer are re-read and
     // any blocking overlay census is re-checked. A new/unknown overlay, account drift, unknown row,
     // footer conflict, foreign/duplicate panel, wrong active or a zero-checked selection stops with ZERO
-    // acknowledge and ZERO drawer commit — we never click behind an overlay. Only after all 30 are
+    // acknowledge and ZERO drawer commit — we never click behind an overlay. Only after all products are
     // positively proven do we navigate back to the ORIGINAL captured batchAnchorId, fresh-prove it,
     // and then proceed (still zero ACK) to the normal drawer 确定 + full main-table readback. The
-    // empty failedIds is derived from this full 30 proof, never from the mere absence of a popup.
+    // empty failedIds is derived from this full batch proof, never from the mere absence of a popup.
     async function proveAllSuccessByPanelNavigation(originalAnchor, mode) {
       const partial=mode==='partial';
       const panelIds=[...new Set(ids.map(String))];
-      if(panelIds.length!==30) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
+      if(panelIds.length!==ids.length) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
       const provesTarget=(s,pid)=>!!s&&s.ok===true&&exactTwo(s)&&consistentSelectionState(s)&&s.totalCount===30
         &&Array.isArray(s.rows)&&s.rows.some(r=>r.checked===true)&&s.rows.every(r=>r.checked===true||r.checked===false)&&panelSetEqualsIds(s)&&provePanelSet(s)===String(pid);
-      // 严格 partial 口径：一个商品的**明确 0** 只有在同一 30-panel 身份、唯一 active=该商品、账号行仍是
+      // 严格 partial 口径：一个商品的**明确 0** 只有在同一批商品面板身份、唯一 active=该商品、账号行仍是
       // 本店已发现的 1-2 个目标账号且全部未选、页脚恰为 0/30 时才算成立。缺行/页脚冲突/账号漂移/读不回
       // 一律不算 0（算 unknown，直接停），绝不把"没结果/一直在加载"当成 0。
       const provesZero=(s,pid)=>!!s&&s.ok===true&&exactTwo(s)&&consistentSelectionState(s)&&s.totalCount===30&&s.selectedCount===0
@@ -6046,7 +6138,7 @@ function createRealDrivers(ctx) {
         }
         prev=pid;
       }
-      // All 30 proven: navigate back to the original batch anchor and fresh-prove it before the commit.
+      // All products proven: navigate back to the original batch anchor and fresh-prove it before the commit.
       if(!(await noBlockingOrClearGuidance())) return {ok:false,reason:'batch-result-panel-navigation-blocking-overlay'};
       let back=null;
       try { back=await page.evaluate(selectBindingDrawerPanelInPage,originalAnchor); } catch(_) { return {ok:false,reason:'batch-result-anchor-restore-rejected'}; }
@@ -6108,9 +6200,9 @@ function createRealDrivers(ctx) {
     // never assume a disabled-row click.
     const blockedHeaderOrRows=s=>s.ok===true&&Array.isArray(s.rows)&&s.rows.some(r=>r.checked!==true&&(s.headerLabelDisabled===true||r.labelDisabled===true));
     // The batch anchor is the product whose drawer is ACTIVE (its accounts get bound by the draft
-    // 确定; the batch adds to the OTHER 29). It may be the first, the second, or the last product —
+    // 确定; the batch adds to the other products). It may be the first, the second, or the last product —
     // so it must come from the freshly-read active panel id, never from ids[0]. Before ANY
-    // navigation / header / batch the drawer must expose a trustworthy 30-product panel list whose
+    // navigation / header / batch the drawer must expose a trustworthy batch panel list whose
     // set is exactly this batch, with a SINGLE active product that belongs to it (provePanelSet is
     // defined above reopenBoundAnchor). The real batch target is ALWAYS the strict object form.
     // 非 exactTwo 初始面板：页脚/行一致门可能不适用，只要 panel 身份可读就进穷举。
@@ -6240,7 +6332,7 @@ function createRealDrivers(ctx) {
         // account-anchor-no-usable-product 诚实停止（零假成功）。
         const noEligibleForProduct=fresh.ok===true&&Array.isArray(fresh.rows)&&fresh.rows.length===0&&Number(fresh.selectedCount)===0&&Number(fresh.totalCount)===30&&panelSetEqualsIds(fresh)&&provePanelSet(fresh)===String(pid);
         if(noEligibleForProduct){ unbindableExhausted.add(String(pid)); continue; }
-        // Distinguish a broken 30-panel SET from a broken ACTIVE product so the stop reason is
+        // Distinguish a broken batch panel SET from a broken ACTIVE product so the stop reason is
         // meaningful: first prove the panel set still equals this batch, then prove the single
         // active still equals the candidate we navigated to.
         if(!panelSetEqualsIds(fresh)) return {ok:false,reason:'account-anchor-panel-set-drift'};
@@ -6250,7 +6342,6 @@ function createRealDrivers(ctx) {
         // 否则最后一个候选的 footer 抖动会整批 account-drawer-footer-row-state-conflict 停死，
         // 永远到不了 batchUnbindableExhausted 换批。
         if(!exactTwo(fresh)||!consistentSelectionState(fresh)){
-          unbindableExhausted.add(String(pid));
           try { console.warn('[plan-publisher] anchor-skip-unusable ' + String(pid) + ' ' + JSON.stringify(footerStateDiag(fresh,'walk-unusable'))); } catch(_){}
           continue;
         }
@@ -6269,7 +6360,7 @@ function createRealDrivers(ctx) {
         snap=fresh; state=fresh.rows.map(r=>r.checked); fullyChecked=settledChecked(fresh); batchAnchorId=pid; found=true; break;
       }
       if(!found){
-        // Whole-batch duplicate: every one of the 30 products had EVERY account row
+        // Whole-batch duplicate: every product in the batch had EVERY account row
         // individually hover-proven with the exact platform copy.
         const allDuplicated=ids.every(id=>provenDuplicates.has(String(id)));
         if(allDuplicated){
@@ -6326,7 +6417,7 @@ function createRealDrivers(ctx) {
           nativeTimeoutMs,'native-header-select-all');
       } catch(_) { after=await page.evaluate(bindingDrawerSnapshotInPage); }
       if(!bindingAccountsSnapshotSettled(after,resolvedTargets,productsPerPlan))return {ok:false,reason:'native-header-select-all-not-confirmed'};
-      // Before the batch is applied, confirm the SAME captured active product / same 30-panel set
+      // Before the batch is applied, confirm the SAME captured active product / same batch panel set
       // is still current: the header fresh-wait must not have let the drawer switch out from under
       // the anchor, or the batch would run on the wrong scope.
       if(!consistentSelectionState(after)||provePanelSet(after)!==batchAnchorId)return {ok:false,reason:'native-header-active-product-drift'};
@@ -6342,12 +6433,45 @@ function createRealDrivers(ctx) {
       const rz=resolveDiscoveredTargets(snap);
       if(!rz.ok)return {ok:false,reason:rz.reason};
     }
-    // STEP 3: batch is a BUTTON that opens a SEPARATE confirm modal (将在29个商品上批量添加
+    const confirmDrawerAndReadBack=async (failedIds,knownFailures)=>{
+      // STEP 5: commit the drawer DRAFT with 确定 (identity re-verified in the callback), then
+      // accept a partial-submit warning ONLY when the recorded outcome proved exact failed ids
+      // (settled result modal, or an explicit 0 read from every panel in the partial-close path).
+      await page.evaluate(confirmBatchAccountsApplyInPage, targetPayload());
+      try { await page.evaluate(acceptPartialDraftWarningInPage,knownFailures); } catch(_) { return {ok:false,reason:'partial-draft-warning-not-acceptable'}; }
+      // The fresh main table is the source of truth (R32 min-1): a row showing a definite
+      // >=1 manual count is KEPT even if the batch result listed it as failed ("1个抖音号
+      // 添加失败" can still mean the other account landed). A row in the proven failed set
+      // may read 0 (both targets missed => removal/backfill handles it); a NON-failed row
+      // must show a definite integer >=1 — 0/unknown/null never passes here, so an unknown
+      // outcome is never widened into success.
+      const failedIdSet=new Set(failedIds);
+      let final;
+      try {
+        final=await until(readMainTable,rs=>rs.length===ids.length&&new Set(rs.map(r=>String(r.productId))).size===ids.length&&ids.every(id=>rs.some(r=>String(r.productId)===id))&&rs.every(r=>(Number.isInteger(r.manualAccounts)&&r.manualAccounts>=1)||failedIdSet.has(String(r.productId))),15000,'manual-account-bind-readback');
+      } catch(_) { return {ok:false,reason:'manual-account-bind-readback-does-not-match-recorded-outcome'}; }
+      lastBindMainRows=final;
+      await guidancePhase();
+      const rowsWithEvidence=final.map(row=>settledZeroIds.has(String(row.productId))
+        && !(Number.isInteger(row.manualAccounts)&&row.manualAccounts>=1)
+        ? {...row,panelZeroConfirmed:true} : row);
+      return {ok:true,accountIds:resolvedTargets.slice(),productCount:final.length,rows:rowsWithEvidence,partial:knownFailures,batchApplied:ids.length>1,failedIds};
+    };
+    if(ids.length===1){
+      const overlay=await page.evaluate(bindingOverlaySnapshotInPage);
+      const fresh=await page.evaluate(bindingDrawerSnapshotInPage);
+      if(!overlay||overlay.accountDrawerCount!==1||overlay.blockingOverlayPresent!==false
+        ||!bindingPanelSettled(fresh,ids,batchAnchorId)||!exactTwo(fresh)||fresh.selectedCount<1){
+        return {ok:false,reason:'single-product-account-binding-not-verified'};
+      }
+      return confirmDrawerAndReadBack([],false);
+    }
+    // STEP 3: batch is a BUTTON that opens a SEPARATE confirm modal (将在 N 个商品上批量添加
     // 2个抖音号). Click the button once, then a bounded FRESH wait that the modal is present
     // with the expected product/account counts while the drawer identity stays settled, then
     // click the MODAL 确定 once. Account drift / unknown modal => zero modal submit.
     await page.evaluate(applyBatchAccountsInPage, targetPayload());
-    const expectedProducts=Math.max(0,ids.length-1);
+    const expectedProducts=ids.length-1;
     let modal;
     try {
       modal=await until(()=>page.evaluate(batchAddAllModalSnapshotInPage, targetPayload()),
@@ -6370,7 +6494,7 @@ function createRealDrivers(ctx) {
     // authorized id, and the ACK callback additionally re-proves that anchor is still the drawer's
     // active product. The legacy array form exists only for the public callback's standalone tests.
     const batchTarget={productIds:ids,anchorProductId:batchAnchorId,targets:resolvedTargets};
-    let failedIds,failedSet,knownFailures;
+    let failedIds,knownFailures;
     let settled=null;
     try { settled=await until(()=>page.evaluate(batchResultSnapshotInPage,batchTarget), s=>s&&s.settled===true, nativeTimeoutMs,'batch-result-settle'); }
     catch(_) { settled=null; }
@@ -6380,15 +6504,14 @@ function createRealDrivers(ctx) {
       let result;
       try { result=await page.evaluate(acknowledgeBatchResultInPage,batchTarget); } catch(_) { return {ok:false,reason:'batch-result-not-acknowledged'}; }
       failedIds=((result&&Array.isArray(result.failedIds))?result.failedIds:[]).map(String);
-      failedSet=new Set(failedIds);
-      knownFailures=failedSet.size>0;
+      knownFailures=failedIds.length>0;
     } else {
       const rs=await page.evaluate(batchResultSnapshotInPage,batchTarget).catch(()=>null);
       if(rs&&rs.present===true&&rs.known===true&&rs.settled===false){
         // 已知部分失败提示但**没有**按旧口径列满全部 29 份结果（部分提示可能只列一部分失败，不等于全批
         // 失败，也不等于全批成功）：走本轮新增的 partial-close 通道——只用该已知标题根内的唯一右上角
         // close 关闭它（未知弹窗/多根/多 close/身份漂移在回调里零点击抛回），关闭本身绝不当成功。
-        // 关闭后必须复用同一把只读 panel 逐商品导航，逐个确定当前授权 30 个唯一商品的已选账号：
+        // 关闭后必须复用同一把只读 panel 逐商品导航，逐个确定当前授权的唯一商品的已选账号：
         // >=1 保留、明确 0 记入 failedIds 交给既有 removal/backfill、任何缺失/unknown 立刻停下且
         // 零抽屉提交。全部读完才允许进入既有 确定 + 部分提交警告。
         let closed=null, closeErr=null;
@@ -6420,14 +6543,14 @@ function createRealDrivers(ctx) {
         const probe=await proveAllSuccessByPanelNavigation(batchAnchorId,'partial');
         if(probe.ok!==true) return probe;
         failedIds=(probe.zeroIds||[]).map(String);
-        failedSet=new Set(failedIds);
+        for(const id of failedIds) settledZeroIds.add(id);
         knownFailures=failedIds.length>0;
       } else {
         // The settled wait timed out. A present-but-unsettled modal is PENDING/UNKNOWN and must STOP,
         // never be probed around. Only a genuinely ABSENT result popup AND no other blocking overlay
         // AND a uniquely-present drawer is the platform's all-success-with-no-modal case; even then we
         // do not treat "no popup" as success — we prove it with a bounded read-only .panel readback of
-        // all 30 ids (zero ACK). If that proof cannot be completed we stop with zero drawer commit.
+        // all product ids (zero ACK). If that proof cannot be completed we stop with zero drawer commit.
         const ov=await page.evaluate(bindingOverlaySnapshotInPage).catch(()=>null);
         if(!rs||rs.present===true) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
         if(!ov||ov.accountDrawerCount!==1||ov.blockingOverlayPresent===true) return {ok:false,reason:'batch-result-pending-or-unknown-not-confirmed'};
@@ -6437,7 +6560,7 @@ function createRealDrivers(ctx) {
         const probe=await proveAllSuccessByPanelNavigation(batchAnchorId,'partial');
         if(probe.ok!==true) return probe;
         failedIds=(probe.zeroIds||[]).map(String);
-        failedSet=new Set(failedIds);
+        for(const id of failedIds) settledZeroIds.add(id);
         knownFailures=failedIds.length>0;
         // 整批探测后 bound 为空 → 等同穷举不可绑，交给换批，勿对空草稿点确定。
         if((probe.boundIds||[]).length===0&&failedIds.length===ids.length){
@@ -6458,24 +6581,7 @@ function createRealDrivers(ctx) {
         }
       }
     }
-    // STEP 5: commit the drawer DRAFT with 确定 (identity re-verified in the callback), then
-    // accept a partial-submit warning ONLY when the recorded outcome proved exact failed ids
-    // (settled result modal, or an explicit 0 read from every panel in the partial-close path).
-    await page.evaluate(confirmBatchAccountsApplyInPage, targetPayload());
-    try { await page.evaluate(acceptPartialDraftWarningInPage,knownFailures); } catch(_) { return {ok:false,reason:'partial-draft-warning-not-acceptable'}; }
-    // The fresh main table is the source of truth (R32 min-1): a row showing a definite
-    // >=1 manual count is KEPT even if the batch result listed it as failed ("1个抖音号
-    // 添加失败" can still mean the other account landed). A row in the proven failed set
-    // may read 0 (both targets missed => removal/backfill handles it); a NON-failed row
-    // must show a definite integer >=1 — 0/unknown/null never passes here, so an unknown
-    // outcome is never widened into success.
-    let final;
-    try {
-      final=await until(readMainTable,rs=>rs.length===ids.length&&new Set(rs.map(r=>String(r.productId))).size===ids.length&&ids.every(id=>rs.some(r=>String(r.productId)===id))&&rs.every(r=>(Number.isInteger(r.manualAccounts)&&r.manualAccounts>=1)||failedSet.has(String(r.productId))),15000,'manual-account-bind-readback');
-    } catch(_) { return {ok:false,reason:'manual-account-bind-readback-does-not-match-recorded-outcome'}; }
-    lastBindMainRows=final;
-    await guidancePhase();
-    return {ok:true,accountIds:resolvedTargets.slice(),productCount:final.length,rows:final,partial:knownFailures,batchApplied:true,failedIds};
+    return confirmDrawerAndReadBack(failedIds,knownFailures);
   }
   // Real bind driver contract: a failure is never returned as a bare "no usable anchor".
   // The rows actually read for this batch are returned together with the exact ids whose
@@ -6483,7 +6589,17 @@ function createRealDrivers(ctx) {
   // zero manual count), so preparePlan can decide a whole-batch repair from real evidence
   // instead of trusting a mock. An unknown/gray row is never added to failedIds.
   async function bindAccountsToAll(input) {
+    assertPreparationDay();
+    bindEvidenceScope = null;
+    settledZeroIds.clear();
+    lastBindMainRows = null;
+    lastBindPanelEvidence.clear();
     const res = await bindAccountsToAllInner(input);
+    if (res?.batchUnbindableExhausted === true && Array.isArray(res.rows)) {
+      for (const row of res.rows) {
+        if (row.unbindableExhausted === true) settledZeroIds.add(String(row.productId));
+      }
+    }
     try {
       console.warn('[plan-publisher] bind-result ok=' + !!(res && res.ok === true)
         + ' reason=' + String((res && res.reason) || (res && res.ok === true ? 'ok' : 'unknown'))
@@ -6650,14 +6766,22 @@ function createRealDrivers(ctx) {
     let before;
     try { before=await readMainTable(); }
     catch(e){ return {ok:false,reason:'repair-main-table-unreadable:'+String((e&&e.message)||e)}; }
+    const beforeIds=new Set(before.map(row=>String(row.productId)));
+    const proofMatchesDraft=bindEvidenceScope?.accountId===String(accountId)
+      && bindEvidenceScope.epoch===bindEvidenceEpoch
+      && bindEvidenceScope.ids.length===before.length && beforeIds.size===before.length
+      && bindEvidenceScope.ids.every(id=>beforeIds.has(id));
     for(const id of removeIds) {
+      assertPreparationDay();
       const row=before.find(r=>r.productId===String(id));
       if(!row)return {ok:false,reason:'removal-lacks-explicit-current-row-evidence:'+id};
       const rowProven=row.autoPullOnly===true
         ||(row.manualEvidence===true&&Number.isInteger(row.manualAccounts)&&row.manualAccounts<1)
         ||row.reviewFailed===true
         ||row.alreadyPlanned===true
-        ||provenDuplicates.has(String(id));
+        ||provenDuplicates.has(String(id))
+        ||(proofMatchesDraft&&settledZeroIds.has(String(id))
+          &&!(Number.isInteger(row.manualAccounts)&&row.manualAccounts>=1));
       if(!rowProven)return {ok:false,reason:'removal-lacks-explicit-current-row-evidence:'+id};
       let removed;
       try { removed=await page.evaluate(removeNativeCardInPage,{productId:String(id),accountId}); }
@@ -6752,10 +6876,34 @@ function createRealDrivers(ctx) {
     const snap=await openPicker();
     const selected=dayState.lastSelected.map(String);
     if(selected.length!==30-removeIds.length||snap.selectedCount!==0||snap.remainingCapacity!==30-selected.length)throw new Error('post-removal-picker-selected-count-mismatch');
-    const result=await browseProducts({selectedIds:selected,needed:30-selected.length,hints,publishedSet:new Set(publishedIds),attemptedSet,cursor:dayState.cursor,categories:wf.CATEGORY_TAB_ORDER,onProgress,requireNextPage:requireNextPage===true});
+    const browseArgs={selectedIds:selected,needed:30-selected.length,hints,publishedSet:new Set(publishedIds),attemptedSet,cursor:dayState.cursor,categories:wf.CATEGORY_TAB_ORDER,onProgress,requireNextPage:requireNextPage===true};
+    let result;
+    try {
+      result=await browseProducts(browseArgs);
+    } catch(error) {
+      const current=dayState.lastSelected.map(String);
+      if(error?.message!=='native-catalog-anomaly:catalog-cursor-chain-broken'
+        ||current.length!==selected.length||!selected.every(id=>current.includes(id)))throw error;
+      dayState.catalogFallbackToAll=true;
+      await persist(dayState);
+      result=await browseProducts({...browseArgs,categories:['全部'],resetCursor:true,allowAttemptedReuse:true,requireNextPage:false});
+    }
     if(!result.ok){
       // 坏行已删；browse 失败（含目录耗尽）时关掉选品抽屉，把剩余主表行带回，供上层按 N 发布。
-      try { await page.keyboard.press('Escape'); } catch (_) {}
+      if(result.lastPageReached===true && selected.length>0 && result.selectedIds.length===selected.length){
+        const handle=await page.evaluateHandle(drawerSnapshotInPage,{emptyPickerCancelTarget:true,capacity:30-selected.length});
+        try {
+          const cancel=handle.asElement();
+          if(!cancel)throw new Error('empty-backfill-picker-cancel-not-unique');
+          await cancel.click({timeout:5000});
+        } finally { await handle.dispose(); }
+        await until(()=>page.evaluate(drawerSnapshotInPage),s=>s.ok===false && s.count===0,5000,'empty-backfill-picker-close');
+        const rows=await readMainTable();
+        const keptIds=new Set(rows.map(row=>String(row.productId)));
+        if(rows.length!==selected.length || !selected.every(id=>keptIds.has(id)))throw new Error('empty-backfill-picker-main-rows-changed');
+      } else {
+        try { await page.keyboard.press('Escape'); } catch (_) {}
+      }
       await sweepOverlays(page, 2).catch(() => {});
       let keptRows = afterRows;
       try { keptRows = await readMainTable(); } catch (_) { keptRows = afterRows; }
@@ -6790,13 +6938,16 @@ function createRealDrivers(ctx) {
       // a rewind, and must not be rejected; the durable-cursor gate above already proved the
       // switch itself was legal.
       if(!catChanged&&afterPage<beforePage)return {ok:false,reason:'repair-cursor-rewound'};
-      if(repairMode==='whole-batch-removal'&&!catChanged&&!seenGrew&&afterPage<=beforePage)return {ok:false,reason:'repair-next-page-not-proven'};
+      if(repairMode==='whole-batch-removal'&&!catChanged&&!seenGrew&&afterPage<=beforePage
+        &&!(isNativeScrollCategory(afterCursor.category)&&result.nativeForwardObserved===true))return {ok:false,reason:'repair-next-page-not-proven'};
     }
     dayState.lastSelected=newIds;dayState.hints=hints;dayState.attempted=[...attemptedSet];await persist(dayState);
     const rows=await readMainTable();
-    if(rows.length!==30||new Set(rows.map(r=>String(r.productId))).size!==30||rows.some(r=>!newIds.includes(r.productId))||newIds.some(id=>!rows.some(r=>String(r.productId)===id)))return {ok:false,reason:'repair-final-rows-do-not-match-final-picker'};
+    const expectedCount=result.catalogExhaustedPartial===true&&result.lastPageReached===true ? newIds.length : 30;
+    if(rows.length!==expectedCount||new Set(rows.map(r=>String(r.productId))).size!==expectedCount||rows.some(r=>!newIds.includes(String(r.productId)))||newIds.some(id=>!rows.some(r=>String(r.productId)===id)))return {ok:false,reason:'repair-final-rows-do-not-match-final-picker'};
     dayState.lastSelected=newIds;dayState.hints=hints;await persist(dayState);
-    return {ok:true,mainRows:rows,selectedCount:newIds.length,progress:true,mode:repairMode||null,bindFailedIds:(failedIds||[]).map(String),backfillCount:Number.isInteger(backfillCount)?backfillCount:null};
+    return {ok:true,mainRows:rows,selectedCount:newIds.length,progress:true,mode:repairMode||null,
+      catalogExhaustedPartial:result.catalogExhaustedPartial===true,lastPageReached:result.lastPageReached===true,bindFailedIds:(failedIds||[]).map(String),backfillCount:Number.isInteger(backfillCount)?backfillCount:null};
   }
   async function configurePlan({businessDate}) {
     const initial=await observe();if(!initial.creation||initial.creation.accountId!==accountId||!initial.creation.mainTableUnique)return {ok:false,reason:'creation-settings-observation-incomplete'};
@@ -6805,13 +6956,31 @@ function createRealDrivers(ctx) {
     const obs=await observe();if(!obs.creation||obs.creation.accountId!==accountId||!obs.creation.mainTableUnique)return {ok:false,reason:'creation-settings-observation-incomplete'};
     if(obs.creation.commissionChecked!==true) await page.evaluate(ensureCommissionInPage);
     if(obs.creation.optionalDirectPayChecked!==false) await page.evaluate(ensureDirectPayOffInPage);
-    const toggles=await observe();
-    if(!toggles.creation||toggles.creation.accountId!==accountId||toggles.creation.commissionChecked!==true||toggles.creation.optionalDirectPayChecked!==false)return {ok:false,reason:'commission-or-direct-pay-state-unknown'};
-    const roi=toggles.elements.filter(e=>e.fillField&&e.fillField.recognized&&e.fillField.kind==='roi');
-    const budget=toggles.elements.filter(e=>e.fillField&&e.fillField.recognized&&e.fillField.kind==='budget');
-    if(roi.length!==1||budget.length!==1)return {ok:false,reason:'roi-budget-fields-not-unique'};
+    // Switching commission mode can remount the settings form asynchronously.
+    // Keep this draft while the fields settle; every candidate read must still
+    // belong to the same account and verified commission/direct-pay mode.
+    const settingsFields=(observation,kind)=>observation.elements.filter(e=>e.fillField?.recognized && e.fillField.kind===kind);
+    const readSettings=async()=>{
+      const observation=await observe();
+      const creation=observation.creation;
+      if(!creation || creation.accountId!==accountId || creation.mainTableUnique!==true
+        || creation.commissionChecked!==true || creation.optionalDirectPayChecked!==false){
+        throw new Error('commission-or-direct-pay-state-unknown');
+      }
+      return observation;
+    };
+    let toggles;
+    try {
+      toggles=await until(readSettings,o=>settingsFields(o,'roi').length===1 && settingsFields(o,'budget').length===1,
+        settingsReadbackSettleMs,'plan-settings-fields');
+    } catch(error) {
+      if(error.message==='commission-or-direct-pay-state-unknown')return {ok:false,reason:error.message};
+      if(error.message==='plan-settings-fields-timeout')return {ok:false,reason:'roi-budget-fields-not-unique'};
+      throw error;
+    }
+    const roi=settingsFields(toggles,'roi');
     if(!guard.samePositiveDecimalValue(roi[0].value,targetRoi))await page.evaluate(guard.actionApply,{observation:toggles.observation,index:roi[0].index,op:'fill',value:String(targetRoi),kind:'roi'});
-    const fresh=await observe();const budgetNow=fresh.elements.filter(e=>e.fillField&&e.fillField.recognized&&e.fillField.kind==='budget');
+    const fresh=await readSettings();const budgetNow=settingsFields(fresh,'budget');
     if(budgetNow.length!==1) return {ok:false,reason:'budget-field-drift'};
     if(!guard.samePositiveDecimalValue(budgetNow[0].value,targetBudget))await page.evaluate(guard.actionApply,{observation:fresh.observation,index:budgetNow[0].index,op:'fill',value:String(targetBudget),kind:'budget'});
     const planName=shanghaiPlanName(businessDate,planNumber);
@@ -6842,6 +7011,16 @@ function createRealDrivers(ctx) {
     // Post-configuration guidance (including a config-stage 下一步) must be
     // handled and read back before this plan can reach ready-awaiting-confirmation.
     await guidancePhase();
+    if ((await observe()).creation?.visibleDialogCount > 0) {
+      await sweepOverlays(page, 2);
+      try {
+        await until(observe, o=>settingsMatch(o) && o.creation.visibleDialogCount===0,
+          settingsReadbackSettleMs,'creation-dialog-clear');
+      } catch(error) {
+        if(error.message!=='creation-dialog-clear-timeout')throw error;
+        return {ok:false,reason:'creation-dialog-still-visible'};
+      }
+    }
     return {ok:true,planName};
   }
   async function readFinalDialog() { return page.evaluate(finalDialogSnapshotInPage); }
@@ -7083,7 +7262,8 @@ function createRealDrivers(ctx) {
         const ident=await managerPage.evaluate(ctx.readAccountInPage);
         if(!ident||String(ident.accountId)!==String(accountId))return {absenceConfirmed:false,present:false,reason:'absence-page-identity-drift'};
         const nameRes=await managerPage.evaluate(readManagementRowsInPage,planName);
-        nameMatches+=(nameRes&&nameRes.rowCount)||0;
+        if(!Number.isInteger(nameRes?.rowCount)||nameRes.rowCount<0)return {absenceConfirmed:false,present:false,reason:'absence-name-read-incomplete'};
+        nameMatches+=nameRes.rowCount;
         const ids=shape.rows.map(r=>String(r&&r.id||''));
         const expectedOnPage=pageNo<totalPages?pageSize:(baseTotal-(pageNo-1)*pageSize);
         if(ids.length!==expectedOnPage)return {absenceConfirmed:false,present:false,reason:'absence-row-count-mismatch'};
@@ -8086,6 +8266,7 @@ async function main() {
       const prep=await wf.preparePlan({
         planNumber,runId,businessDate:date,dayState,business,publishedIds:[...publishedIds],publishedSet:publishedIds,
         requireRealDrivers:true,openCreationPage:drivers.openCreationPage,browseProducts:drivers.browseProducts,
+        commitPicker:drivers.commitPicker,getResolvedBoundAccounts:()=>drivers.resolvedBoundAccounts,
         bindAccountsToAll:drivers.bindAccountsToAll,readMainTable:drivers.readMainTable,awaitMainTableStable:drivers.awaitMainTableStable,repairDraft:drivers.repairDraft,
         configurePlan:drivers.configurePlan,persistState:persist,hints,nowMs:Date.now(),
       });
@@ -8604,13 +8785,47 @@ async function runScheduledPlan(businessInput, opts) {
     if (planNumber > maxPlans) {
       return result('blocked', 'daily-plan-limit-reached', { planNumber: null, succeededToday: consumedToday.length, noAction: true });
     }
-    let dayState = { ...dayStateInitial, runId, businessDate, active: null, lastSelected: [], plans: [...(dayStateInitial.plans || [])] };
+    const useAllCatalog = dayStateInitial.catalogFallbackToAll === true
+      || (dayStateInitial.active?.status === 'preparation-stopped'
+        && [
+          'scheduled-run-exception:native-catalog-anomaly:catalog-cursor-chain-broken',
+          'scheduled-run-exception:native-advance-guide-state-not-persisted',
+        ].includes(dayStateInitial.active.reason));
+    const closedAbsent = dayStateInitial.active?.status === 'preparation-stopped'
+      && dayStateInitial.active.source === 'scheduled-readback-absent-close'
+      && dayStateInitial.businessDate === businessDate;
+    const retryClosedPicker = dayStateInitial.active?.status === 'preparation-stopped'
+      && (dayStateInitial.active.reason === 'prepare-stopped:creation-dialog-still-visible'
+        || (dayStateInitial.active.reason === 'prepare-stopped:catalog-exhausted-all-unbindable'
+          && dayStateInitial.lastSelected.some(id => wf.parseMainTableRow(dayStateInitial.hints?.[id]?.text).manualAccounts > 0)));
+    let dayState = {
+      ...dayStateInitial, runId, businessDate, active: null, lastSelected: [], plans: [...(dayStateInitial.plans || [])],
+      ...(useAllCatalog ? { catalogFallbackToAll: true } : {}),
+    };
     const persist = next => { Object.assign(dayState, next); wf.persistDayState(STATE_FILE, dayState); };
     const attemptedSet = new Set(dayState.attempted || []);
     const hints = { ...(dayState.hints || {}) };
+    let retryEligibleIds = closedAbsent || retryClosedPicker ? dayStateInitial.lastSelected : null;
+    const exhaustedRetry = dayStateInitial.active?.status === 'preparation-stopped'
+      && dayStateInitial.cursor?.category === '全部' && !dayStateInitial.lastSelected.length
+      && dayStateInitial.active.reason === 'prepare-stopped:catalog-exhausted-or-safe-pagination-boundary';
+    if (exhaustedRetry && !dayStateInitial.triedPriorBindings) {
+      const eligible = Object.entries(hints).filter(([id, hint]) => {
+        const row = wf.parseMainTableRow(hint.text);
+        return row.productId === id && row.manualAccounts > 0 && !row.alreadyPlanned && !hint.reviewFailed && !publishedIds.has(id);
+      }).map(([id]) => id);
+      if (eligible.length) {
+        retryEligibleIds = eligible;
+        dayState.triedPriorBindings = true;
+      }
+    }
     const driversFactory = typeof o.driversFactory === 'function' ? o.driversFactory : createRealDrivers;
     drivers = driversFactory({
       page: null, managerPage: opened.target, context, dayState, persist, publishedIds, attemptedSet, hints,
+      retryEligibleIds,
+      assertPreparationDay: () => {
+        if(wf.shanghaiDate(nowOf())!==businessDate)throw new Error('scheduled-preparation-business-date-changed');
+      },
       accountId: business.accountId, business, boundAccounts: business.boundAccounts || null,
       productsPerPlan: business.productsPerPlan, creationUrl: business.creationUrl,
       managementUrl: shopProfile.managementUrlFor(business), legacyBusiness: legacyDefault,
@@ -8621,9 +8836,27 @@ async function runScheduledPlan(businessInput, opts) {
       goFirstShopPageInPage: readers.clickChengfangFirstPageInPage, goNextShopPageInPage: readers.clickChengfangNextPageInPage,
       awaitFinalDialogTimeoutMs: Number.isInteger(o.awaitFinalDialogTimeoutMs) ? o.awaitFinalDialogTimeoutMs : undefined,
     });
+    // The detached draft has no selected rows. A settings failure or an
+    // unreadable binding panel does not disqualify the products it contained.
+    const retryFromFirstCategory = dayStateInitial.active?.status === 'preparation-stopped'
+      && ['prepare-stopped:roi-budget-fields-not-unique', 'prepare-stopped:batch-result-panel-target-not-verified']
+        .includes(dayStateInitial.active.reason);
     const prep = await wf.preparePlan({
       planNumber, runId, businessDate, dayState, business, publishedIds: [...publishedIds], publishedSet: publishedIds,
       requireRealDrivers: true, openCreationPage: drivers.openCreationPage, browseProducts: drivers.browseProducts,
+      commitPicker: drivers.commitPicker, getResolvedBoundAccounts: () => drivers.resolvedBoundAccounts,
+      ...(useAllCatalog ? { categoryOrder: ['全部'] } : {}),
+      restartExhaustedCatalog: closedAbsent || retryClosedPicker || retryFromFirstCategory || (useAllCatalog && dayStateInitial.cursor?.category !== '全部')
+        || (dayStateInitial.active?.status === 'preparation-stopped'
+          && dayStateInitial.cursor?.category === '全部'
+          && (dayStateInitial.active.reason === 'prepare-stopped:catalog-exhausted-all-unbindable'
+            || (dayStateInitial.lastSelected.length === 0
+              && dayStateInitial.active.reason === 'prepare-stopped:catalog-exhausted-or-safe-pagination-boundary'))),
+      reuseClosedDraftCandidates: dayStateInitial.active?.status === 'preparation-stopped'
+        && [
+          'prepare-stopped:manual-account-bind-readback-does-not-match-recorded-outcome',
+          'prepare-stopped:review-or-rows-not-stable-after-configuration',
+        ].includes(dayStateInitial.active.reason),
       bindAccountsToAll: drivers.bindAccountsToAll, readMainTable: drivers.readMainTable, awaitMainTableStable: drivers.awaitMainTableStable, repairDraft: drivers.repairDraft,
       configurePlan: drivers.configurePlan, persistState: persist, hints, nowMs: nowOf(),
       onPreparationDiagnostic: typeof o.onPreparationDiagnostic === 'function' ? o.onPreparationDiagnostic : (summary => { try { log('info', 'scheduled-readiness-summary ' + JSON.stringify(summary)); } catch (_) {} }),
@@ -8776,6 +9009,15 @@ async function runScheduledPlan(businessInput, opts) {
       });
     } catch (error) {
       res = { status: 'unknown', reason: 'scheduled-flow-exception:' + scheduledErrorText(error) };
+    }
+    if (res.status === 'refused' && res.reason === 'blocking-dialog-before-initial') {
+      const reason = 'prepare-stopped:blocking-dialog-before-initial';
+      const closure = applyProvenPreInitialPolicyCancelClose(STATE_FILE, ATTEMPTS_FILE, businessDate, {
+        reason, source: 'scheduled-dialog-before-initial', shop: business.shop, accountId: business.accountId,
+      }, { nowMs: nowOf });
+      if (closure.closed) return result('preparation-stopped', reason, {
+        planNumber, businessDate, runId, noAction: true, noReplay: true, preparationClosure: closure.fact,
+      });
     }
     if (res.status === 'refused') {
       // 确认门/新鲜观察在**任何消费与任何点击之前**拒绝：账本无记录可写，诚实记 blocked。
@@ -8930,19 +9172,22 @@ async function runScheduledPlan(businessInput, opts) {
       // 关闭前截图 + 落 URL 到 plan-publisher/stuck-page.png / stuck-page.log。
       if (lastOutcome && lastOutcome.status !== 'success') {
         try {
-          const pg = opened.target;
+          const pg = drivers?.page || opened.target;
           if (pg && typeof pg.screenshot === 'function' && !pg.isClosed()) {
             const shotPath = path.join(ROOT, 'stuck-page.png');
-            await pg.screenshot({ path: shotPath, fullPage: false });
-            const urlNow = await pg.url().catch(() => '(url 不可读)');
+            await pg.screenshot({ path: shotPath, fullPage: false, timeout: 5000 });
+            const urlNow = new URL(pg.url()).pathname;
             fs.writeFileSync(path.join(ROOT, 'stuck-page.log'),
               `${new Date().toISOString()} status=${lastOutcome.status} reason=${lastOutcome.reason || ''}\nurl=${urlNow}\n`, { flag: 'a' });
             log('warn', `卡点页面已截图: ${shotPath} (url=${String(urlNow).slice(0, 80)})`);
           }
         } catch (_) { /* 截图失败不影响收口 */ }
       }
-      if (!preserveOwnedBrowser) {
-        if (!cookiesSaved) {
+      // A headless browser retained after an unknown result keeps the one-shot
+      // patrol worker alive and suppresses subsequent shop retries. Preserve
+      // the durable unknown and screenshot, then release only this owned browser.
+      if (!preserveOwnedBrowser || o.headless === true) {
+        if (!cookiesSaved && !preserveOwnedBrowser) {
           try {
             const drv = drivers || createRealDrivers({ page: opened.target, managerPage: opened.target, context: opened.context, dayState: {}, persist: () => {}, publishedIds: new Set(), attemptedSet: new Set(), hints: {}, accountId: business.accountId, business, opened, projectRoot: adapterRoot, planNumber: 1, runId: 'scheduled-cleanup' });
             await drv.saveCookies();
@@ -9054,8 +9299,8 @@ function readDaySuccessForShop(shopLike, businessDate, opts) {
 // 账号发现（运行时能力）：配置 accountId=null 的店用**生产 openShop + 严格同店 Cookie
 // 身份验证**取真实千川账户；只读、零点击，关闭浏览器前保存 Cookie。为不预先要求人工填号、
 // 也**绝不借用其它店身份**而：成功返回 accountId 字符串；身份确实未知/未通过同店验证时返回
-// { error } **具体原因**（调用方据此 blocked 并逐字保留，绝不吞成通用 unknown-account，绝不
-// 据此自动重试或当作登录过期）；能力缺失返回 { error:'discovery-capability-unavailable' }。
+// { error } 具体原因（排程保留原始原因，仅对明确的提交前导航故障按退避重试）。
+// 能力缺失返回 { error:'discovery-capability-unavailable' }。
 // headless 由调用方透传（内部免审核后台发布与 runPlan 一致走无窗口）。
 async function discoverShopAccountByLiveSession(shopCfg, business, opts) {
   const o = opts || {};
@@ -9207,11 +9452,9 @@ async function recoverShopDayReadback(shopLike, businessDate, opts) {
       const cc0 = Array.isArray(stateRaw.confirmationConsumptions) ? stateRaw.confirmationConsumptions : [];
       const ccHit = cc0.some(c => c && String(c.confirmationId || '') === cid);
       if (!rec0 && unresolved.length === 0 && !ccHit && frozen.planName) {
-        let rbAbsent = null;
-        try { rbAbsent = await drivers.readManagementRow({ planName: String(frozen.planName), accountId: business.accountId }); } catch (_) { rbAbsent = null; }
-        const absent = !rbAbsent || rbAbsent.found !== true || rbAbsent.rowCount === 0
-          || (Array.isArray(rbAbsent.rows) && rbAbsent.rows.length === 0);
-        if (absent) {
+        const absence = await drivers.readManagementAbsence({ planName: String(frozen.planName), accountId: business.accountId });
+        if (absence?.absenceConfirmed === true && absence.absent === true
+          && String(absence.accountId) === String(business.accountId)) {
           const latest = wf.loadDayState(STATE_FILE, businessDate);
           const la = latest.active || {};
           if (!la || String((la.frozen || {}).confirmationId || '') !== cid || la.status !== 'publish-unknown') {

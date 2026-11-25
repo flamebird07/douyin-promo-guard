@@ -157,12 +157,12 @@ function creationFixture(o = {}) {
   else kids.push(El('div', { rect: [400, 30], text: '伊人美 ID：1710242295996424' }));
   const rowOf = i => El('tr', { rect: [600, 40] }, [
     El('td', { rect: [500, 30], text: '商品' + i + ' 店铺新品 ID：' + APPROVED_IDS[i] + (o.dupId && i === 0 ? ' ID：' + APPROVED_IDS[1] : '') }),
-    El('td', { rect: [140, 30], text: (o.manual == null ? 2 : o.manual) + '个抖音号 管理手动添加抖音号 预估自动拉取 0 个' }),
+    El('td', { rect: [140, 30], text: o.manualLabel || (o.manual == null ? 2 : o.manual) + '个抖音号 管理手动添加抖音号 预估自动拉取 0 个' }),
   ]);
   kids.push(El('table', { class: 'ovui-table', rect: [900, 640] }, [
     El('tr', { rect: [900, 30] }, [
       El('th', { rect: [220, 20], text: '商品信息' }),
-      El('th', { rect: [160, 20], text: '投放抖音号' }),
+      El('th', { rect: [160, 20], text: o.manualLabel ? '投放抖音号 已开启联盟合作达人自动投' : '投放抖音号' }),
       El('th', { rect: [160, 20], text: '素材（默认启用智能优选，推荐同步添加自选素材）' }),
       El('th', { rect: [80, 20], text: '操作' }),
     ]),
@@ -215,6 +215,26 @@ function runPublish(p, obs, o = {}) {
 function throwsMessage(fn) {
   try { fn(); return null; } catch (e) { return String((e && e.message) || e); }
 }
+
+test('a named manual account remains bound when the same cell also shows automatic pull zero', () => {
+  const page = makeCreationPage({ manualLabel: '店铺私服 ID：example_123 管理手动添加抖音号 自动拉取 0 个' });
+  const observation = page.run(c.pageObserve);
+  assert.equal(observation.creation.eachRowHasManualAccount, true);
+  const table = page.run(require('./run-plans.cjs').readMainTableInPage);
+  assert.ok(table.rows.length === 30 && table.rows.every(r => r.manualAccounts === 1 && !r.autoPullOnly));
+  assert.equal(runPublish(page, observation).clicked, true);
+});
+
+test('a checkbox mentioning ROI does not become an editable bid or a second ROI at publish', () => {
+  const checkbox = El('input', { type: 'checkbox', cls: 'aurora-qc-checkbox-input', rect: [16, 16] });
+  const page = makePage([...creationFixture(), El('label', { text: '联盟合作达人自动投 稳定综合营销ROI' }, [checkbox])],
+    '/uni-creation/overall-product-multi', 'https://qianchuan.jinritemai.com');
+  const observation = page.run(c.pageObserve);
+  assert.equal(observation.elements.filter(e => e.fillField?.kind === 'roi' && e.fillField.recognized).length, 1);
+  assert.equal(observation.creation.roi, '15');
+  assert.equal(runPublish(page, observation).clicked, true);
+  assert.equal(checkbox.__clicked, 0);
+});
 
 test('the marketing commission card determines the state despite other commission text', () => {
   const ready = makeCreationPage({ marketingCard: true });

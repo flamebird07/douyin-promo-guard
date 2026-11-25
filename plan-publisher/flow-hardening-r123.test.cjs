@@ -1413,3 +1413,19 @@ test('a blocked headless shop releases its owned browser so the patrol worker ca
   assert.equal(result.noAction, true);
   assert.deepEqual(closed, [browser]);
 });
+
+test('patrol counts the default shop receipt with an omitted configured account', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'default-shop-receipt-'));
+  try {
+    const date = '2026-11-25';
+    fs.writeFileSync(path.join(dir, 'plan-publisher-state.json'), JSON.stringify({
+      businessDate: date, plans: [{ planNumber: 1, status: 'success', planId: '1882790444545113' }],
+    }));
+    assert.equal(rp.readDaySuccessForShop({ shop: wf.BUSINESS.shop }, date, { stateRoot: dir }), 1);
+    assert.equal(rp.readDaySuccessForShop({ shop: '另一间店' }, date, { stateRoot: dir }), 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

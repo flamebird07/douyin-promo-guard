@@ -9221,6 +9221,10 @@ function readDaySuccessForShop(shopLike, businessDate, opts) {
   if (cfgAccount !== null) {
     dirs = shopProfile.isLegacyDefaultProfile({ shop, accountId: cfgAccount }, legacyProfile)
       ? [root] : [path.join(root, 'shop-state', shopProfile.shopSlug({ shop, accountId: cfgAccount }))];
+  } else if (shop === legacyProfile.shop) {
+    const resolved = resolveLocalPreparationState(shop, null, root);
+    if (!resolved.ok || !resolved.legacy) throw new Error('day-success-legacy-identity-unverified:' + resolved.reason);
+    dirs = [{ dir: root, account: resolved.accountId }];
   } else {
     const base = path.join(root, 'shop-state');
     let names = [];

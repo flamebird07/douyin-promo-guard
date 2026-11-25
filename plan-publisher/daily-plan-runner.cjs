@@ -137,6 +137,7 @@ function loadRealDeps() {
   return {
     runPlan: publisher.runScheduledPlan,
     readDaySuccess: publisher.readDaySuccessForShop,
+    readCatalogRest: publisher.readCatalogRest,
     discoverAccount: publisher.discoverShopAccountByLiveSession,
     // R7：本地准备恢复（无浏览器、纯文件、锁内 CAS 收口）——同一 run-plans 既有导出，
     // 绝不 import watch-drill / Monitor；缺导出时恢复钩子不接线（诚实不可用，不伪造）。
@@ -455,6 +456,7 @@ function createDailyRunner(o = {}) {
     nowMs: opts.nowMs,
     onLog,
     listShops: liveShops,
+    readCatalogRest: (shop, date) => deps.readCatalogRest?.(shop, date, stateRoot || undefined),
     buildBusiness: (shop, ctx) => ({
       shop: shop.name,
       accountId: shop.accountId != null && String(shop.accountId) !== '' ? String(shop.accountId) : null,

@@ -37,3 +37,5 @@ plan-publisher/overlay-diag.log
 plan-publisher/stuck-page*
 plan-publisher/numeric-pager-timeout*
 /PlanPublisher/guidance/
+
+/plan-publisher/catalog-rest-days/

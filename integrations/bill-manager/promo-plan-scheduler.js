@@ -702,7 +702,7 @@ function createScheduler(opts = {}) {
       const shopId = String(s.id != null ? s.id : s.name);
       const limit = resolveShopPlansPerDay(s, cfg.plansPerShopPerDay);
       const rec = dayRec[shopId];
-      return rec && (rec.plans >= limit
+      return rec && (rec.catalogRestDate === date || rec.plans >= limit
         || rec.status === 'failed' || rec.status === 'unknown'
         || rec.status === 'failed-permanent'
         || (rec.status === 'blocked' && !canRetryDiscovery(rec, maxUnsubmittedRetries)));
@@ -745,6 +745,19 @@ function createScheduler(opts = {}) {
         const shopId = String(shop.id != null ? shop.id : shop.name);
         const shopLimit = resolveShopPlansPerDay(shop, cfg.plansPerShopPerDay);
         const rec = shopDay(ledger, t.date, shopId);
+        if (opts.readCatalogRest) {
+          try {
+            const rest = opts.readCatalogRest(shop, t.date);
+            if (rest) {
+              rec.catalogRestDate = rest.restDate;
+              results.push({ shopId, status: 'catalog-rest-day', plans: rec.plans, restDate: rest.restDate });
+              continue;
+            }
+          } catch (error) {
+            results.push({ shopId, status: 'unknown', error: 'catalog-rest-read-failed:' + error.message });
+            continue;
+          }
+        }
 
         // 外部真实日状态（含手动发布）与账本取 max：手动已 3 → 本日跳过；未知只读，绝不重放。
         let external = 0;

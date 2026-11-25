@@ -129,7 +129,7 @@ function lateGuidePagerHost(cfg = {}) {
   } };
   const dayState = { lastSelected: [], attempted: [], cursor: { category: cat, page: cfg.cursorPage || 1, seenProductIds: [] } };
   const driver = rp.createRealDrivers({
-    page: pageObj, managerPage: {}, context: {}, dayState, persist: async () => {},
+    page: pageObj, managerPage: {}, context: {}, dayState, onCatalogEnd: cfg.onCatalogEnd, persist: async () => {},
     publishedIds: new Set(), attemptedSet: new Set(), hints: {}, accountId: acct,
     opened: {}, projectRoot: cfg.projectRoot || __dirname, planNumber: 1, runId: 'offline', nativeScrollTimeoutMs: cfg.timeoutMs || 1500,
     saveCookies: async () => { cookieSaves++; return guide === 'saveFail' ? { status: 'failed', reason: 'offline-stub-write-failed' } : { status: 'saved', count: 3, bytes: 128, domains: 1, conflict: false }; },
@@ -480,4 +480,18 @@ test('reopening All on the saved page resumes there without advancing past its p
   assert.deepEqual(result.selectedIds, ids);
   assert.equal(host.state().leafClickCalls, 0);
   assert.equal(host.state().cursorPage, 2);
+});
+
+test('records the catalog end when the last page supplies product 30', async () => {
+  const pages = [];
+  const host = lateGuidePagerHost({ onCatalogEnd: page => pages.push(page) });
+  assert.equal((await host.run()).selectedIds.length, 30);
+  assert.deepEqual(pages, [2]);
+});
+
+test('an interrupted next-page transition does not schedule a rest day', async () => {
+  const pages = [];
+  const host = lateGuidePagerHost({ stallAfterClick: true, timeoutMs: 30, onCatalogEnd: page => pages.push(page) });
+  await assert.rejects(host.run());
+  assert.deepEqual(pages, []);
 });

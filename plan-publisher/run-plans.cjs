@@ -1338,6 +1338,35 @@ function resolvePublisherStatePaths(shopLike, stateRoot) {
   return { ...resolved, sourceExtraFiles: [resolved.paths.publishedFile, resolved.identityFile].filter(Boolean) };
 }
 
+function nextBusinessDate(date) {
+  const midnight = new Date(date + 'T00:00:00Z');
+  midnight.setUTCDate(midnight.getUTCDate() + 1);
+  return midnight.toISOString().slice(0, 10);
+}
+
+function recordCatalogEnd(paths, business, businessDate, page) {
+  if (!Number.isInteger(page) || page < 1) throw new Error('catalog-end-page-invalid');
+  const restDate = nextBusinessDate(businessDate);
+  const fact = { shop: business.shop, accountId: business.accountId, businessDate, restDate, page };
+  atomicWrite(path.join(paths.dir, 'catalog-rest-days', restDate + '.json'), fact);
+  return fact;
+}
+
+function readCatalogRest(shopLike, date, stateRoot) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('catalog-rest-date-invalid');
+  const scoped = resolvePublisherStatePaths(shopLike, stateRoot);
+  if (!scoped.ok) throw new Error(scoped.reason);
+  if (!scoped.paths) return null;
+  const file = path.join(scoped.paths.dir, 'catalog-rest-days', date + '.json');
+  let fact;
+  try { fact = JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  if (fact.restDate !== date || nextBusinessDate(fact.businessDate) !== date
+    || fact.shop !== (shopLike.shop || shopLike.name) || fact.accountId !== scoped.accountId
+    || !Number.isInteger(fact.page) || fact.page < 1) throw new Error('catalog-rest-invalid');
+  return fact;
+}
+
 async function recoverLocalPreparationClose(shopLike, businessDate, opts) {
   const o = opts || {};
   const nowMs = typeof o.nowMs === 'function' ? o.nowMs : () => Date.now();
@@ -4607,7 +4636,7 @@ function createRealDrivers(ctx) {
           if (String(c.accountId) !== String(accountId)) throw new Error('current-product-page-account-drift');
         }
       }
-      return { snap, empty: false, complete: listPageComplete(snap) };
+      return { snap, empty: false, complete: listPageComplete(snap), pagination: pg };
     };
     let r;
     try { r = await until(read, x => x.complete === true, nativeTimeoutMs, 'current-product-page-settle'); }
@@ -5513,6 +5542,10 @@ function createRealDrivers(ctx) {
     pickerRunContext={baseSelectedCount,expectedCapacity,retryScanIds:reusePriorAttempts?attemptedInDraft:null};
     dayState.lastSelected=selectedIds.slice();
     let lastPageReached=false;
+    const noteCatalogEnd=pageNumber=>{
+      if (!lastPageReached && ctx.onCatalogEnd) ctx.onCatalogEnd(pageNumber);
+      lastPageReached=true;
+    };
     let nativeForwardObserved=false;
     let cat=dayState.cursor&&ordered.includes(dayState.cursor.category)?dayState.cursor.category:ordered[0];
     let categoryIndex=Math.max(0,ordered.indexOf(cat));
@@ -5563,7 +5596,7 @@ function createRealDrivers(ctx) {
         if(!native&&pageNo<forwardFloor){
           const advanced=await changePage({cat,native,selectedIds,baseSelectedCount,expectedCapacity});
           if(advanced&&advanced.boundary===true){
-            if(cat==='全部')lastPageReached=true;
+            if(cat==='全部')noteCatalogEnd(advanced.currentPage ?? pageNo);
             forwardFloor=1;
             break;
           }
@@ -5577,6 +5610,15 @@ function createRealDrivers(ctx) {
         // picker re-open, no checkbox/batch/header re-do happens here.
         const settledPage=await settleProductPage({cat,native,tab,pageNo,selectedIds,baseSelectedCount});
         snap=settledPage.snap;
+        if (cat==='全部' && ctx.onCatalogEnd && !lastPageReached) {
+          const pg=settledPage.pagination;
+          const knownEnd=pg?.currentPage===pageNo && (pg.pageCount===pageNo || pg.items?.some(item=>item.kind==='next' && item.disabled===true));
+          const pager=knownEnd ? null : await page.evaluate(numericPickerPagingInPage,{
+            mode:'read',expectedCurrentPage:pageNo,expectedSelectedCount:snap.selectedCount,
+            expectedCapacity:snap.remainingCapacity,selectedIds,accountId,
+          });
+          if (knownEnd || (pager?.ok && pager.nextDisabled===true)) noteCatalogEnd(pageNo);
+        }
         const cardIds=snap.cards.map(c=>c.id).filter(Boolean);
         if(native&&settledPage.empty)break;
         if(native){
@@ -5707,7 +5749,7 @@ function createRealDrivers(ctx) {
         }
         const advanced=await changePage({cat,native,selectedIds,baseSelectedCount,expectedCapacity});
         if(advanced&&advanced.boundary===true){
-          if(cat==='全部')lastPageReached=true;
+          if(cat==='全部')noteCatalogEnd(advanced.currentPage ?? pageNo);
           break;
         }
         if(!advanced.confirmed||advanced.observedPage!==pageNo+1)throw new Error('page-advance-unconfirmed-before-cursor-write');
@@ -8259,7 +8301,7 @@ async function main() {
       if(wf.hasUnresolvedPlan(activeState))throw new Error('day-state-pending-or-unknown-read-only-recovery-required');
       dayState={...activeState,runId,businessDate:date,active:null,lastSelected:[]};
       const attemptedSet=new Set(dayState.attempted||[]);const hints={...(dayState.hints||{})};
-      const drivers=createRealDrivers({page:null,managerPage,context,dayState,persist,publishedIds,attemptedSet,hints,accountId:business.accountId,business,boundAccounts:business.boundAccounts||null,productsPerPlan:business.productsPerPlan,creationUrl:business.creationUrl,managementUrl:shopProfile.managementUrlFor(business),legacyBusiness:legacyDefault,guidancePrivateDir:guidanceScope.privateDir,opened,projectRoot:root,planNumber,runId,dismissObstructions:true,cancelConfirmHandling:true,requireDrawerStability:true,readAccountInPage:readChengfangAccountInPage,clickSubTab:clickChengfangSubTab,readShopRowsInPage:collectChengfangRowsInPage,readShopPaginationInPage:collectChengfangPaginationInPage,goFirstShopPageInPage:clickChengfangFirstPageInPage,goNextShopPageInPage:clickChengfangNextPageInPage});
+      const drivers=createRealDrivers({onCatalogEnd:page=>recordCatalogEnd(paths,business,wf.shanghaiDate(Date.now()),page),page:null,managerPage,context,dayState,persist,publishedIds,attemptedSet,hints,accountId:business.accountId,business,boundAccounts:business.boundAccounts||null,productsPerPlan:business.productsPerPlan,creationUrl:business.creationUrl,managementUrl:shopProfile.managementUrlFor(business),legacyBusiness:legacyDefault,guidancePrivateDir:guidanceScope.privateDir,opened,projectRoot:root,planNumber,runId,dismissObstructions:true,cancelConfirmHandling:true,requireDrawerStability:true,readAccountInPage:readChengfangAccountInPage,clickSubTab:clickChengfangSubTab,readShopRowsInPage:collectChengfangRowsInPage,readShopPaginationInPage:collectChengfangPaginationInPage,goFirstShopPageInPage:clickChengfangFirstPageInPage,goNextShopPageInPage:clickChengfangNextPageInPage});
       // The manager page/context and drivers are held for the complete run. Each
       // preparation creates its own fresh creation page and never carries an old
       // selected list or confirmation into the next plan.
@@ -8723,6 +8765,7 @@ async function runScheduledPlan(businessInput, opts) {
       legacyDefault = shopProfile.isLegacyDefaultProfile(business, legacyProfile);
     }
     if (!paths) { paths = scheduledStatePaths(business, legacyDefault, stateRoot); releaseLock = acquireLock(paths.lockFile); }
+    if (fs.existsSync(path.join(paths.dir, 'catalog-rest-days', businessDate + '.json')) && readCatalogRest(business, businessDate, stateRoot)) return result('skipped', 'catalog-rest-day', { noAction: true });
     const STATE_FILE = paths.stateFile, PUBLISHED_FILE = paths.publishedFile, ATTEMPTS_FILE = paths.attemptsFile;
 
     const stateRaw = fs.existsSync(STATE_FILE) ? JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) : null;
@@ -8822,6 +8865,7 @@ async function runScheduledPlan(businessInput, opts) {
     const driversFactory = typeof o.driversFactory === 'function' ? o.driversFactory : createRealDrivers;
     drivers = driversFactory({
       page: null, managerPage: opened.target, context, dayState, persist, publishedIds, attemptedSet, hints,
+      onCatalogEnd: page => recordCatalogEnd(paths, business, wf.shanghaiDate(nowOf()), page),
       retryEligibleIds,
       assertPreparationDay: () => {
         if(wf.shanghaiDate(nowOf())!==businessDate)throw new Error('scheduled-preparation-business-date-changed');
@@ -10278,3 +10322,7 @@ module.exports={publisherStatePaths,bindingAccountsSnapshotSettled,bindingPanelS
 module.exports.resolvePublisherStatePaths = resolvePublisherStatePaths;
 
 if(require.main===module)main();
+
+module.exports.recordCatalogEnd = recordCatalogEnd;
+module.exports.readCatalogRest = readCatalogRest;
+module.exports.nextBusinessDate = nextBusinessDate;

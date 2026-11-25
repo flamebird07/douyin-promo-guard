@@ -141,7 +141,7 @@ const HTML = `<!DOCTYPE html>
   <button id="btn-stop" class="danger">停止监控</button>
   <button id="btn-qrlogin" title="弹出本机浏览器，用抖音 App 扫码登录抖店；每扫一次登录一家店，Cookie 自动保存并把店铺加入列表">扫码登录店铺</button>
   <button id="btn-rediscover" class="ghost" title="重新扫描 Cookie 目录（项目 cookies/ 与 login.cookieSourceDir），把已有 Cookie 文件补录为店铺">扫描已有 Cookie</button>
-  <span class="muted">批量作用于下方全部未删除店铺的超额巡查；<b>不影响</b>独立的每日 07:00 自动开启任务 · 立即更新只读，不触发广告开关 · 推广广告控制仅抖店</span>
+  <span class="muted">批量作用于下方全部未删除店铺的超额巡查；<b>不影响</b>独立的每日 <span id="firstCheck"></span> 首查开启任务 · 立即更新只读，不触发广告开关 · 推广广告控制仅抖店</span>
 </div>
 <div id="msg" class="muted"></div>
 
@@ -410,11 +410,27 @@ function renderShops(rows) {
       var pubMain = document.createElement('div');
       var okN = Number(pp.success) || 0;
       var tgt = pp.target != null ? pp.target : '—';
-      pubMain.textContent = okN + '/' + tgt + ' 份';
+      pubMain.textContent = pp.restToday ? '今日停发一天' : okN + '/' + tgt + ' 份';
       if (pp.target != null && okN >= pp.target) pubMain.className = 'ok';
       tdPub.appendChild(pubMain);
+      var rest = pp.restToday || pp.restTomorrow;
+      if (rest) {
+        var restLine = document.createElement('div');
+        restLine.textContent = rest.restDate + ' 停发 · 商品目录已到第 ' + rest.page + ' 页';
+        tdPub.appendChild(restLine);
+      }
+      if (pp.readError) {
+        var errorLine = document.createElement('div');
+        errorLine.textContent = '发布数据读取异常：' + pp.readError;
+        tdPub.appendChild(errorLine);
+      }
+      if (pp.lastPlanId) {
+        var idLine = document.createElement('div');
+        idLine.textContent = '成功计划 ID：' + pp.lastPlanId;
+        tdPub.appendChild(idLine);
+      }
       if (pp.lastStatus) {
-        var stWord = { success: '成功', unknown: '未知（不重放）', failed: '失败', 'failed-permanent': '失败（封存）', unsubmitted: '待重试', in_progress: '进行中', preparation_stopped: '已收口' }[pp.lastStatus] || pp.lastStatus;
+        var stWord = { success: '成功', unknown: '未知（不重放）', failed: '失败', 'failed-permanent': '失败（封存）', unsubmitted: '待重试', 'in-progress': '进行中', in_progress: '进行中', 'preparation-stopped': '已收口', preparation_stopped: '已收口' }[pp.lastStatus] || pp.lastStatus;
         var pubLine = document.createElement('div');
         pubLine.style.fontSize = '11px';
         if (pp.lastStatus === 'success') pubLine.className = 'ok';
@@ -565,9 +581,10 @@ async function refresh() {
     var runEl = document.getElementById('run');
     runEl.textContent = s.monitor.running ? '监控运行中' : '监控已停止';
     runEl.className = 'badge ' + (s.monitor.running ? 'dry' : 'off');
+    document.getElementById('firstCheck').textContent = s.monitor.firstCheckTime || '';
     renderShops(s.shopRows || []);
     document.getElementById('sched').textContent =
-      '调度：每日 ' + s.monitor.dailyStartHour + ':00 后 · 每 ' + s.monitor.intervalMinutes + ' 分钟'
+      '调度：每日首查 ' + (s.monitor.firstCheckTime || '—') + ' · 巡查间隔 ' + s.monitor.intervalMinutes + ' 分钟'
       + ' ｜ 最近巡查 ' + fmtTime(s.monitor.lastCycleAt)
       + ' ｜ 下次 ' + fmtTime(s.monitor.nextRunAt)
       + (s.ready ? '' : ' ｜ 待配置：' + (s.pending || []).join('；'));
@@ -689,27 +706,54 @@ function shanghaiTodayStr(nowMs) {
   return new Date((nowMs == null ? Date.now() : nowMs) + 8 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
-function readPlanPublishStatus(nowMs) {
+const publisher = require('../../plan-publisher/run-plans.cjs');
+
+function dailyReceipts(paths, date) {
+  function read(file) {
+    try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch (error) { if (error.code === 'ENOENT') return {}; throw error; }
+  }
+  const state = read(paths.stateFile);
+  if (state.businessDate !== date) return [];
+  const attempts = read(paths.attemptsFile);
+  const published = new Set((read(paths.publishedFile).plans || []).filter(p => p.date === date).map(p => p.planId));
+  const receipts = [];
+  for (const plan of state.plans || []) {
+    if (plan.status !== 'success' || !plan.planId || !published.has(plan.planId)) continue;
+    for (const [id, first] of Object.entries(attempts.consumed || {})) {
+      const final = attempts.finalConsumed?.[id];
+      if (first.runId && first.runId === final?.runId && plan.manifestHash &&
+          [first, final].every(r => r.status === 'success' && r.businessDate === date &&
+            r.manifestHash === plan.manifestHash && r.planNumber === plan.planNumber)) {
+        receipts.push({ planNumber: plan.planNumber, planId: plan.planId, at: first.at });
+        break;
+      }
+    }
+  }
+  return receipts.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+}
+
+function readPlanPublishStatus(nowMs, publisherDir = PUBLISHER_DIR) {
   const empty = { configured: false, autoConfirm: false, byShop: {} };
   let cfg;
   try {
-    cfg = JSON.parse(fs.readFileSync(path.join(PUBLISHER_DIR, 'daily-plan-config.json'), 'utf-8'));
+    cfg = JSON.parse(fs.readFileSync(path.join(publisherDir, 'daily-plan-config.json'), 'utf-8'));
   } catch (_) {
     return empty; // 未配置发布（fail-closed 不触发）→ 列显示「未启用」
   }
   const today = shanghaiTodayStr(nowMs);
   let dayShops = {};
   try {
-    const led = JSON.parse(fs.readFileSync(path.join(PUBLISHER_DIR, 'daily-plan-data', 'ledger.json'), 'utf-8'));
+    const led = JSON.parse(fs.readFileSync(path.join(publisherDir, 'daily-plan-data', 'ledger.json'), 'utf-8'));
     dayShops = (led.days && led.days[today] && led.days[today].shops) || {};
   } catch (_) { /* 无账本 → 各店按未运行显示 */ }
   const byShop = {};
   for (const s of (Array.isArray(cfg.shops) ? cfg.shops : [])) {
     if (!s || s.deleted === true) continue;
     const name = String(s.name || s.id);
-    const d = dayShops[name] || null;
+    const d = dayShops[s.id] || dayShops[name] || null;
     const entries = d && d.entries ? Object.values(d.entries) : [];
-    const last = entries.length ? entries[entries.length - 1] : null;
+    const last = entries.sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0))[0];
     const target = Number.isInteger(s.plansPerShopPerDay) ? s.plansPerShopPerDay
       : (Number.isInteger(cfg.plansPerShopPerDay) ? cfg.plansPerShopPerDay : 3);
     byShop[name] = {
@@ -722,8 +766,30 @@ function readPlanPublishStatus(nowMs) {
       reason: (last && last.reason) || (d && d.error) || null,
       lastAt: (last && last.at) || (d && d.lastAt) || null,
     };
+    const status = byShop[name];
+    const stateRoot = cfg.stateRoot || publisherDir;
+    try {
+      const scoped = publisher.resolvePublisherStatePaths(s, stateRoot);
+      if (!scoped.ok) throw new Error(scoped.reason);
+      const receipts = scoped.paths ? dailyReceipts(scoped.paths, today) : [];
+      const latest = receipts.at(-1);
+      if (latest) {
+        const count = new Set(receipts.map(r => r.planNumber)).size;
+        status.success = Math.max(count, status.success);
+        status.lastPlanId = latest.planId;
+        if (count >= target || !last || Date.parse(latest.at) >= Date.parse(last.at)) {
+          Object.assign(status, { overall: count >= target ? 'success' : 'partial', lastStatus: 'success', reason: null, lastAt: latest.at });
+        }
+      }
+      status.restToday = publisher.readCatalogRest(s, today, stateRoot);
+      status.restTomorrow = publisher.readCatalogRest(s, publisher.nextBusinessDate(today), stateRoot);
+      if (status.restToday) status.overall = 'catalog-rest-day';
+    } catch (error) {
+      status.readError = String(error.message);
+    }
+    if (s.id) byShop[s.id] = status;
   }
-  return { configured: true, autoConfirm: cfg.autoConfirm === true, byShop };
+  return { configured: true, enabled: cfg.enabled === true, autoConfirm: cfg.autoConfirm === true, byShop };
 }
 
 function readBody(req) {
@@ -773,8 +839,7 @@ function createUiServer(monitor, port, opts) {
         const pub = readPlanPublishStatus();
         st.planPublishByShop = pub;
         for (const row of (st.shopRows || [])) {
-          const key = String(row.displayName || row.name || row.id);
-          row.planPublish = pub.byShop[key] || { configured: pub.configured, enabled: pub.enabled === true, autoConfirm: pub.autoConfirm, target: null, success: 0, overall: '未运行', lastStatus: null, reason: null, lastAt: null };
+          row.planPublish = pub.byShop[row.id] || pub.byShop[row.name] || pub.byShop[row.displayName] || { configured: pub.configured, enabled: false, autoConfirm: pub.autoConfirm, target: null, success: 0, overall: '未运行', lastStatus: null, reason: null, lastAt: null };
         }
       } catch (_) { /* 投影失败不阻塞状态 */ }
       return sendJson(200, st);
@@ -826,4 +891,4 @@ function createUiServer(monitor, port, opts) {
   return { server, port };
 }
 
-module.exports = { createUiServer };
+module.exports = { createUiServer, readPlanPublishStatus };

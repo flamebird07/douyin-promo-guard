@@ -937,11 +937,19 @@ function inspectCookieFile(cookieFilePath, readOnly) {
   };
 }
 
-/** 加载某店铺 Cookie 的元信息（不返回值本身）。 */
-function loadShopCookieMeta(loginCfg, shopCfg) {
+/**
+ * 加载某店铺 Cookie 的元信息（不返回值本身）。
+ * 复用 resolveCookieFile / inspectCookieFile，语义不变。
+ *
+ * 可选非拦截路径（状态投影专用）：opts.allowExpired === true 时，文件已过期不抛错，
+ * 返回的 meta 保留 fxgExpired / maxExpires，供界面如实展示「文件已过期」；
+ * 缺失/解析失败仍照常抛 AuthError（由调用方回退 found:false）。
+ * 默认（不传 opts）执行端拒过期行为完全不变。
+ */
+function loadShopCookieMeta(loginCfg, shopCfg, opts = {}) {
   const resolved = resolveCookieFile(loginCfg, shopCfg.cookieFile);
   const meta = inspectCookieFile(resolved.path, resolved.readOnly);
-  if (meta.fxgExpired) {
+  if (meta.fxgExpired && !(opts && opts.allowExpired === true)) {
     throw new AuthError(
       `店铺「${shopCfg.cookieFile}」的抖站 Cookie 已过有效期（最近过期时间 ${meta.maxExpires ? new Date(meta.maxExpires).toISOString() : '未知'}），本轮停止自动操作`
     );

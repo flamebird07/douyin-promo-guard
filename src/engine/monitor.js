@@ -2063,6 +2063,17 @@ class Monitor {
     return this._shopActivity.get(String(shopId)) || null;
   }
 
+  /**
+   * 无在途时的「当前动作」（2026-11-27）：最近一次读取判定登录失效 → 具体文案，不以「空闲」
+   * 掩盖需要重新登录；fix3-four 路径沿用其固定提示（不含扫码类结论）；其余「空闲」。
+   */
+  _idleActivityText(rt) {
+    const re = rt && rt.lastReadError;
+    if (!(re && re.requiresLogin)) return '空闲';
+    const fix3 = re.hint === FIX3_AUTH_HINTS.closed || re.hint === FIX3_AUTH_HINTS.open;
+    return fix3 ? re.hint : '登录已失效，等待重新扫码登录';
+  }
+
   /** 租约持有期间细化当前动作文本（如 巡查租约内：读取数据 → 关闭广告 → 回读确认）。未持租约不生效。 */
   _setShopActivity(shopId, text) {
     const k = String(shopId);
@@ -2518,6 +2529,17 @@ class Monitor {
   }
 
   /** 回读失败：撤销旧 on 证据，写完整原因（lastError/today.blockedReason/结构化分类一致）。 */
+  /**
+   * 读取错误对外提示（单一来源）。fix3-four 路径（错误对象带 authClosure）：结案/未结案各一条
+   * 固定文案，不含扫码类结论；其余按分类取固定文案（未定义分类 → null）。
+   */
+  _readErrorHint(err, kind) {
+    const fix3Auth = kind === 'auth' && !!(err && err.authClosure);
+    return fix3Auth
+      ? (err.authClosure.authClosedOut === true ? FIX3_AUTH_HINTS.closed : FIX3_AUTH_HINTS.open)
+      : (READ_FAILURE_HINTS[kind] !== undefined ? READ_FAILURE_HINTS[kind] : null);
+  }
+
   _applyReadFailure(shopId, err) {
     const rt = this._runtime(shopId);
     // 页面展示的错误详情同样脱敏：保留业务原因与分类，但绝不出站裸 Cookie/令牌/会话值。
@@ -2549,11 +2571,8 @@ class Monitor {
       }
     }
     const reason = `${baseReason}${holdLogFields}`;
-    // fix3-four 路径（authClosure 证据随错误交付）：对外提示不含扫码类结论，结案/未结案分列。
-    const fix3Auth = kind === 'auth' && !!(err && err.authClosure);
-    const hint = fix3Auth
-      ? (err.authClosure.authClosedOut === true ? FIX3_AUTH_HINTS.closed : FIX3_AUTH_HINTS.open)
-      : (READ_FAILURE_HINTS[kind] !== undefined ? READ_FAILURE_HINTS[kind] : null);
+    // 对外提示文案见 _readErrorHint（fix3 结案/未结案与普通分类的单一来源）。
+    const hint = this._readErrorHint(err, kind);
     rt.lastReadError = {
       kind,
       // 四条固定文案（单一来源）：页面/bill-manager 直接消费，不再各自猜文案。
@@ -4064,6 +4083,29 @@ class Monitor {
     } catch (e) {
       const reason = e.reason || e.message;
       rt.lastError = reason;
+      // 2026-11-27：读取链（费用/订单）上的登录失效同样要落可见提示。此前只有广告状态回读路径写
+      // lastReadError.requiresLogin，读取链 AuthError 只落 lastError（主控制页行不渲染该字段）——
+      // 实录：店铺连续 12 轮停在登录页，行上却只有「状态未知 / 空闲 / Cookie 有效」，看不出要重新登录。
+      // 这里只补提示记录（分类与固定文案同 _applyReadFailure），不改判定、不动 adBelief 与串行门；
+      // 记录随下一次成功读取由 _clearReadFailure 清除；后续非登录类失败说明登录已恢复，同样清除。
+      const readErrorKind = this._readErrorKind(e, shopCfg.id);
+      if (readErrorKind === 'auth') {
+        rt.lastReadError = {
+          kind: 'auth',
+          hint: this._readErrorHint(e, 'auth'),
+          requiresLogin: true,
+          reason,
+          loginUrlObserv: null,
+          blocked: (e && e.blocked) || 'ad_state_read',
+          lastStep: (e && e.lastStep) || null,
+          retrying: false,
+          retried: false,
+          retryCount: 0,
+          at: new Date(this.nowFn()).toISOString(),
+        };
+      } else if (rt.lastReadError && rt.lastReadError.requiresLogin) {
+        rt.lastReadError = null;
+      }
       // 异常退出不得把 refreshing 卡在 true（candidate 未提交则维持上一轮已提交读数）。
       rt.dataRefreshing = false;
       if (rt.lastData && typeof rt.lastData === "object") rt.lastData.refreshing = false;
@@ -4907,19 +4949,27 @@ class Monitor {
     return rt;
   }
 
+  // Cookie 文件状态投影（shops / shopRows 两处共用同一规则；2026-11-28 修复）：
+  // 走 loadShopCookieMeta 的可选非拦截路径（allowExpired），已过期文件保留
+  // found:true / expired:true / maxExpires，界面据此给「文件已过期」明确文案，
+  // 不再把过期文件误报成 found:false（缺失）。缺失/解析失败仍回退 found:false。
+  // 只读元信息，绝不包含 Cookie 值；不改变执行端默认拒过期行为。
+  _cookieInfoProjection(s) {
+    try {
+      const meta = loadShopCookieMeta(this.config.login, s, { allowExpired: true });
+      return { found: true, readOnly: meta.readOnly, cookieCount: meta.count, maxExpires: meta.maxExpires, expired: meta.fxgExpired };
+    } catch (e) {
+      return { found: false, error: e.reason || e.message };
+    }
+  }
+
   // ── 界面状态 ─────────────────────────────────────────────────────
   getStatus() {
     const nowMs = this.nowFn();
     const today = shanghaiDate(nowMs);
     const shops = (this.config.shops || []).map((s) => {
       const rt = (this._runtimeMap && this._runtimeMap.get(s.id)) || {};
-      let cookieInfo;
-      try {
-        const meta = loadShopCookieMeta(this.config.login, s);
-        cookieInfo = { found: true, readOnly: meta.readOnly, cookieCount: meta.count, maxExpires: meta.maxExpires, expired: meta.fxgExpired };
-      } catch (e) {
-        cookieInfo = { found: false, error: e.reason || e.message };
-      }
+      const cookieInfo = this._cookieInfoProjection(s);
       const dateRec = (this.batches[s.id] && this.batches[s.id][today]) || null;
       // 旧持久记录可能带同日双 true（历史版本暂停批次后未重置 allEnabledConfirmed）。
       // 投影按**最近一次 run** 修正确认口径：不清历史（runs/totals 原样保留），
@@ -5072,25 +5122,26 @@ class Monitor {
           pauseEligible: (t && t.businessDate === today) ? t.pauseEligible === true : false,
           roiTooLow: !!(t && t.businessDate === today && t.roiTooLow === true),
           lastError: rt.lastError || (t && t.blockedReason) || null,
+          // 登录失效可见提示（2026-11-27）：读取链或回读链任一路径判定 auth → 行上直接给出固定文案，
+          // 供主控制页显示「会话失效」与具体动作（Cookie 列的「文件未到期」只代表文件内最晚到期
+          // 时间未过，不代表平台登录态有效）。
+          requiresLogin: !!(rt.lastReadError && rt.lastReadError.requiresLogin),
+          readHint: (rt.lastReadError && rt.lastReadError.hint) || null,
           // 状态供界面兼容；正常配置店铺不显示待核验标记。
           identityPending: this._shopIdentityState(s).pending,
-          // 当前动作（2026-11-20 主控制页）：租约在途文本 > 只读刷新在途 > 空闲。如实投影，不推断。
+          // 当前动作（2026-11-20 主控制页）：租约在途文本 > 只读刷新在途 > 登录失效待重新登录 > 空闲。
+          // 如实投影，不推断。
           activity: this._shopActivityText(s.id)
-            || (rt.dataRefreshing === true ? '读取数据中（只读）' : '空闲'),
+            || (rt.dataRefreshing === true ? '读取数据中（只读）' : this._idleActivityText(rt)),
           identityNote: this._shopIdentityState(s).reason,
           // D56：有效启用状态等价于"未删除"，避免把历史 enabled=false 的正常店误示为未启用。
           enabled: s.deleted !== true,
           platform: s.platform || 'douyin',
           // Cookie 登录文件状态（2026-11-19 主控制页 Cookie 列）：只读元信息
           // （是否找到/条数/过期/只读来源），绝不包含 Cookie 值本身。
-          cookieInfo: (() => {
-            try {
-              const meta = loadShopCookieMeta(this.config.login, s);
-              return { found: true, readOnly: meta.readOnly, cookieCount: meta.count, maxExpires: meta.maxExpires, expired: meta.fxgExpired };
-            } catch (e) {
-              return { found: false, error: e.reason || e.message };
-            }
-          })(),
+          // 2026-11-28：与 shops 投影共用 _cookieInfoProjection 同一规则，
+          // 过期文件保留 found:true / expired:true（非拦截路径），不再误报缺失。
+          cookieInfo: this._cookieInfoProjection(s),
         };
       }),
       rules: this.config.rules || [],

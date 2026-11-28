@@ -194,6 +194,15 @@ function fmtTime(iso) {
   if (isNaN(d.getTime())) return '—';
   return d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
 }
+// Cookie 到期时间（epoch ms）：只返回「文件内最晚到期时间」这一事实值，无有效日期返回 null；
+// 不推断登录是否有效、不把历史时间标成未来。缺日期既可能是会话型，也可能是缺少抖站域，
+// 因此不在此断言会话型，由调用方按「无固定到期时间」中性呈现。
+function fmtCookieExpire(ms) {
+  if (ms == null || !isFinite(Number(ms)) || Number(ms) <= 0) return null;
+  var d = new Date(Number(ms));
+  if (isNaN(d.getTime())) return null;
+  return '文件内最晚到期时间：' + d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+}
 function adBadge(st) {
   var map = { on: ['开启', 'on'], off: ['暂停', 'off'], mixed: ['混合', 'mixed'], unknown: ['未知', 'unknown'] };
   var m = map[st] || map.unknown;
@@ -337,11 +346,38 @@ function renderShops(rows) {
     // Cookie 登录文件状态（只读元信息：是否找到/是否过期；绝不展示 Cookie 内容）
     var tdCookie = document.createElement('td');
     var ci = s.cookieInfo || null;
-    if (ci && ci.found) {
+    if (s.requiresLogin) {
+      // 2026-11-27：平台已不认本店登录会话（读取时停在登录页）。文件时间戳未过期不等于能登录，
+      // 此时不得再显示绿色「有效」。
+      var cDead = document.createElement('span');
+      cDead.className = 'badge unknown';
+      cDead.title = s.readHint || '登录已失效，请重新登录';
+      cDead.textContent = '会话失效';
+      tdCookie.appendChild(cDead);
+    } else if (ci && ci.found) {
+      // 2026-11-28：文案只描述「文件到期状态」这一只读事实，按三态区分：
+      // 文件已过期 / 文件未到期 / 无固定到期时间（无可显示日期）；不据此推断平台登录
+      // 是否有效（登录态以 requiresLogin 徽标为最高优先级），也不断言一定是会话型
+      //（缺少抖站域时同样取不到日期，故只如实报「无固定到期时间」）。
+      var expText = fmtCookieExpire(ci.maxExpires);
       var cBadge = document.createElement('span');
-      cBadge.className = 'badge ' + (ci.expired ? 'unknown' : 'on');
-      cBadge.textContent = ci.expired ? '已过期' : '有效';
+      cBadge.className = 'badge ' + (expText ? (ci.expired ? 'unknown' : 'on') : 'off');
+      cBadge.textContent = expText ? (ci.expired ? '文件已过期' : '文件未到期') : '无固定到期时间';
+      cBadge.title = expText
+        ? (ci.expired
+          ? 'Cookie 文件内最晚到期时间已过；不代表平台登录态'
+          : 'Cookie 文件内最晚到期时间未过；不代表平台登录态一定有效')
+        : 'Cookie 文件内无可用固定到期时间；不代表平台登录态一定有效';
       tdCookie.appendChild(cBadge);
+      // 到期时间（只读元信息）：仅在取到有效日期时追加，避免与「无固定到期时间」徽标重复；
+      // 明确标注为「文件内最晚到期时间」。
+      if (expText) {
+        var cExp = document.createElement('div');
+        cExp.className = 'muted';
+        cExp.style.fontSize = '11px';
+        cExp.textContent = expText;
+        tdCookie.appendChild(cExp);
+      }
       if (ci.readOnly === true) {
         var cRo = document.createElement('div');
         cRo.className = 'muted';
@@ -392,11 +428,15 @@ function renderShops(rows) {
       pSmall.textContent = '默认';
       tdPlans.appendChild(pSmall);
     }
-    // 当前动作列（2026-11-20）：引擎租约在途文本（巡查/读取/开启/登录接管），无在途即「空闲」
+    // 当前动作列（2026-11-20）：引擎租约在途文本（巡查/读取/开启/登录接管），无在途即「空闲」；
+    // 登录失效（2026-11-27）：红色具体文案 + 原因提示，不以「空闲」掩盖需要重新登录
     var tdAct = document.createElement('td');
-    var actBusy = s.activity && s.activity !== '空闲';
+    var actBusy = s.activity && s.activity !== '空闲' && !s.requiresLogin;
     tdAct.textContent = s.activity || '空闲';
-    if (actBusy) {
+    if (s.requiresLogin) {
+      tdAct.style.color = '#b42318';
+      tdAct.title = s.readHint || '登录已失效，请重新登录';
+    } else if (actBusy) {
       tdAct.style.color = '#1a7f37';
       tdAct.style.fontWeight = 'bold';
     }

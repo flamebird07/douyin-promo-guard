@@ -345,3 +345,55 @@ test('主控制页渲染：会话失效徽标 / 红色当前动作 / requiresLog
     assert.ok(page.body.includes('无固定到期时间'), '无固定到期时间由徽标给出，不附加重复小字');
   });
 });
+
+test('巡查遇到登录页但尚未确认失效：保留失败原因，后续成功后带着历史恢复记录跨重启', async (t) => {
+  const { monitor, behavior, dataDir } = setup(t);
+  const original = monitor._injectedReader.readCostSummary;
+  const now = Date.parse('2026-11-28T00:16:16Z');
+  let observedAt = now;
+  monitor.nowFn = () => observedAt;
+  const failure = new AuthError('千川视图读取遇到登录页或登录控件：尚未取得账户数据');
+  monitor._injectedReader.readCostSummary = async () => { throw failure; };
+
+  await monitor.pollOnce('test');
+  let row = rowOf(monitor);
+  assert.equal(row.requiresLogin, false);
+  assert.deepEqual(row.readHistory, {
+    lastOutcome: 'failure',
+    lastFailure: { at: new Date(now).toISOString(), reason: failure.message, requiresLogin: false },
+  });
+
+  observedAt = now + 60_000;
+  behavior.costFetchedAt = behavior.orderFetchedAt = behavior.adsFetchedAt = new Date(observedAt).toISOString();
+  monitor._injectedReader.readCostSummary = original;
+  monitor.config.monitor.legacyWholeShopCloseEnabled = true;
+  const polled = await monitor.pollOnce('test');
+  assert.equal(polled.results[0].status, 'ok', polled.results[0].reason);
+  row = rowOf(monitor);
+  assert.equal(row.readHistory.lastOutcome, 'success');
+  assert.equal(row.readHistory.lastSuccessAt, new Date(now + 60_000).toISOString());
+  assert.equal(row.readHistory.lastFailure.reason, failure.message);
+  const restarted = new Monitor(monitor.cfgResult, null, { dataDir });
+  const restartedRow = rowOf(restarted);
+  assert.equal(restartedRow.lastDataAt, null);
+  assert.deepEqual(restartedRow.readHistory, row.readHistory);
+  assert.equal(restartedRow.requiresLogin, false);
+});
+
+test('启动时兼容原有巡查审计，忽略损坏记录并按店铺恢复成功和失败时间', (t) => {
+  const { monitor, dataDir } = setup(t);
+  const at = '2026-11-28T00:16:16.000Z';
+  const success = '2026-11-28T01:04:06.000Z';
+  fs.writeFileSync(monitor.auditFile, [
+    JSON.stringify({ ts: at, kind: 'poll', shopId: 'shop-001', status: 'stopped', reason: '千川页面未取得数据' }),
+    'invalid audit line',
+    JSON.stringify({ ts: success, kind: 'poll', shopId: 'shop-001', status: 'ok' }),
+    JSON.stringify({ ts: success, kind: 'poll', shopId: 'shop-002', status: 'stopped', reason: '其他店铺' }),
+  ].join('\n'));
+  const restarted = new Monitor(monitor.cfgResult, null, { dataDir });
+  assert.deepEqual(rowOf(restarted).readHistory, {
+    lastSuccessAt: success,
+    lastOutcome: 'success',
+    lastFailure: { at, reason: '千川页面未取得数据', requiresLogin: false },
+  });
+});

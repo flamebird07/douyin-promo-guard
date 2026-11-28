@@ -152,7 +152,7 @@ const HTML = `<!DOCTYPE html>
       <th>店铺名称</th>
       <th>广告状态</th>
       <th title="本项目 cookies/ 或 login.cookieSourceDir 里的 Cookie 登录文件">Cookie</th>
-      <th>上次数据更新</th>
+      <th>取数状态</th>
       <th>广告费</th>
       <th>订单数</th>
       <th title="广告费 ÷ 订单数">费比</th>
@@ -392,7 +392,38 @@ function renderShops(rows) {
       tdCookie.appendChild(cMiss);
     }
     var td3 = document.createElement('td');
-    td3.textContent = fmtTime(s.lastDataAt);
+    var rh = s.readHistory || {};
+    var success = document.createElement('div');
+    success.textContent = rh.lastSuccessAt ? '上次成功 ' + fmtTime(rh.lastSuccessAt) : '暂无成功记录';
+    td3.appendChild(success);
+    if (!s.lastDataAt && rh.lastSuccessAt) {
+      var waiting = document.createElement('div');
+      waiting.className = 'muted';
+      waiting.textContent = '服务启动后尚无新读数';
+      td3.appendChild(waiting);
+    }
+    var failure = rh.lastFailure;
+    if (failure) {
+      var recovered = rh.lastOutcome === 'success';
+      var detail = document.createElement('div');
+      detail.className = recovered ? 'muted' : 'bad';
+      detail.style.maxWidth = '32ch';
+      detail.style.overflowWrap = 'anywhere';
+      detail.textContent = (recovered ? '上次失败（后续已成功）' : '最近失败') + ' ' + fmtTime(failure.at) + ' · ' + failure.reason;
+      td3.appendChild(detail);
+    }
+    var scan = document.createElement('div');
+    scan.className = s.requiresLogin ? 'bad' : 'muted';
+    if (s.requiresLogin) {
+      scan.textContent = s.readHint || '登录已失效，请重新登录';
+    } else if (failure && !recovered) {
+      scan.textContent = failure.requiresLogin ? '上次确认登录失效，等待本次复核' : '暂未确认需要扫码';
+    } else if (rh.lastSuccessAt) {
+      scan.textContent = '暂无扫码要求';
+    } else {
+      scan.textContent = '登录状态待取数核验';
+    }
+    td3.appendChild(scan);
     var td4 = document.createElement('td');
     td4.textContent = s.costText || yuan(s.costCents);
     var td5 = document.createElement('td');

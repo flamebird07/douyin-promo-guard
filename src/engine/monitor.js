@@ -46,6 +46,7 @@ const { buildHoldLogFields } = require('../login/auth-failure-text');
 const { shanghaiDate, shanghaiClockText, shanghaiWall, shanghaiMs, nextIntervalDelayMs } = require('../lib/time');
 const { centsToYuan } = require('../lib/money');
 const log = require('../lib/log');
+const { loadShopReadHistory, rememberShopRead } = require('./shop-read-history');
 
 const DEFAULT_DATA_DIR = path.join(__dirname, '..', '..', 'data');
 const STATE_VERSION = 2;
@@ -232,6 +233,7 @@ class Monitor {
     // 防止进程重启后对同一天重复告警。只做审计/通知信号，绝不参与任何开关决策。
     this._mixedStuckGateStreaks = new Map();
 
+    this._shopReadHistory = loadShopReadHistory(this.auditFile);
     const loaded = this._loadState();
     this.batches = loaded.batches || {}; // shopId -> date -> { runs:[], totals:{} }
     // 最近一次会话 Cookie 回写结果（仅元信息：条数/域名/冲突；绝不保存任何 Cookie 值）。
@@ -640,6 +642,12 @@ class Monitor {
    * **不重复**：文件与事件流是同一份记录的两个出口；事件流本身有界，
    * 消费方以 evtSeq 去重。
    */
+  _recordShopRead(shopId, ok, reason, requiresLogin) {
+    const entry = { kind: 'shop-read', shopId, at: new Date(this.nowFn()).toISOString(), ok, reason, requiresLogin };
+    rememberShopRead(this._shopReadHistory, entry);
+    this._audit(entry);
+  }
+
   _audit(entry) {
     try {
       this._ensureDataDir();
@@ -1918,6 +1926,7 @@ class Monitor {
       } catch (e) {
         if (e instanceof NotConnectedError) {
           rt.lastError = '推广数据读取尚未接入';
+          this._recordShopRead(shopId, false, rt.lastError);
           return { ok: false, reason: rt.lastError, zeroClick: true };
         }
         throw e;
@@ -1977,6 +1986,7 @@ class Monitor {
       this._applyObservedAdState(shopCfg.id, stateRead.state || 'unknown', '只读清单/页面回读');
       this._commitShopLastData(rt, candidate);
       if (data.ok === false) {
+        this._recordShopRead(shopId, false, data.reason);
         rt.lastData.blockedReason = data.reason;
         return {
           ok: data.blocked !== 'orders_unavailable',
@@ -1989,6 +1999,7 @@ class Monitor {
           zeroClick: true,
         };
       }
+      this._recordShopRead(shopId, true);
       this._audit({ kind: 'shop-refresh', shopId, readOnly: true, zeroClick: true, adState: rt.lastAdState });
       return {
         ok: true,
@@ -2587,6 +2598,7 @@ class Monitor {
       retryCount: (err && err.retryCount) || 0,
       at: new Date(this.nowFn()).toISOString(),
     };
+    this._recordShopRead(shopId, false, baseReason, kind === 'auth');
     rt.lastError = reason;
     if (rt.lastData) rt.lastData.blockedReason = reason;
     // 新 Auth 失败撤销旧 on 证据：旧 adBelief/旧确认时间不得继续作为本轮可信依据。
@@ -3873,6 +3885,7 @@ class Monitor {
       } catch (e) {
         if (e instanceof NotConnectedError) {
           rt.lastError = '推广数据读取尚未接入（等待用户提供推广页面）';
+          this._recordShopRead(shopCfg.id, false, rt.lastError);
           this._memPush(this.recentErrors, { scope: `shop:${shopCfg.id}`, error: rt.lastError }, undefined, 'error');
           this._audit({ kind: 'poll', shopId: shopCfg.id, status: 'blocked', reason: rt.lastError });
           return { status: 'blocked', reason: rt.lastError };
@@ -3900,6 +3913,7 @@ class Monitor {
 
       // 早退路径不读广告状态/余额：candidate 先写余额终态（skipped）再提交，保持终态完整。
       if (data.ok === false) {
+        this._recordShopRead(shopCfg.id, false, data.reason);
         candidate.blockedReason = data.reason;
         this._commitShopLastDataSkippedBalance(rt, candidate, '本轮数据读取失败，未读取千川余额');
         this._emitJudgement(shopCfg, { data, over: null, status: 'blocked', reason: data.reason });
@@ -3962,6 +3976,7 @@ class Monitor {
       this._applyObservedAdState(shopCfg.id, currentAdState, '只读清单/页面回读');
       // 竞态修正：余额终态已写入 candidate，此刻一次性原子提交为本轮可见读数。
       this._commitShopLastData(rt, candidate);
+      this._recordShopRead(shopCfg.id, true);
       const thresholdCents = this._thresholdCents(shopCfg);
       const decision = this._switchOrchestrator.evaluatePeriodic({
         costCents: data.cost.valueCents,
@@ -4106,6 +4121,7 @@ class Monitor {
       } else if (rt.lastReadError && rt.lastReadError.requiresLogin) {
         rt.lastReadError = null;
       }
+      this._recordShopRead(shopCfg.id, false, reason, readErrorKind === 'auth');
       // 异常退出不得把 refreshing 卡在 true（candidate 未提交则维持上一轮已提交读数）。
       rt.dataRefreshing = false;
       if (rt.lastData && typeof rt.lastData === "object") rt.lastData.refreshing = false;
@@ -5099,6 +5115,7 @@ class Monitor {
             unknownBlock: mr.unknownBlock,
           },
           lastDataAt: rt.lastDataAt || (t && t.fetchedAt) || null,
+          readHistory: this._shopReadHistory.get(s.id) || null,
           costCents: t && t.costCents != null ? t.costCents : null,
           costText: t ? t.costText : null,
           orders: t && t.orders != null ? t.orders : null,
